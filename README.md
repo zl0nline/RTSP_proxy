@@ -1,265 +1,146 @@
-# RTSP_proxy
+# RTSP Proxy
 
-> **Статус:** первоначальный MVP-план ниже сохранён как история решений. Целевая production-архитектура для dashboard и масштабирования до 10 000 зарегистрированных камер описана в [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md). Реализация должна вестись по GitHub issues, созданным из этого плана.
+Production-oriented план единой точки доступа к RTSP-камерам через один configurable TCP endpoint.
 
-Минимальный план единой точки доступа к RTSP-камерам через один внешний порт.
+> **Текущий статус**
+>
+> - Planning: **READY** — решения #1–#13 согласованы и прошли внешнее критическое ревью.
+> - Implementation: **NOT AUTHORIZED** — код и deployment не начинаются без отдельного решения владельца.
+> - Production: **NOT READY** — spikes, tests, security, restore и pilot gates ещё не выполнены.
+> - 10k: **NOT CLAIMED** — capacity определяется только измерениями.
 
-## Исходные условия
+Полный нормативный документ: [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md). Итоговый planning verdict: [EPIC #14](https://github.com/zl0nline/RTSP_proxy/issues/14#issuecomment-5203794735).
 
-- центральный сервер уже маршрутизирует уникальные серые IP всех камер;
-- большинство камер — OMNY, но модели и RTSP-пути могут различаться;
-- сейчас каждой камере назначается отдельный внешний порт;
-- требуется заменить сотни портов адресами вида `rtsp://server:9999/<camera_id>`;
-- пароль самой камеры не должен передаваться внешнему клиенту.
+## Задача
 
-## Архитектура MVP
-
-```text
-RTSP-клиент
-    |
-    | rtsp://external_user:external_password@server:9999/<public_id>
-    | RTSP over TCP (interleaved)
-    v
-MediaMTX
-    |
-    | sourceOnDemand: true
-    v
-rtsp://camera_user:camera_password@<private_ip>:<port>/<stream_path>
-
-                    cameras.json
-                         |
-                  Python CLI-утилита
-          add / edit / disable / check / import / links / sync
-                         |
-                 локальный Control API
-                    MediaMTX:9997
-```
-
-MediaMTX передаёт видео и слушает один внешний RTSP-порт `9999`. Python-утилита не участвует в медиапотоке: она ведёт файловый каталог камер, проверяет записи, генерирует внешние ссылки и синхронизирует заранее известные пути с MediaMTX.
-
-Полноценный REST API, SQL-база и постоянно работающий control service для MVP не нужны. Локальный Control API MediaMTX используется только утилитой для применения изменений без ручного редактирования конфигурации и не публикуется наружу.
-
-## Стек
-
-- MediaMTX;
-- Python 3.12+;
-- JSON-файл как каталог камер;
-- Python CLI на `argparse` или Typer;
-- опционально после MVP — небольшая веб-форма на FastAPI + HTMX поверх того же каталога и командного слоя;
-- Docker Compose для запуска MediaMTX и, если понадобится, веб-формы.
-
-## Каталог камер
-
-Рабочий файл `data/cameras.json` хранится только на сервере, не добавляется в Git и имеет права `0600`. Для 600 камер JSON достаточно: изменения редкие, а каталог целиком помещается в памяти.
-
-Пример структуры:
-
-```json
-{
-  "version": 1,
-  "cameras": {
-    "dZ8k2N4pQ7xM": {
-      "name": "warehouse-01",
-      "model": "OMNY-IPC-X",
-      "profile": "omny-main-av0_0",
-      "private_ip": "10.20.30.40",
-      "rtsp_port": 554,
-      "stream_path": "av0_0",
-      "camera_username": "viewer",
-      "camera_password": "change-me",
-      "external_username": "cam_dZ8k2N4pQ7xM",
-      "external_password": "generated-random-secret",
-      "enabled": true
-    }
-  }
-}
-```
-
-Ключ записи — случайный непрозрачный `public_id`, а не IP, серийный номер или порядковый номер. Запись файла выполняется атомарно: блокировка, запись во временный файл, `fsync`, переименование. Перед изменением создаётся резервная копия. Одновременное редактирование файла вручную и через CLI запрещается.
-
-Для быстрого MVP пароли находятся в локальном JSON. Это допустимо только при `0600`, исключении файла из Git, резервных копиях с теми же ограничениями и отсутствии секретов в логах. Позже секреты можно вынести в отдельный файл или хранилище без изменения внешней архитектуры.
-
-## Профили моделей OMNY
-
-Повторяющиеся настройки моделей хранятся в версионируемом `config/profiles.yaml`:
-
-```yaml
-omny-main-av0_0:
-  vendor: OMNY
-  stream_path: av0_0
-  source_protocol: tcp
-```
-
-При добавлении камеры оператор выбирает готовый профиль. Поле `stream_path` в записи камеры может переопределить шаблон для отдельной модели или прошивки. Новая модель сначала проверяется командой `check`, после чего для неё создаётся профиль.
-
-## Управление камерами
-
-Предлагаемый интерфейс:
-
-```bash
-rtsp-proxy add \
-  --name warehouse-01 \
-  --model OMNY-IPC-X \
-  --profile omny-main-av0_0 \
-  --ip 10.20.30.40 \
-  --port 554 \
-  --camera-user viewer \
-  --camera-password '...'
-
-rtsp-proxy edit <public_id> --ip 10.20.30.41
-rtsp-proxy disable <public_id>
-rtsp-proxy list
-rtsp-proxy check <public_id>
-rtsp-proxy link <public_id>
-rtsp-proxy sync
-rtsp-proxy import cameras.csv --dry-run
-```
-
-`add` выполняет валидацию, генерирует `public_id` и отдельную пару внешних учётных данных, сохраняет запись атомарно, синхронизирует путь с MediaMTX и печатает готовую ссылку. Если проверка или синхронизация не удалась, утилита сообщает ошибку и не оставляет частично применённое состояние.
-
-`import` предназначен для массового добавления 100 камер. Сначала выполняется `--dry-run` с отчётом о дубликатах IP, неизвестных профилях, неверных полях и недоступных источниках; затем изменения применяются одним пакетом.
-
-## Генерация внешних ссылок
-
-Основной формат:
+Вместо отдельного внешнего порта на каждую камеру система должна предоставлять адреса вида:
 
 ```text
-rtsp://external_user:external_password@46.151.159.150:9999/<public_id>
+rtsp://<external-user>:<external-password>@<host>:9999/<public_id>
 ```
 
-Логин и пароль камеры в ссылку не попадают. Если клиентское ПО не принимает credentials в URL, команда `link` выводит отдельно:
+При этом:
 
-- RTSP URL без credentials;
-- внешний логин;
-- внешний пароль.
+- внешний клиент не получает IP и credentials камеры;
+- поддерживаемый media transport — RTSP over TCP interleaved;
+- эталонный клиент — FFmpeg вместе с supervisor;
+- dashboard и Python control plane не участвуют в медиапотоке;
+- изменение одной камеры не должно обрывать остальные streams;
+- registered paths, active sources и readers измеряются независимо.
 
-Специальные символы в credentials URL-кодируются. Команда массовой выгрузки ссылок не показывает пароли по умолчанию; раскрытие секретов требует отдельного флага и не записывается в журнал.
-
-Для первой версии используется отдельная внешняя пара credentials на камеру. Это позволяет отозвать доступ к одной камере без изменения пароля источника и без затрагивания остальных путей.
-
-## Синхронизация MediaMTX
-
-- все включённые пути заранее создаются в MediaMTX;
-- источники работают с `sourceOnDemand: true`;
-- подключение MediaMTX к камере принудительно выполняется по TCP;
-- `rtsp-proxy sync` сравнивает JSON с текущей конфигурацией, показывает план изменений и применяет его через локальный Control API;
-- `rtsp-proxy sync --full` восстанавливает все пути после чистого запуска или рестарта MediaMTX;
-- API MediaMTX слушает только `127.0.0.1:9997` либо внутреннюю Docker-сеть и не публикуется наружу;
-- неизвестные пути не создаются по входящему RTSP-запросу.
-
-Перед реализацией нужно проверить на стенде, сохраняются ли действующие RTSP-сессии при добавлении и удалении другого пути через Control API. Изменение одной камеры не должно обрывать остальные потоки.
-
-## Этапы реализации
-
-### 0. Проверка камер
-
-- взять 2–3 представителя основных моделей OMNY и по одному экземпляру редких моделей;
-- проверить `DESCRIBE/SETUP/PLAY`, TCP interleaved, повторное подключение и восстановление после обрыва;
-- зафиксировать RTSP-пути и создать профили;
-- проверить доступность камер с сервера.
-
-Критерий: сервер стабильно читает тестовые камеры напрямую по серым IP.
-
-### 1. PoC MediaMTX
-
-- запустить MediaMTX на внешнем порту `9999`;
-- вручную добавить 2–3 пути с `sourceOnDemand: true`;
-- проверить VLC и FFmpeg, параллельных клиентов и отсутствие внешних UDP-портов;
-- проверить отдельную внешнюю авторизацию для каждого пути.
-
-Критерий: разные камеры доступны через один порт, а клиент не знает адрес и пароль источника.
-
-### 2. Python CLI и JSON
-
-- реализовать схему и строгую валидацию `cameras.json`;
-- реализовать атомарное сохранение, блокировку и резервную копию;
-- добавить команды `add/edit/disable/list/check/link/sync`;
-- исключить секреты из Git, stdout по умолчанию и логов;
-- проверить безопасное изменение одного пути без обрыва остальных.
-
-Критерий: камера добавляется одной командой, после чего готовая ссылка сразу работает.
-
-### 3. Массовый импорт
-
-- определить CSV-формат существующего списка;
-- реализовать `import --dry-run` и пакетное применение;
-- сформировать отчёт `добавлено / пропущено / ошибка`;
-- сначала импортировать 10, затем 100 камер.
-
-Критерий: повторный импорт идемпотентен и не создаёт дубликаты.
-
-### 4. Опциональная веб-форма
-
-Если CLI окажется неудобным, добавить FastAPI + HTMX:
-
-- таблица камер без отображения паролей;
-- форма добавления и редактирования;
-- кнопки `проверить`, `отключить`, `скопировать ссылку`;
-- локальная или VPN-доступная админская авторизация.
-
-Веб-форма использует тот же Python-модуль каталога и синхронизации. Она не обязательна для запуска прокси и не участвует в видеопотоке.
-
-## Безопасность MVP
-
-- наружу публикуется только RTSP-порт `9999`;
-- Control API и веб-форма доступны только локально или через административную сеть/VPN;
-- `cameras.json`, резервные копии и сгенерированный конфиг имеют права `0600`;
-- рабочие файлы с секретами перечислены в `.gitignore`;
-- реальные пароли камер не попадают во внешние ссылки и логи;
-- `public_id` и внешние пароли генерируются криптографически стойко;
-- внешний доступ можно отозвать без изменения настроек камеры;
-- после PoC отдельно оценивается RTSPS либо ограничение доступа доверенной сетью/VPN.
-
-## Проверки MVP
-
-- несколько камер работают через один TCP-порт;
-- два клиента одновременно смотрят один путь;
-- добавление или изменение камеры не обрывает другие потоки;
-- отключение и возврат камеры корректно восстанавливают поток;
-- неизвестный `public_id` и неверная авторизация отклоняются;
-- пароль камеры отсутствует во внешнем URL и логах;
-- `sync --full` восстанавливает пути после рестарта MediaMTX;
-- повреждённый JSON не заменяет последнюю рабочую конфигурацию;
-- повторный импорт не создаёт дубликаты.
-
-## Структура репозитория
+## Согласованная архитектура
 
 ```text
-rtsp_proxy/
-  catalog.py
-  cli.py
-  mediamtx.py
-  models.py
-  profiles.py
-config/
-  profiles.yaml
-deploy/
-  docker-compose.yml
-  mediamtx.yml
-examples/
-  cameras.example.json
-  import.example.csv
-tests/
-.gitignore
-pyproject.toml
+Operator -> HTTPS Dashboard/API -> PostgreSQL
+                    |                 |
+                    |                 +-> desired state / audit / outbox
+                    v
+             workers / reconciler / bounded probes
+                    |
+External FFmpeg -> RTSP/TCP :9999 -> MediaMTX -> cameras
+                                      |
+                                      +-> metrics/events -> TSDB
 ```
 
-## Что сознательно не входит в MVP
+- Control plane: Python 3.12, FastAPI, Jinja2/HTMX, PostgreSQL.
+- Media plane: pinned MediaMTX digest; Python не proxy/transcode media.
+- Desired state: PostgreSQL + transactional outbox + idempotent reconciler.
+- Health: дешёвые MediaMTX signals + bounded sandboxed ffprobe.
+- Observability: versioned signal catalog, bounded cardinality/query/SSE budgets.
+- Security: separated source secrets/access grants, envelope encryption, RBAC/authz epochs, append-only/WORM audit.
+- Operations: role-specific health, expand-contract migrations, PITR, drain/rollback state machine и проверяемые runbooks.
 
-- PostgreSQL, SQLite, ORM и миграции;
-- Go-сервис;
-- собственный публичный REST API;
-- Prometheus, Vault/KMS, HA и оркестратор;
-- собственная реализация RTSP-протокола;
-- динамическое создание неизвестного пути по первому RTSP-запросу;
-- постоянный Python-сервис в медиапути.
+## Ключевые инварианты
 
-## Оценка
+1. Один внешний RTSP endpoint, порт задаётся конфигурацией, default `9999`.
+2. PostgreSQL — production source of truth; JSON используется только для import/export.
+3. CRUD одной камеры не вызывает reload/restart MediaMTX и не влияет на другие paths.
+4. Established media sessions продолжаются при потере control plane/DB в доказанных границах.
+5. L4 не умеет выбирать shard по RTSP path; схема `L4 -> assigned shard` исключена.
+6. Сначала измеряется safe envelope одного node. Multi-node включается только после отдельного ADR/spike.
+7. FFmpeg reconnect обеспечивается supervisor: full handshake, exponential full-jitter backoff `1s -> 30s`.
+8. Security, audit, observability, restore, rollback и capacity — release gates, а не отложенная работа.
 
-- проверка основных моделей и профилей OMNY: 1–2 рабочих дня;
-- PoC MediaMTX: 1 рабочий день;
-- Python CLI, JSON-каталог, синхронизация и ссылки: 2–4 рабочих дня;
-- массовый импорт и испытание на 100 камерах: 1–2 рабочих дня;
-- опциональная веб-форма: ещё 1–2 рабочих дня.
+## Scale-out: single-node first
 
-Оценка уточняется после проверки реальных RTSP URL и механизма авторизации MediaMTX на путях.
+Заявления вида «поддерживает 10k streams» запрещены без evidence. Сначала измеряется single-node envelope по registered paths, active sources, readers, bitrate, packet rate, RAM, CPU, FD и network per hop.
+
+Single-node проходит gate после 24h soak с faults/churn, выполненными SLO и запасом не менее 30% по каждому hard limit. Достижение/прогноз 70% любого hard limit запускает scale-out planning.
+
+Если одного node недостаточно:
+
+1. проверяется replicated MediaMTX gateway tier с on-demand pull к origin shards;
+2. при провале его SLO/security/capacity — готовый RTSP-aware L7 router;
+3. собственный RTSP router остаётся последним резервом.
+
+## Initial numerical gates
+
+- RTSP connect: warm `<=500ms`, cold `<=3s`, измеряются p95 и p99;
+- catalog read `<=200ms`, CRUD `<=1s`;
+- authz downgrade/revoke `<=2s`, fail closed;
+- supervisor recovery p95 `<=10s`, max `<=35s`;
+- successful steady handshakes `>=99.9%`;
+- probes: throughput loss `<=5%`, latency regression `<=10%`, errors `<=0.1pp`;
+- PostgreSQL RPO `<=5m`, control-plane RTO `<=30m`;
+- metrics budget `<=100k` active series и `<=6` per enabled camera;
+- canary 5%, затем gated soak/waves; pilot exit требует `>=99%` readable и ноль system-caused disconnects healthy streams в exit window.
+
+Это planning budgets. Они становятся доказанными характеристиками только после reproducible tests; ослабление требует versioned ADR.
+
+## План исполнения
+
+Реализация пока не разрешена. После явного `START PHASE 0` порядок такой:
+
+### Phase 0 — evidence foundation
+
+- ADR/SLI/release manifests;
+- pinned MediaMTX API/auth/hot-update/metrics compatibility spike;
+- reproducible load harness, untuned baseline и single-node knee;
+- topology decision на измерениях.
+
+### Phase 1 — foundation
+
+- control plane и migrations;
+- PostgreSQL data model;
+- dashboard/RBAC;
+- reconciler/hot-update;
+- health scheduler/probes.
+
+### Phase 2 — production contracts
+
+- observability;
+- FFmpeg compatibility;
+- security;
+- полная load/chaos matrix и published safe envelope.
+
+### Phase 3 — operations and release
+
+- deployment/drain/PITR/restore/runbook drills;
+- lab -> pilot 10 -> pilot 100 -> controlled waves;
+- отдельный `GO | HOLD | ROLLBACK` на каждом gate.
+
+## Repository status
+
+Репозиторий сейчас содержит архитектурный план. Наличие описанной функции в документации не означает, что соответствующий код уже существует. EPIC #14 остаётся открытой execution map; consensus дочернего issue означает «контракт согласован», а не «готово».
+
+## Нормативные ссылки
+
+- [Подробный production-план](docs/PRODUCTION_PLAN.md)
+- [EPIC #14 и итоговый verdict](https://github.com/zl0nline/RTSP_proxy/issues/14)
+- [Architecture/SLO/capacity #1](https://github.com/zl0nline/RTSP_proxy/issues/1)
+- [Foundation #2](https://github.com/zl0nline/RTSP_proxy/issues/2)
+- [Data model #3](https://github.com/zl0nline/RTSP_proxy/issues/3)
+- [Dashboard/RBAC #4](https://github.com/zl0nline/RTSP_proxy/issues/4)
+- [Reconciler #5](https://github.com/zl0nline/RTSP_proxy/issues/5)
+- [Health #6](https://github.com/zl0nline/RTSP_proxy/issues/6)
+- [Observability #7](https://github.com/zl0nline/RTSP_proxy/issues/7)
+- [FFmpeg compatibility #8](https://github.com/zl0nline/RTSP_proxy/issues/8)
+- [Security #9](https://github.com/zl0nline/RTSP_proxy/issues/9)
+- [Scale/topology #10](https://github.com/zl0nline/RTSP_proxy/issues/10)
+- [Performance/chaos #11](https://github.com/zl0nline/RTSP_proxy/issues/11)
+- [Operations #12](https://github.com/zl0nline/RTSP_proxy/issues/12)
+- [Release/migration #13](https://github.com/zl0nline/RTSP_proxy/issues/13)
+
+## License
+
+См. [LICENSE](LICENSE).
