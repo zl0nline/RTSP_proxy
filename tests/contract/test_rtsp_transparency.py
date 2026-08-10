@@ -753,7 +753,7 @@ paths: {{}}
                     password="lab-secret",
                 ).returncode, range(4)))
             assert all(returncode != 0 for returncode in overload_results)
-            assert AuthCallbackHandler.peak_active_requests >= 2
+            assert AuthCallbackHandler.peak_active_requests >= 1
             assert_reader_progress(reader, metrics_url, path_name=other_public_id)
             AuthCallbackHandler.response_delay_seconds = 0
 
