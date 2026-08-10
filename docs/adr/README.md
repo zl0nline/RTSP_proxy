@@ -23,3 +23,4 @@ Current records:
 |---|---|---|
 | [0001](0001-mediamtx-v1.20.0-phase-0-candidate.md) | Proposed | MediaMTX v1.20.0 Phase 0 candidate |
 | [0002](0002-ffmpeg-phase-0-candidate.md) | Proposed | FFmpeg/ffprobe Phase 0 candidate and provenance gate |
+| [0003](0003-single-node-http-auth-callback.md) | Proposed | Loopback HTTP callback for dynamic RTSP grants |

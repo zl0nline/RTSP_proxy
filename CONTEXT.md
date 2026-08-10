@@ -42,8 +42,13 @@ our own internal modules or assert private call order.
 
 ## Current implementation boundary
 
-The repository is in Phase 0/foundation. Role processes currently expose a
-fail-closed readiness scaffold, not their later task loops or dependency
-adapters. Implemented behavior must not imply that MediaMTX/FFmpeg
-compatibility, PostgreSQL durability, artifact provenance, capacity or
-production readiness have already been proven.
+The repository is in Phase 0. The reviewed foundation provides fail-closed role
+readiness, native release verification and direct-Linux service artifacts. The
+Phase 0A compatibility layer provides a MediaMTX path adapter and a bounded
+ffprobe adapter; executable contracts cover ordinary RTSP-over-TCP, on-demand
+pull, restart/cold restore, auth behavior and pinned metrics on real binaries.
+
+Role processes do not yet run catalog, grant, reconciler, scheduler or
+observability loops. PostgreSQL durability, artifact provenance, capacity and
+production readiness have not been proven. Proposed ADRs and successful lab
+contracts must not be presented as production approval.

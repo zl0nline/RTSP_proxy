@@ -33,6 +33,18 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
         self._respond(200, b'{"status":"ok"}')
 
     def do_GET(self) -> None:
+        if self.path.startswith("/v3/config/paths/list?"):
+            self._respond(
+                200,
+                json.dumps(
+                    {
+                        "itemCount": len(self.paths),
+                        "pageCount": 1,
+                        "items": list(self.paths.values()),
+                    }
+                ).encode("utf-8"),
+            )
+            return
         name = self.path.removeprefix("/v3/config/paths/get/")
         if name == "c" * 25:
             self._respond(200, b"not-json")
@@ -71,7 +83,9 @@ def media_api() -> Iterator[str]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        host, port = server.server_address
+        host = server.server_address[0]
+        port = server.server_address[1]
+        assert isinstance(host, str)
         yield f"http://{host}:{port}"
     finally:
         server.shutdown()
@@ -88,6 +102,7 @@ def test_media_path_operations_converge_without_exposing_http_routes(media_api: 
     )
 
     client.put_path(path)
+    assert client.list_path_names() == (path.name,)
     assert client.get_path(path.name) == path
 
     client.delete_path(path.name)

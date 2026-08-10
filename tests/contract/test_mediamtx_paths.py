@@ -105,6 +105,7 @@ def test_path_hot_update_and_delete_are_idempotent_and_isolated(tmp_path: Path) 
         client.put_path(second)
         client.put_path(first_v2)
 
+        assert set(client.list_path_names()) == {first_name, second_name}
         assert client.get_path(first_name) == first_v2
         assert client.get_path(second_name) == second
 

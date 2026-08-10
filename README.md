@@ -8,9 +8,12 @@ TCP endpoint.
 > - Planning consensus: **COMPLETE** — issues #1–#14 согласованы, сквозные
 >   противоречия исправлены.
 > - Phase 0: **IN PROGRESS** — owner authorization получено 10 августа 2026.
-> - Foundation implementation: **IN PROGRESS** — fail-closed role readiness
->   scaffold, release verifier, Python package, native amd64/arm64 CI и
->   direct-Linux systemd artifacts созданы.
+> - Foundation implementation: **REVIEWED** — fail-closed role readiness,
+>   release verifier, Python package, native amd64/arm64 CI и direct-Linux
+>   systemd artifacts прошли Standards/Spec review.
+> - Phase 0A compatibility lab: **IN PROGRESS** — MediaMTX adapter и внешний
+>   ordinary-RTSP contract реализованы; auth/security forks остаются evidence
+>   gated до полного exit review.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -204,12 +207,17 @@ Product behavior, зависящий от неподтверждённых Media
 Репозиторий содержит исполняемый Phase 0 foundation: Python package,
 role-specific fail-closed readiness scaffold, checksum/path/version/
 architecture release verifier, tests, direct-Linux systemd artifacts и native
-amd64/arm64 CI. Catalog, PostgreSQL, реальные dependency providers и task loops,
-MediaMTX adapter и полный внешний FFmpeg RTSP contract ещё не реализованы;
-baseline effective-config contract запускается против pinned MediaMTX отдельно
-на обеих архитектурах. FFmpeg/ffprobe зафиксированы как Phase 0 candidate, но их
-текущий upstream artifact не имеет GitHub attestation и ещё не прошёл security
-provenance gate. Наличие foundation-кода не означает доказанную production
+amd64/arm64 CI. В Phase 0A уже реализованы MediaMTX management adapter,
+безопасный ffprobe adapter и исполняемый внешний контракт против реальных
+MediaMTX/FFmpeg/ffprobe: обычный `rtsp://` по TCP, on-demand pull, hot-update
+изоляция, restart/cold-restore, internal/HTTP auth, revoke/outage, no-oracle
+fallback и pinned metrics schema. Последний набор изменений считается
+подтверждённым только после native CI и exit review фазы.
+
+Catalog, PostgreSQL, grant verifier, reconciler/task loops, dashboard и load
+harness ещё не реализованы. FFmpeg/ffprobe зафиксированы как Phase 0 candidate,
+но upstream artifact не имеет GitHub attestation и ещё не прошёл security
+provenance gate. Наличие Phase 0-кода не означает доказанную production
 характеристику. Issue #10 остаётся evidence blocker для scale-out topology;
 issues #1–#14 — execution map.
 
@@ -223,10 +231,13 @@ uv run mypy
 uv build
 ```
 
-External MediaMTX contract запускается отдельно с проверенным binary:
+External media contract запускается отдельно с проверенными binaries:
 
 ```sh
-MEDIAMTX_BINARY=/path/to/mediamtx uv run pytest -m contract tests/contract
+MEDIAMTX_BINARY=/path/to/mediamtx \
+FFMPEG_BINARY=/path/to/ffmpeg \
+FFPROBE_BINARY=/path/to/ffprobe \
+uv run pytest -m contract tests/contract
 ```
 
 Direct-Linux layout и activation contract описаны в

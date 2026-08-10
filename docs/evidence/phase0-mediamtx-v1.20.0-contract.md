@@ -16,6 +16,21 @@
   proxy is not used as a substitute for the source path;
 - an external FFmpeg/ffprobe consumer receives H.264 through a standard Basic
   Auth RTSP URL and does not require a proxy-specific scheme or handshake;
+- four simultaneous first readers of one cold on-demand path all succeed while
+  the origin observes exactly one upstream proxy reader;
+- both internal and HTTP callback auth modes pass the ordinary RTSP contract;
+  callback input contains the expected user/password/action/path/protocol;
+- callback denial revokes new sessions within 10 seconds; callback outage
+  fails new sessions closed while an established reader continues;
+- wrong password, unknown user and unknown path return the same RTSP response
+  through the HTTP callback, without a path or credential enumeration oracle;
+- registered configs, runtime path/source state, readers and RTSP sessions have
+  distinct pinned API/metrics signals; no `rtsps_*` family is emitted;
+- the platform ffprobe interface uses the pinned `-timeout` microsecond option,
+  TCP transport and credential-free errors even when raw ffprobe stderr contains
+  the rejected userinfo URL;
+- MediaMTX output collected across successful auth, denied auth and callback
+  outage does not contain the exercised external passwords;
 - runtime paths written through the management API disappear after MediaMTX
   restart and can be restored with a repeated convergent apply.
 
@@ -41,9 +56,9 @@ corresponding commit is green.
 
 ## Still open in Phase 0A
 
-- external callback versus runtime/static auth decision, revoke-new and auth
-  outage behavior;
-- metrics schema inventory and signal mapping;
-- explicit on-demand race and secret-leak negative tests;
 - two-version FFmpeg/supervisor timeout and reconnect matrix;
+- process-argument isolation for source credentials and remaining source-error
+  MediaMTX log scenarios;
+- callback overload/rate-limit tests and statistical timing-oracle analysis;
+- cross-host callback/L4/VPN source-IP boundary;
 - security-owner decision for FFmpeg build provenance.

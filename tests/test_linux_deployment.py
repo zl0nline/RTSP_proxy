@@ -2,9 +2,13 @@ from configparser import ConfigParser
 from pathlib import Path
 
 
+class CaseSensitiveConfigParser(ConfigParser):
+    def optionxform(self, optionstr: str) -> str:
+        return optionstr
+
+
 def read_unit(name: str) -> ConfigParser:
-    parser = ConfigParser(interpolation=None, strict=True)
-    parser.optionxform = str
+    parser = CaseSensitiveConfigParser(interpolation=None, strict=True)
     parser.read(Path("deploy/systemd") / name)
     return parser
 

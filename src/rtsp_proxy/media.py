@@ -74,6 +74,33 @@ class MediaMtxClient:
             source_on_demand=source_on_demand,
         )
 
+    def list_path_names(self) -> tuple[str, ...]:
+        names: list[str] = []
+        page = 0
+        while True:
+            response = self._request(
+                "GET",
+                f"/v3/config/paths/list?itemsPerPage=1000&page={page}",
+            )
+            if not isinstance(response, dict):
+                raise MediaNodeProtocolError("mediamtx_invalid_path_list")
+            page_count = response.get("pageCount")
+            items = response.get("items")
+            if (
+                not isinstance(page_count, int)
+                or isinstance(page_count, bool)
+                or page_count < 0
+                or not isinstance(items, list)
+            ):
+                raise MediaNodeProtocolError("mediamtx_invalid_path_list")
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise MediaNodeProtocolError("mediamtx_invalid_path_list")
+                names.append(item["name"])
+            page += 1
+            if page >= page_count:
+                return tuple(names)
+
     def delete_path(self, name: str) -> None:
         self._request(
             "DELETE",
