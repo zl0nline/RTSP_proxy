@@ -139,6 +139,7 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
     assert FFPROBE_BINARY is not None
     fixture = tmp_path / f"fixture.{codec}"
     create_fixture(FFMPEG_BINARY, fixture, codec)
+    expected_codec_name = "h264" if codec == "h264" else "hevc"
     port = unused_tcp_port()
     server = subprocess.Popen(
         [
@@ -175,7 +176,7 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
             assert result.returncode == 0, result.stderr
             assert json.loads(result.stdout)["streams"] == [
                 {
-                    "codec_name": codec,
+                    "codec_name": expected_codec_name,
                     "codec_type": "video",
                     "width": 160,
                     "height": 120,
