@@ -22,12 +22,14 @@ TCP endpoint.
 единый endpoint и opaque path:
 
 ```text
-rtsps://<host>:9999/<public_id>
+rtsp://<external-user>:<external-password>@<host>:9999/<public_id>
 ```
 
-Это безопасный default для недоверенной сети. Username/password access grant
-передаются consumer отдельно через управляемый secret workflow. Plain
-`rtsp://` допускается только в явно выбранном trusted VPN/private profile.
+Это обычный RTSP URL: FFmpeg выполняет стандартный DESCRIBE/SETUP/PLAY и не
+должен знать, что endpoint является proxy, а не прямой камерой.
+`external-user`/`external-password` — access grant прокси, не credentials
+камеры. Если канал недоверенный, шифрование обеспечивает внешний VPN/private
+network, не меняющий `rtsp://` URL и RTSP handshake.
 
 Целевые свойства:
 
@@ -49,7 +51,7 @@ Operator -> HTTPS Dashboard/API -> PostgreSQL
                     v
           workers / reconciler / bounded probes
                     |
-External FFmpeg -> RTSP(S)/TCP :9999 -> MediaMTX -> cameras
+External FFmpeg -> RTSP/TCP :9999 -> MediaMTX -> cameras
                                       |
                                       +-> metrics/events -> collector / TSDB
 ```
@@ -150,7 +152,7 @@ L4 перед gateway допустим только потому, что люб�
 ### Phase 0 — evidence foundation
 
 - pin MediaMTX/FFmpeg/ffprobe versions and digests;
-- prove API/auth/hot-update/restart/metrics/TLS semantics;
+- prove API/auth/hot-update/restart/metrics and transparent RTSP semantics;
 - build pull-mode RTSP load harness;
 - find single-node knee and publish safe envelope;
 - run gateway/L7 topology spikes only if single-node is insufficient.
@@ -167,7 +169,7 @@ L4 перед gateway допустим только потому, что люб�
 
 - #7 observability;
 - #8 FFmpeg/supervisor compatibility;
-- #9 security/auth/TLS/hardening;
+- #9 security/auth/network-boundary/hardening;
 - #11 full load/chaos and published envelope.
 
 ### Phase 3 — operations and release

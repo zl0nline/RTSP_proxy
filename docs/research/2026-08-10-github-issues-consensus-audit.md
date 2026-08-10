@@ -25,6 +25,7 @@
 | RAM `≤75%` против 30% headroom | Применяется пересечение gates: CPU `≤65%`, NIC/pps `≤60%`, FD/RAM `<70%` |
 | Отсутствующие gateway/legacy signals | В #7 добавлены conditional signals, provenance, staleness/cardinality и evidence gates |
 | Неопределённый legacy zero-session period | Минимум 30 дней compatibility + 7 consecutive full days fresh zero sessions |
+| Внешний `rtsps://` из security review против owner requirement прозрачного RTSP | Внешний contract возвращён на обычный `rtsp://`/RTSP-over-TCP; RTSPS/TLS listener исключён, недоверенный канал защищается внешним VPN/private L3 transport |
 
 Повторный автоматизированный поиск по всем 14 текущим телам не нашёл старые
 22-char ID, async normative audit, unconditional cold `≤3s`, API p95-as-SLO,
@@ -33,6 +34,12 @@ RAM 75% или неопределённый zero-session period.
 Открытый blocker #10 сохранён намеренно: это evidence gate на выбор scale-out
 topology до Spike #0, а не внутреннее противоречие спецификации. Реализация и
 production readiness по-прежнему не заявлены.
+
+После отдельного уточнения владельца тела #1/#2/#8/#9/#12/#13/#14 также
+синхронизированы с требованием protocol transparency: FFmpeg видит обычную
+RTSP-камеру и не получает `rtsps://` либо proxy-specific handshake. Историческое
+замечание T6 ниже и прежний TLS/certificate fork сохранены только как запись
+исходного аудита и больше не являются рекомендацией проекта.
 
 Ниже сохранён исходный аудит до remediation как traceability record.
 

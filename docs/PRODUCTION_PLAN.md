@@ -42,15 +42,17 @@ threshold или смена topology запрещены.
 Система заменяет отдельные внешние RTSP-порты камер одним настраиваемым
 endpoint, по умолчанию `:9999`.
 
-Безопасный внешний адрес для недоверенной сети:
+Внешний адрес:
 
 ```text
-rtsps://<host>:9999/<public_id>
+rtsp://<external-user>:<external-password>@<host>:9999/<public_id>
 ```
 
-Grant username/password передаются consumer отдельно через управляемый secret
-workflow. README и dashboard не нормализуют credential-bearing URL как default.
-Plain `rtsp://` допустим только в явно выбранном trusted VPN/private profile.
+Это стандартный RTSP URL. Consumer выполняет обычный DESCRIBE/SETUP/PLAY и не
+получает proxy-specific scheme, redirect, header или setup step. External grant
+скрывает source credentials камеры. Для недоверенной сети confidentiality
+обеспечивается внешним VPN/private L3 transport, который не меняет `rtsp://`
+URL или handshake.
 
 Целевой результат:
 
@@ -117,7 +119,7 @@ Plain `rtsp://` допустим только в явно выбранном tru
 
 - project owner разрешает phase, pilot и следующую wave;
 - technical owner останавливает rollout при SLO/integrity/capacity breach;
-- security owner останавливает при auth, secret, audit, TLS или boundary breach;
+- security owner останавливает при auth, secret, audit или network-boundary breach;
 - operations owner принимает restore, drain, rollback и runbook evidence;
 - on-call вправе объявить `STOP`; возобновление требует нового owner `GO`.
 
@@ -126,7 +128,9 @@ Plain `rtsp://` допустим только в явно выбранном tru
 1. Один внешний configurable RTSP endpoint, default port `9999`.
 2. **RTSP-over-TCP interleaved — единственный поддерживаемый transport** снаружи
    и до источника. UDP/multicast выключены. `sockets_per_session = 1`. Изменение
-   транспорта требует отдельного ADR и пересчёта capacity.
+   транспорта требует отдельного ADR и пересчёта capacity. Внешняя схема всегда
+   обычная `rtsp://`; consumer не должен отличать proxy endpoint от прямой
+   RTSP-камеры.
 3. Python не находится в media datapath и не proxy/remux/transcode video.
 4. MediaMTX запускается только по pinned digest и compatibility manifest.
 5. PostgreSQL — единственный source of truth desired state. JSON/CSV используются
@@ -173,7 +177,7 @@ web / worker / reconciler / probe scheduler <-------+
 MediaMTX management boundary
       ^
       |
-External FFmpeg + supervisor --> RTSP(S)/TCP :9999 --> MediaMTX --> cameras
+External FFmpeg + supervisor --> RTSP/TCP :9999 --> MediaMTX --> cameras
                                                         |
                                                         +--> metrics/events
                                                                |
@@ -312,7 +316,7 @@ Readiness проверяет effective config через API:
 | Класс | Примеры | Изменение |
 |---|---|---|
 | `runtime` | paths, credentials, per-camera settings | API/hot-update без разрыва unrelated sessions |
-| `restart-node` | RTSP port, transports, TLS listener | drain, maintenance, restart, smoke |
+| `restart-node` | RTSP listen address/port, transports | drain, maintenance, restart, smoke |
 | `restart-control-plane` | pool size, tracing, sessions | rolling control-plane update |
 
 Смена `RTSP_PORT` — не CRUD. Она обрывает sessions узла и выполняется только по
@@ -613,17 +617,21 @@ Callback model requires at least two auth instances, internal LB and mTLS.
 - old key removed only after 100% re-encryption and backup recovery window;
 - crypto-erasure restore marks `UNRECOVERABLE/REISSUE_REQUIRED`.
 
-### 15.3 Network, abuse и TLS
+### 15.3 Transparent RTSP, network boundary и abuse protection
 
 - management API/metrics never public;
 - camera egress limited to approved CIDR/destination;
 - edge/pre-auth/auth/post-auth/media limits are separate;
 - unknown path/user/wrong password have no-oracle parity;
 - Slowloris controls accept, headers, auth and `SETUP→PLAY` deadlines;
-- RTSPS required on untrusted network; plain RTSP only explicit trusted profile;
-- certificate spike selects native hot reload or HA TLS terminator;
-- terminator preserves source IP through PROXY protocol or records an explicit
-  policy blocker/trade-off.
+- external media contract is ordinary `rtsp://` over TCP interleaved; consumer
+  must not receive proxy-specific protocol behavior;
+- RTSPS/TLS listener is outside scope;
+- untrusted WAN/Internet path requires WireGuard/IPsec/managed VPN or private L3
+  transport outside RTSP; without it deployment is NO-GO or needs explicit owner
+  risk acceptance;
+- L4/VPN boundary preserves source IP directly or through proven PROXY protocol;
+  otherwise rate-limit/audit impact is an explicit blocker/trade-off.
 
 MediaMTX logs are inside secret-scan perimeter.
 
@@ -800,7 +808,8 @@ SERVING -> STOP_NEW -> DRAINING -> FORCE_BATCH -> UPDATING -> SMOKE -> SERVING
 - observation window 5m;
 - failed smoke → rollback/quarantine, never automatic return.
 
-Same procedure is mandatory for RTSP port, transport and TLS listener changes.
+Same procedure is mandatory for RTSP listen address/port and transport changes.
+The media listener remains ordinary `rtsp://`; TLS/RTSPS is not introduced.
 Single-node maintenance honestly means media interruption without proven
 redundancy.
 
@@ -934,7 +943,7 @@ Implementation begins only after explicit owner authorization.
 - path persistence after node restart;
 - external callback vs static/runtime auth;
 - cache/revoke/established-session behavior;
-- TLS native reload vs terminator and PROXY protocol;
+- transparent ordinary-RTSP contract and L4/VPN source-IP boundary;
 - metrics inventory;
 - TCP-only, FFmpeg, on-demand race and secret-leak tests.
 
@@ -980,7 +989,8 @@ redaction/audit assertions and rollback evidence.
    polling/SSE, alerts/dead-man.
 2. **#8 FFmpeg:** two-version matrix, supervisor, timeout/reconnect, TCP-only and
    process-secret tests.
-3. **#9 Security:** auth/TLS decision, grants, keys, limits, hardening and drills.
+3. **#9 Security:** auth/network-boundary decision, grants, keys, limits,
+   hardening and drills.
 4. **#11 Performance:** full A/B, load, chaos and 24h soak; publish envelope.
 
 **Exit:** release candidate has evidenced SLO/security/resource limits and no
@@ -1033,10 +1043,10 @@ load harness and no architecture blocker in the topology being implemented.
 |---|---|---|
 | R1 single-node capacity | 10k is multidimensional | Spike #0 and published envelope |
 | R2 multi-node topology | L4 not path-aware; gateway is hypothesis | Spike #1/#2 and ADR |
-| R3 MediaMTX semantics | API/auth/delete/persistence/TLS depend on digest | pinned contract suite |
+| R3 MediaMTX semantics | API/auth/delete/persistence/transparent RTSP depend on digest | pinned contract suite |
 | R4 client rollback | hardcoded external URL unmanaged | supervisor/service discovery/DNS/cohort mapping |
 | R5 environment drift | OMNY/WAN/NAT/kernel/NIC/overlap alter knee | preflight and production-like soak |
-| R6 auth/TLS fork | callback/static and native/terminator unknown | Phase 0 security spike |
+| R6 auth/network fork | callback/static and VPN/L4 source-IP boundary unknown | Phase 0 security spike |
 | R7 restore deletes newer runtime paths | restored desired older than actual | report-only diff and delete approval |
 
 These are evidence gates, not internal specification contradictions. They block
@@ -1054,7 +1064,7 @@ the corresponding feature, claim or rollout until proved.
 | [#6](https://github.com/zl0nline/RTSP_proxy/issues/6) | Health, probes, SSRF, profiles |
 | [#7](https://github.com/zl0nline/RTSP_proxy/issues/7) | Metrics, TSDB, UI, tracing, alerts |
 | [#8](https://github.com/zl0nline/RTSP_proxy/issues/8) | FFmpeg/supervisor and TCP-only regression |
-| [#9](https://github.com/zl0nline/RTSP_proxy/issues/9) | Threat model, auth, keys, TLS, hardening |
+| [#9](https://github.com/zl0nline/RTSP_proxy/issues/9) | Threat model, auth, keys, network boundary, hardening |
 | [#10](https://github.com/zl0nline/RTSP_proxy/issues/10) | Single-node-first and topology spikes |
 | [#11](https://github.com/zl0nline/RTSP_proxy/issues/11) | Load generator, performance, chaos |
 | [#12](https://github.com/zl0nline/RTSP_proxy/issues/12) | Deploy, drain, migrations, PITR, runbooks |
