@@ -79,6 +79,8 @@ class NetworkProfile(StrictModel):
 
 
 class WorkloadAxes(StrictModel):
+    endpoint_mode: Literal["proxy", "direct-control"]
+    session_temperature: Literal["warm", "cold"]
     registered_paths: Annotated[int, Field(gt=0)]
     active_sources: Annotated[int, Field(ge=0)]
     total_readers: Annotated[int, Field(ge=0)]

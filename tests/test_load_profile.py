@@ -76,6 +76,8 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
             "loss_percent": 0,
         },
         "workload": {
+            "endpoint_mode": "proxy",
+            "session_temperature": "warm",
             "registered_paths": 4,
             "active_sources": 4,
             "total_readers": 8,
@@ -307,3 +309,14 @@ def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid
     assert invalid_output["invalid_reasons"] == [
         "generator_network_headroom_below_30_percent"
     ]
+
+
+def test_versioned_smoke_profile_example_matches_the_strict_schema() -> None:
+    payload = json.loads(
+        Path("tools/load/profiles/smoke.example.json").read_text(encoding="utf-8")
+    )
+
+    profile = LoadProfile.model_validate(payload)
+
+    assert profile.tier == "smoke"
+    assert profile.fixture.source_mode == "rtsp-pull"

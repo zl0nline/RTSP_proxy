@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 
 from rtsp_proxy.identifiers import PublicId
-from rtsp_proxy.load_catalog import build_load_catalog, load_public_id, write_load_catalog
+from rtsp_proxy.load_catalog import (
+    build_load_catalog,
+    load_public_id,
+    write_load_catalog,
+    write_reader_paths,
+)
 from rtsp_proxy.load_profile import LoadProfile
 from tests.test_load_profile import valid_profile
 
@@ -57,3 +62,16 @@ def test_catalog_write_is_exclusive_and_contains_no_userinfo(tmp_path: Path) -> 
         pass
     else:
         raise AssertionError("load catalog was overwritten")
+
+
+def test_reader_paths_are_bound_to_the_same_catalog_without_urls(tmp_path: Path) -> None:
+    profile = LoadProfile.model_validate(valid_profile())
+    destination = tmp_path / "reader-paths.txt"
+
+    paths_sha256 = write_reader_paths(build_load_catalog(profile), destination)
+
+    assert len(paths_sha256) == 64
+    assert destination.read_text(encoding="utf-8").splitlines() == [
+        path.public_id for path in build_load_catalog(profile).paths
+    ]
+    assert "rtsp://" not in destination.read_text(encoding="utf-8")

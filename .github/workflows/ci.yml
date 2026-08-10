@@ -196,6 +196,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             libgstrtspserver-1.0-dev \
+            gstreamer1.0-tools \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad
@@ -215,8 +216,15 @@ jobs:
           echo "$ffmpeg_sha256  .artifacts/ffmpeg/bin/ffmpeg" | sha256sum --check
           echo "$ffprobe_sha256  .artifacts/ffmpeg/bin/ffprobe" | sha256sum --check
 
-      - name: Build native GStreamer pull server
-        run: make -C tools/load
+      - name: Build native GStreamer load binaries
+        run: |
+          gst-launch-1.0 --version
+          dpkg-query --show --showformat='${Package}=${Version}\n' \
+            libgstrtspserver-1.0-dev gstreamer1.0-tools \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad
+          make -C tools/load
+          sha256sum tools/load/rtsp-pull-server tools/load/rtsp-load-reader
 
       - name: Verify H264/H265 independent pull endpoints over RTSP/TCP
         env:

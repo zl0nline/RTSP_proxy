@@ -12,6 +12,7 @@
 typedef struct _RunContext RunContext;
 
 typedef struct {
+    guint id;
     gchar *path;
     GstElement *pipeline;
     guint bus_watch_id;
@@ -100,9 +101,10 @@ record_failure(Reader *reader, const gchar *reason)
         reader->failed = TRUE;
         run->failed_readers++;
         g_fprintf(run->events,
-                  "{\"event\":\"reader_error\",\"path\":\"%s\","
+                  "{\"event\":\"reader_error\",\"reader_id\":%u,"
+                  "\"path\":\"%s\","
                   "\"reason\":\"%s\"}\n",
-                  reader->path, reason);
+                  reader->id, reader->path, reason);
         fflush(run->events);
     }
     g_mutex_unlock(&run->lock);
@@ -122,9 +124,10 @@ on_handoff(GstElement *sink G_GNUC_UNUSED, GstBuffer *buffer G_GNUC_UNUSED,
         reader->first_packet_seen = TRUE;
         run->ready_readers++;
         g_fprintf(run->events,
-                  "{\"event\":\"first_packet\",\"path\":\"%s\","
+                  "{\"event\":\"first_packet\",\"reader_id\":%u,"
+                  "\"path\":\"%s\","
                   "\"latency_ms\":%.3f}\n",
-                  reader->path, latency_ms);
+                  reader->id, reader->path, latency_ms);
         fflush(run->events);
     }
     g_mutex_unlock(&run->lock);
@@ -187,6 +190,7 @@ create_reader(RunContext *run, const gchar *path, const gchar *username,
         escaped_url);
 
     reader = g_new0(Reader, 1);
+    reader->id = run->readers->len;
     reader->path = g_strdup(path);
     reader->run = run;
     reader->pipeline = gst_parse_launch(launch, error);

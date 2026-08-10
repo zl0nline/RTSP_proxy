@@ -50,6 +50,11 @@ contracts cover ordinary RTSP-over-TCP, on-demand pull, restart/cold restore,
 auth behavior and pinned metrics on real binaries. There is no production
 ffprobe runner until ADR 0004's process/egress boundary is accepted.
 
+Phase 0B is in progress. `tools/load` contains native GStreamer pull-source and
+multi-reader binaries; strict profiles/catalogs and JSONL headroom/latency
+summaries are in the Python package. Native CI is functional evidence only and
+must not be described as a measured single-node capacity envelope.
+
 Role processes do not yet run catalog, grant, reconciler, scheduler or
 observability loops. PostgreSQL durability, artifact provenance, capacity and
 production readiness have not been proven. Proposed ADRs and successful lab

@@ -115,3 +115,13 @@ def apply_load_catalog(
         applied_paths=len(catalog.paths),
         verified_paths=len(sample_offsets),
     )
+
+
+def write_reader_paths(catalog: LoadCatalog, destination: Path) -> str:
+    body = ("\n".join(path.public_id for path in catalog.paths) + "\n").encode("ascii")
+    with destination.open("xb") as output:
+        output.write(body)
+        output.flush()
+        os.fsync(output.fileno())
+    destination.chmod(0o640)
+    return hashlib.sha256(body).hexdigest()

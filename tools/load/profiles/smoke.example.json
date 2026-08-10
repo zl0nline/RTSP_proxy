@@ -1,0 +1,59 @@
+{
+  "artifacts": {
+    "ffmpeg_sha256": "48a805177021feaa26ebaa2d0a9e31d7139b6bcfe1a180af17a98ca786a3c668",
+    "ffmpeg_version": "n8.1.2-34-g9b6c8969e0-20260810",
+    "ffprobe_sha256": "0f7a6c43858e8123f09b2f2236e7084165d76642e618d8d0ec9304cff3135d95",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "gstreamer_build_id": "replace-with-dpkg-build-id",
+    "gstreamer_version": "1.24.2",
+    "mediamtx_sha256": "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336",
+    "mediamtx_version": "v1.20.0",
+    "pull_server_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "duration": {
+    "measurement_seconds": 600,
+    "soak_seconds": 0,
+    "warmup_seconds": 0
+  },
+  "fixture": {
+    "audio": "none",
+    "bitrate_bps": 2000000,
+    "codec": "h264",
+    "fps": 25,
+    "gop_frames": 50,
+    "path": "/srv/rtsp-load/fixtures/h264-2mbit-gop50.h264",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_mode": "rtsp-pull"
+  },
+  "generator_hosts": [
+    {
+      "architecture": "amd64",
+      "name": "generator-a",
+      "rtsp_host": "generator-a.load.internal",
+      "rtsp_port": 8554,
+      "source_count": 100,
+      "source_start": 0
+    }
+  ],
+  "network": {
+    "interface": "camera0",
+    "jitter_ms": 0,
+    "loss_percent": 0,
+    "profile": "lan",
+    "rtt_ms": 0
+  },
+  "schema_version": 1,
+  "seed": 52545350,
+  "sut_architecture": "amd64",
+  "tier": "smoke",
+  "workload": {
+    "active_sources": 100,
+    "connect_rate_per_second": 10,
+    "crud_rate_per_second": 0,
+    "endpoint_mode": "proxy",
+    "probe_rate_per_second": 0,
+    "registered_paths": 100,
+    "session_temperature": "warm",
+    "total_readers": 100
+  }
+}

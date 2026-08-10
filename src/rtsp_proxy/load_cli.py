@@ -5,7 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from rtsp_proxy.load_catalog import apply_load_catalog, build_load_catalog, write_load_catalog
+from rtsp_proxy.load_catalog import (
+    apply_load_catalog,
+    build_load_catalog,
+    write_load_catalog,
+    write_reader_paths,
+)
 from rtsp_proxy.load_evidence import (
     load_observations,
     sample_linux_host_resources,
@@ -16,6 +21,7 @@ from rtsp_proxy.load_profile import (
     canonical_profile_bytes,
     initialize_run_directory,
 )
+from rtsp_proxy.load_results import summarize_reader_events
 from rtsp_proxy.media import MediaMtxClient
 
 
@@ -30,6 +36,9 @@ def _parser() -> argparse.ArgumentParser:
     catalog = commands.add_parser("render-catalog")
     catalog.add_argument("profile", type=Path)
     catalog.add_argument("destination", type=Path)
+    reader_paths = commands.add_parser("render-reader-paths")
+    reader_paths.add_argument("profile", type=Path)
+    reader_paths.add_argument("destination", type=Path)
     apply_paths = commands.add_parser("apply-paths")
     apply_paths.add_argument("profile", type=Path)
     apply_paths.add_argument("--api-url", required=True)
@@ -42,6 +51,9 @@ def _parser() -> argparse.ArgumentParser:
     summarize = commands.add_parser("summarize-generator")
     summarize.add_argument("profile", type=Path)
     summarize.add_argument("observations", type=Path)
+    summarize_readers = commands.add_parser("summarize-readers")
+    summarize_readers.add_argument("profile", type=Path)
+    summarize_readers.add_argument("events", type=Path)
     return parser
 
 
@@ -68,6 +80,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"CATALOG path={arguments.destination} sha256={catalog_sha256}"
             )
             return 0
+        if arguments.command == "render-reader-paths":
+            paths_sha256 = write_reader_paths(
+                build_load_catalog(profile), arguments.destination
+            )
+            print(
+                f"READER_PATHS path={arguments.destination} sha256={paths_sha256}"
+            )
+            return 0
         if arguments.command == "apply-paths":
             result = apply_load_catalog(
                 build_load_catalog(profile),
@@ -81,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"verified={result.verified_paths}"
             )
             return 0
+        if arguments.command == "summarize-readers":
+            reader_summary = summarize_reader_events(profile, arguments.events)
+            print(json.dumps(reader_summary.model_dump(mode="json"), sort_keys=True))
+            return 0 if reader_summary.valid else 3
         expected_duration = (
             profile.duration.warmup_seconds
             + profile.duration.measurement_seconds
@@ -97,12 +121,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SAMPLED observations={count} output={arguments.output}")
             return 0
         observations = load_observations(arguments.observations)
-        summary = summarize_generator_headroom(
+        generator_summary = summarize_generator_headroom(
             observations,
             minimum_duration_seconds=expected_duration,
         )
-        print(json.dumps(summary.model_dump(mode="json"), sort_keys=True))
-        return 0 if summary.valid else 3
+        print(json.dumps(generator_summary.model_dump(mode="json"), sort_keys=True))
+        return 0 if generator_summary.valid else 3
     except FileExistsError:
         print("load_profile_error: destination_exists", file=sys.stderr)
     except (OSError, ValueError):

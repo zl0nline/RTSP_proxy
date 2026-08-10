@@ -987,7 +987,7 @@ behavior, pilot and rollout.
 Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
 `31406619869`. Proposed ADR constraints remain production gates.
 
-#### 0B. Reproducible load harness and Spike #0
+#### 0B. Reproducible load harness and Spike #0 — IN PROGRESS
 
 - RTSP pull-server generator and fixtures;
 - manifest/raw artifacts;
@@ -996,6 +996,11 @@ Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
 - safe envelope and hardware/network profile.
 
 **Exit:** `SINGLE_NODE BASELINE` decision or authorization for Spike #1.
+
+Implementation status: native GStreamer pull sources/readers, strict immutable
+profiles/catalogs and generator-headroom/reader-latency summaries are present.
+CI is not capacity evidence; dedicated LAN/WAN hardware, saturation knee and
+24h soak remain mandatory before exit.
 
 #### 0C. Conditional topology spike
 

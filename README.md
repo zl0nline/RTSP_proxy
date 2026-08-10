@@ -14,6 +14,9 @@ TCP endpoint.
 > - Phase 0A compatibility lab: **COMPLETE** — MediaMTX adapter и внешний
 >   ordinary-RTSP contract прошли Standards/Spec exit review и native
 >   amd64/arm64 CI; Proposed auth/security gates всё ещё блокируют production.
+> - Phase 0B load harness: **IN PROGRESS** — native GStreamer pull sources,
+>   scalable TCP readers и immutable evidence profiles проходят amd64/arm64 CI;
+>   production-equivalent Spike #0 и 24h soak ещё не выполнены.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -219,8 +222,10 @@ Production ffprobe runner намеренно не поставляется: пе
 оставлял бы source credentials в argv и допускал SSRF. Кандидатная граница
 зафиксирована в ADR 0004 и должна быть реализована в health/security slices.
 
-Catalog, PostgreSQL, grant verifier, reconciler/task loops, dashboard и load
-harness ещё не реализованы. FFmpeg/ffprobe зафиксированы как Phase 0 candidate,
+Catalog, PostgreSQL, grant verifier, reconciler/task loops и dashboard ещё не
+реализованы. Phase 0B load harness реализован функционально, но capacity
+envelope не опубликован без выделенных стендов и 24h soak. FFmpeg/ffprobe
+зафиксированы как Phase 0 candidate,
 но upstream artifact не имеет GitHub attestation и ещё не прошёл security
 provenance gate. Наличие Phase 0-кода не означает доказанную production
 характеристику. Issue #10 остаётся evidence blocker для scale-out topology;

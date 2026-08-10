@@ -1,3 +1,4 @@
+import subprocess
 from configparser import ConfigParser
 from pathlib import Path
 
@@ -60,3 +61,14 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
 
     assert "Verify native release manifest end to end" in workflow
     assert "uv run rtsp-proxy-verify-release --manifest" in workflow
+
+
+def test_load_fixture_builder_has_valid_bash_syntax() -> None:
+    result = subprocess.run(
+        ["bash", "-n", "tools/load/prepare_fixture.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
