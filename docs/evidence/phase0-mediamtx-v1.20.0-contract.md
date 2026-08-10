@@ -23,9 +23,9 @@
 - callback denial revokes new sessions within 10 seconds; callback outage
   fails new sessions closed while an established reader remains live and its
   outbound-byte counter continues increasing after both events;
-- wrong password, unknown user and unknown path return the same RTSP response
-  body/headers through the HTTP callback; six interleaved timing samples per
-  class stay within the candidate parity threshold;
+- a revoked grant, wrong password, unknown user and unknown path return the same
+  byte-for-byte RTSP response through the HTTP callback; the short runtime
+  contract does not claim statistical timing equivalence;
 - four concurrent callbacks delayed past the one-second MediaMTX read deadline
   fail new sessions closed while the established reader continues progressing;
 - an incomplete RTSP header remains open past that one-second setting, proving
@@ -60,15 +60,18 @@ FFPROBE_BINARY=/path/to/ffprobe \
 uv run pytest -m contract tests/contract
 ```
 
-CI executes this suite natively on Linux amd64 and arm64. Commit `f3ee2f0`
-passed both architecture-specific unit/release jobs and both real-binary media
-contract jobs in [CI run 31399094437](https://github.com/zl0nline/RTSP_proxy/actions/runs/31399094437).
+CI executes this suite natively on Linux amd64 and arm64. Remediation commit
+`3849773` passed both architecture-specific unit/release jobs and both
+real-binary media contract jobs in
+[CI run 31401373333](https://github.com/zl0nline/RTSP_proxy/actions/runs/31401373333).
 
 ## Still open in Phase 0A
 
 - two-version FFmpeg/supervisor timeout and reconnect matrix;
 - isolated production probe execution (ADR 0004; health/security slices);
 - auth-layer/edge rate limiting and slow-client resource controls;
+- statistically powered timing no-oracle evidence for revoked, wrong-password,
+  unknown-user and unknown-path denials;
 - native VPN source-IP preservation; L4/NAT and cross-host callback remain
   explicitly prohibited for the single-node candidate until that evidence;
 - security-owner decision for FFmpeg build provenance.

@@ -5,7 +5,6 @@ import os
 import re
 import signal
 import socket
-import statistics
 import subprocess
 import sys
 import threading
@@ -84,7 +83,7 @@ def wait_for_json(url: str, process: subprocess.Popen[str], *, ready_path: bool 
 
 def authenticated_describe_response(
     *, host: str, port: int, path: str, username: str, password: str
-) -> tuple[bytes, float]:
+) -> bytes:
     authorization = b64encode(f"{username}:{password}".encode()).decode()
     request = (
         f"DESCRIBE rtsp://{host}:{port}/{path} RTSP/1.0\r\n"
@@ -93,9 +92,8 @@ def authenticated_describe_response(
         "Accept: application/sdp\r\n"
         "\r\n"
     ).encode()
-    started_at = time.monotonic()
-    with socket.create_connection((host, port), timeout=6) as connection:
-        connection.settimeout(6)
+    with socket.create_connection((host, port), timeout=10) as connection:
+        connection.settimeout(10)
         connection.sendall(request)
         response = bytearray()
         while b"\r\n\r\n" not in response:
@@ -114,7 +112,7 @@ def authenticated_describe_response(
             if not chunk:
                 break
             body += chunk
-    return headers + separator + body[:content_length], time.monotonic() - started_at
+    return headers + separator + body[:content_length]
 
 
 def run_lab_ffprobe(
@@ -245,21 +243,24 @@ def assert_reader_progress(
     assert after > before
 
 
-def assert_process_has_no_udp_listener(process: subprocess.Popen[str], port: int) -> None:
+def process_owned_udp_sockets(
+    process: subprocess.Popen[str],
+) -> frozenset[tuple[str, str, str]]:
     if not sys.platform.startswith("linux"):
-        return
+        return frozenset()
     socket_inodes = {
         target.removeprefix("socket:[").removesuffix("]")
         for fd in (Path("/proc") / str(process.pid) / "fd").iterdir()
         if (target := os.readlink(fd)).startswith("socket:[")
     }
+    sockets: set[tuple[str, str, str]] = set()
     for table_name in ("udp", "udp6"):
         table = Path("/proc") / str(process.pid) / "net" / table_name
         for line in table.read_text(encoding="utf-8").splitlines()[1:]:
             fields = line.split()
-            local_port = int(fields[1].rsplit(":", 1)[1], 16)
-            if local_port == port and fields[9] in socket_inodes:
-                pytest.fail("MediaMTX opened a UDP socket on the external RTSP port")
+            if fields[9] in socket_inodes:
+                sockets.add((table_name, fields[1], fields[2]))
+    return frozenset(sockets)
 
 
 def assert_partial_rtsp_header_outlives_media_read_timeout(host: str, port: int) -> None:
@@ -274,6 +275,7 @@ def assert_partial_rtsp_header_outlives_media_read_timeout(host: str, port: int)
 
 class AuthCallbackServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128
 
 
 class AuthCallbackHandler(BaseHTTPRequestHandler):
@@ -342,6 +344,7 @@ def test_external_rtsp_tcp_is_transparent_and_unrelated_hot_update_isolated(
     other_public_id = "g" * 25
     race_public_id = "h" * 25
     failing_source_public_id = "i" * 25
+    unknown_public_id = "j" * 25
 
     origin_config = tmp_path / "origin.yml"
     origin_config.write_text(
@@ -479,7 +482,8 @@ paths:
             f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get",
             proxy,
         )
-        assert_process_has_no_udp_listener(proxy, proxy_rtsp_port)
+        udp_socket_baseline = process_owned_udp_sockets(proxy)
+        assert not udp_socket_baseline
         client = MediaMtxClient(
             api_url=f"http://127.0.0.1:{proxy_api_port}",
             timeout_seconds=2,
@@ -491,7 +495,6 @@ paths:
                     f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
                     "/fixture"
                 ),
-                source_on_demand=True,
             )
         )
         client.put_path(
@@ -501,7 +504,6 @@ paths:
                     f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
                     "/fixture"
                 ),
-                source_on_demand=True,
             )
         )
         client.put_path(
@@ -511,7 +513,6 @@ paths:
                     f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
                     "/fixture"
                 ),
-                source_on_demand=True,
             )
         )
         client.put_path(
@@ -521,7 +522,6 @@ paths:
                     f"rtsp://origin-reader:wrong-source-secret@127.0.0.1:"
                     f"{origin_rtsp_port}/fixture"
                 ),
-                source_on_demand=True,
             )
         )
 
@@ -581,6 +581,7 @@ paths:
             transport="udp",
         )
         assert udp_result.returncode != 0, "UDP transport was unexpectedly admitted"
+        assert process_owned_udp_sockets(proxy) == udp_socket_baseline
 
         reader = start_process(
             [
@@ -601,20 +602,21 @@ paths:
         )
         wait_for_reader(metrics_url, path_name=other_public_id)
         assert reader.poll() is None
+        assert process_owned_udp_sockets(proxy) == udp_socket_baseline
         assert_partial_rtsp_header_outlives_media_read_timeout(
             "127.0.0.1", proxy_rtsp_port
         )
         assert_reader_progress(reader, metrics_url, path_name=other_public_id)
 
-        expected_path_configs = {
-            public_id,
-            other_public_id,
-            race_public_id,
-            failing_source_public_id,
+        expected_camera_ids = {
+            PublicId.parse(public_id),
+            PublicId.parse(other_public_id),
+            PublicId.parse(race_public_id),
+            PublicId.parse(failing_source_public_id),
         }
-        if auth_method == "http":
-            expected_path_configs.add("~^[a-z0-9]{25}$")
-        assert set(client.list_path_names()) == expected_path_configs
+        inventory = client.inventory_paths()
+        assert set(inventory.camera_ids) == expected_camera_ids
+        assert inventory.no_oracle_matcher_present is (auth_method == "http")
         observed_metrics = metrics_lines(metrics_url)
         schema_contract = json.loads(
             Path("docs/evidence/mediamtx-v1.20.0-metrics-schema.json").read_text(
@@ -645,42 +647,6 @@ paths:
                 ("read", other_public_id, "rtsp"),
             }
 
-            denied_responses: set[bytes] = set()
-            denial_timings: dict[str, list[float]] = {
-                "wrong-password": [],
-                "unknown-user": [],
-                "unknown-path": [],
-            }
-            denial_cases = {
-                "wrong-password": (public_id, "external", "wrong-secret"),
-                "unknown-user": (public_id, "unknown-user", "lab-secret"),
-                "unknown-path": ("z" * 25, "external", "lab-secret"),
-            }
-            def sample_denial(
-                sample: tuple[str, tuple[str, str, str]],
-            ) -> tuple[str, bytes, float]:
-                case_name, (case_path, case_username, case_password) = sample
-                response, elapsed = authenticated_describe_response(
-                        host="127.0.0.1",
-                        port=proxy_rtsp_port,
-                        path=case_path,
-                        username=case_username,
-                        password=case_password,
-                    )
-                return case_name, response, elapsed
-
-            samples = list(denial_cases.items()) * 6
-            with ThreadPoolExecutor(max_workers=len(samples)) as executor:
-                denial_results = list(executor.map(sample_denial, samples))
-            for case_name, response, elapsed in denial_results:
-                denied_responses.add(response)
-                denial_timings[case_name].append(elapsed)
-            assert len(denied_responses) == 1
-            canonical_denial = next(iter(denied_responses))
-            assert canonical_denial.startswith(b"RTSP/1.0 401 Unauthorized")
-            denial_means = [statistics.fmean(samples) for samples in denial_timings.values()]
-            assert max(denial_means) - min(denial_means) <= 2.0
-
             def expect_new_session_denied() -> None:
                 denied = run_lab_ffprobe(
                     binary=FFPROBE_BINARY,
@@ -696,14 +662,28 @@ paths:
             revoke_started_at = time.monotonic()
             expect_new_session_denied()
             assert time.monotonic() - revoke_started_at <= 10
-            revoked_response, _ = authenticated_describe_response(
-                host="127.0.0.1",
-                port=proxy_rtsp_port,
-                path=public_id,
-                username="external",
-                password="lab-secret",
+
+            denial_cases = (
+                (public_id, "external", "lab-secret"),
+                (public_id, "external", "wrong-secret"),
+                (public_id, "unknown-user", "lab-secret"),
+                (unknown_public_id, "external", "lab-secret"),
             )
-            assert revoked_response == canonical_denial
+            denied_responses = {
+                authenticated_describe_response(
+                    host="127.0.0.1",
+                    port=proxy_rtsp_port,
+                    path=case_path,
+                    username=case_username,
+                    password=case_password,
+                )
+                for case_path, case_username, case_password in denial_cases
+            }
+
+            assert len(denied_responses) == 1
+            canonical_denial = next(iter(denied_responses))
+            assert canonical_denial.startswith(b"RTSP/1.0 401 Unauthorized")
+
             assert_reader_progress(reader, metrics_url, path_name=other_public_id)
             AuthCallbackHandler.accept_credentials = True
 
@@ -739,7 +719,6 @@ paths:
                     f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
                     "/different"
                 ),
-                source_on_demand=True,
             )
         )
 

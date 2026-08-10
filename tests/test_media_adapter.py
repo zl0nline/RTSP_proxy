@@ -65,6 +65,18 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
                 ).encode("utf-8"),
             )
             return
+        if name == "g" * 25:
+            self._respond(
+                200,
+                json.dumps(
+                    {
+                        "name": name,
+                        "source": "rtsp://camera.invalid/main",
+                        "sourceOnDemand": False,
+                    }
+                ).encode("utf-8"),
+            )
+            return
         path = self.paths.get(name)
         if path is None:
             self._respond(404, b'{"error":"path configuration not found"}')
@@ -111,11 +123,12 @@ def test_media_path_operations_converge_without_exposing_http_routes(media_api: 
     path = MediaPathConfig(
         name=PublicId.parse("a" * 25),
         source_url="rtsp://camera.invalid/main",
-        source_on_demand=True,
     )
 
     client.put_path(path)
-    assert client.list_path_names() == (str(path.name),)
+    inventory = client.inventory_paths()
+    assert inventory.camera_ids == (path.name,)
+    assert inventory.no_oracle_matcher_present is False
     assert client.get_path(path.name) == path
 
     client.delete_path(path.name)
@@ -137,6 +150,17 @@ def test_media_adapter_rejects_invalid_or_rejected_responses_without_secrets(
 
     with pytest.raises(MediaNodeProtocolError, match="mediamtx_path_identity_mismatch"):
         client.get_path(PublicId.parse("e" * 25))
+
+    with pytest.raises(MediaNodeProtocolError, match="mediamtx_path_not_on_demand"):
+        client.get_path(PublicId.parse("g" * 25))
+
+    MediaMtxFixtureHandler.paths["~^vendor-detail$"] = {
+        "name": "~^vendor-detail$",
+        "source": "publisher",
+        "sourceOnDemand": False,
+    }
+    with pytest.raises(MediaNodeProtocolError, match="mediamtx_unknown_path_name"):
+        client.inventory_paths()
 
 
 def test_media_adapter_reports_an_unreachable_node_with_a_stable_reason() -> None:

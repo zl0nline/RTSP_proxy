@@ -89,17 +89,14 @@ def test_path_hot_update_and_delete_are_idempotent_and_isolated(tmp_path: Path) 
     first_v1 = MediaPathConfig(
         name=first_id,
         source_url=f"rtsp://127.0.0.1:{source_port}/first-v1",
-        source_on_demand=True,
     )
     first_v2 = MediaPathConfig(
         name=first_id,
         source_url=f"rtsp://127.0.0.1:{source_port}/first-v2",
-        source_on_demand=True,
     )
     second = MediaPathConfig(
         name=second_id,
         source_url=f"rtsp://127.0.0.1:{source_port}/second",
-        source_on_demand=True,
     )
 
     try:
@@ -108,7 +105,7 @@ def test_path_hot_update_and_delete_are_idempotent_and_isolated(tmp_path: Path) 
         client.put_path(second)
         client.put_path(first_v2)
 
-        assert set(client.list_path_names()) == {first_name, second_name}
+        assert set(client.inventory_paths().camera_ids) == {first_id, second_id}
         assert client.get_path(first_id) == first_v2
         assert client.get_path(second_id) == second
 
@@ -136,7 +133,6 @@ def test_runtime_paths_require_cold_restore_after_a_media_node_restart(tmp_path:
     path = MediaPathConfig(
         name=PublicId.parse("e" * 25),
         source_url=f"rtsp://127.0.0.1:{source_port}/main",
-        source_on_demand=True,
     )
     client = MediaMtxClient(api_url=api_url, timeout_seconds=2)
 

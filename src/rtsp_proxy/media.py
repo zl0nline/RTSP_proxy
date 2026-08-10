@@ -9,12 +9,19 @@ from urllib.parse import quote
 
 from rtsp_proxy.identifiers import InvalidPublicId, PublicId
 
+NO_ORACLE_PATH_MATCHER = "~^[a-z0-9]{25}$"
+
 
 @dataclass(frozen=True, slots=True)
 class MediaPathConfig:
     name: PublicId
     source_url: str
-    source_on_demand: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPathInventory:
+    camera_ids: tuple[PublicId, ...]
+    no_oracle_matcher_present: bool
 
 
 class MediaNodeError(RuntimeError):
@@ -47,7 +54,7 @@ class MediaMtxClient:
             f"/v3/config/paths/replace/{name}",
             payload={
                 "source": path.source_url,
-                "sourceOnDemand": path.source_on_demand,
+                "sourceOnDemand": True,
                 "rtspTransport": "tcp",
             },
         )
@@ -73,6 +80,8 @@ class MediaMtxClient:
             or not isinstance(source_on_demand, bool)
         ):
             raise MediaNodeProtocolError("mediamtx_invalid_path_response")
+        if not source_on_demand:
+            raise MediaNodeProtocolError("mediamtx_path_not_on_demand")
         try:
             parsed_name = PublicId.parse(response_name)
         except InvalidPublicId:
@@ -82,11 +91,11 @@ class MediaMtxClient:
         return MediaPathConfig(
             name=parsed_name,
             source_url=source,
-            source_on_demand=source_on_demand,
         )
 
-    def list_path_names(self) -> tuple[str, ...]:
-        names: list[str] = []
+    def inventory_paths(self) -> MediaPathInventory:
+        camera_ids: set[PublicId] = set()
+        no_oracle_matcher_present = False
         page = 0
         while True:
             response = self._request(
@@ -107,10 +116,25 @@ class MediaMtxClient:
             for item in items:
                 if not isinstance(item, dict) or not isinstance(item.get("name"), str):
                     raise MediaNodeProtocolError("mediamtx_invalid_path_list")
-                names.append(item["name"])
+                name = item["name"]
+                if name == NO_ORACLE_PATH_MATCHER:
+                    if no_oracle_matcher_present:
+                        raise MediaNodeProtocolError("mediamtx_duplicate_path_name")
+                    no_oracle_matcher_present = True
+                    continue
+                try:
+                    public_id = PublicId.parse(name)
+                except InvalidPublicId:
+                    raise MediaNodeProtocolError("mediamtx_unknown_path_name") from None
+                if public_id in camera_ids:
+                    raise MediaNodeProtocolError("mediamtx_duplicate_path_name")
+                camera_ids.add(public_id)
             page += 1
             if page >= page_count:
-                return tuple(names)
+                return MediaPathInventory(
+                    camera_ids=tuple(sorted(camera_ids, key=str)),
+                    no_oracle_matcher_present=no_oracle_matcher_present,
+                )
 
     def delete_path(self, name: PublicId) -> None:
         path_segment = _path_segment(name)
