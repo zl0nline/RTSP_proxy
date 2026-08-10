@@ -19,6 +19,7 @@ dependencies = [
 rtsp-proxy-verify-release = "rtsp_proxy.cli:main"
 rtsp-proxy-web = "rtsp_proxy.runtime:run_web"
 rtsp-proxy-role = "rtsp_proxy.runtime:run_background"
+rtsp-proxy-load = "rtsp_proxy.load_cli:main"
 
 [dependency-groups]
 dev = [

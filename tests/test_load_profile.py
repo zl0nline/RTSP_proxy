@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from rtsp_proxy.load_profile import LoadProfile
+from rtsp_proxy.load_cli import main as load_cli_main
+from rtsp_proxy.load_profile import (
+    LoadProfile,
+    canonical_profile_bytes,
+    initialize_run_directory,
+)
 
 
 def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
@@ -16,6 +24,8 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
         {
             "name": "generator-a",
             "architecture": "arm64",
+            "rtsp_host": "generator-a.load.internal",
+            "rtsp_port": 8554,
             "source_start": 0,
             "source_count": 4 if tier == "smoke" else 2,
         }
@@ -25,6 +35,8 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
             {
                 "name": "generator-b",
                 "architecture": "amd64",
+                "rtsp_host": "generator-b.load.internal",
+                "rtsp_port": 8554,
                 "source_start": 2,
                 "source_count": 2,
             }
@@ -36,9 +48,14 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
         "sut_architecture": "amd64",
         "artifacts": {
             "git_commit": "a" * 40,
+            "mediamtx_version": "v1.20.0",
             "mediamtx_sha256": "b" * 64,
+            "ffmpeg_version": "n8.1.2-34-g9b6c8969e0-20260810",
             "ffmpeg_sha256": "c" * 64,
             "ffprobe_sha256": "d" * 64,
+            "gstreamer_version": "1.24.2",
+            "gstreamer_build_id": "ubuntu-1.24.2-1ubuntu0.1",
+            "pull_server_sha256": "f" * 64,
         },
         "fixture": {
             "source_mode": "rtsp-pull",
@@ -165,3 +182,128 @@ def test_unknown_fields_fail_closed() -> None:
 
     with pytest.raises(ValidationError, match="extra_forbidden"):
         LoadProfile.model_validate(raw)
+
+
+def test_canonical_profile_and_digest_are_stable() -> None:
+    profile = LoadProfile.model_validate(valid_profile())
+
+    first_body, first_sha256 = canonical_profile_bytes(profile)
+    second_body, second_sha256 = canonical_profile_bytes(profile)
+
+    assert first_body == second_body
+    assert first_sha256 == second_sha256
+    assert len(first_sha256) == 64
+    assert first_body.endswith(b"\n")
+    assert json.loads(first_body)["fixture"]["source_mode"] == "rtsp-pull"
+
+
+def test_run_directory_is_immutable_and_starts_with_a_bound_manifest(tmp_path: Path) -> None:
+    profile = LoadProfile.model_validate(valid_profile())
+    run_directory = tmp_path / "run-001"
+
+    manifest = initialize_run_directory(profile, run_directory)
+
+    stored_profile = (run_directory / "profile.json").read_bytes()
+    stored_manifest = json.loads(
+        (run_directory / "run-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest == stored_manifest
+    assert stored_manifest == {
+        "schema_version": 1,
+        "status": "initialized",
+        "profile_sha256": canonical_profile_bytes(profile)[1],
+        "git_commit": "a" * 40,
+        "sut_architecture": "amd64",
+    }
+    assert stored_profile == canonical_profile_bytes(profile)[0]
+    assert run_directory.stat().st_mode & 0o777 == 0o750
+    assert (run_directory / "profile.json").stat().st_mode & 0o777 == 0o640
+
+    with pytest.raises(FileExistsError):
+        initialize_run_directory(profile, run_directory)
+
+
+def test_load_cli_validates_and_initializes_without_overwrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(valid_profile()), encoding="utf-8")
+    run_directory = tmp_path / "run-001"
+
+    assert load_cli_main(["validate", str(profile_path)]) == 0
+    validation_output = capsys.readouterr()
+    assert validation_output.err == ""
+    assert validation_output.out.startswith("VALID profile_sha256=")
+
+    assert load_cli_main(["init", str(profile_path), str(run_directory)]) == 0
+    init_output = capsys.readouterr()
+    assert init_output.err == ""
+    assert init_output.out == f"INITIALIZED directory={run_directory}\n"
+
+    assert load_cli_main(["init", str(profile_path), str(run_directory)]) == 2
+    failure_output = capsys.readouterr()
+    assert failure_output.out == ""
+    assert failure_output.err == "load_profile_error: destination_exists\n"
+
+    catalog_path = tmp_path / "catalog.json"
+    assert load_cli_main(["render-catalog", str(profile_path), str(catalog_path)]) == 0
+    catalog_output = capsys.readouterr()
+    assert catalog_output.err == ""
+    assert catalog_output.out.startswith(f"CATALOG path={catalog_path} sha256=")
+
+
+def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw_profile = valid_profile()
+    raw_profile["duration"] = {
+        "warmup_seconds": 0,
+        "measurement_seconds": 1,
+        "soak_seconds": 0,
+    }
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(raw_profile), encoding="utf-8")
+    observations_path = tmp_path / "generator.jsonl"
+
+    def write_observations(network_percent: float) -> None:
+        observations_path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "timestamp": timestamp,
+                        "cpu_percent": 10,
+                        "ram_percent": 20,
+                        "fd_percent": 30,
+                        "network_percent": network_percent,
+                    }
+                )
+                + "\n"
+                for timestamp in (
+                    "2026-08-10T12:00:00Z",
+                    "2026-08-10T12:00:01Z",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+    write_observations(40)
+    assert (
+        load_cli_main(
+            ["summarize-generator", str(profile_path), str(observations_path)]
+        )
+        == 0
+    )
+    valid_output = json.loads(capsys.readouterr().out)
+    assert valid_output["valid"] is True
+
+    write_observations(70)
+    assert (
+        load_cli_main(
+            ["summarize-generator", str(profile_path), str(observations_path)]
+        )
+        == 3
+    )
+    invalid_output = json.loads(capsys.readouterr().out)
+    assert invalid_output["invalid_reasons"] == [
+        "generator_network_headroom_below_30_percent"
+    ]

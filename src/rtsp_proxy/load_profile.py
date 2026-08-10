@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -16,9 +19,14 @@ class StrictModel(BaseModel):
 
 class ArtifactPins(StrictModel):
     git_commit: GitCommit
+    mediamtx_version: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     mediamtx_sha256: Sha256
+    ffmpeg_version: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     ffmpeg_sha256: Sha256
     ffprobe_sha256: Sha256
+    gstreamer_version: Annotated[str, StringConstraints(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")]
+    gstreamer_build_id: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    pull_server_sha256: Sha256
 
 
 class FixtureProfile(StrictModel):
@@ -46,6 +54,8 @@ class FixtureProfile(StrictModel):
 class GeneratorHost(StrictModel):
     name: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,253}$")]
     architecture: Architecture
+    rtsp_host: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._:-]{1,253}$")]
+    rtsp_port: Annotated[int, Field(ge=1, le=65535)]
     source_start: Annotated[int, Field(ge=0)]
     source_count: Annotated[int, Field(gt=0)]
 
@@ -129,3 +139,44 @@ class LoadProfile(StrictModel):
             if self.duration.soak_seconds < 86400:
                 raise ValueError("capacity_requires_24h_soak")
         return self
+
+
+def canonical_profile_bytes(profile: LoadProfile) -> tuple[bytes, str]:
+    body = (
+        json.dumps(
+            profile.model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return body, hashlib.sha256(body).hexdigest()
+
+
+def _write_immutable_file(path: Path, body: bytes) -> None:
+    with path.open("xb") as destination:
+        destination.write(body)
+        destination.flush()
+        os.fsync(destination.fileno())
+    path.chmod(0o640)
+
+
+def initialize_run_directory(profile: LoadProfile, destination: Path) -> dict[str, object]:
+    profile_body, profile_sha256 = canonical_profile_bytes(profile)
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "status": "initialized",
+        "profile_sha256": profile_sha256,
+        "git_commit": profile.artifacts.git_commit,
+        "sut_architecture": profile.sut_architecture,
+    }
+    manifest_body = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+    destination.mkdir(mode=0o750, parents=False, exist_ok=False)
+    destination.chmod(0o750)
+    _write_immutable_file(destination / "profile.json", profile_body)
+    _write_immutable_file(destination / "run-manifest.json", manifest_body)
+    return manifest

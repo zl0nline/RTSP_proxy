@@ -5,11 +5,15 @@ import socket
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.load_catalog import apply_load_catalog, build_load_catalog
+from rtsp_proxy.load_cli import main as load_cli_main
+from rtsp_proxy.load_profile import LoadProfile
 from rtsp_proxy.media import (
     MediaMtxClient,
     MediaNodeProtocolError,
@@ -17,6 +21,7 @@ from rtsp_proxy.media import (
     MediaNodeUnavailable,
     MediaPathConfig,
 )
+from tests.test_load_profile import valid_profile
 
 
 class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
@@ -134,6 +139,40 @@ def test_media_path_operations_converge_without_exposing_http_routes(media_api: 
     client.delete_path(path.name)
     client.delete_path(path.name)
     assert client.get_path(path.name) is None
+
+
+def test_load_catalog_apply_is_on_demand_and_verifies_inventory_and_mapping(
+    media_api: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = MediaMtxClient(api_url=media_api, timeout_seconds=1)
+    profile = LoadProfile.model_validate(valid_profile())
+    catalog = build_load_catalog(profile)
+
+    result = apply_load_catalog(catalog, client)
+
+    assert result.applied_paths == 4
+    assert result.verified_paths == 3
+    assert set(MediaMtxFixtureHandler.paths) == {
+        path.public_id for path in catalog.paths
+    }
+    assert all(
+        path["sourceOnDemand"] is True for path in MediaMtxFixtureHandler.paths.values()
+    )
+
+    MediaMtxFixtureHandler.paths = {}
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(valid_profile()), encoding="utf-8")
+    assert (
+        load_cli_main(
+            ["apply-paths", str(profile_path), "--api-url", media_api]
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert output.out == "APPLIED paths=4 verified=3\n"
 
 
 def test_media_adapter_rejects_invalid_or_rejected_responses_without_secrets(
