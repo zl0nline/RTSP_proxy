@@ -46,3 +46,10 @@ with another pinned release or an explicit design change.
 Implementation may build the adapter and contract harness against this exact
 candidate. It may not claim MediaMTX compatibility or production readiness
 until the acceptance evidence is attached and this ADR is accepted.
+
+Runtime path configuration written through the v1.20.0 management API is not
+persisted to the root-owned YAML file and is absent after a media-node restart.
+Therefore PostgreSQL remains the only desired-state source of truth. A restarted
+node must fail readiness while the reconciler inventories it and cold-restores
+the required paths with bounded concurrency; traffic admission before that
+restore is an explicit degraded-mode decision, not the default.

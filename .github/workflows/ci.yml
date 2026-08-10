@@ -161,4 +161,6 @@ jobs:
       - name: Verify effective listener contract
         env:
           MEDIAMTX_BINARY: .artifacts/mediamtx/mediamtx
+          FFMPEG_BINARY: .artifacts/ffmpeg/bin/ffmpeg
+          FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest -m contract tests/contract
