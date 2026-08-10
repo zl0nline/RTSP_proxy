@@ -239,7 +239,12 @@ def assert_reader_progress(
     before = metric_value(metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        assert reader.poll() is None
+        if reader.poll() is not None:
+            output, _ = reader.communicate(timeout=1)
+            pytest.fail(
+                f"established reader exited before progress: "
+                f"returncode={reader.returncode}, output={output!r}"
+            )
         after = metric_value(
             metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name
         )
@@ -454,6 +459,7 @@ paths:
             [
                 FFMPEG_BINARY,
                 "-hide_banner",
+                "-nostdin",
                 "-loglevel",
                 "error",
                 "-re",
@@ -593,6 +599,7 @@ paths:
             [
                 FFMPEG_BINARY,
                 "-hide_banner",
+                "-nostdin",
                 "-loglevel",
                 "error",
                 "-rtsp_transport",
