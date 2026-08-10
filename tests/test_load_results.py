@@ -4,10 +4,16 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from rtsp_proxy.load_cli import main as load_cli_main
 from rtsp_proxy.load_profile import LoadProfile, initialize_run_directory
-from rtsp_proxy.load_results import summarize_cold_comparison, summarize_reader_events
+from rtsp_proxy.load_results import (
+    ReaderEvent,
+    merge_reader_event_files,
+    summarize_cold_comparison,
+    summarize_reader_events,
+)
 from tests.test_load_profile import valid_profile
 
 
@@ -65,6 +71,42 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
             ]
         )
     return events
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "event": "play_sent",
+            "reader_id": 0,
+            "cycle": 0,
+            "path": "a" * 25,
+            "at_monotonic_ms": 1,
+        },
+        {
+            "event": "reader_started",
+            "reader_id": 0,
+            "cycle": 0,
+            "path": "a" * 25,
+            "at_monotonic_ms": 1,
+            "reason": "gstreamer_error",
+        },
+    ],
+)
+def test_reader_event_shapes_fail_closed(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="invalid_reader_event_shape"):
+        ReaderEvent.model_validate(payload)
+
+
+def test_reader_event_merge_rejects_duplicate_cross_host_events(tmp_path: Path) -> None:
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    event = successful_events()[0]
+    write_events(first, [event])
+    write_events(second, [event])
+
+    with pytest.raises(ValueError, match="duplicate_reader_event_across_inputs"):
+        merge_reader_event_files((first, second), tmp_path / "merged.jsonl")
 
 
 def test_warm_reader_summary_gates_describe_to_play_not_first_rtp(tmp_path: Path) -> None:
@@ -186,8 +228,32 @@ def test_reader_summary_cli_writes_exclusive_machine_readable_result(
     profile = reader_profile()
     run_directory = tmp_path / "run"
     initialize_run_directory(profile, run_directory)
+    first_events = run_directory / "readers-a.jsonl"
+    second_events = run_directory / "readers-b.jsonl"
+    all_events = successful_events()
+    write_events(
+        first_events,
+        [event for event in all_events if event["reader_id"] in {0, 2}],
+    )
+    write_events(
+        second_events,
+        [event for event in all_events if event["reader_id"] in {1, 3}],
+    )
     events_path = run_directory / "readers.jsonl"
-    write_events(events_path, successful_events())
+    assert (
+        load_cli_main(
+            [
+                "merge-readers",
+                str(run_directory),
+                str(events_path),
+                str(first_events),
+                str(second_events),
+            ]
+        )
+        == 0
+    )
+    merge_output = capsys.readouterr()
+    assert merge_output.out.startswith("MERGED_READERS events=12")
     output_path = run_directory / "summary.json"
 
     assert (

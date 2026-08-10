@@ -1,21 +1,23 @@
 # Phase 0B native load harness
 
-This harness runs directly on dedicated Linux hosts. It does not use Docker or
-another container runtime. Functional contracts run natively on both `amd64`
-and `arm64`; capacity evidence is published separately for each architecture.
+The harness runs directly on dedicated Linux hosts. Docker and other container
+runtimes are outside the deployment and evidence contract. Functional jobs
+compile and execute the same source natively on Linux `amd64` and `arm64`;
+capacity envelopes are measured and published separately for each architecture.
 
-The source side is pull-only: `rtsp-pull-server` exposes independent GStreamer
-RTSP server endpoints backed by a prepared H.264 or H.265 fixture. MediaMTX
-initiates each source connection on demand. Publishing fixtures into MediaMTX
-is not an accepted substitute.
+The source side is pull-only. `rtsp-pull-server` exposes prepared H.264/H.265
+fixtures as camera-like RTSP endpoints and MediaMTX connects on demand. The
+external reader always uses ordinary `rtsp://` with interleaved TCP. Neither a
+publisher into MediaMTX nor `rtsps://` is part of the primary test path.
 
-`rtsp-load-reader` creates many GStreamer RTSP consumers in one process, forces
-TCP, records first-packet latency/errors as JSONL and can read synthetic Basic
-Auth credentials from a two-line file. Credentials never appear in its argv or
-event output. A bounded matrix of pinned FFmpeg readers remains required for
-reference-consumer diversity during the real spike.
+`rtsp-load-reader` consumes a strict TSV plan (`path`, reader count, first
+global reader ID), timestamps outgoing DESCRIBE and PLAY requests, and records
+the first parsed non-delta video access unit. It therefore publishes separate
+`DESCRIBE→PLAY`, `PLAY→first decodable` and end-to-end values instead of
+mislabeling the first RTP buffer as the SLO. Stable global IDs allow a cold
+proxy run to be paired with the corresponding direct-control run.
 
-## Native packages and build
+## Native build
 
 On Ubuntu 24.04 install the architecture-native packages:
 
@@ -28,14 +30,13 @@ sudo apt-get install --yes --no-install-recommends \
 make -C tools/load
 ```
 
-Record `gst-launch-1.0 --version`, the exact `dpkg-query` package versions and
-SHA-256 of both built binaries in every run profile. CI only proves functional
-compatibility; distro package drift invalidates comparisons between load runs.
+Record `gst-launch-1.0 --version`, exact package build IDs and SHA-256 of both
+binaries in the profile. CI proves compatibility only; distro/package drift
+invalidates comparisons.
 
 ## Prepared fixture
 
-Use the pinned FFmpeg artifact to prepare the elementary stream before starting
-load. The builder refuses to overwrite an existing artifact:
+Prepare media before the measured run. The builder refuses to overwrite:
 
 ```sh
 mkdir -p /srv/rtsp-load/fixtures
@@ -45,95 +46,139 @@ bash tools/load/prepare_fixture.sh \
   h264 2000000 25 50 120
 ```
 
-Create distinct profiles for the typical and worst measured GOP. Record the
-fixture SHA-256 in each profile. Do not generate/encode media during a measured
-run.
+Create separate compatible profile pairs for typical and worst measured OMNY
+GOP. The schema accepts only `none` or `opus`, matching the native source
+server; unsupported AAC cannot silently become Opus.
 
-## Immutable run inputs
+## Prepare one evidence-bound run
 
-Copy `profiles/smoke.example.json` and replace every placeholder with values
-measured on the target hosts. The capacity tier additionally requires two
-generator hosts, at least 15 minutes warm-up, 30 minutes measurement and a
-24-hour soak.
+Copy `profiles/smoke.example.json` and replace every placeholder. `prepare`
+verifies the fixture and both load-binary digests, creates the canonical
+profile, catalog, per-host reader plans and exact argv-only launch plan with
+exclusive writes:
 
 ```sh
 rtsp-proxy-load validate /srv/rtsp-load/profiles/run.json
-rtsp-proxy-load init \
+rtsp-proxy-load prepare \
   /srv/rtsp-load/profiles/run.json \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64
-rtsp-proxy-load render-catalog \
-  /srv/rtsp-load/profiles/run.json \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/path-catalog.json
-rtsp-proxy-load render-reader-paths \
-  /srv/rtsp-load/profiles/run.json \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/reader-paths.txt
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
+  --pull-server-binary /opt/rtsp-load/bin/rtsp-pull-server \
+  --load-reader-binary /opt/rtsp-load/bin/rtsp-load-reader
 ```
 
-All writers use exclusive creation and mode `0640`; reuse a new run directory
-instead of editing evidence from an earlier run.
+Do not reconstruct reader/source arguments manually. Execute each `argv` from
+`launch-plan.json` on its named generator host under a dedicated systemd scope.
+Reader shards use global IDs and coordinated schedule indexes, so proxy and
+direct-control runs have the same path/readers distribution and aggregate
+connect/disconnect rate.
 
-## Source hosts
-
-Start one source-server process for each non-overlapping range from
-`generator_hosts`. This example serves indices 0 through 99:
-
-```sh
-tools/load/rtsp-pull-server \
-  --address 0.0.0.0 --port 8554 \
-  --source-start 0 --source-count 100 \
-  --fixture /srv/rtsp-load/fixtures/h264-2mbit-gop50.h264 \
-  --codec h264 --fps 25
-```
-
-Apply the corresponding on-demand catalog only through the MediaMTX loopback
-management listener on the SUT:
+For a proxy run, apply paths only through a literal loopback HTTP management
+listener on the SUT; DNS names, userinfo and non-loopback addresses fail closed:
 
 ```sh
-rtsp-proxy-load apply-paths /srv/rtsp-load/profiles/run.json \
+rtsp-proxy-load apply-paths \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
   --api-url http://127.0.0.1:9997
 ```
 
-## Readers and generator headroom
+The optional external Basic Auth file is not included in argv contents. It
+must be an owner-owned regular file, mode `0600`/`0400`, no symlink, and contain
+exactly username and password on separate non-empty lines.
 
-The credentials file contains exactly the synthetic external username and
-password on separate lines and must be readable only by the load user.
+## Churn and outage primitives
+
+One immutable profile selects one lifecycle:
+
+- `single`: functional or steady-state hold without injected disconnects;
+- `steady`: aggregate 10/s or 100/s connect/disconnect;
+- `ramp`: controlled 100 readers/s;
+- `burst`: 1000 readers/s with bounded retry/backoff/jitter;
+- `outage`: an exact global 10%, 25% or 100% cohort, followed by deterministic
+  jitter across the configured backoff window.
+
+Raw events include start, PLAY, first-decodable, error, injected disconnect and
+scheduled reconnect points. SIGINT/SIGTERM, incomplete initial starts, missing
+decodable readers or an unrecovered injected cohort always return non-zero;
+`--allow-failures` cannot turn an interrupted run into valid evidence.
+
+## Generator headroom
+
+Run every source and reader process inside one finite-limit cgroup per generator
+host. The sampler has no public fake-root or free-form cadence option: cadence
+comes from the stored profile, `/proc` and cgroup v2 come from the real host,
+and every workload PID is explicit.
+
+The argument order is `sample-generator RUN_DIR OUTPUT`; for example:
 
 ```sh
-tools/load/rtsp-load-reader \
-  --host proxy.load.internal --port 9999 \
-  --paths-file /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/reader-paths.txt \
-  --readers-per-path 1 --connect-rate 100 --hold-seconds 600 \
-  --credentials-file /run/rtsp-load/external-basic.txt \
-  --events-file /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/readers.jsonl
-rtsp-proxy-load summarize-readers /srv/rtsp-load/profiles/run.json \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/readers.jsonl
+rtsp-proxy-load sample-generator \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-a.jsonl \
+  --generator-host generator-a --pid 1234 --pid 1235 \
+  --cgroup rtsp-load.slice
+
+rtsp-proxy-load summarize-generator \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-a.jsonl \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/summary/generator-a.json \
+  --generator-host generator-a
 ```
 
-Set `endpoint_mode` to `proxy` or `direct-control` and
-`session_temperature` to `warm` or `cold` in separate immutable profiles.
-Warm proxy runs enforce the 500 ms p99 gate. Cold proxy output is deliberately
-marked `requires_direct_control_decomposition`; it cannot claim the 1 second
-proxy-overhead SLO until paired with the same fixture/GOP direct-control run.
+Validation uses host CPU/RAM/NIC plus maximum per-process single-core CPU and
+RLIMIT_NOFILE consumption and cgroup CPU/memory/pids hard limits. Identity,
+boot ID, expected sample count and maximum cadence gap are checked. Any hard
+resource reaching 70%, a missing host summary or a short/gapped sample window
+invalidates finalization.
 
-Run the host sampler for the entire profile duration on every source and reader
-generator host:
+## Reader and cold A/B summaries
+
+When a run has multiple reader processes, merge their exclusive raw files and
+then summarize:
 
 ```sh
-rtsp-proxy-load sample-host /srv/rtsp-load/profiles/run.json \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-a.jsonl
-rtsp-proxy-load summarize-generator /srv/rtsp-load/profiles/run.json \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-a.jsonl
+rtsp-proxy-load merge-readers RUN_DIR RUN_DIR/raw/readers.jsonl \
+  RUN_DIR/raw/readers-generator-a.jsonl \
+  RUN_DIR/raw/readers-generator-b.jsonl
+rtsp-proxy-load summarize-readers RUN_DIR RUN_DIR/raw/readers.jsonl \
+  RUN_DIR/summary/readers.json
 ```
 
-A summary is invalid when the observation window is short or CPU, RAM, global
-FD allocation, or NIC utilization reaches `70%`. At least 30% generator
-headroom is mandatory; adding load hosts is the remedy, not accepting the run.
+Warm proxy pass/fail uses p99 `DESCRIBE→PLAY ≤500 ms`; first-decodable
+percentiles remain separate diagnostics. Cold proxy output has no standalone
+latency pass. First finalize and verify the compatible direct-control run, then
+bind its final-manifest digest into the proxy comparison:
 
-## Evidence boundary
+```sh
+rtsp-proxy-load finalize DIRECT_RUN_DIR
+rtsp-proxy-load verify DIRECT_RUN_DIR
+rtsp-proxy-load compare-cold \
+  PROXY_RUN_DIR PROXY_RUN_DIR/raw/readers.jsonl \
+  DIRECT_RUN_DIR DIRECT_RUN_DIR/raw/readers.jsonl \
+  PROXY_RUN_DIR/summary/cold-comparison.json
+```
 
-The current CI smoke proves buildability, H.264/H.265 decodability, independent
-paths, fan-out readers and TCP-only sockets on Linux `amd64` and `arm64`. It
-does not prove a single-node capacity envelope. A valid Spike #0 still requires
-dedicated source/reader hosts, LAN and measured WAN/netem profiles, untuned
-100/500/1000 baselines, separate typical/worst GOP runs, the full churn/fault
-matrix and a 24-hour production-equivalent soak.
+The paired profiles must match byte-for-byte except `endpoint_mode`. Cold p99
+`proxy_overhead` is gated at 1 second; the direct path's
+PLAY-to-first-decodable value publishes the GOP/keyframe contribution.
+
+## Finalization and evidence boundary
+
+```sh
+rtsp-proxy-load finalize RUN_DIR
+rtsp-proxy-load verify RUN_DIR
+```
+
+Finalization requires a green reader summary (when readers are configured), a
+green digest-bound headroom summary for every generator host, and the cold A/B
+summary when applicable. It hashes every input/raw/summary file, creates an
+exclusive final manifest, then changes files/directories to `0440`/`0550`.
+This is locally tamper-evident and read-only, not magical WORM: production
+evidence must then be transferred to root-owned immutable storage or the
+approved WORM target.
+
+The current CI smoke proves native compilation, H.264/H.265 decodability,
+independent paths, fan-out, timing events, interruption failure and TCP-only
+sockets on Linux amd64/arm64. It does not prove production capacity. Spike #0
+still requires dedicated hardware, LAN and camera-side WAN/netem, typical and
+worst GOP, untuned 100/500/1000 baselines, the full lifecycle/fault matrix and
+a 24-hour production-equivalent soak.

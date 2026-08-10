@@ -11,11 +11,11 @@ from rtsp_proxy.load_cli import main as load_cli_main
 from rtsp_proxy.load_profile import (
     LoadProfile,
     canonical_profile_bytes,
-    finalize_run_directory,
     initialize_run_directory,
     validate_comparison_pair,
     verify_run_directory,
 )
+from rtsp_proxy.load_run import load_stored_profile, prepare_run_directory
 
 
 def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
@@ -282,6 +282,7 @@ def test_canonical_profile_and_digest_are_stable() -> None:
 
 def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     profile = LoadProfile.model_validate(valid_profile())
     run_directory = tmp_path / "run-001"
@@ -343,7 +344,12 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
         encoding="utf-8",
     )
 
-    final_manifest = finalize_run_directory(run_directory)
+    assert load_cli_main(["finalize", str(run_directory)]) == 0
+    finalized_output = capsys.readouterr()
+    assert finalized_output.out == f"FINALIZED directory={run_directory}\n"
+    final_manifest = json.loads(
+        (run_directory / "final-manifest.json").read_text(encoding="utf-8")
+    )
 
     assert final_manifest["status"] == "finalized"
     assert set(final_manifest["files"]) == {
@@ -359,6 +365,9 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     assert (run_directory / "final-manifest.json").stat().st_mode & 0o777 == 0o440
     assert (run_directory / "raw" / "readers.jsonl").stat().st_mode & 0o777 == 0o440
     assert run_directory.stat().st_mode & 0o777 == 0o550
+    assert load_cli_main(["verify", str(run_directory)]) == 0
+    verified_output = capsys.readouterr()
+    assert verified_output.out == f"VERIFIED directory={run_directory}\n"
     verify_run_directory(run_directory)
 
     (run_directory / "summary" / "readers.json").chmod(0o640)
@@ -447,6 +456,94 @@ def test_load_cli_validates_and_prepares_a_digest_bound_run_without_overwrite(
     failure_output = capsys.readouterr()
     assert failure_output.out == ""
     assert failure_output.err == "load_profile_error: destination_exists\n"
+
+
+def test_direct_control_prepare_writes_one_coordinated_reader_shard_per_host(
+    tmp_path: Path,
+) -> None:
+    pull_server = tmp_path / "rtsp-pull-server"
+    load_reader = tmp_path / "rtsp-load-reader"
+    fixture = tmp_path / "fixture.h264"
+    pull_server.write_bytes(b"pull-server")
+    load_reader.write_bytes(b"load-reader")
+    fixture.write_bytes(b"fixture")
+    pull_server.chmod(0o750)
+    load_reader.chmod(0o750)
+    raw = valid_profile(tier="capacity")
+    artifacts = raw["artifacts"]
+    fixture_profile = raw["fixture"]
+    workload = raw["workload"]
+    assert isinstance(artifacts, dict)
+    assert isinstance(fixture_profile, dict)
+    assert isinstance(workload, dict)
+    artifacts["pull_server_sha256"] = hashlib.sha256(b"pull-server").hexdigest()
+    artifacts["load_reader_sha256"] = hashlib.sha256(b"load-reader").hexdigest()
+    fixture_profile["path"] = str(fixture)
+    fixture_profile["sha256"] = hashlib.sha256(b"fixture").hexdigest()
+    workload["endpoint_mode"] = "direct-control"
+    profile = LoadProfile.model_validate(raw)
+    run_directory = tmp_path / "direct-run"
+
+    launch_plan = prepare_run_directory(
+        profile,
+        run_directory,
+        pull_server_binary=pull_server,
+        load_reader_binary=load_reader,
+    )
+
+    assert len(launch_plan["readers"]) == 2
+    for shard_index, launch in enumerate(launch_plan["readers"]):
+        arguments = launch["argv"]
+        assert "--schedule-shards" in arguments
+        assert arguments[arguments.index("--schedule-shards") + 1] == "2"
+        assert arguments[arguments.index("--schedule-shard-index") + 1] == str(
+            shard_index
+        )
+        assert arguments[arguments.index("--global-reader-count") + 1] == "8"
+    assert (run_directory / "reader-plan-generator-a.tsv").is_file()
+    assert (run_directory / "reader-plan-generator-b.tsv").is_file()
+
+
+def test_run_preparation_rejects_unpinned_binary_paths_and_tampered_manifest(
+    tmp_path: Path,
+) -> None:
+    profile = LoadProfile.model_validate(valid_profile())
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"wrong")
+
+    with pytest.raises(ValueError, match="path_must_be_absolute"):
+        prepare_run_directory(
+            profile,
+            tmp_path / "relative-failure",
+            pull_server_binary=Path("relative-binary"),
+            load_reader_binary=binary,
+        )
+
+    with pytest.raises(ValueError, match="type_or_mode_invalid"):
+        prepare_run_directory(
+            profile,
+            tmp_path / "mode-failure",
+            pull_server_binary=binary,
+            load_reader_binary=binary,
+        )
+
+    binary.chmod(0o750)
+    with pytest.raises(ValueError, match="digest_mismatch"):
+        prepare_run_directory(
+            profile,
+            tmp_path / "digest-failure",
+            pull_server_binary=binary,
+            load_reader_binary=binary,
+        )
+
+    run_directory = tmp_path / "tampered-run"
+    initialize_run_directory(profile, run_directory)
+    manifest_path = run_directory / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["profile_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="stored_profile_manifest_mismatch"):
+        load_stored_profile(run_directory)
 
 def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
