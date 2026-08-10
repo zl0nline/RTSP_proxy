@@ -5,11 +5,14 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
+
+from rtsp_proxy.identifiers import InvalidPublicId, PublicId
 
 
 @dataclass(frozen=True, slots=True)
 class MediaPathConfig:
-    name: str
+    name: PublicId
     source_url: str
     source_on_demand: bool
 
@@ -38,9 +41,10 @@ class MediaMtxClient:
         self._timeout_seconds = timeout_seconds
 
     def put_path(self, path: MediaPathConfig) -> None:
+        name = _path_segment(path.name)
         self._request(
             "POST",
-            f"/v3/config/paths/replace/{path.name}",
+            f"/v3/config/paths/replace/{name}",
             payload={
                 "source": path.source_url,
                 "sourceOnDemand": path.source_on_demand,
@@ -48,10 +52,11 @@ class MediaMtxClient:
             },
         )
 
-    def get_path(self, name: str) -> MediaPathConfig | None:
+    def get_path(self, name: PublicId) -> MediaPathConfig | None:
+        path_segment = _path_segment(name)
         response = self._request(
             "GET",
-            f"/v3/config/paths/get/{name}",
+            f"/v3/config/paths/get/{path_segment}",
             not_found_is_none=True,
         )
         if response is None:
@@ -68,8 +73,14 @@ class MediaMtxClient:
             or not isinstance(source_on_demand, bool)
         ):
             raise MediaNodeProtocolError("mediamtx_invalid_path_response")
+        try:
+            parsed_name = PublicId.parse(response_name)
+        except InvalidPublicId:
+            raise MediaNodeProtocolError("mediamtx_invalid_path_response") from None
+        if parsed_name != name:
+            raise MediaNodeProtocolError("mediamtx_path_identity_mismatch")
         return MediaPathConfig(
-            name=response_name,
+            name=parsed_name,
             source_url=source,
             source_on_demand=source_on_demand,
         )
@@ -101,10 +112,11 @@ class MediaMtxClient:
             if page >= page_count:
                 return tuple(names)
 
-    def delete_path(self, name: str) -> None:
+    def delete_path(self, name: PublicId) -> None:
+        path_segment = _path_segment(name)
         self._request(
             "DELETE",
-            f"/v3/config/paths/delete/{name}",
+            f"/v3/config/paths/delete/{path_segment}",
             not_found_is_none=True,
         )
 
@@ -139,3 +151,7 @@ class MediaMtxClient:
             return json.loads(content)
         except (UnicodeError, json.JSONDecodeError) as error:
             raise MediaNodeProtocolError("mediamtx_invalid_json") from error
+
+
+def _path_segment(public_id: PublicId) -> str:
+    return quote(str(public_id), safe="")

@@ -41,11 +41,22 @@ runtime config mutation and would weaken per-grant revoke semantics.
 
 - callback request bodies contain credentials and must never be logged;
 - loopback HTTP is allowed only while callback and MediaMTX share a host;
-- any cross-host callback requires an accepted authenticated-encryption design
-  (pinned HTTPS identity or an approved private network), tested fail closed;
+- the single-node candidate accepts external RTSP only by direct trusted/private
+  L3 delivery. An L4 proxy, NAT boundary that hides the client, or cross-host
+  callback is a deployment NO-GO until a separate accepted source-IP and
+  authenticated-encryption design passes native network tests;
+- an outer WireGuard/IPsec/private-L3 transport may terminate on the same host
+  only when the inner client IP reaches MediaMTX unchanged; the client still
+  uses ordinary `rtsp://` and no TLS-aware RTSP configuration;
 - API/metrics listeners and callback stay off the external RTSP interface;
 - callback latency and availability are part of new-session admission, not
   established media-session availability.
+- MediaMTX v1.20.0 `readTimeout` bounds the external HTTP auth request but does
+  not bound an incomplete initial RTSP header: a native contract keeps a
+  partial header open past the configured one-second timeout. Production
+  admission therefore still requires an accepted edge/host control for
+  handshake deadline, connection caps and rate limiting. Direct exposure before
+  that control is a NO-GO.
 
 ## Evidence required before Accepted
 
@@ -53,6 +64,8 @@ runtime config mutation and would weaken per-grant revoke semantics.
   session tests pass on the pinned artifacts;
 - unknown, revoked and existing path responses pass no-oracle parity tests;
 - callback overload/timeout budgets and rate limits pass the security spike;
+- incomplete-header, connection-flood and brute-force controls pass without
+  interrupting established readers;
 - credential redaction covers application logs, MediaMTX logs, traces and
   internal probe/supervisor failures;
 - security and operations owners approve the cross-host rule and emergency

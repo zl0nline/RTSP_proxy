@@ -9,6 +9,7 @@ from typing import ClassVar
 
 import pytest
 
+from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import (
     MediaMtxClient,
     MediaNodeProtocolError,
@@ -51,6 +52,18 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
             return
         if name == "d" * 25:
             self._respond(400, b'{"error":"request contained rtsp://secret@camera"}')
+            return
+        if name == "e" * 25:
+            self._respond(
+                200,
+                json.dumps(
+                    {
+                        "name": "f" * 25,
+                        "source": "rtsp://camera.invalid/main",
+                        "sourceOnDemand": True,
+                    }
+                ).encode("utf-8"),
+            )
             return
         path = self.paths.get(name)
         if path is None:
@@ -96,13 +109,13 @@ def media_api() -> Iterator[str]:
 def test_media_path_operations_converge_without_exposing_http_routes(media_api: str) -> None:
     client = MediaMtxClient(api_url=media_api, timeout_seconds=1)
     path = MediaPathConfig(
-        name="a" * 25,
+        name=PublicId.parse("a" * 25),
         source_url="rtsp://camera.invalid/main",
         source_on_demand=True,
     )
 
     client.put_path(path)
-    assert client.list_path_names() == (path.name,)
+    assert client.list_path_names() == (str(path.name),)
     assert client.get_path(path.name) == path
 
     client.delete_path(path.name)
@@ -116,11 +129,14 @@ def test_media_adapter_rejects_invalid_or_rejected_responses_without_secrets(
     client = MediaMtxClient(api_url=media_api, timeout_seconds=1)
 
     with pytest.raises(MediaNodeProtocolError, match="mediamtx_invalid_json"):
-        client.get_path("c" * 25)
+        client.get_path(PublicId.parse("c" * 25))
 
     with pytest.raises(MediaNodeRejected, match="mediamtx_http_400") as rejected:
-        client.get_path("d" * 25)
+        client.get_path(PublicId.parse("d" * 25))
     assert "secret" not in str(rejected.value)
+
+    with pytest.raises(MediaNodeProtocolError, match="mediamtx_path_identity_mismatch"):
+        client.get_path(PublicId.parse("e" * 25))
 
 
 def test_media_adapter_reports_an_unreachable_node_with_a_stable_reason() -> None:
@@ -130,4 +146,4 @@ def test_media_adapter_reports_an_unreachable_node_with_a_stable_reason() -> Non
 
     client = MediaMtxClient(api_url=f"http://{host}:{port}", timeout_seconds=0.1)
     with pytest.raises(MediaNodeUnavailable, match="mediamtx_unavailable"):
-        client.get_path("a" * 25)
+        client.get_path(PublicId.parse("a" * 25))

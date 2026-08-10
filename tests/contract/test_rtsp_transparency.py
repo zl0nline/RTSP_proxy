@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
+import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -17,8 +20,8 @@ from typing import ClassVar
 
 import pytest
 
+from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
-from rtsp_proxy.probe import FfprobeRunner, ProbeFailed, RtspEndpoint
 
 MEDIA_MTX_BINARY = os.environ.get("MEDIAMTX_BINARY")
 FFMPEG_BINARY = os.environ.get("FFMPEG_BINARY")
@@ -81,7 +84,7 @@ def wait_for_json(url: str, process: subprocess.Popen[str], *, ready_path: bool 
 
 def authenticated_describe_response(
     *, host: str, port: int, path: str, username: str, password: str
-) -> bytes:
+) -> tuple[bytes, float]:
     authorization = b64encode(f"{username}:{password}".encode()).decode()
     request = (
         f"DESCRIBE rtsp://{host}:{port}/{path} RTSP/1.0\r\n"
@@ -90,6 +93,7 @@ def authenticated_describe_response(
         "Accept: application/sdp\r\n"
         "\r\n"
     ).encode()
+    started_at = time.monotonic()
     with socket.create_connection((host, port), timeout=6) as connection:
         connection.settimeout(6)
         connection.sendall(request)
@@ -99,31 +103,218 @@ def authenticated_describe_response(
             if not chunk:
                 break
             response.extend(chunk)
-    return bytes(response).partition(b"\r\n\r\n")[0]
+        headers, separator, body = bytes(response).partition(b"\r\n\r\n")
+        content_length = 0
+        for header in headers.split(b"\r\n")[1:]:
+            name, delimiter, value = header.partition(b":")
+            if delimiter and name.lower() == b"content-length":
+                content_length = int(value.strip())
+        while len(body) < content_length:
+            chunk = connection.recv(min(4096, content_length - len(body)))
+            if not chunk:
+                break
+            body += chunk
+    return headers + separator + body[:content_length], time.monotonic() - started_at
+
+
+def run_lab_ffprobe(
+    *,
+    binary: str,
+    host: str,
+    port: int,
+    path: str,
+    username: str,
+    password: str,
+    transport: str = "tcp",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            binary,
+            "-v",
+            "error",
+            "-rtsp_transport",
+            transport,
+            "-timeout",
+            "5000000",
+            "-show_entries",
+            "stream=codec_type,codec_name,width,height",
+            "-of",
+            "json",
+            f"rtsp://{username}:{password}@{host}:{port}/{path}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def run_lab_ffmpeg_reader(
+    *, binary: str, host: str, port: int, path: str, username: str, password: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            f"rtsp://{username}:{password}@{host}:{port}/{path}",
+            "-t",
+            "3",
+            "-map",
+            "0:v:0",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def metrics_lines(url: str) -> list[str]:
+    with urllib.request.urlopen(url, timeout=2) as response:
+        payload = response.read()
+    assert isinstance(payload, bytes)
+    return payload.decode("utf-8").splitlines()
+
+
+def metric_value(lines: list[str], family: str, *, path_name: str) -> float:
+    for line in lines:
+        if line.startswith(f"{family}{{") and f'name="{path_name}"' in line:
+            return float(line.rsplit(" ", 1)[1])
+    pytest.fail(f"metric {family} for the expected path is absent")
+
+
+def metric_schema(lines: list[str]) -> dict[str, list[str]]:
+    schema: dict[str, set[str]] = {}
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        metric, _, _value = line.rpartition(" ")
+        family, separator, raw_labels = metric.partition("{")
+        labels = set(re.findall(r'(\w+)="', raw_labels)) if separator else set()
+        schema.setdefault(family, set()).update(labels)
+    return {family: sorted(labels) for family, labels in sorted(schema.items())}
+
+
+def wait_for_reader(metrics_url: str, *, path_name: str) -> None:
+    deadline = time.monotonic() + 10
+    expected = f'paths_readers{{name="{path_name}",readerType="rtspSession",state="ready"}} 1'
+    while time.monotonic() < deadline:
+        if expected in metrics_lines(metrics_url):
+            return
+        time.sleep(0.1)
+    pytest.fail("RTSP reader did not become observable within 10 seconds")
+
+
+def wait_for_cold_race(
+    *, origin_api_url: str, proxy_metrics_url: str, path_name: str
+) -> None:
+    deadline = time.monotonic() + 10
+    expected_proxy_readers = (
+        f'paths_readers{{name="{path_name}",readerType="rtspSession",state="ready"}} 4'
+    )
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(origin_api_url, timeout=1) as response:
+                origin_path = json.load(response)
+            if (
+                len(origin_path["readers"]) == 1
+                and expected_proxy_readers in metrics_lines(proxy_metrics_url)
+            ):
+                return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    pytest.fail("cold-reader race did not converge to one upstream and four readers")
+
+
+def assert_reader_progress(
+    reader: subprocess.Popen[str], metrics_url: str, *, path_name: str
+) -> None:
+    before = metric_value(metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name)
+    time.sleep(0.5)
+    after = metric_value(metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name)
+    assert reader.poll() is None
+    assert after > before
+
+
+def assert_process_has_no_udp_listener(process: subprocess.Popen[str], port: int) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    socket_inodes = {
+        target.removeprefix("socket:[").removesuffix("]")
+        for fd in (Path("/proc") / str(process.pid) / "fd").iterdir()
+        if (target := os.readlink(fd)).startswith("socket:[")
+    }
+    for table_name in ("udp", "udp6"):
+        table = Path("/proc") / str(process.pid) / "net" / table_name
+        for line in table.read_text(encoding="utf-8").splitlines()[1:]:
+            fields = line.split()
+            local_port = int(fields[1].rsplit(":", 1)[1], 16)
+            if local_port == port and fields[9] in socket_inodes:
+                pytest.fail("MediaMTX opened a UDP socket on the external RTSP port")
+
+
+def assert_partial_rtsp_header_outlives_media_read_timeout(host: str, port: int) -> None:
+    started_at = time.monotonic()
+    with socket.create_connection((host, port), timeout=2) as connection:
+        connection.settimeout(1.5)
+        connection.sendall(f"DESCRIBE rtsp://{host}:{port}/".encode())
+        with pytest.raises(TimeoutError):
+            connection.recv(4096)
+    assert time.monotonic() - started_at >= 1
+
+
+class AuthCallbackServer(ThreadingHTTPServer):
+    daemon_threads = True
 
 
 class AuthCallbackHandler(BaseHTTPRequestHandler):
     accepted_paths: ClassVar[set[str]] = set()
     valid_requests: ClassVar[list[dict[str, object]]] = []
     accept_credentials: ClassVar[bool] = True
+    response_delay_seconds: ClassVar[float] = 0
+    active_requests: ClassVar[int] = 0
+    peak_active_requests: ClassVar[int] = 0
+    request_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(length))
-        valid = (
-            payload.get("user") == "external"
-            and payload.get("password") == "lab-secret"
-            and payload.get("action") == "read"
-            and payload.get("path") in self.accepted_paths
-            and payload.get("protocol") == "rtsp"
-            and payload.get("ip") == "127.0.0.1"
-        )
-        if valid and self.accept_credentials:
-            self.valid_requests.append(payload)
-            self.send_response(204)
-        else:
-            self.send_response(401)
-        self.end_headers()
+        with self.request_lock:
+            type(self).active_requests += 1
+            type(self).peak_active_requests = max(
+                type(self).peak_active_requests,
+                type(self).active_requests,
+            )
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            time.sleep(self.response_delay_seconds)
+            valid = (
+                payload.get("user") == "external"
+                and payload.get("password") == "lab-secret"
+                and payload.get("action") == "read"
+                and payload.get("path") in self.accepted_paths
+                and payload.get("protocol") == "rtsp"
+                and payload.get("ip") == "127.0.0.1"
+            )
+            if valid and self.accept_credentials:
+                self.valid_requests.append(payload)
+                self.send_response(204)
+            else:
+                self.send_response(401)
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            with self.request_lock:
+                type(self).active_requests -= 1
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -150,6 +341,7 @@ def test_external_rtsp_tcp_is_transparent_and_unrelated_hot_update_isolated(
     public_id = "f" * 25
     other_public_id = "g" * 25
     race_public_id = "h" * 25
+    failing_source_public_id = "i" * 25
 
     origin_config = tmp_path / "origin.yml"
     origin_config.write_text(
@@ -164,7 +356,11 @@ authInternalUsers:
     permissions:
       - action: api
       - action: publish
+  - user: origin-reader
+    pass: origin-secret
+    permissions:
       - action: read
+        path: fixture
 api: true
 apiAddress: 127.0.0.1:{origin_api_port}
 metrics: false
@@ -187,6 +383,7 @@ paths:
     )
 
     template = Path("deploy/mediamtx.yml.example").read_text(encoding="utf-8")
+    template = template.replace("logStructured: true", "logStructured: true\nreadTimeout: 1s")
     if auth_method == "http":
         template = template.replace(
             "authMethod: internal",
@@ -208,7 +405,8 @@ paths:
             "    pass: lab-secret\n"
             "    permissions:\n"
             "      - action: read\n"
-            f"        path: ~^({public_id}|{other_public_id}|{race_public_id})$\n",
+            f"        path: ~^({public_id}|{other_public_id}|{race_public_id}|"
+            f"{failing_source_public_id})$\n",
         ),
         encoding="utf-8",
     )
@@ -225,10 +423,14 @@ paths:
                 public_id,
                 other_public_id,
                 race_public_id,
+                failing_source_public_id,
             }
             AuthCallbackHandler.valid_requests = []
             AuthCallbackHandler.accept_credentials = True
-            auth_server = ThreadingHTTPServer(
+            AuthCallbackHandler.response_delay_seconds = 0
+            AuthCallbackHandler.active_requests = 0
+            AuthCallbackHandler.peak_active_requests = 0
+            auth_server = AuthCallbackServer(
                 ("127.0.0.1", auth_port),
                 AuthCallbackHandler,
             )
@@ -277,81 +479,108 @@ paths:
             f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get",
             proxy,
         )
+        assert_process_has_no_udp_listener(proxy, proxy_rtsp_port)
         client = MediaMtxClient(
             api_url=f"http://127.0.0.1:{proxy_api_port}",
             timeout_seconds=2,
         )
         client.put_path(
             MediaPathConfig(
-                name=public_id,
-                source_url=f"rtsp://127.0.0.1:{origin_rtsp_port}/fixture",
+                name=PublicId.parse(public_id),
+                source_url=(
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
+                    "/fixture"
+                ),
                 source_on_demand=True,
             )
         )
         client.put_path(
             MediaPathConfig(
-                name=other_public_id,
-                source_url=f"rtsp://127.0.0.1:{origin_rtsp_port}/fixture",
+                name=PublicId.parse(other_public_id),
+                source_url=(
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
+                    "/fixture"
+                ),
                 source_on_demand=True,
             )
         )
         client.put_path(
             MediaPathConfig(
-                name=race_public_id,
-                source_url=f"rtsp://127.0.0.1:{origin_rtsp_port}/fixture",
+                name=PublicId.parse(race_public_id),
+                source_url=(
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
+                    "/fixture"
+                ),
+                source_on_demand=True,
+            )
+        )
+        client.put_path(
+            MediaPathConfig(
+                name=PublicId.parse(failing_source_public_id),
+                source_url=(
+                    f"rtsp://origin-reader:wrong-source-secret@127.0.0.1:"
+                    f"{origin_rtsp_port}/fixture"
+                ),
                 source_on_demand=True,
             )
         )
 
-        def inspect_cold_path(_: int) -> str:
-            observation = FfprobeRunner(
-                binary=Path(FFPROBE_BINARY),
-                io_timeout_seconds=5,
-                total_timeout_seconds=15,
-            ).inspect(
-                RtspEndpoint(
-                    host="127.0.0.1",
-                    port=proxy_rtsp_port,
-                    path=race_public_id,
-                    username="external",
-                    password="lab-secret",
-                )
+        failing_source_probe = run_lab_ffprobe(
+            binary=FFPROBE_BINARY,
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=failing_source_public_id,
+            username="external",
+            password="lab-secret",
+        )
+        assert failing_source_probe.returncode != 0
+
+        metrics_url = f"http://127.0.0.1:{proxy_metrics_port}/metrics"
+
+        def consume_cold_path() -> subprocess.CompletedProcess[str]:
+            return run_lab_ffmpeg_reader(
+                binary=FFMPEG_BINARY,
+                host="127.0.0.1",
+                port=proxy_rtsp_port,
+                path=race_public_id,
+                username="external",
+                password="lab-secret",
             )
-            return observation.streams[0].codec_name
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            assert list(executor.map(inspect_cold_path, range(4))) == ["h264"] * 4
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{origin_api_port}/v3/paths/get/fixture",
-            timeout=2,
-        ) as origin_path_response:
-            origin_path = json.load(origin_path_response)
-        assert len(origin_path["readers"]) == 1
+            cold_readers = [executor.submit(consume_cold_path) for _ in range(4)]
+            wait_for_cold_race(
+                origin_api_url=(
+                    f"http://127.0.0.1:{origin_api_port}/v3/paths/get/fixture"
+                ),
+                proxy_metrics_url=metrics_url,
+                path_name=race_public_id,
+            )
+            assert all(reader.result().returncode == 0 for reader in cold_readers)
 
-        result = subprocess.run(
-            [
-                FFPROBE_BINARY,
-                "-v",
-                "error",
-                "-rtsp_transport",
-                "tcp",
-                "-rw_timeout",
-                "5000000",
-                "-show_entries",
-                "stream=codec_name,width,height",
-                "-of",
-                "json",
-                f"rtsp://external:lab-secret@127.0.0.1:{proxy_rtsp_port}/{public_id}",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
+        result = run_lab_ffprobe(
+            binary=FFPROBE_BINARY,
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=public_id,
+            username="external",
+            password="lab-secret",
         )
         assert result.returncode == 0, "ffprobe failed against the ordinary RTSP endpoint"
         assert json.loads(result.stdout)["streams"] == [
-            {"codec_name": "h264", "width": 160, "height": 120}
+            {"codec_name": "h264", "codec_type": "video", "width": 160, "height": 120}
         ]
+
+        udp_result = run_lab_ffprobe(
+            binary=FFPROBE_BINARY,
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=public_id,
+            username="external",
+            password="lab-secret",
+            transport="udp",
+        )
+        assert udp_result.returncode != 0, "UDP transport was unexpectedly admitted"
 
         reader = start_process(
             [
@@ -363,8 +592,6 @@ paths:
                 "tcp",
                 "-i",
                 f"rtsp://external:lab-secret@127.0.0.1:{proxy_rtsp_port}/{other_public_id}",
-                "-t",
-                "3",
                 "-map",
                 "0:v:0",
                 "-f",
@@ -372,36 +599,42 @@ paths:
                 "-",
             ]
         )
-        time.sleep(0.5)
-        if reader.poll() is not None:
-            reader_output, _ = reader.communicate()
-            pytest.fail("reader failed before the isolated hot update: " + reader_output)
+        wait_for_reader(metrics_url, path_name=other_public_id)
+        assert reader.poll() is None
+        assert_partial_rtsp_header_outlives_media_read_timeout(
+            "127.0.0.1", proxy_rtsp_port
+        )
+        assert_reader_progress(reader, metrics_url, path_name=other_public_id)
 
         expected_path_configs = {
             public_id,
             other_public_id,
             race_public_id,
+            failing_source_public_id,
         }
         if auth_method == "http":
             expected_path_configs.add("~^[a-z0-9]{25}$")
         assert set(client.list_path_names()) == expected_path_configs
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{proxy_metrics_port}/metrics",
-            timeout=2,
-        ) as metrics_response:
-            metric_lines = metrics_response.read().decode("utf-8").splitlines()
-        assert f'paths{{name="{other_public_id}",state="ready"}} 1' in metric_lines
+        observed_metrics = metrics_lines(metrics_url)
+        schema_contract = json.loads(
+            Path("docs/evidence/mediamtx-v1.20.0-metrics-schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert metric_schema(observed_metrics) == schema_contract["families"]
+        assert not any(line.startswith(("# HELP ", "# TYPE ")) for line in observed_metrics)
+        assert f'paths{{name="{other_public_id}",state="ready"}} 1' in observed_metrics
         assert (
             f'paths_readers{{name="{other_public_id}",readerType="rtspSession",state="ready"}} 1'
-            in metric_lines
+            in observed_metrics
         )
         assert any(
             line.startswith("rtsp_sessions{")
             and f'path="{other_public_id}"' in line
             and 'state="read"' in line
-            for line in metric_lines
+            for line in observed_metrics
         )
-        assert not any(line.startswith("rtsps_") for line in metric_lines)
+        assert not any(line.startswith("rtsps_") for line in observed_metrics)
 
         if auth_server is not None:
             assert {
@@ -412,45 +645,83 @@ paths:
                 ("read", other_public_id, "rtsp"),
             }
 
-            denied_responses = {
-                authenticated_describe_response(
-                    host="127.0.0.1",
-                    port=proxy_rtsp_port,
-                    path=case_path,
-                    username=case_username,
-                    password=case_password,
-                )
-                for case_path, case_username, case_password in (
-                    (public_id, "external", "wrong-secret"),
-                    (public_id, "unknown-user", "lab-secret"),
-                    ("z" * 25, "external", "lab-secret"),
-                )
+            denied_responses: set[bytes] = set()
+            denial_timings: dict[str, list[float]] = {
+                "wrong-password": [],
+                "unknown-user": [],
+                "unknown-path": [],
             }
+            denial_cases = {
+                "wrong-password": (public_id, "external", "wrong-secret"),
+                "unknown-user": (public_id, "unknown-user", "lab-secret"),
+                "unknown-path": ("z" * 25, "external", "lab-secret"),
+            }
+            def sample_denial(
+                sample: tuple[str, tuple[str, str, str]],
+            ) -> tuple[str, bytes, float]:
+                case_name, (case_path, case_username, case_password) = sample
+                response, elapsed = authenticated_describe_response(
+                        host="127.0.0.1",
+                        port=proxy_rtsp_port,
+                        path=case_path,
+                        username=case_username,
+                        password=case_password,
+                    )
+                return case_name, response, elapsed
+
+            samples = list(denial_cases.items()) * 6
+            with ThreadPoolExecutor(max_workers=len(samples)) as executor:
+                denial_results = list(executor.map(sample_denial, samples))
+            for case_name, response, elapsed in denial_results:
+                denied_responses.add(response)
+                denial_timings[case_name].append(elapsed)
             assert len(denied_responses) == 1
-            assert next(iter(denied_responses)).startswith(b"RTSP/1.0 401 Unauthorized")
+            canonical_denial = next(iter(denied_responses))
+            assert canonical_denial.startswith(b"RTSP/1.0 401 Unauthorized")
+            denial_means = [statistics.fmean(samples) for samples in denial_timings.values()]
+            assert max(denial_means) - min(denial_means) <= 2.0
 
             def expect_new_session_denied() -> None:
-                with pytest.raises(ProbeFailed, match="ffprobe_failed") as denied:
-                    FfprobeRunner(
-                        binary=Path(FFPROBE_BINARY),
-                        io_timeout_seconds=2,
-                        total_timeout_seconds=5,
-                    ).inspect(
-                        RtspEndpoint(
-                            host="127.0.0.1",
-                            port=proxy_rtsp_port,
-                            path=public_id,
-                            username="external",
-                            password="lab-secret",
-                        )
-                    )
-                assert "lab-secret" not in str(denied.value)
+                denied = run_lab_ffprobe(
+                    binary=FFPROBE_BINARY,
+                    host="127.0.0.1",
+                    port=proxy_rtsp_port,
+                    path=public_id,
+                    username="external",
+                    password="lab-secret",
+                )
+                assert denied.returncode != 0
 
             AuthCallbackHandler.accept_credentials = False
             revoke_started_at = time.monotonic()
             expect_new_session_denied()
             assert time.monotonic() - revoke_started_at <= 10
+            revoked_response, _ = authenticated_describe_response(
+                host="127.0.0.1",
+                port=proxy_rtsp_port,
+                path=public_id,
+                username="external",
+                password="lab-secret",
+            )
+            assert revoked_response == canonical_denial
+            assert_reader_progress(reader, metrics_url, path_name=other_public_id)
             AuthCallbackHandler.accept_credentials = True
+
+            AuthCallbackHandler.response_delay_seconds = 2
+            AuthCallbackHandler.peak_active_requests = 0
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                overload_results = list(executor.map(lambda _: run_lab_ffprobe(
+                    binary=FFPROBE_BINARY,
+                    host="127.0.0.1",
+                    port=proxy_rtsp_port,
+                    path=public_id,
+                    username="external",
+                    password="lab-secret",
+                ).returncode, range(4)))
+            assert all(returncode != 0 for returncode in overload_results)
+            assert AuthCallbackHandler.peak_active_requests >= 2
+            assert_reader_progress(reader, metrics_url, path_name=other_public_id)
+            AuthCallbackHandler.response_delay_seconds = 0
 
             auth_server.shutdown()
             auth_server.server_close()
@@ -459,24 +730,32 @@ paths:
             auth_server = None
             auth_thread = None
             expect_new_session_denied()
+            assert_reader_progress(reader, metrics_url, path_name=other_public_id)
 
         client.put_path(
             MediaPathConfig(
-                name=public_id,
-                source_url=f"rtsp://127.0.0.1:{origin_rtsp_port}/different",
+                name=PublicId.parse(public_id),
+                source_url=(
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
+                    "/different"
+                ),
                 source_on_demand=True,
             )
         )
 
-        reader_output, _ = reader.communicate(timeout=10)
-        assert reader.returncode == 0, (
-            "reader of an unrelated path was interrupted: " + reader_output
-        )
+        assert reader.poll() is None
+        stop_process(reader)
         reader = None
 
         proxy_output = stop_process(proxy)
         proxy = None
-        for forbidden_secret in ("lab-secret", "wrong-secret"):
+        for forbidden_secret in (
+            "lab-secret",
+            "wrong-secret",
+            "origin-reader",
+            "origin-secret",
+            "wrong-source-secret",
+        ):
             assert forbidden_secret not in proxy_output
     finally:
         if auth_server is not None:

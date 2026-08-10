@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
 
 MEDIA_MTX_BINARY = os.environ.get("MEDIAMTX_BINARY")
@@ -82,19 +83,21 @@ def test_path_hot_update_and_delete_are_idempotent_and_isolated(tmp_path: Path) 
     process = start_mediamtx(config)
     first_name = "a" * 25
     second_name = "b" * 25
+    first_id = PublicId.parse(first_name)
+    second_id = PublicId.parse(second_name)
     client = MediaMtxClient(api_url=api_url, timeout_seconds=2)
     first_v1 = MediaPathConfig(
-        name=first_name,
+        name=first_id,
         source_url=f"rtsp://127.0.0.1:{source_port}/first-v1",
         source_on_demand=True,
     )
     first_v2 = MediaPathConfig(
-        name=first_name,
+        name=first_id,
         source_url=f"rtsp://127.0.0.1:{source_port}/first-v2",
         source_on_demand=True,
     )
     second = MediaPathConfig(
-        name=second_name,
+        name=second_id,
         source_url=f"rtsp://127.0.0.1:{source_port}/second",
         source_on_demand=True,
     )
@@ -106,14 +109,14 @@ def test_path_hot_update_and_delete_are_idempotent_and_isolated(tmp_path: Path) 
         client.put_path(first_v2)
 
         assert set(client.list_path_names()) == {first_name, second_name}
-        assert client.get_path(first_name) == first_v2
-        assert client.get_path(second_name) == second
+        assert client.get_path(first_id) == first_v2
+        assert client.get_path(second_id) == second
 
-        client.delete_path(first_name)
-        client.delete_path(first_name)
+        client.delete_path(first_id)
+        client.delete_path(first_id)
 
-        assert client.get_path(first_name) is None
-        assert client.get_path(second_name) == second
+        assert client.get_path(first_id) is None
+        assert client.get_path(second_id) == second
     finally:
         stop_mediamtx(process)
 
@@ -131,7 +134,7 @@ def test_runtime_paths_require_cold_restore_after_a_media_node_restart(tmp_path:
         encoding="utf-8",
     )
     path = MediaPathConfig(
-        name="e" * 25,
+        name=PublicId.parse("e" * 25),
         source_url=f"rtsp://127.0.0.1:{source_port}/main",
         source_on_demand=True,
     )

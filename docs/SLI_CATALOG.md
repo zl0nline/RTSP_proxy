@@ -34,6 +34,11 @@ Rules:
 | RTSP sessions | metrics | `rtsp_sessions{id,path,remoteAddr,state}` |
 | RTSP transport traffic/loss | metrics | non-deprecated `rtsp_sessions_*` counters |
 
+The complete emitted family/label compatibility contract is versioned in
+[`evidence/mediamtx-v1.20.0-metrics-schema.json`](evidence/mediamtx-v1.20.0-metrics-schema.json).
+MediaMTX v1.20.0 does not emit Prometheus `HELP`/`TYPE` declarations, so every
+collector query must use the pinned family semantics rather than infer a type.
+
 The runtime `paths` metric is not catalog cardinality: an on-demand configured
 path can be registered while absent from runtime metrics. Dashboard and capacity
 reports therefore keep registered configs, ready sources and readers separate.

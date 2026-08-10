@@ -207,12 +207,17 @@ Product behavior, зависящий от неподтверждённых Media
 Репозиторий содержит исполняемый Phase 0 foundation: Python package,
 role-specific fail-closed readiness scaffold, checksum/path/version/
 architecture release verifier, tests, direct-Linux systemd artifacts и native
-amd64/arm64 CI. В Phase 0A уже реализованы MediaMTX management adapter,
-безопасный ffprobe adapter и исполняемый внешний контракт против реальных
+amd64/arm64 CI. В Phase 0A уже реализованы типизированный MediaMTX management
+adapter и исполняемый внешний контракт против реальных
 MediaMTX/FFmpeg/ffprobe: обычный `rtsp://` по TCP, on-demand pull, hot-update
 изоляция, restart/cold-restore, internal/HTTP auth, revoke/outage, no-oracle
 fallback и pinned metrics schema. Последний набор изменений считается
 подтверждённым только после native CI и exit review фазы.
+
+Production ffprobe runner намеренно не поставляется: первоначальный runner был
+удалён после exit review, потому что до отдельной Unix/cgroup/egress границы он
+оставлял бы source credentials в argv и допускал SSRF. Кандидатная граница
+зафиксирована в ADR 0004 и должна быть реализована в health/security slices.
 
 Catalog, PostgreSQL, grant verifier, reconciler/task loops, dashboard и load
 harness ещё не реализованы. FFmpeg/ffprobe зафиксированы как Phase 0 candidate,
