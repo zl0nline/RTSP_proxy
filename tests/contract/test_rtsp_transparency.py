@@ -237,10 +237,16 @@ def assert_reader_progress(
     reader: subprocess.Popen[str], metrics_url: str, *, path_name: str
 ) -> None:
     before = metric_value(metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name)
-    time.sleep(0.5)
-    after = metric_value(metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name)
-    assert reader.poll() is None
-    assert after > before
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        assert reader.poll() is None
+        after = metric_value(
+            metrics_lines(metrics_url), "paths_outbound_bytes", path_name=path_name
+        )
+        if after > before:
+            return
+        time.sleep(0.1)
+    pytest.fail("established reader bytes did not progress within five seconds")
 
 
 def process_owned_udp_sockets(
@@ -722,6 +728,7 @@ paths:
             )
         )
 
+        assert_reader_progress(reader, metrics_url, path_name=other_public_id)
         assert reader.poll() is None
         stop_process(reader)
         reader = None
