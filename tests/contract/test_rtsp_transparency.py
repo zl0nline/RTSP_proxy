@@ -754,6 +754,20 @@ paths: {{}}
                 ).returncode, range(4)))
             assert all(returncode != 0 for returncode in overload_results)
             assert AuthCallbackHandler.peak_active_requests >= 1
+            drain_deadline = time.monotonic() + 15
+            zero_since: float | None = None
+            while time.monotonic() < drain_deadline:
+                with AuthCallbackHandler.request_lock:
+                    active_requests = AuthCallbackHandler.active_requests
+                if active_requests == 0:
+                    zero_since = zero_since or time.monotonic()
+                    if time.monotonic() - zero_since >= 0.5:
+                        break
+                else:
+                    zero_since = None
+                time.sleep(0.1)
+            assert AuthCallbackHandler.active_requests == 0
+            assert reader.poll() is None
             assert_reader_progress(reader, metrics_url, path_name=other_public_id)
             AuthCallbackHandler.response_delay_seconds = 0
 
