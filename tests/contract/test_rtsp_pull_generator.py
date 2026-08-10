@@ -55,11 +55,14 @@ def wait_for_listener(process: subprocess.Popen[str], port: int) -> None:
 def process_owned_udp_sockets(process: subprocess.Popen[str]) -> frozenset[str]:
     if not sys.platform.startswith("linux"):
         return frozenset()
-    socket_inodes = {
-        target.removeprefix("socket:[").removesuffix("]")
-        for fd in (Path("/proc") / str(process.pid) / "fd").iterdir()
-        if (target := os.readlink(fd)).startswith("socket:[")
-    }
+    socket_inodes: set[str] = set()
+    for fd in (Path("/proc") / str(process.pid) / "fd").iterdir():
+        try:
+            target = os.readlink(fd)
+        except FileNotFoundError:
+            continue
+        if target.startswith("socket:["):
+            socket_inodes.add(target.removeprefix("socket:[").removesuffix("]"))
     owned: set[str] = set()
     for table_name in ("udp", "udp6"):
         table = Path("/proc") / str(process.pid) / "net" / table_name
