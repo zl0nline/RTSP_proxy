@@ -11,9 +11,9 @@ TCP endpoint.
 > - Foundation implementation: **REVIEWED** — fail-closed role readiness,
 >   release verifier, Python package, native amd64/arm64 CI и direct-Linux
 >   systemd artifacts прошли Standards/Spec review.
-> - Phase 0A compatibility lab: **IN PROGRESS** — MediaMTX adapter и внешний
->   ordinary-RTSP contract реализованы; auth/security forks остаются evidence
->   gated до полного exit review.
+> - Phase 0A compatibility lab: **COMPLETE** — MediaMTX adapter и внешний
+>   ordinary-RTSP contract прошли Standards/Spec exit review и native
+>   amd64/arm64 CI; Proposed auth/security gates всё ещё блокируют production.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -211,8 +211,8 @@ amd64/arm64 CI. В Phase 0A уже реализованы типизирован
 adapter и исполняемый внешний контракт против реальных
 MediaMTX/FFmpeg/ffprobe: обычный `rtsp://` по TCP, on-demand pull, hot-update
 изоляция, restart/cold-restore, internal/HTTP auth, revoke/outage, no-oracle
-fallback и pinned metrics schema. Последний набор изменений считается
-подтверждённым только после native CI и exit review фазы.
+fallback и pinned metrics schema. Exit review фазы пройден на обеих нативных
+архитектурах; это compatibility evidence, а не production approval.
 
 Production ffprobe runner намеренно не поставляется: первоначальный runner был
 удалён после exit review, потому что до отдельной Unix/cgroup/egress границы он

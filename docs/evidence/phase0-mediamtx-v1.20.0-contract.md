@@ -61,11 +61,11 @@ uv run pytest -m contract tests/contract
 ```
 
 CI executes this suite natively on Linux amd64 and arm64. Remediation commit
-`a3702b1` passed both architecture-specific unit/release jobs and both
+`653f93b` passed both architecture-specific unit/release jobs and both
 real-binary media contract jobs in
-[CI run 31403072711](https://github.com/zl0nline/RTSP_proxy/actions/runs/31403072711).
+[CI run 31406619869](https://github.com/zl0nline/RTSP_proxy/actions/runs/31406619869).
 
-## Still open in Phase 0A
+## Follow-up gates after the Phase 0A exit
 
 - two-version FFmpeg/supervisor timeout and reconnect matrix;
 - isolated production probe execution (ADR 0004; health/security slices);

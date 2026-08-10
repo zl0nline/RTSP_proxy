@@ -44,10 +44,11 @@ our own internal modules or assert private call order.
 
 The repository is in Phase 0. The reviewed foundation provides fail-closed role
 readiness, native release verification and direct-Linux service artifacts. The
-Phase 0A compatibility layer provides a typed MediaMTX path adapter; executable
-lab contracts cover ordinary RTSP-over-TCP, on-demand pull, restart/cold
-restore, auth behavior and pinned metrics on real binaries. There is no
-production ffprobe runner until ADR 0004's process/egress boundary is accepted.
+Phase 0A compatibility layer passed Standards/Spec exit review and native
+amd64/arm64 CI. It provides a typed MediaMTX path adapter; executable lab
+contracts cover ordinary RTSP-over-TCP, on-demand pull, restart/cold restore,
+auth behavior and pinned metrics on real binaries. There is no production
+ffprobe runner until ADR 0004's process/egress boundary is accepted.
 
 Role processes do not yet run catalog, grant, reconciler, scheduler or
 observability loops. PostgreSQL durability, artifact provenance, capacity and

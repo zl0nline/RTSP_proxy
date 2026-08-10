@@ -113,8 +113,9 @@ URL или handshake.
 |---|---|---|
 | Planning consensus | COMPLETE | Issues согласованы, corrections внесены |
 | Phase 0 | IN PROGRESS | Owner authorization получено 2026-08-10 |
+| Phase 0A compatibility | COMPLETE | Standards/Spec PASS; native amd64/arm64 contract CI |
 | Scale-out topology | EVIDENCE BLOCKED | Провален single-node gate и пройден topology spike #10 |
-| Foundation implementation | IN PROGRESS | Health/release/package/Linux artifacts начаты |
+| Foundation implementation | REVIEWED | Health/release/package/Linux artifacts прошли exit review |
 | Product behavior | EVIDENCE GATED | Зелёные обязательные Phase 0 fork decisions |
 | Production pilot | NO-GO | Зелёные artifacts #1–#12 и owner sign-off |
 | Scale after pilot 100 | NO-GO | 7-day exit gate #13 и опубликованный envelope |
@@ -970,7 +971,7 @@ behavior, pilot and rollout.
 
 ### Phase 0 — evidence foundation
 
-#### 0A. MediaMTX/FFmpeg/ffprobe compatibility lab
+#### 0A. MediaMTX/FFmpeg/ffprobe compatibility lab — COMPLETE
 
 - pin versions and release-artifact checksums;
 - API create/update/delete/isolation/idempotency/read-back tests;
@@ -982,6 +983,9 @@ behavior, pilot and rollout.
 - TCP-only, FFmpeg, on-demand race and secret-leak tests.
 
 **Exit:** critical forks have Proposed/Accepted ADR backed by evidence.
+
+Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
+`31406619869`. Proposed ADR constraints remain production gates.
 
 #### 0B. Reproducible load harness and Spike #0
 
