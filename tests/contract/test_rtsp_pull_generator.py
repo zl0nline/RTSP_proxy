@@ -12,13 +12,21 @@ from pathlib import Path
 import pytest
 
 RTSP_PULL_SERVER_BINARY = os.environ.get("RTSP_PULL_SERVER_BINARY")
+RTSP_LOAD_READER_BINARY = os.environ.get("RTSP_LOAD_READER_BINARY")
 FFMPEG_BINARY = os.environ.get("FFMPEG_BINARY")
 FFPROBE_BINARY = os.environ.get("FFPROBE_BINARY")
 pytestmark = [
     pytest.mark.contract,
     pytest.mark.skipif(
-        not all((RTSP_PULL_SERVER_BINARY, FFMPEG_BINARY, FFPROBE_BINARY)),
-        reason="GStreamer pull server, FFmpeg and ffprobe binaries are required",
+        not all(
+            (
+                RTSP_PULL_SERVER_BINARY,
+                RTSP_LOAD_READER_BINARY,
+                FFMPEG_BINARY,
+                FFPROBE_BINARY,
+            )
+        ),
+        reason="GStreamer load binaries, FFmpeg and ffprobe are required",
     ),
 ]
 
@@ -135,6 +143,7 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
     tmp_path: Path, codec: str
 ) -> None:
     assert RTSP_PULL_SERVER_BINARY is not None
+    assert RTSP_LOAD_READER_BINARY is not None
     assert FFMPEG_BINARY is not None
     assert FFPROBE_BINARY is not None
     fixture = tmp_path / f"fixture.{codec}"
@@ -185,6 +194,44 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         assert process_owned_udp_sockets(server) == frozenset()
         rejected_udp = probe_source(FFPROBE_BINARY, port, "source-00000", "udp")
         assert rejected_udp.returncode != 0
+
+        paths_file = tmp_path / "reader-paths.txt"
+        paths_file.write_text("source-00000\nsource-00001\n", encoding="utf-8")
+        events_file = tmp_path / "reader-events.jsonl"
+        load_reader = subprocess.Popen(
+            [
+                RTSP_LOAD_READER_BINARY,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--paths-file",
+                str(paths_file),
+                "--readers-per-path",
+                "2",
+                "--connect-rate",
+                "10",
+                "--hold-seconds",
+                "2",
+                "--events-file",
+                str(events_file),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        time.sleep(1)
+        assert load_reader.poll() is None
+        assert process_owned_udp_sockets(load_reader) == frozenset()
+        reader_output, _ = load_reader.communicate(timeout=10)
+        assert load_reader.returncode == 0, reader_output
+        assert "SUMMARY started=4 first_packet=4 failed=0 transport=tcp" in reader_output
+        reader_events = [
+            json.loads(line)
+            for line in events_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(reader_events) == 4
+        assert {event["event"] for event in reader_events} == {"first_packet"}
     finally:
         if server.poll() is None:
             server.send_signal(signal.SIGINT)

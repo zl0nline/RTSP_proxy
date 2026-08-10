@@ -221,6 +221,7 @@ jobs:
       - name: Verify H264/H265 independent pull endpoints over RTSP/TCP
         env:
           RTSP_PULL_SERVER_BINARY: tools/load/rtsp-pull-server
+          RTSP_LOAD_READER_BINARY: tools/load/rtsp-load-reader
           FFMPEG_BINARY: .artifacts/ffmpeg/bin/ffmpeg
           FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest tests/contract/test_rtsp_pull_generator.py

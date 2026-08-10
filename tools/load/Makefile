@@ -6,10 +6,13 @@ LDLIBS += $(shell pkg-config --libs gstreamer-rtsp-server-1.0)
 
 .PHONY: all clean
 
-all: rtsp-pull-server
+all: rtsp-pull-server rtsp-load-reader
 
 rtsp-pull-server: rtsp_pull_server.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDLIBS) -o $@
 
+rtsp-load-reader: rtsp_load_reader.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDLIBS) -o $@
+
 clean:
-	$(RM) rtsp-pull-server
+	$(RM) rtsp-pull-server rtsp-load-reader
