@@ -230,6 +230,11 @@ class LoadProfile(StrictModel):
             raise ValueError("ramp_requires_100_readers_per_second")
         if mode == "burst" and rate != 1000:
             raise ValueError("burst_requires_1000_readers_per_second")
+        if mode in {"steady", "burst", "outage"} and (
+            self.duration.total_seconds * 1000
+            <= self.reader_lifecycle.backoff_max_ms + 2000
+        ):
+            raise ValueError("lifecycle_duration_does_not_cover_backoff_recovery")
 
         if self.tier == "capacity":
             if self.duration.warmup_seconds < 900:

@@ -9,6 +9,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from rtsp_proxy.load_catalog import build_direct_reader_plan
 from rtsp_proxy.load_profile import LoadProfile, validate_comparison_pair
 
 LatencyGate = Literal[
@@ -75,6 +76,22 @@ class ReaderEvent(BaseModel):
         return self
 
 
+class ReaderRunCompletedEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    event: Literal["run_completed"]
+    at_monotonic_ms: Annotated[float, Field(ge=0)]
+    started_readers: Annotated[int, Field(ge=0, le=100000)]
+    ready_readers: Annotated[int, Field(ge=0, le=100000)]
+    failed_attempts: Annotated[int, Field(ge=0)]
+    normal_completion: bool
+    interrupted: bool
+    lifecycle_complete: bool
+    exit_code: Annotated[int, Field(ge=0, le=255)]
+    schedule_shard_index: Annotated[int, Field(ge=0, lt=10000)]
+    schedule_shards: Annotated[int, Field(gt=0, le=10000)]
+
+
 class ReaderRunSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -132,13 +149,20 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_reader_events(path: Path) -> tuple[ReaderEvent, ...]:
-    events: list[ReaderEvent] = []
+RawReaderEvent = ReaderEvent | ReaderRunCompletedEvent
+
+
+def _load_reader_events(path: Path) -> tuple[RawReaderEvent, ...]:
+    events: list[RawReaderEvent] = []
     with path.open(encoding="utf-8") as source:
         for line in source:
             if not line.strip():
                 raise ValueError("blank_reader_event_line")
-            events.append(ReaderEvent.model_validate(json.loads(line)))
+            payload = json.loads(line)
+            if payload.get("event") == "run_completed":
+                events.append(ReaderRunCompletedEvent.model_validate(payload))
+            else:
+                events.append(ReaderEvent.model_validate(payload))
     if not events:
         raise ValueError("reader_events_empty")
     return tuple(events)
@@ -155,17 +179,29 @@ def merge_reader_event_files(paths: tuple[Path, ...], destination: Path) -> int:
         "reader_error": 3,
         "reader_disconnected": 4,
         "reconnect_scheduled": 5,
+        "run_completed": 6,
     }
     events.sort(
         key=lambda event: (
-            event.reader_id,
-            event.cycle,
+            event.reader_id if isinstance(event, ReaderEvent) else 100000,
+            event.cycle if isinstance(event, ReaderEvent) else event.schedule_shard_index,
             event_order[event.event],
-        )
+        ),
     )
-    identities = [(event.reader_id, event.cycle, event.event) for event in events]
+    identities = [
+        (event.reader_id, event.cycle, event.event)
+        for event in events
+        if isinstance(event, ReaderEvent)
+    ]
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate_reader_event_across_inputs")
+    completion_shards = [
+        event.schedule_shard_index
+        for event in events
+        if isinstance(event, ReaderRunCompletedEvent)
+    ]
+    if len(completion_shards) != len(set(completion_shards)):
+        raise ValueError("duplicate_reader_completion_across_inputs")
     with destination.open("x", encoding="utf-8") as output:
         destination.chmod(0o640)
         for event in events:
@@ -179,12 +215,17 @@ def _event_maps(
     profile: LoadProfile, path: Path
 ) -> tuple[
     tuple[ReaderEvent, ...],
+    tuple[ReaderRunCompletedEvent, ...],
     set[tuple[int, int]],
     dict[tuple[int, int], float],
     dict[tuple[int, int], tuple[float, float]],
     set[tuple[int, int]],
 ]:
-    events = _load_reader_events(path)
+    raw_events = _load_reader_events(path)
+    events = tuple(event for event in raw_events if isinstance(event, ReaderEvent))
+    completions = tuple(
+        event for event in raw_events if isinstance(event, ReaderRunCompletedEvent)
+    )
     starts: set[tuple[int, int]] = set()
     plays: dict[tuple[int, int], float] = {}
     frames: dict[tuple[int, int], tuple[float, float]] = {}
@@ -216,11 +257,11 @@ def _event_maps(
         raise ValueError("reader_start_events_missing")
     if not set(plays).issubset(starts) or not set(frames).issubset(starts):
         raise ValueError("reader_event_without_start")
-    return events, starts, plays, frames, failures
+    return events, completions, starts, plays, frames, failures
 
 
 def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummary:
-    events, starts, plays, frames, failures = _event_maps(profile, path)
+    events, completions, starts, plays, frames, failures = _event_maps(profile, path)
     handshake_latencies = list(plays.values())
     frame_latencies = [value[0] for value in frames.values()]
     success_percent = len(frames) / len(starts) * 100
@@ -229,11 +270,54 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
         reasons.append("session_establishment_below_99_9_percent")
     if failures:
         reasons.append("reader_errors_observed")
+    initial_starts = sorted(
+        (event for event in events if event.event == "reader_started" and event.cycle == 0),
+        key=lambda event: event.reader_id,
+    )
+    if {event.reader_id for event in initial_starts} != set(
+        range(profile.workload.total_readers)
+    ):
+        reasons.append("initial_reader_set_incomplete")
+    elif profile.workload.connect_rate_per_second > 0 and len(initial_starts) > 1:
+        expected_span_ms = (
+            (initial_starts[-1].reader_id - initial_starts[0].reader_id)
+            * 1000
+            / profile.workload.connect_rate_per_second
+        )
+        observed_span_ms = (
+            initial_starts[-1].at_monotonic_ms - initial_starts[0].at_monotonic_ms
+        )
+        tolerance_ms = max(5.0, 200 / profile.workload.connect_rate_per_second)
+        if observed_span_ms + tolerance_ms < expected_span_ms:
+            reasons.append("initial_connect_rate_exceeded")
     if any(
         event.event == "reader_disconnected" and event.injected is False
         for event in events
     ):
         reasons.append("unexpected_healthy_disconnect")
+    expected_shards = sum(
+        bool(build_direct_reader_plan(profile, host.name).targets)
+        for host in profile.generator_hosts
+    )
+    completion_indices = {item.schedule_shard_index for item in completions}
+    completion_valid = (
+        len(completions) == expected_shards
+        and completion_indices == set(range(expected_shards))
+        and all(item.schedule_shards == expected_shards for item in completions)
+        and all(
+            item.normal_completion
+            and not item.interrupted
+            and item.lifecycle_complete
+            and item.exit_code == 0
+            for item in completions
+        )
+        and sum(item.started_readers for item in completions)
+        == profile.workload.total_readers
+        and sum(item.ready_readers for item in completions)
+        == profile.workload.total_readers
+    )
+    if not completion_valid:
+        reasons.append("reader_process_completion_missing_or_invalid")
 
     p95 = _nearest_rank(handshake_latencies, 0.95)
     p99 = _nearest_rank(handshake_latencies, 0.99)
@@ -285,8 +369,8 @@ def summarize_cold_comparison(
         raise ValueError("cold_comparison_requires_cold_profiles")
     proxy_summary = summarize_reader_events(proxy_profile, proxy_events)
     direct_summary = summarize_reader_events(direct_profile, direct_events)
-    _, _, _, proxy_frames, _ = _event_maps(proxy_profile, proxy_events)
-    _, _, _, direct_frames, _ = _event_maps(direct_profile, direct_events)
+    _, _, _, _, proxy_frames, _ = _event_maps(proxy_profile, proxy_events)
+    _, _, _, _, direct_frames, _ = _event_maps(direct_profile, direct_events)
     if set(proxy_frames) != set(direct_frames):
         raise ValueError("comparison_establishments_differ")
     overhead = [

@@ -72,6 +72,7 @@ struct _RunContext {
     guint steady_cursor;
     guint injected_disconnects;
     gint64 next_disconnect_us;
+    gint64 stop_deadline_us;
     gboolean allow_failures;
     gboolean normal_completion;
     gboolean interrupted;
@@ -540,6 +541,8 @@ static void
 finish_initial_start(RunContext *run)
 {
     if (run->stop_source_id == 0) {
+        run->stop_deadline_us =
+            g_get_monotonic_time() + ((gint64) run->hold_seconds * G_USEC_PER_SEC);
         run->stop_source_id =
             g_timeout_add_seconds(run->hold_seconds, stop_run_normal, run);
     }
@@ -631,6 +634,9 @@ steady_disconnect(gpointer user_data)
     gint64 delay_us;
 
     run->lifecycle_source_id = 0;
+    if (now + ((gint64) run->backoff_max_ms * 1000) >= run->stop_deadline_us) {
+        return G_SOURCE_REMOVE;
+    }
     while (examined < run->readers->len) {
         Reader *reader =
             g_ptr_array_index(run->readers, run->steady_cursor % run->readers->len);
@@ -1007,6 +1013,10 @@ main(int argc, char *argv[])
     }
     for (target_index = 0; target_index < run.readers->len; target_index++) {
         Reader *reader = g_ptr_array_index(run.readers, target_index);
+        if (!g_atomic_int_get(&reader->connected) ||
+            reader->reconnect_source_id != 0) {
+            lifecycle_complete = FALSE;
+        }
         gst_element_set_state(reader->pipeline, GST_STATE_NULL);
         if (g_atomic_int_get(&reader->outage_member) &&
             !g_atomic_int_get(&reader->outage_recovered)) {
@@ -1023,15 +1033,7 @@ main(int argc, char *argv[])
     started_snapshot = run.started_readers;
     ready_snapshot = run.ready_readers;
     failed_snapshot = run.failed_attempts;
-    fflush(run.events);
-    fsync(fileno(run.events));
     g_mutex_unlock(&run.lock);
-
-    g_print("SUMMARY started=%u decodable=%u failed=%u transport=tcp "
-            "completed=%s interrupted=%s\n",
-            started_snapshot, ready_snapshot, failed_snapshot,
-            run.normal_completion ? "true" : "false",
-            run.interrupted ? "true" : "false");
     if (!run.normal_completion || run.interrupted ||
         started_snapshot != run.readers->len || ready_snapshot != run.readers->len ||
         !lifecycle_complete) {
@@ -1041,6 +1043,27 @@ main(int argc, char *argv[])
     } else {
         exit_code = 0;
     }
+    g_mutex_lock(&run.lock);
+    g_fprintf(run.events,
+              "{\"event\":\"run_completed\",\"at_monotonic_ms\":%.3f,"
+              "\"started_readers\":%u,\"ready_readers\":%u,"
+              "\"failed_attempts\":%u,\"normal_completion\":%s,"
+              "\"interrupted\":%s,\"lifecycle_complete\":%s,"
+              "\"exit_code\":%d,\"schedule_shard_index\":%u,"
+              "\"schedule_shards\":%u}\n",
+              event_time_ms(&run), started_snapshot, ready_snapshot,
+              failed_snapshot, run.normal_completion ? "true" : "false",
+              run.interrupted ? "true" : "false",
+              lifecycle_complete ? "true" : "false", exit_code,
+              run.schedule_shard_index, run.schedule_shards);
+    fflush(run.events);
+    fsync(fileno(run.events));
+    g_mutex_unlock(&run.lock);
+    g_print("SUMMARY started=%u decodable=%u failed=%u transport=tcp "
+            "completed=%s interrupted=%s\n",
+            started_snapshot, ready_snapshot, failed_snapshot,
+            run.normal_completion ? "true" : "false",
+            run.interrupted ? "true" : "false");
     g_ptr_array_unref(run.readers);
     g_main_loop_unref(run.loop);
     g_mutex_clear(&run.lock);

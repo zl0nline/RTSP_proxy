@@ -237,11 +237,12 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
             json.loads(line)
             for line in events_file.read_text(encoding="utf-8").splitlines()
         ]
-        assert len(reader_events) == 12
+        assert len(reader_events) == 13
         assert {event["event"] for event in reader_events} == {
             "reader_started",
             "play_sent",
             "first_decodable_frame",
+            "run_completed",
         }
         assert {
             event["reader_id"]
@@ -325,6 +326,10 @@ def test_load_reader_interruption_never_reports_a_partial_run_as_success(
 
     assert process.returncode == 6, output
     assert "completed=false interrupted=true" in output
+    completion = json.loads(events.read_text(encoding="utf-8").splitlines()[-1])
+    assert completion["event"] == "run_completed"
+    assert completion["exit_code"] == 6
+    assert completion["interrupted"] is True
 
 
 def test_load_reader_rejects_a_group_readable_credentials_file(tmp_path: Path) -> None:

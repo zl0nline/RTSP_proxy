@@ -213,6 +213,7 @@ def test_consensus_reader_lifecycle_profiles_are_executable(
         mode=mode,
         disconnect_rate_per_second=disconnect_rate,
         reconnect_attempts=3 if mode in {"steady", "burst", "outage"} else 0,
+        backoff_max_ms=5000,
         outage_percent=outage_percent,
     )
 

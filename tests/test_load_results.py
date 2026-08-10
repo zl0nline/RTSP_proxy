@@ -70,6 +70,21 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
                 },
             ]
         )
+    events.append(
+        {
+            "event": "run_completed",
+            "at_monotonic_ms": 1000,
+            "started_readers": 4,
+            "ready_readers": 4,
+            "failed_attempts": 0,
+            "normal_completion": True,
+            "interrupted": False,
+            "lifecycle_complete": True,
+            "exit_code": 0,
+            "schedule_shard_index": 0,
+            "schedule_shards": 1,
+        }
+    )
     return events
 
 
@@ -128,9 +143,30 @@ def test_warm_reader_summary_gates_describe_to_play_not_first_rtp(tmp_path: Path
     assert summary.latency_slo_pass is True
 
 
+def test_reader_summary_rejects_missing_completion_and_rate_overshoot(
+    tmp_path: Path,
+) -> None:
+    events_path = tmp_path / "readers.jsonl"
+    events = successful_events()[:-1]
+    for event in events:
+        if event["event"] == "reader_started":
+            event["at_monotonic_ms"] = 0
+    write_events(events_path, events)
+
+    summary = summarize_reader_events(reader_profile(), events_path)
+
+    assert summary.valid is False
+    assert "initial_connect_rate_exceeded" in summary.invalid_reasons
+    assert "reader_process_completion_missing_or_invalid" in summary.invalid_reasons
+
+
 def test_reader_errors_and_missing_decodable_frame_invalidate_run(tmp_path: Path) -> None:
     events_path = tmp_path / "readers.jsonl"
-    events = successful_events()[:-3]
+    events = [
+        event
+        for event in successful_events()
+        if event["event"] != "run_completed" and event.get("reader_id") != 3
+    ]
     events.extend(
         [
             {
@@ -139,6 +175,19 @@ def test_reader_errors_and_missing_decodable_frame_invalidate_run(tmp_path: Path
                 "cycle": 0,
                 "path": "a" * 25,
                 "at_monotonic_ms": 300,
+            },
+            {
+                "event": "run_completed",
+                "at_monotonic_ms": 1000,
+                "started_readers": 4,
+                "ready_readers": 3,
+                "failed_attempts": 1,
+                "normal_completion": True,
+                "interrupted": False,
+                "lifecycle_complete": True,
+                "exit_code": 6,
+                "schedule_shard_index": 0,
+                "schedule_shards": 1,
             },
             {
                 "event": "reader_error",
@@ -161,6 +210,7 @@ def test_reader_errors_and_missing_decodable_frame_invalidate_run(tmp_path: Path
     assert summary.invalid_reasons == (
         "session_establishment_below_99_9_percent",
         "reader_errors_observed",
+        "reader_process_completion_missing_or_invalid",
     )
 
 
@@ -233,11 +283,19 @@ def test_reader_summary_cli_writes_exclusive_machine_readable_result(
     all_events = successful_events()
     write_events(
         first_events,
-        [event for event in all_events if event["reader_id"] in {0, 2}],
+        [
+            event
+            for event in all_events
+            if event["event"] == "run_completed" or event.get("reader_id") in {0, 2}
+        ],
     )
     write_events(
         second_events,
-        [event for event in all_events if event["reader_id"] in {1, 3}],
+        [
+            event
+            for event in all_events
+            if event["event"] != "run_completed" and event.get("reader_id") in {1, 3}
+        ],
     )
     events_path = run_directory / "readers.jsonl"
     assert (
@@ -253,7 +311,7 @@ def test_reader_summary_cli_writes_exclusive_machine_readable_result(
         == 0
     )
     merge_output = capsys.readouterr()
-    assert merge_output.out.startswith("MERGED_READERS events=12")
+    assert merge_output.out.startswith("MERGED_READERS events=13")
     output_path = run_directory / "summary.json"
 
     assert (
