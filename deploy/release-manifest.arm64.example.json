@@ -16,7 +16,7 @@
     "binary_sha256": "2da379972ba86627632aa7e3f779c680ba04a5ee26ef2a20dc61cefcc24f73b8"
   },
   "ffmpeg": {
-    "version": "n8.1.2-34-g9b6c8969e0",
+    "version": "n8.1.2-34-g9b6c8969e0-20260810",
     "binary": "bin/ffmpeg",
     "binary_sha256": "fa909ba4ebe3bc0c4d0476f39c036afb1fb6642febea0e154b403ba8410df8be",
     "ffprobe_binary": "bin/ffprobe",

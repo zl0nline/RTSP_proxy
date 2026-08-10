@@ -17,7 +17,7 @@
     }
   },
   "ffmpeg": {
-    "version": "n8.1.2-34-g9b6c8969e0",
+    "version": "n8.1.2-34-g9b6c8969e0-20260810",
     "release_tag": "autobuild-2026-08-10-13-17",
     "source_repository": "https://github.com/BtbN/FFmpeg-Builds",
     "provenance": "archive SHA-256 published by GitHub; artifact attestation unavailable",
