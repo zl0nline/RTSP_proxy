@@ -8,6 +8,7 @@ Every run records independent workload axes. Blank cells mean unknown, not zero.
 |---|---|
 | Release ID / git commit | TBD |
 | MediaMTX version / binary SHA-256 | TBD |
+| Architecture (`amd64` or `arm64`) | TBD |
 | Linux distribution / kernel | TBD |
 | CPU / RAM / NIC / storage | TBD |
 | sysctl / ulimit / systemd limits | TBD |

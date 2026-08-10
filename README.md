@@ -9,7 +9,8 @@ TCP endpoint.
 >   противоречия исправлены.
 > - Phase 0: **IN PROGRESS** — owner authorization получено 10 августа 2026.
 > - Foundation implementation: **IN PROGRESS** — health API, release verifier,
->   Python package и direct-Linux systemd artifacts созданы.
+>   Python package, native amd64/arm64 CI и direct-Linux systemd artifacts
+>   созданы.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -71,7 +72,8 @@ External FFmpeg -> RTSP/TCP :9999 -> MediaMTX -> cameras
 - Operations: role health, expand-contract migrations, PITR,
   post-restore report-only, drain/quarantine и runbooks.
 - Deployment: напрямую на Linux hosts — versioned root-owned releases,
-  dedicated users и hardened `systemd` units; Docker не используется.
+  dedicated users и hardened `systemd` units; amd64/arm64 имеют одинаковые
+  release gates, Docker не используется.
 
 ## Ключевые инварианты
 
@@ -89,6 +91,8 @@ External FFmpeg -> RTSP/TCP :9999 -> MediaMTX -> cameras
 9. Single-node измеряется первым; gateway/L7 появляются только после evidence.
 10. Cold start зависит от GOP: SLO относится к `proxy_overhead`, а не к
     безусловному end-to-end `≤3s`.
+11. Linux amd64 и arm64 поддерживаются независимо проверенными release
+    manifests, native CI и MediaMTX contract tests.
 
 ## Initial SLO и gates
 
@@ -199,11 +203,12 @@ Product behavior, зависящий от неподтверждённых Media
 
 Репозиторий содержит исполняемый Phase 0 foundation: Python package, role-aware
 health API, checksum/path/architecture release verifier, тесты и direct-Linux
-  systemd artifacts. Catalog, PostgreSQL, MediaMTX adapter и полный внешний
-  FFmpeg RTSP contract ещё не реализованы; baseline effective-config contract
-  уже запускается против pinned MediaMTX. Наличие foundation-кода не означает
-  доказанную production характеристику. Issue #10 остаётся evidence blocker
-  для scale-out topology; issues #1–#14 — execution map.
+  systemd artifacts и native amd64/arm64 CI. Catalog, PostgreSQL, MediaMTX
+  adapter и полный внешний FFmpeg RTSP contract ещё не реализованы; baseline
+  effective-config contract запускается против pinned MediaMTX отдельно на
+  обеих архитектурах. Наличие foundation-кода не означает доказанную production
+  характеристику. Issue #10 остаётся evidence blocker для scale-out topology;
+  issues #1–#14 — execution map.
 
 ## Локальная разработка
 

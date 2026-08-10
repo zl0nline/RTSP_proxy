@@ -67,6 +67,21 @@ class ReleaseVerificationError(ValueError):
     """A release cannot be trusted or is incompatible with this runtime."""
 
 
+def normalize_linux_arch(machine: str) -> str:
+    canonical = machine.strip().lower()
+    aliases = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }
+    try:
+        return aliases[canonical]
+    except KeyError as error:
+        value = canonical or "unknown"
+        raise ReleaseVerificationError(f"unsupported_linux_arch:{value}") from error
+
+
 def verify_release(
     manifest_path: Path,
     *,

@@ -53,6 +53,11 @@ release verifier, systemd artifacts и pinned MediaMTX effective-config contract
 Исторические утверждения ниже об отсутствии owner authorization и кода относятся
 к моменту исходного аудита, а не к текущему состоянию ветки.
 
+Следующее owner clarification установило равноправную поддержку Linux amd64 и
+arm64. В issues #1/#2/#5/#6/#8/#9/#11/#12/#13/#14 добавлен общий native-evidence
+contract: architecture-specific release manifests/checksums, native CI/smoke и
+раздельные capacity envelopes; результат одной архитектуры не доказывает другую.
+
 Ниже сохранён исходный аудит до remediation как traceability record.
 
 ## Исходный вердикт до исправлений

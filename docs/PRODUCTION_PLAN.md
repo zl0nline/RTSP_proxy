@@ -93,6 +93,8 @@ URL или handshake.
 - observability, load/chaos, deployment, restore, drain и rollback;
 - single-node baseline и доказуемый путь к scale-out;
 - controlled migration со старой системы.
+- direct Linux deployment на amd64 и arm64 с одинаковыми SLO/security/release
+  gates и нативными tests для каждой архитектуры.
 
 Не входят:
 
@@ -161,6 +163,10 @@ URL или handshake.
     version и binary SHA-256.
 16. Cold start = `proxy_overhead + wait_for_keyframe(GOP)`. SLO предъявляется к
     нашей части; GOP фиксируется в camera profile.
+17. Linux amd64 и arm64 — равноправные production targets. Release manifest,
+    native binary checksum, compatibility suite, clean-host smoke, load envelope
+    и rollback evidence формируются отдельно для каждой архитектуры; evidence
+    одной архитектуры не переносится на другую.
 
 ## 6. Логическая архитектура
 
@@ -296,6 +302,8 @@ evidence.
 ### 9.1 Linux release и supply chain
 
 - Docker/containers не используются; target — direct Linux deployment;
+- target architectures — amd64 и arm64; CI запускает application и pinned
+  MediaMTX contract нативно на обеих архитектурах без эмуляции;
 - release manifest фиксирует application wheel/lock hash, MediaMTX binary
   version/SHA-256, FFmpeg/ffprobe versions, schema/config compatibility;
 - CI проверяет checksums, provenance/signature где доступна, SBOM, dependencies,

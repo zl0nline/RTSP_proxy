@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from rtsp_proxy.cli import main
-from rtsp_proxy.release import ReleaseVerificationError, verify_release
+from rtsp_proxy.release import (
+    ReleaseManifest,
+    ReleaseVerificationError,
+    normalize_linux_arch,
+    verify_release,
+)
 
 
 def sha256(payload: bytes) -> str:
@@ -142,3 +147,55 @@ def test_non_utf8_manifest_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ReleaseVerificationError, match="invalid_manifest"):
         verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
+
+
+@pytest.mark.parametrize(
+    ("machine", "expected"),
+    [
+        ("x86_64", "amd64"),
+        ("AMD64", "amd64"),
+        ("aarch64", "arm64"),
+        ("ARM64", "arm64"),
+    ],
+)
+def test_linux_machine_architecture_has_one_canonical_release_name(
+    machine: str,
+    expected: str,
+) -> None:
+    assert normalize_linux_arch(machine) == expected
+
+
+def test_unknown_linux_machine_architecture_fails_closed() -> None:
+    with pytest.raises(ReleaseVerificationError, match="unsupported_linux_arch:riscv64"):
+        normalize_linux_arch("riscv64")
+
+
+def test_cli_detects_the_native_linux_architecture_when_not_overridden(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = write_release(tmp_path)
+    monkeypatch.setattr("rtsp_proxy.cli.platform.machine", lambda: "x86_64")
+
+    exit_code = main(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--python-version",
+            "3.12",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "verified release 0.1.0\n"
+
+
+def test_example_manifests_cover_both_supported_linux_architectures() -> None:
+    manifests = [
+        ReleaseManifest.model_validate_json(path.read_text(encoding="utf-8"))
+        for path in sorted(Path("deploy").glob("release-manifest.*.example.json"))
+    ]
+
+    assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
+    assert len({manifest.release_id for manifest in manifests}) == 2

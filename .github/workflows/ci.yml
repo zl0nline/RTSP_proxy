@@ -10,7 +10,16 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    name: test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - name: Check out source
@@ -39,7 +48,20 @@ jobs:
         run: uv build
 
   mediamtx-contract:
-    runs-on: ubuntu-24.04
+    name: mediamtx-contract (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            archive_sha256: 952d5f7d31d1b448ab4da4509550594c511d42636db9d7bb175d377f4ede81df
+            binary_sha256: 25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            archive_sha256: 6aa3c03da7b6477f1e110c8e18e819cf9ef121e8981b52b8f8219982dae35f2f
+            binary_sha256: 2da379972ba86627632aa7e3f779c680ba04a5ee26ef2a20dc61cefcc24f73b8
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - name: Check out source
@@ -55,15 +77,15 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
-      - name: Download and verify MediaMTX v1.20.0
+      - name: Download and verify MediaMTX v1.20.0 (${{ matrix.arch }})
         run: |
           mkdir -p .artifacts/mediamtx
           curl --fail --location --silent --show-error \
             --output .artifacts/mediamtx.tar.gz \
-            https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_amd64.tar.gz
-          echo "952d5f7d31d1b448ab4da4509550594c511d42636db9d7bb175d377f4ede81df  .artifacts/mediamtx.tar.gz" | sha256sum --check
+            https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_${{ matrix.arch }}.tar.gz
+          echo "${{ matrix.archive_sha256 }}  .artifacts/mediamtx.tar.gz" | sha256sum --check
           tar -xzf .artifacts/mediamtx.tar.gz -C .artifacts/mediamtx
-          echo "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336  .artifacts/mediamtx/mediamtx" | sha256sum --check
+          echo "${{ matrix.binary_sha256 }}  .artifacts/mediamtx/mediamtx" | sha256sum --check
 
       - name: Verify effective listener contract
         env:

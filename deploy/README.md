@@ -1,7 +1,8 @@
 # Direct Linux deployment artifacts
 
 Docker and container runtimes are not part of the deployment contract. The
-target is a systemd-based Linux host with Python 3.12 and either amd64 or arm64.
+target is a systemd-based Linux host with Python 3.12. Linux amd64 and arm64 are
+equally supported; neither architecture may ship on evidence from the other.
 
 ## Immutable layout
 
@@ -38,6 +39,11 @@ The files are a Phase 0 baseline, not a production install bundle. Database,
 secrets, auth and resource-limit values must pass their later gates before a
 host is admitted.
 
+`release-manifest.amd64.example.json` and
+`release-manifest.arm64.example.json` show the architecture-specific release
+identity and MediaMTX checksum. The Python wheel remains platform-independent;
+external binaries and every native dependency are verified per architecture.
+
 ## Activation contract
 
 Before changing `current`, installation automation must run from the candidate
@@ -46,12 +52,14 @@ release environment:
 ```sh
 rtsp-proxy-verify-release \
   --manifest /opt/rtsp-proxy/releases/<release-id>/release-manifest.json \
-  --python-version 3.12 \
-  --arch amd64
+  --python-version 3.12
 ```
 
-Use `--arch arm64` on AArch64. A checksum, Python-version, architecture,
-missing-file, symlink-escape or manifest-schema failure aborts activation.
+The verifier maps native Linux `x86_64` to `amd64` and `aarch64` to `arm64`.
+`--arch` is an explicit CI/offline-build override, not a normal host setting.
+Any other machine architecture is unsupported and fail-closed. A checksum,
+Python-version, architecture, missing-file, symlink-escape or manifest-schema
+failure aborts activation.
 
 Activation creates a temporary symlink in `/opt/rtsp-proxy`, atomically renames
 it to `current`, reloads systemd, starts the units and checks role readiness plus

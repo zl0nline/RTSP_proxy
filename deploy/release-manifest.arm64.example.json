@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "0.1.0-linux-arm64",
+  "git_commit": "0000000000000000000000000000000000000000",
+  "python": {
+    "version": "3.12",
+    "lock": "uv.lock",
+    "lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "wheel": "dist/rtsp_proxy-0.1.0-py3-none-any.whl",
+    "wheel_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "mediamtx": {
+    "version": "v1.20.0",
+    "linux_arch": "arm64",
+    "binary": "bin/mediamtx",
+    "binary_sha256": "2da379972ba86627632aa7e3f779c680ba04a5ee26ef2a20dc61cefcc24f73b8"
+  },
+  "ffmpeg": {
+    "version": "TBD_BY_PHASE_0"
+  },
+  "schema_compatibility": {
+    "minimum": "base",
+    "maximum": "base"
+  },
+  "config_schema_version": 1
+}
