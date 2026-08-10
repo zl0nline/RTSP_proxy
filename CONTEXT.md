@@ -51,9 +51,12 @@ auth behavior and pinned metrics on real binaries. There is no production
 ffprobe runner until ADR 0004's process/egress boundary is accepted.
 
 Phase 0B is in progress. `tools/load` contains native GStreamer pull-source and
-multi-reader binaries; strict profiles/catalogs and JSONL headroom/latency
-summaries are in the Python package. Native CI is functional evidence only and
-must not be described as a measured single-node capacity envelope.
+multi-reader binaries plus a digest-bound per-host run orchestrator. Latency is
+split into RTSP handshake and first-decodable measurements; cold results require
+a finalized direct-control pair. Generator evidence is host/process/cgroup
+bound and final bundles are hash-complete/read-only. Repeat exit review is in
+progress; native CI is functional evidence only and is not a measured
+single-node capacity envelope.
 
 Role processes do not yet run catalog, grant, reconciler, scheduler or
 observability loops. PostgreSQL durability, artifact provenance, capacity and

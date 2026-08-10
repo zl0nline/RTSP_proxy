@@ -348,8 +348,10 @@ def test_external_rtsp_tcp_is_transparent_and_unrelated_hot_update_isolated(
         proxy_metrics_port,
         proxy_rtsp_port,
         auth_port,
+        timeout_api_port,
+        timeout_rtsp_port,
     ) = (
-        unused_tcp_ports(6)
+        unused_tcp_ports(8)
     )
     public_id = "f" * 25
     other_public_id = "g" * 25
@@ -396,8 +398,39 @@ paths:
         encoding="utf-8",
     )
 
+    timeout_config = tmp_path / "timeout-proxy.yml"
+    timeout_config.write_text(
+        f"""
+logLevel: warn
+logDestinations: [stdout]
+readTimeout: 1s
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: api
+api: true
+apiAddress: 127.0.0.1:{timeout_api_port}
+metrics: false
+pprof: false
+playback: false
+rtsp: true
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtspAddress: 127.0.0.1:{timeout_rtsp_port}
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+paths: {{}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
     template = Path("deploy/mediamtx.yml.example").read_text(encoding="utf-8")
-    template = template.replace("logStructured: true", "logStructured: true\nreadTimeout: 1s")
     if auth_method == "http":
         template = template.replace(
             "authMethod: internal",
@@ -429,6 +462,7 @@ paths:
     publisher: subprocess.Popen[str] | None = None
     proxy: subprocess.Popen[str] | None = None
     reader: subprocess.Popen[str] | None = None
+    timeout_proxy: subprocess.Popen[str] | None = None
     auth_server: ThreadingHTTPServer | None = None
     auth_thread: threading.Thread | None = None
     try:
@@ -455,6 +489,16 @@ paths:
             f"http://127.0.0.1:{origin_api_port}/v3/config/global/get",
             origin,
         )
+        timeout_proxy = start_process([MEDIA_MTX_BINARY, str(timeout_config)])
+        wait_for_json(
+            f"http://127.0.0.1:{timeout_api_port}/v3/config/global/get",
+            timeout_proxy,
+        )
+        assert_partial_rtsp_header_outlives_media_read_timeout(
+            "127.0.0.1", timeout_rtsp_port
+        )
+        stop_process(timeout_proxy)
+        timeout_proxy = None
         publisher = start_process(
             [
                 FFMPEG_BINARY,
@@ -616,9 +660,6 @@ paths:
         wait_for_reader(metrics_url, path_name=other_public_id)
         assert reader.poll() is None
         assert process_owned_udp_sockets(proxy) == udp_socket_baseline
-        assert_partial_rtsp_header_outlives_media_read_timeout(
-            "127.0.0.1", proxy_rtsp_port
-        )
         assert_reader_progress(reader, metrics_url, path_name=other_public_id)
 
         expected_camera_ids = {
@@ -756,6 +797,6 @@ paths:
             auth_server.server_close()
         if auth_thread is not None:
             auth_thread.join(timeout=2)
-        for process in (reader, proxy, publisher, origin):
+        for process in (reader, timeout_proxy, proxy, publisher, origin):
             if process is not None:
                 stop_process(process)

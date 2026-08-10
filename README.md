@@ -15,7 +15,8 @@ TCP endpoint.
 >   ordinary-RTSP contract прошли Standards/Spec exit review и native
 >   amd64/arm64 CI; Proposed auth/security gates всё ещё блокируют production.
 > - Phase 0B load harness: **IN PROGRESS** — native GStreamer pull sources,
->   scalable TCP readers и immutable evidence profiles проходят amd64/arm64 CI;
+>   scalable TCP readers и tamper-evident run bundles реализованы; повторное
+>   exit review и native amd64/arm64 CI выполняются после hardening. Выделенный
 >   production-equivalent Spike #0 и 24h soak ещё не выполнены.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
@@ -222,9 +223,14 @@ Production ffprobe runner намеренно не поставляется: пе
 оставлял бы source credentials в argv и допускал SSRF. Кандидатная граница
 зафиксирована в ADR 0004 и должна быть реализована в health/security slices.
 
-Catalog, PostgreSQL, grant verifier, reconciler/task loops и dashboard ещё не
-реализованы. Phase 0B load harness реализован функционально, но capacity
-envelope не опубликован без выделенных стендов и 24h soak. FFmpeg/ffprobe
+Catalog продукта, PostgreSQL, grant verifier, reconciler/task loops и dashboard
+ещё не реализованы. Phase 0B load harness теперь связывает profile, fixture и
+SHA load binaries с точным per-host launch plan; reader измеряет отдельно
+`DESCRIBE→PLAY` и первый декодируемый access unit, поддерживает steady/ramp/
+burst/outage и парный direct-control. Generator headroom проверяется по host,
+process/RLIMIT и finite cgroup limits, а final manifest хэширует весь raw/
+summary bundle. Эти механизмы не публикуют capacity envelope без выделенных
+стендов, LAN/WAN matrix и 24h soak. FFmpeg/ffprobe
 зафиксированы как Phase 0 candidate,
 но upstream artifact не имеет GitHub attestation и ещё не прошёл security
 provenance gate. Наличие Phase 0-кода не означает доказанную production

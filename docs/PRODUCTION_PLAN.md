@@ -997,10 +997,20 @@ Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
 
 **Exit:** `SINGLE_NODE BASELINE` decision or authorization for Spike #1.
 
-Implementation status: native GStreamer pull sources/readers, strict immutable
-profiles/catalogs and generator-headroom/reader-latency summaries are present.
-CI is not capacity evidence; dedicated LAN/WAN hardware, saturation knee and
-24h soak remain mandatory before exit.
+Implementation status: native GStreamer pull sources/readers and a digest-bound
+orchestrator are present. A stored profile generates exact per-host source and
+reader plans; active paths and reader counts remain independent. Reader events
+separate outgoing `DESCRIBE→PLAY` from the first parsed non-delta access unit,
+and cold pass/fail is accepted only from a compatible finalized direct-control
+pair. Seeded steady/ramp/burst/outage primitives, interruption fail-closed,
+owner-only credentials, per-process/RLIMIT/cgroup generator headroom and a
+hash-complete read-only final bundle are implemented. The bundle is moved to
+root-owned immutable/WORM storage after local finalization.
+
+The hardened harness is undergoing repeat Standards/Spec exit review and native
+amd64/arm64 CI. CI is not capacity evidence; dedicated LAN/WAN hardware,
+untuned baselines, saturation knee, complete fault matrix and 24h soak remain
+mandatory before the Phase 0B exit decision.
 
 #### 0C. Conditional topology spike
 
