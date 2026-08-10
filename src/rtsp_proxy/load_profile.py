@@ -27,9 +27,7 @@ class ArtifactPins(StrictModel):
     ffmpeg_version: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     ffmpeg_sha256: Sha256
     ffprobe_sha256: Sha256
-    gstreamer_version: Annotated[
-        str, StringConstraints(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")
-    ]
+    gstreamer_version: Annotated[str, StringConstraints(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")]
     gstreamer_build_id: Annotated[str, StringConstraints(min_length=1, max_length=256)]
     pull_server_sha256: Sha256
     load_reader_sha256: Sha256
@@ -69,6 +67,8 @@ class FixtureProfile(StrictModel):
             raise ValueError("fixture_path_must_be_absolute")
         if self.sha256 == "0" * 64:
             raise ValueError("fixture_placeholder_not_replaced")
+        if self.fps > 240:
+            raise ValueError("fixture_fps_exceeds_native_limit")
         return self
 
     @property
@@ -88,6 +88,7 @@ class GeneratorHost(StrictModel):
 class NetworkProfile(StrictModel):
     profile: Literal["lan", "wan", "chaos"]
     interface: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_.:-]{1,15}$")]
+    mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
     rtt_ms: Annotated[float, Field(ge=0)]
     jitter_ms: Annotated[float, Field(ge=0)]
     loss_percent: Annotated[float, Field(ge=0, lt=100)]
@@ -100,6 +101,8 @@ class NetworkProfile(StrictModel):
             self.rtt_ms < 50 or self.jitter_ms < 10 or self.loss_percent < 0.5
         ):
             raise ValueError("wan_profile_below_consensus_impairment")
+        if self.profile != "lan":
+            raise ValueError("network_impairment_driver_not_implemented")
         return self
 
 
@@ -110,17 +113,28 @@ class WorkloadAxes(StrictModel):
     active_sources: Annotated[int, Field(ge=0)]
     total_readers: Annotated[int, Field(ge=0)]
     connect_rate_per_second: Annotated[int, Field(ge=0, le=1000)]
+    minimum_rtp_packets_per_second: Annotated[int, Field(ge=0)]
     probe_rate_per_second: Annotated[float, Field(ge=0)]
     crud_rate_per_second: Annotated[float, Field(ge=0)]
 
     @model_validator(mode="after")
     def keep_axes_physically_possible(self) -> Self:
+        if self.registered_paths > 10000:
+            raise ValueError("registered_paths_exceed_native_limit")
+        if self.active_sources > 10000:
+            raise ValueError("active_sources_exceed_native_limit")
+        if self.total_readers > 100000:
+            raise ValueError("readers_exceed_native_limit")
         if self.active_sources > self.registered_paths:
             raise ValueError("active_sources_exceed_registered_paths")
         if self.total_readers < self.active_sources:
             raise ValueError("readers_below_active_sources")
         if self.active_sources == 0 and self.total_readers != 0:
             raise ValueError("readers_require_active_sources")
+        if (self.total_readers == 0) != (self.minimum_rtp_packets_per_second == 0):
+            raise ValueError("rtp_packet_rate_must_match_reader_presence")
+        if self.probe_rate_per_second != 0 or self.crud_rate_per_second != 0:
+            raise ValueError("probe_crud_drivers_not_implemented")
         return self
 
 
@@ -168,6 +182,7 @@ class ReaderLifecycle(StrictModel):
 class EvidenceSampling(StrictModel):
     interval_seconds: Annotated[float, Field(ge=0.1, le=60)]
     maximum_gap_factor: Annotated[float, Field(ge=1, le=3)]
+    maximum_clock_error_ms: Annotated[float, Field(gt=0, le=1000)]
 
 
 class RunDuration(StrictModel):
@@ -179,6 +194,12 @@ class RunDuration(StrictModel):
     def total_seconds(self) -> int:
         return self.warmup_seconds + self.measurement_seconds + self.soak_seconds
 
+    @model_validator(mode="after")
+    def enforce_native_duration_limit(self) -> Self:
+        if self.total_seconds > 172800:
+            raise ValueError("duration_exceeds_native_limit")
+        return self
+
 
 class LoadProfile(StrictModel):
     schema_version: Literal[1]
@@ -186,9 +207,7 @@ class LoadProfile(StrictModel):
     seed: Annotated[int, Field(ge=0, le=2147483647)]
     comparison_id: SafeName
     sut_architecture: Architecture
-    sut_rtsp_host: Annotated[
-        str, StringConstraints(pattern=r"^[a-zA-Z0-9._:-]{1,253}$")
-    ]
+    sut_rtsp_host: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._:-]{1,253}$")]
     sut_rtsp_port: Annotated[int, Field(ge=1, le=65535)]
     reader_credentials_file: str | None
     artifacts: ArtifactPins
@@ -230,9 +249,15 @@ class LoadProfile(StrictModel):
             raise ValueError("ramp_requires_100_readers_per_second")
         if mode == "burst" and rate != 1000:
             raise ValueError("burst_requires_1000_readers_per_second")
+        if mode == "burst" and self.workload.total_readers < 1000:
+            raise ValueError("burst_requires_at_least_1000_readers")
+        if (
+            mode == "outage"
+            and self.workload.total_readers * self.reader_lifecycle.outage_percent % 100 != 0
+        ):
+            raise ValueError("outage_cohort_not_exactly_representable")
         if mode in {"steady", "burst", "outage"} and (
-            self.duration.total_seconds * 1000
-            <= self.reader_lifecycle.backoff_max_ms + 2000
+            self.duration.total_seconds * 1000 <= self.reader_lifecycle.backoff_max_ms + 2000
         ):
             raise ValueError("lifecycle_duration_does_not_cover_backoff_recovery")
 
@@ -325,6 +350,21 @@ def _hash_file(path: Path) -> tuple[str, int]:
 
 
 def finalize_run_directory(destination: Path) -> dict[str, object]:
+    from rtsp_proxy.load_evidence import (
+        GeneratorHeadroomSummary,
+        load_observations,
+        summarize_generator_headroom,
+    )
+    from rtsp_proxy.load_results import (
+        ColdComparisonSummary,
+        ReaderRunCompletedEvent,
+        ReaderRunSummary,
+        load_reader_events,
+        summarize_cold_comparison,
+        summarize_reader_events,
+    )
+    from rtsp_proxy.load_run import validate_prepared_run_directory
+
     if (destination / "final-manifest.json").exists():
         raise FileExistsError("run_already_finalized")
     files = _evidence_files(destination)
@@ -348,46 +388,110 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
     profile_sha256, _ = _hash_file(files["profile.json"])
     if initial.get("profile_sha256") != profile_sha256:
         raise ValueError("evidence_profile_digest_mismatch")
-    raw_hashes = {
-        _hash_file(path)[0]
-        for name, path in files.items()
-        if name.startswith("raw/")
+    prepared_launch = validate_prepared_run_directory(destination, profile)
+
+    expected_summary_names = {
+        f"summary/generator-{host.name}.json" for host in profile.generator_hosts
     }
-    generator_summaries: set[str] = set()
-    reader_summary_seen = False
-    cold_comparison_seen = False
-    for name, path in files.items():
-        if not name.startswith("summary/") or not name.endswith(".json"):
-            continue
-        summary = json.loads(path.read_text(encoding="utf-8"))
-        if summary.get("valid") is not True:
-            raise ValueError("evidence_contains_invalid_summary")
-        if isinstance(summary.get("generator_host"), str):
-            if summary.get("observations_sha256") not in raw_hashes:
-                raise ValueError("generator_summary_raw_digest_missing")
-            generator_summaries.add(summary["generator_host"])
-        if "expected_concurrent_readers" in summary:
-            if summary.get("events_sha256") not in raw_hashes:
-                raise ValueError("reader_summary_raw_digest_missing")
-            reader_summary_seen = True
-        if "proxy_overhead_slo_pass" in summary:
-            if summary.get("proxy_events_sha256") not in raw_hashes:
-                raise ValueError("cold_comparison_proxy_raw_digest_missing")
-            if summary.get("proxy_overhead_slo_pass") is not True:
-                raise ValueError("cold_comparison_slo_failed")
-            cold_comparison_seen = True
-    expected_generators = {host.name for host in profile.generator_hosts}
-    if generator_summaries != expected_generators:
-        raise ValueError("generator_summary_set_incomplete")
-    if profile.workload.total_readers > 0 and not reader_summary_seen:
-        raise ValueError("reader_summary_missing")
-    if (
+    reader_events_path = destination / "raw" / "readers.jsonl"
+    if profile.workload.total_readers > 0:
+        expected_summary_names.add("summary/readers.json")
+    cold_required = (
         profile.workload.total_readers > 0
         and profile.workload.endpoint_mode == "proxy"
         and profile.workload.session_temperature == "cold"
-        and not cold_comparison_seen
-    ):
-        raise ValueError("cold_comparison_summary_missing")
+    )
+    if cold_required:
+        expected_summary_names.add("summary/cold-comparison.json")
+    observed_summary_names = {name for name in files if name.startswith("summary/")}
+    if observed_summary_names != expected_summary_names:
+        raise ValueError("evidence_summary_set_invalid")
+
+    completions: tuple[ReaderRunCompletedEvent, ...] = ()
+    if profile.workload.total_readers > 0:
+        expected_reader_summary = summarize_reader_events(profile, reader_events_path)
+        stored_reader_summary = ReaderRunSummary.model_validate_json(
+            files["summary/readers.json"].read_text(encoding="utf-8")
+        )
+        if stored_reader_summary != expected_reader_summary or not stored_reader_summary.valid:
+            raise ValueError("reader_summary_not_reproducible_or_invalid")
+        completions = tuple(
+            event
+            for event in load_reader_events(reader_events_path)
+            if isinstance(event, ReaderRunCompletedEvent)
+        )
+        if any(
+            item.scheduled_start_unix_ms != prepared_launch["coordinated_start_unix_ms"]
+            for item in completions
+        ):
+            raise ValueError("reader_completion_start_not_bound_to_launch")
+
+    generator_machine_ids: set[str] = set()
+    for host in profile.generator_hosts:
+        raw_name = f"raw/generator-{host.name}.jsonl"
+        summary_name = f"summary/generator-{host.name}.json"
+        if raw_name not in files:
+            raise ValueError("generator_raw_evidence_missing")
+        observations = load_observations(files[raw_name])
+        expected_generator_summary = summarize_generator_headroom(
+            observations,
+            expected_generator_host=host.name,
+            minimum_duration_seconds=profile.duration.total_seconds,
+            expected_interval_seconds=profile.evidence_sampling.interval_seconds,
+            maximum_gap_factor=profile.evidence_sampling.maximum_gap_factor,
+            observations_sha256=_hash_file(files[raw_name])[0],
+        )
+        stored_generator_summary = GeneratorHeadroomSummary.model_validate_json(
+            files[summary_name].read_text(encoding="utf-8")
+        )
+        if (
+            stored_generator_summary != expected_generator_summary
+            or not stored_generator_summary.valid
+            or stored_generator_summary.interface_mtu_bytes != profile.network.mtu_bytes
+        ):
+            raise ValueError("generator_summary_not_reproducible_or_invalid")
+        expected_process_count = sum(
+            item.get("generator_host") == host.name
+            for category in ("source_servers", "readers")
+            for item in prepared_launch[category]
+        )
+        if stored_generator_summary.process_count != expected_process_count:
+            raise ValueError("generator_workload_process_count_mismatch")
+        generator_machine_ids.add(stored_generator_summary.machine_id_sha256)
+        host_completions = [item for item in completions if item.generator_host == host.name]
+        if host_completions:
+            first_sample_ms = int(
+                datetime.fromisoformat(observations[0].timestamp).timestamp() * 1000
+            )
+            last_sample_ms = int(
+                datetime.fromisoformat(observations[-1].timestamp).timestamp() * 1000
+            )
+            if first_sample_ms > min(
+                item.scheduled_start_unix_ms for item in host_completions
+            ) or last_sample_ms < max(item.process_end_unix_ms for item in host_completions):
+                raise ValueError("generator_observation_window_does_not_cover_load")
+    if profile.tier == "capacity" and len(generator_machine_ids) != len(profile.generator_hosts):
+        raise ValueError("capacity_generator_machine_id_not_unique")
+
+    if cold_required:
+        reference_profile_path = destination / "reference" / "direct-profile.json"
+        reference_events_path = destination / "reference" / "direct-readers.jsonl"
+        reference_manifest_path = destination / "reference" / "direct-final-manifest.json"
+        direct_profile = LoadProfile.model_validate_json(
+            reference_profile_path.read_text(encoding="utf-8")
+        )
+        expected_cold = summarize_cold_comparison(
+            profile,
+            reader_events_path,
+            direct_profile,
+            reference_events_path,
+            direct_final_manifest_sha256=_hash_file(reference_manifest_path)[0],
+        )
+        stored_cold = ColdComparisonSummary.model_validate_json(
+            files["summary/cold-comparison.json"].read_text(encoding="utf-8")
+        )
+        if stored_cold != expected_cold or not stored_cold.valid:
+            raise ValueError("cold_comparison_not_reproducible_or_invalid")
     file_entries = {
         name: {"sha256": digest, "size_bytes": size}
         for name, path in files.items()
@@ -402,9 +506,9 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         "finalized_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "files": file_entries,
     }
-    body = (
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+    body = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
     _write_exclusive_file(destination / "final-manifest.json", body, mode=0o440)
     for path in files.values():
         path.chmod(0o440)

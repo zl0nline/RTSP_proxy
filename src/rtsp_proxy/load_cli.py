@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -43,6 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("destination", type=Path)
     prepare.add_argument("--pull-server-binary", required=True, type=Path)
     prepare.add_argument("--load-reader-binary", required=True, type=Path)
+    prepare.add_argument("--start-unix-ms", required=True, type=int)
 
     apply_paths = commands.add_parser("apply-paths")
     apply_paths.add_argument("run_directory", type=Path)
@@ -53,7 +57,8 @@ def _parser() -> argparse.ArgumentParser:
     sample.add_argument("run_directory", type=Path)
     sample.add_argument("output", type=Path)
     sample.add_argument("--generator-host", required=True)
-    sample.add_argument("--pid", required=True, action="append", type=int)
+    sample.add_argument("--source-pid", required=True, action="append", type=int)
+    sample.add_argument("--reader-pid", action="append", type=int, default=[])
     sample.add_argument("--cgroup", required=True)
 
     summarize = commands.add_parser("summarize-generator")
@@ -114,6 +119,17 @@ def _loopback_api_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def _copy_reference_exclusive(source: Path, destination: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("reference_source_must_be_regular_file")
+    with source.open("rb") as input_file, destination.open("xb") as output_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            output_file.write(chunk)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    destination.chmod(0o640)
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
@@ -129,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.destination,
                 pull_server_binary=arguments.pull_server_binary,
                 load_reader_binary=arguments.load_reader_binary,
+                coordinated_start_unix_ms=arguments.start_unix_ms,
             )
             print(
                 f"PREPARED directory={arguments.destination} "
@@ -162,19 +179,58 @@ def main(argv: list[str] | None = None) -> int:
             print(f"APPLIED paths={result.applied_paths} verified={result.verified_paths}")
             return 0
         if arguments.command == "sample-generator":
-            if arguments.generator_host not in {
-                host.name for host in profile.generator_hosts
-            }:
+            if arguments.generator_host not in {host.name for host in profile.generator_hosts}:
                 raise ValueError("unknown_generator_host")
             _require_run_path(run_directory, arguments.output)
+            source_pids = tuple(arguments.source_pid)
+            reader_pids = tuple(arguments.reader_pid)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            expected_source_count = sum(
+                launch.get("generator_host") == arguments.generator_host
+                for launch in launch_plan.get("source_servers", [])
+            )
+            expected_reader_count = sum(
+                launch.get("generator_host") == arguments.generator_host
+                for launch in launch_plan.get("readers", [])
+            )
+            if (
+                len(source_pids) != expected_source_count
+                or len(reader_pids) != expected_reader_count
+            ):
+                raise ValueError("generator_workload_pid_set_incomplete")
+            expected_executables = {
+                **{pid: profile.artifacts.pull_server_sha256 for pid in source_pids},
+                **{pid: profile.artifacts.load_reader_sha256 for pid in reader_pids},
+            }
+            coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start_ms, int):
+                raise ValueError("launch_plan_start_invalid")
+            rate = profile.workload.connect_rate_per_second
+            ramp_seconds = (
+                0
+                if rate == 0 or profile.workload.total_readers < 2
+                else (profile.workload.total_readers - 1) / rate
+            )
+            sample_until_ms = (
+                coordinated_start_ms
+                + math.ceil(ramp_seconds * 1000)
+                + profile.duration.total_seconds * 1000
+            )
+            duration_seconds = math.ceil((sample_until_ms - time.time_ns() // 1_000_000) / 1000)
+            if duration_seconds < 1:
+                raise ValueError("generator_sampling_window_already_expired")
             count = sample_linux_generator_resources(
                 root=Path("/"),
                 generator_host=arguments.generator_host,
                 interface=profile.network.interface,
-                pids=tuple(arguments.pid),
+                pids=source_pids + reader_pids,
                 cgroup=arguments.cgroup,
+                expected_executables=expected_executables,
+                expected_mtu_bytes=profile.network.mtu_bytes,
                 output=arguments.output,
-                duration_seconds=profile.duration.total_seconds,
+                duration_seconds=duration_seconds,
                 interval_seconds=profile.evidence_sampling.interval_seconds,
             )
             print(f"SAMPLED observations={count} output={arguments.output}")
@@ -214,14 +270,25 @@ def main(argv: list[str] | None = None) -> int:
             _require_run_path(run_directory, arguments.proxy_events)
             _require_run_path(arguments.direct_run_directory, arguments.direct_events)
             _require_run_path(run_directory, arguments.output)
+            reference_directory = run_directory / "reference"
+            reference_directory.mkdir(mode=0o750, exist_ok=False)
+            reference_profile = reference_directory / "direct-profile.json"
+            reference_events = reference_directory / "direct-readers.jsonl"
+            reference_manifest = reference_directory / "direct-final-manifest.json"
+            _copy_reference_exclusive(
+                arguments.direct_run_directory / "profile.json", reference_profile
+            )
+            _copy_reference_exclusive(arguments.direct_events, reference_events)
+            _copy_reference_exclusive(
+                arguments.direct_run_directory / "final-manifest.json",
+                reference_manifest,
+            )
             comparison = summarize_cold_comparison(
                 profile,
                 arguments.proxy_events,
                 direct_profile,
-                arguments.direct_events,
-                direct_final_manifest_sha256=sha256_file(
-                    arguments.direct_run_directory / "final-manifest.json"
-                ),
+                reference_events,
+                direct_final_manifest_sha256=sha256_file(reference_manifest),
             )
             write_summary(arguments.output, comparison)
             print(f"SUMMARIZED_COLD_COMPARISON output={arguments.output}")

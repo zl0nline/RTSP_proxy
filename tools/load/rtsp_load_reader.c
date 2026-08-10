@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/timex.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_PATHS 10000
@@ -34,6 +36,7 @@ typedef struct {
     volatile gint connected;
     volatile gint outage_member;
     volatile gint outage_recovered;
+    guint64 rtp_packets;
     RunContext *run;
 } Reader;
 
@@ -78,6 +81,11 @@ struct _RunContext {
     gboolean interrupted;
     gboolean outage_injected;
     gboolean lifecycle_started;
+    volatile gint stopping;
+    gint64 scheduled_start_unix_ms;
+    gint64 process_start_unix_ms;
+    gboolean clock_synchronized;
+    gdouble clock_max_error_ms;
     const gchar *lifecycle;
 };
 
@@ -99,6 +107,10 @@ static gint scenario_seed = 0;
 static gint schedule_shards = 1;
 static gint schedule_shard_index = 0;
 static gint global_reader_count = 0;
+static gchar *generator_host = NULL;
+static gchar *profile_sha256 = NULL;
+static gchar *reader_plan_sha256 = NULL;
+static gint64 start_unix_ms = 0;
 static gboolean allow_failures = FALSE;
 
 static GOptionEntry entries[] = {
@@ -138,6 +150,14 @@ static GOptionEntry entries[] = {
      "Zero-based coordinated reader process index", "INDEX"},
     {"global-reader-count", 0, 0, G_OPTION_ARG_INT, &global_reader_count,
      "Readers across all coordinated processes", "COUNT"},
+    {"generator-host", 0, 0, G_OPTION_ARG_STRING, &generator_host,
+     "Generator host identity bound by the launch plan", "NAME"},
+    {"profile-sha256", 0, 0, G_OPTION_ARG_STRING, &profile_sha256,
+     "Canonical load profile digest", "SHA256"},
+    {"reader-plan-sha256", 0, 0, G_OPTION_ARG_STRING, &reader_plan_sha256,
+     "Reader plan digest", "SHA256"},
+    {"start-unix-ms", 0, 0, G_OPTION_ARG_INT64, &start_unix_ms,
+     "Common future realtime start epoch in milliseconds", "MILLISECONDS"},
     {"allow-failures", 0, 0, G_OPTION_ARG_NONE, &allow_failures,
      "Allow recorded failures only after a complete non-interrupted run", NULL},
     {NULL}
@@ -188,6 +208,27 @@ event_time_ms(RunContext *run)
     return (g_get_monotonic_time() - run->epoch_us) / 1000.0;
 }
 
+static gint64
+unix_time_ms(void)
+{
+    return g_get_real_time() / 1000;
+}
+
+static gboolean
+safe_sha256(const gchar *value)
+{
+    guint index;
+    if (value == NULL || strlen(value) != 64) {
+        return FALSE;
+    }
+    for (index = 0; index < 64; index++) {
+        if (!g_ascii_isxdigit(value[index]) || g_ascii_isupper(value[index])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 static void
 record_reader_started(Reader *reader)
 {
@@ -195,8 +236,9 @@ record_reader_started(Reader *reader)
     g_fprintf(run->events,
               "{\"event\":\"reader_started\",\"reader_id\":%u,"
               "\"cycle\":%u,\"path\":\"%s\","
-              "\"at_monotonic_ms\":%.3f}\n",
-              reader->id, reader->cycle, reader->path, event_time_ms(run));
+              "\"at_monotonic_ms\":%.3f,\"at_unix_ms\":%" G_GINT64_FORMAT "}\n",
+              reader->id, reader->cycle, reader->path, event_time_ms(run),
+              unix_time_ms());
     fflush(run->events);
 }
 
@@ -338,25 +380,30 @@ start_lifecycle_if_ready(RunContext *run)
     }
 }
 
-static void
-on_handoff(GstElement *sink G_GNUC_UNUSED, GstBuffer *buffer,
-           GstPad *pad G_GNUC_UNUSED, gpointer user_data)
-{
-    Reader *reader = user_data;
-    RunContext *run = reader->run;
-    gint64 now;
+typedef struct {
+    Reader *reader;
+    gint64 observed_at_us;
+} DecodableNotice;
 
-    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT) ||
-        !g_atomic_int_compare_and_exchange(&reader->decodable_seen, FALSE, TRUE)) {
-        return;
+static gboolean
+process_decodable(gpointer user_data)
+{
+    DecodableNotice *notice = user_data;
+    Reader *reader = notice->reader;
+    RunContext *run = reader->run;
+    gint64 now = notice->observed_at_us;
+
+    if (g_atomic_int_get(&run->stopping)) {
+        g_free(notice);
+        return G_SOURCE_REMOVE;
     }
-    now = g_get_monotonic_time();
     g_mutex_lock(&run->lock);
     if (reader->describe_at_us == 0 || reader->play_at_us == 0) {
         g_atomic_int_set(&reader->decodable_seen, FALSE);
         g_mutex_unlock(&run->lock);
         record_failure(reader, "state_change_failure");
-        return;
+        g_free(notice);
+        return G_SOURCE_REMOVE;
     }
     g_atomic_int_set(&reader->connected, TRUE);
     run->decodable_attempts++;
@@ -380,6 +427,48 @@ on_handoff(GstElement *sink G_GNUC_UNUSED, GstBuffer *buffer,
     fflush(run->events);
     start_lifecycle_if_ready(run);
     g_mutex_unlock(&run->lock);
+    g_free(notice);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+on_handoff(GstElement *sink G_GNUC_UNUSED, GstBuffer *buffer,
+           GstPad *pad G_GNUC_UNUSED, gpointer user_data)
+{
+    Reader *reader = user_data;
+    RunContext *run = reader->run;
+    DecodableNotice *notice;
+
+    if (g_atomic_int_get(&run->stopping)) {
+        return;
+    }
+    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT) ||
+        !g_atomic_int_compare_and_exchange(&reader->decodable_seen, FALSE, TRUE)) {
+        return;
+    }
+    notice = g_new0(DecodableNotice, 1);
+    notice->reader = reader;
+    notice->observed_at_us = g_get_monotonic_time();
+    g_main_context_invoke(NULL, process_decodable, notice);
+}
+
+static GstPadProbeReturn
+count_rtp_packet(GstPad *pad G_GNUC_UNUSED, GstPadProbeInfo *info,
+                 gpointer user_data)
+{
+    Reader *reader = user_data;
+    if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) != 0) {
+        reader->rtp_packets++;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static void
+on_source_pad_added(GstElement *source G_GNUC_UNUSED, GstPad *pad,
+                    gpointer user_data)
+{
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_rtp_packet,
+                      user_data, NULL);
 }
 
 static gboolean
@@ -477,6 +566,7 @@ create_reader(RunContext *run, guint reader_id, const gchar *path,
         g_object_set(source, "user-id", username, "user-pw", password, NULL);
     }
     g_signal_connect(source, "before-send", G_CALLBACK(on_before_send), reader);
+    g_signal_connect(source, "pad-added", G_CALLBACK(on_source_pad_added), reader);
     g_signal_connect(sink, "handoff", G_CALLBACK(on_handoff), reader);
     gst_object_unref(source);
     gst_object_unref(sink);
@@ -703,7 +793,8 @@ read_credentials(gchar **username, gchar **password, GError **error)
     descriptor = open(credentials_file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor < 0 || fstat(descriptor, &metadata) != 0 ||
         !S_ISREG(metadata.st_mode) || metadata.st_uid != geteuid() ||
-        (metadata.st_mode & 0077) != 0 || metadata.st_size < 3 ||
+        !((metadata.st_mode & 0777) == 0600 ||
+          (metadata.st_mode & 0777) == 0400) || metadata.st_size < 3 ||
         metadata.st_size > MAX_SECRET_BYTES) {
         if (descriptor >= 0) {
             close(descriptor);
@@ -761,6 +852,18 @@ read_plan(GError **error)
     if (reader_plan_file == NULL || !g_path_is_absolute(reader_plan_file) ||
         !g_file_get_contents(reader_plan_file, &contents, NULL, error)) {
         return NULL;
+    }
+    {
+        gchar *observed_digest = g_compute_checksum_for_string(
+            G_CHECKSUM_SHA256, contents, -1);
+        if (!g_str_equal(observed_digest, reader_plan_sha256)) {
+            g_free(observed_digest);
+            g_free(contents);
+            g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
+                                "reader_plan_digest_mismatch");
+            return NULL;
+        }
+        g_free(observed_digest);
     }
     lines = g_strsplit(contents, "\n", -1);
     seen_paths = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
@@ -898,6 +1001,9 @@ main(int argc, char *argv[])
     guint failed_snapshot;
     gboolean lifecycle_complete = TRUE;
     gint exit_code;
+    guint64 rtp_packets_snapshot = 0;
+    struct timex clock_state = {0};
+    gint clock_status;
 
     option_context = g_option_context_new("- scalable GStreamer RTSP/TCP readers");
     g_option_context_add_main_entries(option_context, entries, NULL);
@@ -915,7 +1021,9 @@ main(int argc, char *argv[])
         !(g_str_equal(codec, "h264") || g_str_equal(codec, "h265")) ||
         connect_rate < 0 || connect_rate > 1000 || hold_seconds < 1 ||
         hold_seconds > 172800 || events_file == NULL ||
-        !g_path_is_absolute(events_file) || !valid_lifecycle_configuration()) {
+        !g_path_is_absolute(events_file) || !safe_token(generator_host, 253) ||
+        !safe_sha256(profile_sha256) || !safe_sha256(reader_plan_sha256) ||
+        start_unix_ms < 0 || !valid_lifecycle_configuration()) {
         g_printerr("configuration_error: invalid_reader_configuration\n");
         return 2;
     }
@@ -955,6 +1063,25 @@ main(int argc, char *argv[])
     run.allow_failures = allow_failures;
     run.lifecycle = lifecycle;
     g_mutex_init(&run.lock);
+    clock_status = adjtimex(&clock_state);
+    run.clock_synchronized =
+        clock_status != TIME_ERROR && (clock_state.status & STA_UNSYNC) == 0;
+    run.clock_max_error_ms =
+        MAX(clock_state.maxerror, clock_state.esterror) / 1000.0;
+    run.process_start_unix_ms = unix_time_ms();
+    run.scheduled_start_unix_ms =
+        start_unix_ms == 0 ? run.process_start_unix_ms : start_unix_ms;
+    if (run.process_start_unix_ms > run.scheduled_start_unix_ms) {
+        g_printerr("configuration_error: coordinated_start_is_not_in_future\n");
+        g_ptr_array_unref(targets);
+        g_ptr_array_unref(run.readers);
+        g_main_loop_unref(run.loop);
+        g_mutex_clear(&run.lock);
+        fclose(run.events);
+        wipe_and_free(username);
+        wipe_and_free(password);
+        return 2;
+    }
 
     for (target_index = 0; target_index < targets->len; target_index++) {
         PlanTarget *target = g_ptr_array_index(targets, target_index);
@@ -992,11 +1119,13 @@ main(int argc, char *argv[])
     wipe_and_free(username);
     wipe_and_free(password);
 
-    run.epoch_us = g_get_monotonic_time();
+    run.epoch_us = g_get_monotonic_time() +
+                   (run.scheduled_start_unix_ms - unix_time_ms()) * 1000;
     signal_int_id = g_unix_signal_add(SIGINT, interrupt_run, &run);
     signal_term_id = g_unix_signal_add(SIGTERM, interrupt_run, &run);
     schedule_next_reader(&run);
     g_main_loop_run(run.loop);
+    g_atomic_int_set(&run.stopping, TRUE);
     g_source_remove(signal_int_id);
     g_source_remove(signal_term_id);
     if (run.start_source_id != 0) {
@@ -1018,6 +1147,8 @@ main(int argc, char *argv[])
             lifecycle_complete = FALSE;
         }
         gst_element_set_state(reader->pipeline, GST_STATE_NULL);
+        gst_element_get_state(reader->pipeline, NULL, NULL, 5 * GST_SECOND);
+        rtp_packets_snapshot += reader->rtp_packets;
         if (g_atomic_int_get(&reader->outage_member) &&
             !g_atomic_int_get(&reader->outage_recovered)) {
             lifecycle_complete = FALSE;
@@ -1028,6 +1159,9 @@ main(int argc, char *argv[])
     }
     if (g_str_equal(run.lifecycle, "steady") && run.injected_disconnects == 0) {
         lifecycle_complete = FALSE;
+    }
+    while (g_main_context_pending(NULL)) {
+        g_main_context_iteration(NULL, FALSE);
     }
     g_mutex_lock(&run.lock);
     started_snapshot = run.started_readers;
@@ -1050,12 +1184,23 @@ main(int argc, char *argv[])
               "\"failed_attempts\":%u,\"normal_completion\":%s,"
               "\"interrupted\":%s,\"lifecycle_complete\":%s,"
               "\"exit_code\":%d,\"schedule_shard_index\":%u,"
-              "\"schedule_shards\":%u}\n",
+              "\"schedule_shards\":%u,\"generator_host\":\"%s\","
+              "\"profile_sha256\":\"%s\","
+              "\"reader_plan_sha256\":\"%s\","
+              "\"scheduled_start_unix_ms\":%" G_GINT64_FORMAT ","
+              "\"process_start_unix_ms\":%" G_GINT64_FORMAT ","
+              "\"process_end_unix_ms\":%" G_GINT64_FORMAT ","
+              "\"clock_synchronized\":%s,\"clock_max_error_ms\":%.3f,"
+              "\"rtp_packets\":%" G_GUINT64_FORMAT "}\n",
               event_time_ms(&run), started_snapshot, ready_snapshot,
               failed_snapshot, run.normal_completion ? "true" : "false",
               run.interrupted ? "true" : "false",
               lifecycle_complete ? "true" : "false", exit_code,
-              run.schedule_shard_index, run.schedule_shards);
+              run.schedule_shard_index, run.schedule_shards, generator_host,
+              profile_sha256, reader_plan_sha256,
+              run.scheduled_start_unix_ms, run.process_start_unix_ms,
+              unix_time_ms(), run.clock_synchronized ? "true" : "false",
+              run.clock_max_error_ms, rtp_packets_snapshot);
     fflush(run.events);
     fsync(fileno(run.events));
     g_mutex_unlock(&run.lock);
@@ -1074,5 +1219,8 @@ main(int argc, char *argv[])
     g_free(credentials_file);
     g_free(events_file);
     g_free(lifecycle);
+    g_free(generator_host);
+    g_free(profile_sha256);
+    g_free(reader_plan_sha256);
     return exit_code;
 }

@@ -141,9 +141,7 @@ def _target_specs(profile: LoadProfile) -> tuple[tuple[int, int, int], ...]:
     return tuple(targets)
 
 
-def build_proxy_reader_plan(
-    profile: LoadProfile, generator_host: str | None = None
-) -> ReaderPlan:
+def build_proxy_reader_plan(profile: LoadProfile, generator_host: str | None = None) -> ReaderPlan:
     catalog_by_index = {path.index: path for path in build_load_catalog(profile).paths}
     selected_host = None
     if generator_host is not None:
@@ -153,11 +151,14 @@ def build_proxy_reader_plan(
         )
         if selected_host is None:
             raise ValueError("unknown_generator_host")
+
     def belongs_to_selected_host(index: int) -> bool:
         if selected_host is None:
             return True
-        return selected_host.source_start <= index < (
-            selected_host.source_start + selected_host.source_count
+        return (
+            selected_host.source_start
+            <= index
+            < (selected_host.source_start + selected_host.source_count)
         )
 
     targets = tuple(
@@ -214,17 +215,13 @@ def _write_bytes(destination: Path, body: bytes) -> str:
 def write_load_catalog(profile: LoadProfile, destination: Path) -> str:
     catalog = build_load_catalog(profile)
     body = (
-        json.dumps(
-            catalog.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True
-        )
+        json.dumps(catalog.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True)
         + "\n"
     ).encode("utf-8")
     return _write_bytes(destination, body)
 
 
-def apply_load_catalog(
-    catalog: LoadCatalog, client: MediaMtxClient
-) -> LoadCatalogApplyResult:
+def apply_load_catalog(catalog: LoadCatalog, client: MediaMtxClient) -> LoadCatalogApplyResult:
     for path in catalog.paths:
         client.put_path(
             MediaPathConfig(
@@ -260,7 +257,5 @@ def write_reader_paths(plan: ReaderPlan, destination: Path) -> str:
     return _write_bytes(destination, body)
 
 
-def write_direct_reader_paths(
-    profile: LoadProfile, generator_host: str, destination: Path
-) -> str:
+def write_direct_reader_paths(profile: LoadProfile, generator_host: str, destination: Path) -> str:
     return write_reader_paths(build_direct_reader_plan(profile, generator_host), destination)

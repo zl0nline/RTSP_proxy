@@ -9,8 +9,16 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from rtsp_proxy.load_catalog import build_direct_reader_plan
-from rtsp_proxy.load_profile import LoadProfile, validate_comparison_pair
+from rtsp_proxy.load_catalog import (
+    ReaderPlan,
+    build_direct_reader_plan,
+    build_proxy_reader_plan,
+)
+from rtsp_proxy.load_profile import (
+    LoadProfile,
+    canonical_profile_bytes,
+    validate_comparison_pair,
+)
 
 LatencyGate = Literal[
     "warm_proxy_p99",
@@ -35,18 +43,18 @@ class ReaderEvent(BaseModel):
     cycle: Annotated[int, Field(ge=0, le=1000000)]
     path: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_.:-]{1,128}$")]
     at_monotonic_ms: Annotated[float, Field(ge=0)]
+    at_unix_ms: Annotated[int, Field(ge=0)] | None = None
     describe_to_play_ms: Annotated[float, Field(ge=0)] | None = None
     describe_to_first_decodable_ms: Annotated[float, Field(ge=0)] | None = None
     play_to_first_decodable_ms: Annotated[float, Field(ge=0)] | None = None
     backoff_ms: Annotated[float, Field(ge=0)] | None = None
     injected: bool | None = None
-    reason: Literal[
-        "gstreamer_error", "unexpected_eos", "state_change_failure"
-    ] | None = None
+    reason: Literal["gstreamer_error", "unexpected_eos", "state_change_failure"] | None = None
 
     @model_validator(mode="after")
     def validate_event_shape(self) -> Self:
         populated = {
+            "at_unix_ms": self.at_unix_ms,
             "describe_to_play_ms": self.describe_to_play_ms,
             "describe_to_first_decodable_ms": self.describe_to_first_decodable_ms,
             "play_to_first_decodable_ms": self.play_to_first_decodable_ms,
@@ -69,7 +77,7 @@ class ReaderEvent(BaseModel):
         elif self.event == "reconnect_scheduled":
             expected = {"backoff_ms"}
         else:
-            expected = set()
+            expected = {"at_unix_ms"} if self.event == "reader_started" else set()
         actual = {name for name, value in populated.items() if value is not None}
         if actual != expected:
             raise ValueError("invalid_reader_event_shape")
@@ -90,6 +98,21 @@ class ReaderRunCompletedEvent(BaseModel):
     exit_code: Annotated[int, Field(ge=0, le=255)]
     schedule_shard_index: Annotated[int, Field(ge=0, lt=10000)]
     schedule_shards: Annotated[int, Field(gt=0, le=10000)]
+    generator_host: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,253}$")]
+    profile_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    reader_plan_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    scheduled_start_unix_ms: Annotated[int, Field(gt=0)]
+    process_start_unix_ms: Annotated[int, Field(gt=0)]
+    process_end_unix_ms: Annotated[int, Field(gt=0)]
+    clock_synchronized: bool
+    clock_max_error_ms: Annotated[float, Field(ge=0)]
+    rtp_packets: Annotated[int, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def validate_process_window(self) -> Self:
+        if self.process_end_unix_ms <= self.process_start_unix_ms:
+            raise ValueError("reader_process_window_invalid")
+        return self
 
 
 class ReaderRunSummary(BaseModel):
@@ -100,6 +123,10 @@ class ReaderRunSummary(BaseModel):
     establishment_attempts: int
     decodable_establishments: int
     failed_establishments: int
+    observed_rtp_packets: int
+    observed_rtp_packets_per_second: float
+    minimum_rtp_packets_per_second: int
+    packet_rate_slo_pass: bool
     establishment_success_percent: float
     describe_to_play_p50_ms: float | None
     describe_to_play_p95_ms: float | None
@@ -120,14 +147,13 @@ class ColdComparisonSummary(BaseModel):
     comparison_id: str
     proxy_events_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     direct_events_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-    direct_final_manifest_sha256: Annotated[
-        str, StringConstraints(pattern=r"^[0-9a-f]{64}$")
-    ]
+    direct_final_manifest_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     compared_establishments: int
     proxy_overhead_p50_ms: float
     proxy_overhead_p95_ms: float
     proxy_overhead_p99_ms: float
     direct_wait_for_decodable_p99_ms: float
+    proxy_wait_for_decodable_p99_ms: float
     proxy_overhead_slo_ms: float
     proxy_overhead_slo_pass: bool
     valid: bool
@@ -168,6 +194,10 @@ def _load_reader_events(path: Path) -> tuple[RawReaderEvent, ...]:
     return tuple(events)
 
 
+def load_reader_events(path: Path) -> tuple[RawReaderEvent, ...]:
+    return _load_reader_events(path)
+
+
 def merge_reader_event_files(paths: tuple[Path, ...], destination: Path) -> int:
     if not paths:
         raise ValueError("reader_event_inputs_empty")
@@ -196,9 +226,7 @@ def merge_reader_event_files(paths: tuple[Path, ...], destination: Path) -> int:
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate_reader_event_across_inputs")
     completion_shards = [
-        event.schedule_shard_index
-        for event in events
-        if isinstance(event, ReaderRunCompletedEvent)
+        event.schedule_shard_index for event in events if isinstance(event, ReaderRunCompletedEvent)
     ]
     if len(completion_shards) != len(set(completion_shards)):
         raise ValueError("duplicate_reader_completion_across_inputs")
@@ -223,9 +251,7 @@ def _event_maps(
 ]:
     raw_events = _load_reader_events(path)
     events = tuple(event for event in raw_events if isinstance(event, ReaderEvent))
-    completions = tuple(
-        event for event in raw_events if isinstance(event, ReaderRunCompletedEvent)
-    )
+    completions = tuple(event for event in raw_events if isinstance(event, ReaderRunCompletedEvent))
     starts: set[tuple[int, int]] = set()
     plays: dict[tuple[int, int], float] = {}
     frames: dict[tuple[int, int], tuple[float, float]] = {}
@@ -260,12 +286,50 @@ def _event_maps(
     return events, completions, starts, plays, frames, failures
 
 
+def _plan_body_sha256(plan: ReaderPlan) -> str:
+    targets = plan.targets
+    body = "".join(
+        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}\n" for target in targets
+    ).encode("ascii")
+    return hashlib.sha256(body).hexdigest()
+
+
+def _expected_reader_contract(
+    profile: LoadProfile,
+) -> tuple[dict[int, str], dict[str, tuple[int, str]]]:
+    expected_paths: dict[int, str] = {}
+    shard_contract: dict[str, tuple[int, str]] = {}
+    plans = []
+    for host in profile.generator_hosts:
+        plan = (
+            build_proxy_reader_plan(profile, host.name)
+            if profile.workload.endpoint_mode == "proxy"
+            else build_direct_reader_plan(profile, host.name)
+        )
+        if plan.targets:
+            plans.append((host.name, plan))
+    for shard_index, (host_name, plan) in enumerate(plans):
+        shard_contract[host_name] = (shard_index, _plan_body_sha256(plan))
+        for target in plan.targets:
+            for reader_id in range(
+                target.reader_id_start,
+                target.reader_id_start + target.reader_count,
+            ):
+                if reader_id in expected_paths:
+                    raise ValueError("reader_plan_duplicate_global_id")
+                expected_paths[reader_id] = target.path
+    return expected_paths, shard_contract
+
+
 def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummary:
     events, completions, starts, plays, frames, failures = _event_maps(profile, path)
     handshake_latencies = list(plays.values())
     frame_latencies = [value[0] for value in frames.values()]
     success_percent = len(frames) / len(starts) * 100
     reasons: list[str] = []
+    expected_paths, shard_contract = _expected_reader_contract(profile)
+    if any(expected_paths.get(event.reader_id) != event.path for event in events):
+        reasons.append("reader_path_plan_mismatch")
     if success_percent < 99.9:
         reasons.append("session_establishment_below_99_9_percent")
     if failures:
@@ -274,32 +338,14 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
         (event for event in events if event.event == "reader_started" and event.cycle == 0),
         key=lambda event: event.reader_id,
     )
-    if {event.reader_id for event in initial_starts} != set(
-        range(profile.workload.total_readers)
-    ):
+    if {event.reader_id for event in initial_starts} != set(range(profile.workload.total_readers)):
         reasons.append("initial_reader_set_incomplete")
-    elif profile.workload.connect_rate_per_second > 0 and len(initial_starts) > 1:
-        expected_span_ms = (
-            (initial_starts[-1].reader_id - initial_starts[0].reader_id)
-            * 1000
-            / profile.workload.connect_rate_per_second
-        )
-        observed_span_ms = (
-            initial_starts[-1].at_monotonic_ms - initial_starts[0].at_monotonic_ms
-        )
-        tolerance_ms = max(5.0, 200 / profile.workload.connect_rate_per_second)
-        if observed_span_ms + tolerance_ms < expected_span_ms:
-            reasons.append("initial_connect_rate_exceeded")
-    if any(
-        event.event == "reader_disconnected" and event.injected is False
-        for event in events
-    ):
+    if any(event.event == "reader_disconnected" and event.injected is False for event in events):
         reasons.append("unexpected_healthy_disconnect")
-    expected_shards = sum(
-        bool(build_direct_reader_plan(profile, host.name).targets)
-        for host in profile.generator_hosts
-    )
+    expected_shards = len(shard_contract)
     completion_indices = {item.schedule_shard_index for item in completions}
+    scheduled_starts = {item.scheduled_start_unix_ms for item in completions}
+    profile_sha256 = canonical_profile_bytes(profile)[1]
     completion_valid = (
         len(completions) == expected_shards
         and completion_indices == set(range(expected_shards))
@@ -311,13 +357,66 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
             and item.exit_code == 0
             for item in completions
         )
-        and sum(item.started_readers for item in completions)
-        == profile.workload.total_readers
-        and sum(item.ready_readers for item in completions)
-        == profile.workload.total_readers
+        and sum(item.started_readers for item in completions) == profile.workload.total_readers
+        and sum(item.ready_readers for item in completions) == profile.workload.total_readers
+        and len(scheduled_starts) == 1
+        and all(
+            item.generator_host in shard_contract
+            and shard_contract[item.generator_host]
+            == (item.schedule_shard_index, item.reader_plan_sha256)
+            and item.profile_sha256 == profile_sha256
+            and item.clock_synchronized
+            and item.clock_max_error_ms <= profile.evidence_sampling.maximum_clock_error_ms
+            and item.process_start_unix_ms <= item.scheduled_start_unix_ms
+            for item in completions
+        )
     )
     if not completion_valid:
         reasons.append("reader_process_completion_missing_or_invalid")
+
+    if len(scheduled_starts) == 1:
+        schedule_start = next(iter(scheduled_starts))
+        rate = profile.workload.connect_rate_per_second
+        tolerance = profile.evidence_sampling.maximum_clock_error_ms + 5
+        for event in initial_starts:
+            assert event.at_unix_ms is not None
+            expected_at = (
+                schedule_start if rate == 0 else schedule_start + (event.reader_id * 1000 / rate)
+            )
+            if event.at_unix_ms + tolerance < expected_at:
+                reasons.append("initial_connect_rate_exceeded")
+                break
+        if rate > 0 and len(initial_starts) > 1:
+            actual_starts = sorted(
+                event.at_unix_ms for event in initial_starts if event.at_unix_ms is not None
+            )
+            window = min(rate, len(actual_starts) - 1)
+            minimum_span_ms = window * 1000 / rate
+            if (
+                any(
+                    actual_starts[index + window] - actual_starts[index] + tolerance
+                    < minimum_span_ms
+                    for index in range(len(actual_starts) - window)
+                )
+                and "initial_connect_rate_exceeded" not in reasons
+            ):
+                reasons.append("initial_connect_rate_exceeded")
+    elif initial_starts:
+        reasons.append("reader_schedule_epoch_inconsistent")
+
+    observed_rtp_packets = sum(item.rtp_packets for item in completions)
+    if completions and len(scheduled_starts) == 1:
+        measurement_seconds = max(
+            0.001,
+            (max(item.process_end_unix_ms for item in completions) - next(iter(scheduled_starts)))
+            / 1000,
+        )
+        observed_rtp_rate = observed_rtp_packets / measurement_seconds
+    else:
+        observed_rtp_rate = 0.0
+    packet_rate_pass = observed_rtp_rate >= profile.workload.minimum_rtp_packets_per_second
+    if not packet_rate_pass:
+        reasons.append("rtp_packet_rate_below_profile_minimum")
 
     p95 = _nearest_rank(handshake_latencies, 0.95)
     p99 = _nearest_rank(handshake_latencies, 0.99)
@@ -341,6 +440,10 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
         establishment_attempts=len(starts),
         decodable_establishments=len(frames),
         failed_establishments=len(failures),
+        observed_rtp_packets=observed_rtp_packets,
+        observed_rtp_packets_per_second=observed_rtp_rate,
+        minimum_rtp_packets_per_second=profile.workload.minimum_rtp_packets_per_second,
+        packet_rate_slo_pass=packet_rate_pass,
         establishment_success_percent=success_percent,
         describe_to_play_p50_ms=_nearest_rank(handshake_latencies, 0.50),
         describe_to_play_p95_ms=p95,
@@ -369,22 +472,25 @@ def summarize_cold_comparison(
         raise ValueError("cold_comparison_requires_cold_profiles")
     proxy_summary = summarize_reader_events(proxy_profile, proxy_events)
     direct_summary = summarize_reader_events(direct_profile, direct_events)
-    _, _, _, _, proxy_frames, _ = _event_maps(proxy_profile, proxy_events)
-    _, _, _, _, direct_frames, _ = _event_maps(direct_profile, direct_events)
+    _, _, _, proxy_plays, proxy_frames, _ = _event_maps(proxy_profile, proxy_events)
+    _, _, _, direct_plays, direct_frames, _ = _event_maps(direct_profile, direct_events)
     if set(proxy_frames) != set(direct_frames):
         raise ValueError("comparison_establishments_differ")
-    overhead = [
-        proxy_frames[key][0] - direct_frames[key][0] for key in sorted(proxy_frames)
-    ]
+    if set(proxy_plays) != set(direct_plays) or set(proxy_plays) != set(proxy_frames):
+        raise ValueError("comparison_handshakes_differ")
+    overhead = [proxy_plays[key] - direct_plays[key] for key in sorted(proxy_plays)]
     direct_wait = [value[1] for value in direct_frames.values()]
+    proxy_wait = [value[1] for value in proxy_frames.values()]
     if not overhead:
         raise ValueError("comparison_has_no_establishments")
     p50 = _nearest_rank(overhead, 0.50)
     p95 = _nearest_rank(overhead, 0.95)
     p99 = _nearest_rank(overhead, 0.99)
     direct_wait_p99 = _nearest_rank(direct_wait, 0.99)
+    proxy_wait_p99 = _nearest_rank(proxy_wait, 0.99)
     assert p50 is not None and p95 is not None and p99 is not None
     assert direct_wait_p99 is not None
+    assert proxy_wait_p99 is not None
     slo_pass = p99 <= 1000
     reasons: list[str] = []
     if not proxy_summary.valid:
@@ -403,6 +509,7 @@ def summarize_cold_comparison(
         proxy_overhead_p95_ms=p95,
         proxy_overhead_p99_ms=p99,
         direct_wait_for_decodable_p99_ms=direct_wait_p99,
+        proxy_wait_for_decodable_p99_ms=proxy_wait_p99,
         proxy_overhead_slo_ms=1000,
         proxy_overhead_slo_pass=slo_pass,
         valid=not reasons,

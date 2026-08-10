@@ -19,6 +19,7 @@
   "comparison_id": "smoke-lan-warm-gop50-a",
   "evidence_sampling": {
     "interval_seconds": 1,
+    "maximum_clock_error_ms": 10,
     "maximum_gap_factor": 1.5
   },
   "fixture": {
@@ -45,6 +46,7 @@
     "interface": "camera0",
     "jitter_ms": 0,
     "loss_percent": 0,
+    "mtu_bytes": 1500,
     "profile": "lan",
     "rtt_ms": 0
   },
@@ -68,6 +70,7 @@
     "connect_rate_per_second": 10,
     "crud_rate_per_second": 0,
     "endpoint_mode": "proxy",
+    "minimum_rtp_packets_per_second": 100,
     "probe_rate_per_second": 0,
     "registered_paths": 100,
     "session_temperature": "warm",

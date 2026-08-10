@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -113,6 +114,17 @@ def create_fixture(binary: str, path: Path, codec: str) -> None:
     assert path.stat().st_size > 0
 
 
+def reader_evidence_arguments(plan: Path) -> list[str]:
+    return [
+        "--generator-host",
+        "generator-a",
+        "--profile-sha256",
+        "a" * 64,
+        "--reader-plan-sha256",
+        hashlib.sha256(plan.read_bytes()).hexdigest(),
+    ]
+
+
 def probe_source(
     binary: str, port: int, path: str, transport: str
 ) -> subprocess.CompletedProcess[str]:
@@ -196,9 +208,7 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         assert rejected_udp.returncode != 0
 
         reader_plan = tmp_path / "reader-plan.tsv"
-        reader_plan.write_text(
-            "source-00000\t2\t0\nsource-00001\t2\t2\n", encoding="utf-8"
-        )
+        reader_plan.write_text("source-00000\t2\t0\nsource-00001\t2\t2\n", encoding="utf-8")
         events_file = tmp_path / "reader-events.jsonl"
         load_reader = subprocess.Popen(
             [
@@ -221,6 +231,7 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
                 "single",
                 "--global-reader-count",
                 "4",
+                *reader_evidence_arguments(reader_plan),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -234,8 +245,7 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         assert "SUMMARY started=4 decodable=4 failed=0 transport=tcp" in reader_output
         assert "completed=true interrupted=false" in reader_output
         reader_events = [
-            json.loads(line)
-            for line in events_file.read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()
         ]
         assert len(reader_events) == 13
         assert {event["event"] for event in reader_events} == {
@@ -315,6 +325,7 @@ def test_load_reader_interruption_never_reports_a_partial_run_as_success(
             "--global-reader-count",
             "4",
             "--allow-failures",
+            *reader_evidence_arguments(plan),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -363,6 +374,7 @@ def test_load_reader_rejects_a_group_readable_credentials_file(tmp_path: Path) -
             "single",
             "--global-reader-count",
             "1",
+            *reader_evidence_arguments(plan),
         ],
         check=False,
         capture_output=True,

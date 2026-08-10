@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -42,6 +43,12 @@ def observation(
         max_process_fd_percent=fd,
         cgroup_pids_percent=fd,
         network_percent=network,
+        network_packets_per_second=1000,
+        packet_rate_percent=10,
+        interface_mtu_bytes=1500,
+        process_count=1,
+        workload_processes_sha256="c" * 64,
+        cgroup_path_sha256="e" * 64,
     )
 
 
@@ -61,7 +68,10 @@ def generator_counters(
             memory_available_bytes=500,
             network_rx_bytes=network_rx,
             network_tx_bytes=network_tx,
+            network_rx_packets=100,
+            network_tx_packets=200,
             nic_bits_per_second=8_000,
+            interface_mtu_bytes=1500,
         ),
         processes=(
             ProcessCounters(
@@ -70,6 +80,8 @@ def generator_counters(
                 rss_bytes=200,
                 open_file_descriptors=200,
                 max_file_descriptors=1_000,
+                executable_sha256="d" * 64,
+                start_time_ticks=10,
             ),
         ),
         cgroup=CgroupCounters(
@@ -83,6 +95,7 @@ def generator_counters(
         machine_id_sha256="a" * 64,
         boot_id="11111111-1111-1111-1111-111111111111",
         clock_ticks_per_second=100,
+        cgroup_path_sha256="e" * 64,
     )
 
 
@@ -117,6 +130,8 @@ def test_generator_counter_delta_uses_process_cgroup_and_nic_hard_limits() -> No
     assert measured.max_process_fd_percent == 20
     assert measured.cgroup_pids_percent == 20
     assert measured.network_percent == 60
+    assert measured.network_packets_per_second == 0
+    assert measured.interface_mtu_bytes == 1500
 
 
 def test_generator_headroom_requires_every_resource_to_stay_below_70_percent() -> None:
@@ -203,6 +218,10 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
         encoding="utf-8",
     )
     (tmp_path / "proc/123/status").write_text("VmRSS:\t200 kB\n", encoding="utf-8")
+    (tmp_path / "proc/123/cgroup").write_text("0::/load.slice\n", encoding="utf-8")
+    executable = tmp_path / "load-reader"
+    executable.write_bytes(b"load-reader")
+    (tmp_path / "proc/123/exe").symlink_to(executable)
     (tmp_path / "proc/123/fd/0").touch()
     (tmp_path / "proc/123/fd/1").touch()
     (tmp_path / "sys/class/net/camera0/statistics").mkdir(parents=True)
@@ -221,13 +240,12 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
         "MemTotal:       1000 kB\nMemAvailable:    600 kB\n",
         encoding="utf-8",
     )
-    (tmp_path / "sys/class/net/camera0/statistics/rx_bytes").write_text(
-        "1234\n", encoding="utf-8"
-    )
-    (tmp_path / "sys/class/net/camera0/statistics/tx_bytes").write_text(
-        "5678\n", encoding="utf-8"
-    )
+    (tmp_path / "sys/class/net/camera0/statistics/rx_bytes").write_text("1234\n", encoding="utf-8")
+    (tmp_path / "sys/class/net/camera0/statistics/tx_bytes").write_text("5678\n", encoding="utf-8")
+    (tmp_path / "sys/class/net/camera0/statistics/rx_packets").write_text("123\n", encoding="utf-8")
+    (tmp_path / "sys/class/net/camera0/statistics/tx_packets").write_text("456\n", encoding="utf-8")
     (tmp_path / "sys/class/net/camera0/speed").write_text("1000\n", encoding="utf-8")
+    (tmp_path / "sys/class/net/camera0/mtu").write_text("1500\n", encoding="utf-8")
     cgroup = tmp_path / "sys/fs/cgroup/load.slice"
     (cgroup / "cpu.stat").write_text("usage_usec 1234\n", encoding="utf-8")
     (cgroup / "cpu.max").write_text("100000 100000\n", encoding="utf-8")
@@ -235,12 +253,15 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
     (cgroup / "memory.max").write_text("1000000\n", encoding="utf-8")
     (cgroup / "pids.current").write_text("10\n", encoding="utf-8")
     (cgroup / "pids.max").write_text("100\n", encoding="utf-8")
+    (cgroup / "cgroup.procs").write_text("123\n", encoding="utf-8")
 
     counters = read_linux_generator_counters(
         tmp_path,
         interface="camera0",
         pids=(123,),
         cgroup="load.slice",
+        expected_executables={123: hashlib.sha256(b"load-reader").hexdigest()},
+        expected_mtu_bytes=1500,
     )
 
     assert counters.host.cpu_total_ticks == 621
@@ -256,7 +277,12 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
 def test_linux_counter_reader_rejects_an_unsafe_interface_name(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="invalid_network_interface"):
         read_linux_generator_counters(
-            tmp_path, interface="../secret", pids=(123,), cgroup="load.slice"
+            tmp_path,
+            interface="../secret",
+            pids=(123,),
+            cgroup="load.slice",
+            expected_executables={123: "a" * 64},
+            expected_mtu_bytes=1500,
         )
 
 
@@ -292,7 +318,9 @@ def test_linux_sampler_writes_exclusive_raw_observations(
     monkeypatch.setattr(
         load_evidence_module,
         "read_linux_generator_counters",
-        lambda root, *, interface, pids, cgroup: next(counters),
+        lambda root, *, interface, pids, cgroup, expected_executables, expected_mtu_bytes: next(
+            counters
+        ),
     )
     monkeypatch.setattr(load_evidence_module.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(load_evidence_module.time, "sleep", lambda _: None)
@@ -304,6 +332,8 @@ def test_linux_sampler_writes_exclusive_raw_observations(
         interface="camera0",
         pids=(123,),
         cgroup="load.slice",
+        expected_executables={123: "d" * 64},
+        expected_mtu_bytes=1500,
         output=output,
         duration_seconds=1,
         interval_seconds=1,

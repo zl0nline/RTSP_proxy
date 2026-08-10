@@ -22,18 +22,14 @@ Timestamp = Annotated[
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 BootId = Annotated[
     str,
-    StringConstraints(
-        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-    ),
+    StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
 ]
 
 
 class ResourceObservation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
-    generator_host: Annotated[
-        str, StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,253}$")
-    ]
+    generator_host: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,253}$")]
     machine_id_sha256: Sha256
     boot_id: BootId
     timestamp: Timestamp
@@ -46,6 +42,12 @@ class ResourceObservation(BaseModel):
     max_process_fd_percent: Percent
     cgroup_pids_percent: Percent
     network_percent: Percent
+    network_packets_per_second: Annotated[float, Field(ge=0)]
+    packet_rate_percent: Percent
+    interface_mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
+    process_count: Annotated[int, Field(gt=0)]
+    workload_processes_sha256: Sha256
+    cgroup_path_sha256: Sha256
 
 
 class GeneratorHeadroomSummary(BaseModel):
@@ -66,6 +68,12 @@ class GeneratorHeadroomSummary(BaseModel):
     max_process_fd_percent: Percent
     max_cgroup_pids_percent: Percent
     max_network_percent: Percent
+    max_network_packets_per_second: Annotated[float, Field(ge=0)]
+    max_packet_rate_percent: Percent
+    interface_mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
+    process_count: Annotated[int, Field(gt=0)]
+    workload_processes_sha256: Sha256
+    cgroup_path_sha256: Sha256
     valid: bool
     invalid_reasons: tuple[str, ...]
 
@@ -78,7 +86,10 @@ class HostCounters:
     memory_available_bytes: int
     network_rx_bytes: int
     network_tx_bytes: int
+    network_rx_packets: int
+    network_tx_packets: int
     nic_bits_per_second: int
+    interface_mtu_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +99,8 @@ class ProcessCounters:
     rss_bytes: int
     open_file_descriptors: int
     max_file_descriptors: int
+    executable_sha256: str
+    start_time_ticks: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +121,7 @@ class GeneratorCounters:
     machine_id_sha256: str
     boot_id: str
     clock_ticks_per_second: int
+    cgroup_path_sha256: str
 
     def observation_since(
         self,
@@ -121,6 +135,8 @@ class GeneratorCounters:
         idle_delta = self.host.cpu_idle_ticks - previous.host.cpu_idle_ticks
         rx_delta = self.host.network_rx_bytes - previous.host.network_rx_bytes
         tx_delta = self.host.network_tx_bytes - previous.host.network_tx_bytes
+        rx_packets_delta = self.host.network_rx_packets - previous.host.network_rx_packets
+        tx_packets_delta = self.host.network_tx_packets - previous.host.network_tx_packets
         previous_processes = {item.pid: item for item in previous.processes}
         if (
             elapsed_seconds <= 0
@@ -129,12 +145,17 @@ class GeneratorCounters:
             or idle_delta > total_delta
             or rx_delta < 0
             or tx_delta < 0
+            or rx_packets_delta < 0
+            or tx_packets_delta < 0
             or self.host.memory_total_bytes <= 0
             or not 0 <= self.host.memory_available_bytes <= self.host.memory_total_bytes
             or self.host.nic_bits_per_second <= 0
+            or not 576 <= self.host.interface_mtu_bytes <= 9216
+            or self.host.interface_mtu_bytes != previous.host.interface_mtu_bytes
             or self.machine_id_sha256 != previous.machine_id_sha256
             or self.boot_id != previous.boot_id
             or self.clock_ticks_per_second <= 0
+            or self.cgroup_path_sha256 != previous.cgroup_path_sha256
             or {item.pid for item in self.processes} != set(previous_processes)
             or self.cgroup.cpu_capacity_cores <= 0
             or self.cgroup.memory_limit_bytes <= 0
@@ -151,27 +172,18 @@ class GeneratorCounters:
                 tick_delta < 0
                 or process.rss_bytes < 0
                 or process.max_file_descriptors <= 0
-                or not 0
-                <= process.open_file_descriptors
-                <= process.max_file_descriptors
+                or process.executable_sha256 != prior.executable_sha256
+                or process.start_time_ticks != prior.start_time_ticks
+                or not 0 <= process.open_file_descriptors <= process.max_file_descriptors
             ):
                 raise ValueError("invalid_or_non_monotonic_generator_counters")
-            process_cpu.append(
-                tick_delta
-                / self.clock_ticks_per_second
-                / elapsed_seconds
-                * 100
-            )
-            fd_percent.append(
-                process.open_file_descriptors / process.max_file_descriptors * 100
-            )
+            process_cpu.append(tick_delta / self.clock_ticks_per_second / elapsed_seconds * 100)
+            fd_percent.append(process.open_file_descriptors / process.max_file_descriptors * 100)
 
         cgroup_cpu_delta = self.cgroup.cpu_usage_usec - previous.cgroup.cpu_usage_usec
         if (
             cgroup_cpu_delta < 0
-            or not 0
-            <= self.cgroup.memory_current_bytes
-            <= self.cgroup.memory_limit_bytes
+            or not 0 <= self.cgroup.memory_current_bytes <= self.cgroup.memory_limit_bytes
             or not 0 <= self.cgroup.pids_current <= self.cgroup.pids_limit
         ):
             raise ValueError("invalid_or_non_monotonic_generator_counters")
@@ -182,19 +194,26 @@ class GeneratorCounters:
             * 100
         )
         cgroup_cpu = (
-            cgroup_cpu_delta
-            / 1_000_000
-            / elapsed_seconds
-            / self.cgroup.cpu_capacity_cores
-            * 100
+            cgroup_cpu_delta / 1_000_000 / elapsed_seconds / self.cgroup.cpu_capacity_cores * 100
         )
         network = (
-            max(rx_delta, tx_delta)
-            * 8
-            / elapsed_seconds
-            / self.host.nic_bits_per_second
-            * 100
+            max(rx_delta, tx_delta) * 8 / elapsed_seconds / self.host.nic_bits_per_second * 100
         )
+        network_packets_per_second = max(rx_packets_delta, tx_packets_delta) / elapsed_seconds
+        line_rate_packets_per_second = self.host.nic_bits_per_second / (
+            (self.host.interface_mtu_bytes + 38) * 8
+        )
+        process_binding = [
+            {
+                "pid": item.pid,
+                "executable_sha256": item.executable_sha256,
+                "start_time_ticks": item.start_time_ticks,
+            }
+            for item in sorted(self.processes, key=lambda item: item.pid)
+        ]
+        processes_sha256 = hashlib.sha256(
+            json.dumps(process_binding, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         return ResourceObservation(
             generator_host=generator_host,
             machine_id_sha256=self.machine_id_sha256,
@@ -206,13 +225,20 @@ class GeneratorCounters:
             max_process_cpu_percent=min(max(process_cpu, default=0), 100),
             cgroup_cpu_percent=min(cgroup_cpu, 100),
             cgroup_ram_percent=(
-                self.cgroup.memory_current_bytes
-                / self.cgroup.memory_limit_bytes
-                * 100
+                self.cgroup.memory_current_bytes / self.cgroup.memory_limit_bytes * 100
             ),
             max_process_fd_percent=max(fd_percent, default=0),
             cgroup_pids_percent=self.cgroup.pids_current / self.cgroup.pids_limit * 100,
             network_percent=min(network, 100),
+            network_packets_per_second=network_packets_per_second,
+            packet_rate_percent=min(
+                network_packets_per_second / line_rate_packets_per_second * 100,
+                100,
+            ),
+            interface_mtu_bytes=self.host.interface_mtu_bytes,
+            process_count=len(self.processes),
+            workload_processes_sha256=processes_sha256,
+            cgroup_path_sha256=self.cgroup_path_sha256,
         )
 
 
@@ -235,7 +261,19 @@ def summarize_generator_headroom(
     hosts = {item.generator_host for item in observations}
     machines = {item.machine_id_sha256 for item in observations}
     boots = {item.boot_id for item in observations}
-    if len(hosts) != 1 or len(machines) != 1 or len(boots) != 1:
+    bindings = {item.workload_processes_sha256 for item in observations}
+    mtus = {item.interface_mtu_bytes for item in observations}
+    process_counts = {item.process_count for item in observations}
+    cgroups = {item.cgroup_path_sha256 for item in observations}
+    if (
+        len(hosts) != 1
+        or len(machines) != 1
+        or len(boots) != 1
+        or len(bindings) != 1
+        or len(mtus) != 1
+        or len(process_counts) != 1
+        or len(cgroups) != 1
+    ):
         raise ValueError("generator_observation_identity_changed")
     generator_host = next(iter(hosts))
     if expected_generator_host is not None and generator_host != expected_generator_host:
@@ -244,8 +282,7 @@ def summarize_generator_headroom(
     if timestamps != sorted(timestamps) or len(timestamps) != len(set(timestamps)):
         raise ValueError("generator_observation_timestamps_not_monotonic")
     timestamp_gaps = [
-        (current - previous).total_seconds()
-        for previous, current in itertools.pairwise(timestamps)
+        (current - previous).total_seconds() for previous, current in itertools.pairwise(timestamps)
     ]
     maximum_allowed_gap = expected_interval_seconds * maximum_gap_factor
     max_gap = max(
@@ -269,6 +306,7 @@ def summarize_generator_headroom(
         "process_fd": max(item.max_process_fd_percent for item in observations),
         "cgroup_pids": max(item.cgroup_pids_percent for item in observations),
         "network": max(item.network_percent for item in observations),
+        "packet_rate": max(item.packet_rate_percent for item in observations),
     }
     for resource, value in maxima.items():
         if value >= 70:
@@ -289,6 +327,14 @@ def summarize_generator_headroom(
         max_process_fd_percent=maxima["process_fd"],
         max_cgroup_pids_percent=maxima["cgroup_pids"],
         max_network_percent=maxima["network"],
+        max_network_packets_per_second=max(
+            item.network_packets_per_second for item in observations
+        ),
+        max_packet_rate_percent=maxima["packet_rate"],
+        interface_mtu_bytes=next(iter(mtus)),
+        process_count=next(iter(process_counts)),
+        workload_processes_sha256=next(iter(bindings)),
+        cgroup_path_sha256=next(iter(cgroups)),
         valid=not reasons,
         invalid_reasons=tuple(reasons),
     )
@@ -336,8 +382,19 @@ def _read_host_counters(root: Path, *, interface: str) -> HostCounters:
         memory_available_bytes=memory["MemAvailable"],
         network_rx_bytes=_read_integer(interface_root / "statistics/rx_bytes"),
         network_tx_bytes=_read_integer(interface_root / "statistics/tx_bytes"),
+        network_rx_packets=_read_integer(interface_root / "statistics/rx_packets"),
+        network_tx_packets=_read_integer(interface_root / "statistics/tx_packets"),
         nic_bits_per_second=_read_integer(interface_root / "speed") * 1_000_000,
+        interface_mtu_bytes=_read_integer(interface_root / "mtu"),
     )
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _read_process_counters(root: Path, pid: int) -> ProcessCounters:
@@ -352,6 +409,7 @@ def _read_process_counters(root: Path, pid: int) -> ProcessCounters:
     if len(fields) < 13:
         raise ValueError("invalid_process_stat")
     cpu_ticks = int(fields[11]) + int(fields[12])
+    start_time_ticks = int(fields[19])
     rss_match = re.search(
         r"^VmRSS:\s+(\d+)\s+kB$",
         (process_root / "status").read_text(encoding="utf-8"),
@@ -370,6 +428,8 @@ def _read_process_counters(root: Path, pid: int) -> ProcessCounters:
         rss_bytes=int(rss_match.group(1)) * 1024,
         open_file_descriptors=len(tuple((process_root / "fd").iterdir())),
         max_file_descriptors=int(limit_match.group(1)),
+        executable_sha256=_hash_file((process_root / "exe").resolve(strict=True)),
+        start_time_ticks=start_time_ticks,
     )
 
 
@@ -410,22 +470,44 @@ def read_linux_generator_counters(
     interface: str,
     pids: tuple[int, ...],
     cgroup: str,
+    expected_executables: dict[int, str],
+    expected_mtu_bytes: int,
 ) -> GeneratorCounters:
     if re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) is None:
         raise ValueError("invalid_network_interface")
     if not pids or len(set(pids)) != len(pids):
         raise ValueError("generator_pids_empty_or_duplicate")
+    if set(pids) != set(expected_executables):
+        raise ValueError("generator_executable_binding_incomplete")
+    cgroup_root = _safe_cgroup_root(root, cgroup)
+    cgroup_pids = {
+        int(line)
+        for line in (cgroup_root / "cgroup.procs").read_text(encoding="utf-8").splitlines()
+        if line
+    }
+    if cgroup_pids != set(pids):
+        raise ValueError("generator_cgroup_process_set_mismatch")
+    expected_cgroup = "/" + PurePosixPath(cgroup).as_posix()
+    for pid in pids:
+        membership = (root / "proc" / str(pid) / "cgroup").read_text(encoding="utf-8").splitlines()
+        if membership != [f"0::{expected_cgroup}"]:
+            raise ValueError("generator_process_cgroup_membership_mismatch")
     machine_id = (root / "etc/machine-id").read_text(encoding="utf-8").strip()
-    boot_id = (
-        root / "proc/sys/kernel/random/boot_id"
-    ).read_text(encoding="utf-8").strip()
+    boot_id = (root / "proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    host = _read_host_counters(root, interface=interface)
+    if host.interface_mtu_bytes != expected_mtu_bytes:
+        raise ValueError("generator_interface_mtu_mismatch")
+    processes = tuple(_read_process_counters(root, pid) for pid in sorted(pids))
+    if any(process.executable_sha256 != expected_executables[process.pid] for process in processes):
+        raise ValueError("generator_process_executable_digest_mismatch")
     return GeneratorCounters(
-        host=_read_host_counters(root, interface=interface),
-        processes=tuple(_read_process_counters(root, pid) for pid in sorted(pids)),
+        host=host,
+        processes=processes,
         cgroup=_read_cgroup_counters(root, cgroup),
         machine_id_sha256=hashlib.sha256(machine_id.encode()).hexdigest(),
         boot_id=boot_id,
         clock_ticks_per_second=int(os.sysconf("SC_CLK_TCK")),
+        cgroup_path_sha256=hashlib.sha256(expected_cgroup.encode()).hexdigest(),
     )
 
 
@@ -436,6 +518,8 @@ def sample_linux_generator_resources(
     interface: str,
     pids: tuple[int, ...],
     cgroup: str,
+    expected_executables: dict[int, str],
+    expected_mtu_bytes: int,
     output: Path,
     duration_seconds: int,
     interval_seconds: float,
@@ -449,7 +533,12 @@ def sample_linux_generator_resources(
         if not output.parent.is_dir():
             raise
     previous = read_linux_generator_counters(
-        root, interface=interface, pids=pids, cgroup=cgroup
+        root,
+        interface=interface,
+        pids=pids,
+        cgroup=cgroup,
+        expected_executables=expected_executables,
+        expected_mtu_bytes=expected_mtu_bytes,
     )
     previous_at = time.monotonic()
     deadline = previous_at + duration_seconds
@@ -460,7 +549,12 @@ def sample_linux_generator_resources(
             time.sleep(min(interval_seconds, deadline - previous_at))
             observed_at = time.monotonic()
             current = read_linux_generator_counters(
-                root, interface=interface, pids=pids, cgroup=cgroup
+                root,
+                interface=interface,
+                pids=pids,
+                cgroup=cgroup,
+                expected_executables=expected_executables,
+                expected_mtu_bytes=expected_mtu_bytes,
             )
             timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             observation = current.observation_since(

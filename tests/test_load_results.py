@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from rtsp_proxy.load_catalog import build_direct_reader_plan, build_proxy_reader_plan
 from rtsp_proxy.load_cli import main as load_cli_main
-from rtsp_proxy.load_profile import LoadProfile, initialize_run_directory
+from rtsp_proxy.load_profile import LoadProfile, canonical_profile_bytes, initialize_run_directory
 from rtsp_proxy.load_results import (
     ReaderEvent,
     merge_reader_event_files,
@@ -17,9 +19,7 @@ from rtsp_proxy.load_results import (
 from tests.test_load_profile import valid_profile
 
 
-def reader_profile(
-    *, temperature: str = "warm", endpoint_mode: str = "proxy"
-) -> LoadProfile:
+def reader_profile(*, temperature: str = "warm", endpoint_mode: str = "proxy") -> LoadProfile:
     raw = valid_profile()
     workload = raw["workload"]
     assert isinstance(workload, dict)
@@ -36,10 +36,33 @@ def write_events(path: Path, events: list[dict[str, object]]) -> None:
     )
 
 
-def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, object]]:
+def successful_events(
+    *,
+    endpoint_mode: str = "proxy",
+    temperature: str = "warm",
+    schedule_start_unix_ms: int = 2_000_000,
+    handshake_offset_ms: float = 0,
+    decodable_offset_ms: float = 0,
+) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
-    for reader_id, handshake_ms in enumerate((100, 200, 300, 400)):
-        path = "a" * 25
+    profile = reader_profile(temperature=temperature, endpoint_mode=endpoint_mode)
+    plan = (
+        build_proxy_reader_plan(profile, "generator-a")
+        if endpoint_mode == "proxy"
+        else build_direct_reader_plan(profile, "generator-a")
+    )
+    expected_paths = {
+        reader_id: target.path
+        for target in plan.targets
+        for reader_id in range(target.reader_id_start, target.reader_id_start + target.reader_count)
+    }
+    plan_body = "".join(
+        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}\n"
+        for target in plan.targets
+    ).encode("ascii")
+    for reader_id, base_handshake_ms in enumerate((100, 200, 300, 400)):
+        handshake_ms = base_handshake_ms + handshake_offset_ms
+        path = expected_paths[reader_id]
         events.extend(
             [
                 {
@@ -48,6 +71,7 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
                     "cycle": 0,
                     "path": path,
                     "at_monotonic_ms": reader_id * 100,
+                    "at_unix_ms": schedule_start_unix_ms + reader_id * 100,
                 },
                 {
                     "event": "play_sent",
@@ -63,9 +87,7 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
                     "cycle": 0,
                     "path": path,
                     "at_monotonic_ms": reader_id * 100 + handshake_ms + 500,
-                    "describe_to_first_decodable_ms": handshake_ms
-                    + 500
-                    + decodable_offset_ms,
+                    "describe_to_first_decodable_ms": handshake_ms + 500 + decodable_offset_ms,
                     "play_to_first_decodable_ms": 500 + decodable_offset_ms,
                 },
             ]
@@ -83,6 +105,15 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
             "exit_code": 0,
             "schedule_shard_index": 0,
             "schedule_shards": 1,
+            "generator_host": "generator-a",
+            "profile_sha256": canonical_profile_bytes(profile)[1],
+            "reader_plan_sha256": hashlib.sha256(plan_body).hexdigest(),
+            "scheduled_start_unix_ms": schedule_start_unix_ms,
+            "process_start_unix_ms": schedule_start_unix_ms - 100,
+            "process_end_unix_ms": schedule_start_unix_ms + 1000,
+            "clock_synchronized": True,
+            "clock_max_error_ms": 1,
+            "rtp_packets": 1000,
         }
     )
     return events
@@ -97,6 +128,7 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
             "cycle": 0,
             "path": "a" * 25,
             "at_monotonic_ms": 1,
+            "at_unix_ms": 1,
         },
         {
             "event": "reader_started",
@@ -104,6 +136,7 @@ def successful_events(*, decodable_offset_ms: float = 0) -> list[dict[str, objec
             "cycle": 0,
             "path": "a" * 25,
             "at_monotonic_ms": 1,
+            "at_unix_ms": 1,
             "reason": "gstreamer_error",
         },
     ],
@@ -147,17 +180,40 @@ def test_reader_summary_rejects_missing_completion_and_rate_overshoot(
     tmp_path: Path,
 ) -> None:
     events_path = tmp_path / "readers.jsonl"
-    events = successful_events()[:-1]
+    events = successful_events()
     for event in events:
         if event["event"] == "reader_started":
             event["at_monotonic_ms"] = 0
+            event["at_unix_ms"] = 2_000_000
     write_events(events_path, events)
 
     summary = summarize_reader_events(reader_profile(), events_path)
 
     assert summary.valid is False
     assert "initial_connect_rate_exceeded" in summary.invalid_reasons
-    assert "reader_process_completion_missing_or_invalid" in summary.invalid_reasons
+    missing_path = tmp_path / "missing-completion.jsonl"
+    write_events(missing_path, successful_events()[:-1])
+    missing = summarize_reader_events(reader_profile(), missing_path)
+    assert "reader_process_completion_missing_or_invalid" in missing.invalid_reasons
+
+
+def test_reader_summary_rejects_reader_id_path_mismatch(tmp_path: Path) -> None:
+    events_path = tmp_path / "readers.jsonl"
+    events = successful_events()
+    wrong_path = next(
+        event["path"]
+        for event in events
+        if event.get("reader_id") == 0 and event.get("event") == "reader_started"
+    )
+    for event in events:
+        if event.get("reader_id") == 3:
+            event["path"] = wrong_path
+    write_events(events_path, events)
+
+    summary = summarize_reader_events(reader_profile(), events_path)
+
+    assert summary.valid is False
+    assert "reader_path_plan_mismatch" in summary.invalid_reasons
 
 
 def test_reader_errors_and_missing_decodable_frame_invalidate_run(tmp_path: Path) -> None:
@@ -167,33 +223,34 @@ def test_reader_errors_and_missing_decodable_frame_invalidate_run(tmp_path: Path
         for event in successful_events()
         if event["event"] != "run_completed" and event.get("reader_id") != 3
     ]
+    expected_path = next(
+        event["path"]
+        for event in successful_events()
+        if event.get("reader_id") == 3 and event.get("event") == "reader_started"
+    )
+    failed_completion = dict(successful_events()[-1])
+    failed_completion.update(
+        ready_readers=3,
+        failed_attempts=1,
+        exit_code=6,
+        rtp_packets=750,
+    )
     events.extend(
         [
             {
                 "event": "reader_started",
                 "reader_id": 3,
                 "cycle": 0,
-                "path": "a" * 25,
+                "path": expected_path,
                 "at_monotonic_ms": 300,
+                "at_unix_ms": 2_000_300,
             },
-            {
-                "event": "run_completed",
-                "at_monotonic_ms": 1000,
-                "started_readers": 4,
-                "ready_readers": 3,
-                "failed_attempts": 1,
-                "normal_completion": True,
-                "interrupted": False,
-                "lifecycle_complete": True,
-                "exit_code": 6,
-                "schedule_shard_index": 0,
-                "schedule_shards": 1,
-            },
+            failed_completion,
             {
                 "event": "reader_error",
                 "reader_id": 3,
                 "cycle": 0,
-                "path": "a" * 25,
+                "path": expected_path,
                 "at_monotonic_ms": 350,
                 "reason": "gstreamer_error",
             },
@@ -219,12 +276,16 @@ def test_cold_latency_requires_compatible_direct_control_decomposition(
 ) -> None:
     proxy_events = tmp_path / "proxy.jsonl"
     direct_events = tmp_path / "direct.jsonl"
-    write_events(proxy_events, successful_events(decodable_offset_ms=200))
-    write_events(direct_events, successful_events())
-    proxy_profile = reader_profile(temperature="cold")
-    direct_profile = reader_profile(
-        temperature="cold", endpoint_mode="direct-control"
+    write_events(
+        proxy_events,
+        successful_events(temperature="cold", handshake_offset_ms=200, decodable_offset_ms=900),
     )
+    write_events(
+        direct_events,
+        successful_events(endpoint_mode="direct-control", temperature="cold"),
+    )
+    proxy_profile = reader_profile(temperature="cold")
+    direct_profile = reader_profile(temperature="cold", endpoint_mode="direct-control")
 
     standalone = summarize_reader_events(proxy_profile, proxy_events)
     comparison = summarize_cold_comparison(
@@ -239,6 +300,8 @@ def test_cold_latency_requires_compatible_direct_control_decomposition(
     assert standalone.latency_gate == "requires_direct_control_decomposition"
     assert comparison.compared_establishments == 4
     assert comparison.proxy_overhead_p99_ms == 200
+    assert comparison.proxy_wait_for_decodable_p99_ms == 1400
+    assert comparison.direct_wait_for_decodable_p99_ms == 500
     assert comparison.proxy_overhead_slo_pass is True
     assert comparison.valid is True
 
@@ -246,8 +309,11 @@ def test_cold_latency_requires_compatible_direct_control_decomposition(
 def test_cold_comparison_rejects_incompatible_profiles(tmp_path: Path) -> None:
     proxy_events = tmp_path / "proxy.jsonl"
     direct_events = tmp_path / "direct.jsonl"
-    write_events(proxy_events, successful_events())
-    write_events(direct_events, successful_events())
+    write_events(proxy_events, successful_events(temperature="cold"))
+    write_events(
+        direct_events,
+        successful_events(endpoint_mode="direct-control", temperature="cold"),
+    )
     proxy_profile = reader_profile(temperature="cold")
     incompatible_raw = valid_profile()
     workload = incompatible_raw["workload"]
