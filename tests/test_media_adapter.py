@@ -13,7 +13,7 @@ import pytest
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.load_catalog import apply_load_catalog, build_load_catalog
 from rtsp_proxy.load_cli import main as load_cli_main
-from rtsp_proxy.load_profile import LoadProfile
+from rtsp_proxy.load_profile import LoadProfile, initialize_run_directory
 from rtsp_proxy.media import (
     MediaMtxClient,
     MediaNodeProtocolError,
@@ -162,17 +162,31 @@ def test_load_catalog_apply_is_on_demand_and_verifies_inventory_and_mapping(
     )
 
     MediaMtxFixtureHandler.paths = {}
-    profile_path = tmp_path / "profile.json"
-    profile_path.write_text(json.dumps(valid_profile()), encoding="utf-8")
+    run_directory = tmp_path / "run"
+    initialize_run_directory(profile, run_directory)
     assert (
         load_cli_main(
-            ["apply-paths", str(profile_path), "--api-url", media_api]
+            ["apply-paths", str(run_directory), "--api-url", media_api]
         )
         == 0
     )
     output = capsys.readouterr()
     assert output.err == ""
     assert output.out == "APPLIED paths=4 verified=3\n"
+
+    assert (
+        load_cli_main(
+            [
+                "apply-paths",
+                str(run_directory),
+                "--api-url",
+                media_api.replace("127.0.0.1", "localhost"),
+            ]
+        )
+        == 2
+    )
+    rejected = capsys.readouterr()
+    assert rejected.err == "load_profile_error: invalid_or_unreadable_profile\n"
 
 
 def test_media_adapter_rejects_invalid_or_rejected_responses_without_secrets(

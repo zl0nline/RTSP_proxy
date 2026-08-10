@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.load_catalog import (
     build_load_catalog,
+    build_proxy_reader_plan,
     load_public_id,
+    write_direct_reader_paths,
     write_load_catalog,
     write_reader_paths,
 )
@@ -64,14 +68,79 @@ def test_catalog_write_is_exclusive_and_contains_no_userinfo(tmp_path: Path) -> 
         raise AssertionError("load catalog was overwritten")
 
 
-def test_reader_paths_are_bound_to_the_same_catalog_without_urls(tmp_path: Path) -> None:
+def test_proxy_reader_plan_is_bound_to_the_catalog_without_urls(tmp_path: Path) -> None:
     profile = LoadProfile.model_validate(valid_profile())
     destination = tmp_path / "reader-paths.txt"
 
-    paths_sha256 = write_reader_paths(build_load_catalog(profile), destination)
+    plan = build_proxy_reader_plan(profile)
+    paths_sha256 = write_reader_paths(plan, destination)
 
     assert len(paths_sha256) == 64
     assert destination.read_text(encoding="utf-8").splitlines() == [
-        path.public_id for path in build_load_catalog(profile).paths
+        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}"
+        for target in plan.targets
     ]
     assert "rtsp://" not in destination.read_text(encoding="utf-8")
+
+
+def test_reader_paths_include_only_active_sources(tmp_path: Path) -> None:
+    raw = valid_profile()
+    workload = raw["workload"]
+    assert isinstance(workload, dict)
+    workload["active_sources"] = 2
+    workload["total_readers"] = 4
+    profile = LoadProfile.model_validate(raw)
+    destination = tmp_path / "reader-paths.txt"
+
+    write_reader_paths(build_proxy_reader_plan(profile), destination)
+
+    assert len(destination.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_direct_control_paths_are_rendered_per_generator_host(tmp_path: Path) -> None:
+    raw = valid_profile(tier="capacity")
+    workload = raw["workload"]
+    assert isinstance(workload, dict)
+    workload["endpoint_mode"] = "direct-control"
+    profile = LoadProfile.model_validate(raw)
+    first = tmp_path / "generator-a.txt"
+    second = tmp_path / "generator-b.txt"
+
+    write_direct_reader_paths(profile, "generator-a", first)
+    write_direct_reader_paths(profile, "generator-b", second)
+
+    assert first.read_text(encoding="utf-8").splitlines() == [
+        "source-00000\t2\t0",
+        "source-00001\t2\t4",
+    ]
+    assert second.read_text(encoding="utf-8").splitlines() == [
+        "source-00002\t2\t2",
+        "source-00003\t2\t6",
+    ]
+
+    with pytest.raises(ValueError, match="unknown_generator_host"):
+        write_direct_reader_paths(profile, "missing", tmp_path / "missing.txt")
+
+
+def test_reader_plan_preserves_independent_active_and_reader_axes() -> None:
+    raw = valid_profile()
+    workload = raw["workload"]
+    assert isinstance(workload, dict)
+    workload["active_sources"] = 3
+    workload["total_readers"] = 8
+    profile = LoadProfile.model_validate(raw)
+
+    plan = build_proxy_reader_plan(profile)
+
+    assert len(plan.targets) == 3
+    assert sum(target.reader_count for target in plan.targets) == 8
+    assert [target.reader_count for target in plan.targets] == [3, 3, 2]
+    ids = {
+        reader_id
+        for target in plan.targets
+        for reader_id in range(
+            target.reader_id_start,
+            target.reader_id_start + target.reader_count,
+        )
+    }
+    assert ids == set(range(8))

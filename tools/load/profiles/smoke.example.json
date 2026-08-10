@@ -6,6 +6,7 @@
     "git_commit": "0000000000000000000000000000000000000000",
     "gstreamer_build_id": "replace-with-dpkg-build-id",
     "gstreamer_version": "1.24.2",
+    "load_reader_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "mediamtx_sha256": "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336",
     "mediamtx_version": "v1.20.0",
     "pull_server_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -14,6 +15,11 @@
     "measurement_seconds": 600,
     "soak_seconds": 0,
     "warmup_seconds": 0
+  },
+  "comparison_id": "smoke-lan-warm-gop50-a",
+  "evidence_sampling": {
+    "interval_seconds": 1,
+    "maximum_gap_factor": 1.5
   },
   "fixture": {
     "audio": "none",
@@ -44,7 +50,18 @@
   },
   "schema_version": 1,
   "seed": 52545350,
+  "reader_credentials_file": "/run/rtsp-load/external-basic.txt",
+  "reader_lifecycle": {
+    "backoff_base_ms": 250,
+    "backoff_max_ms": 30000,
+    "disconnect_rate_per_second": 0,
+    "mode": "single",
+    "outage_percent": 0,
+    "reconnect_attempts": 0
+  },
   "sut_architecture": "amd64",
+  "sut_rtsp_host": "proxy.load.internal",
+  "sut_rtsp_port": 9999,
   "tier": "smoke",
   "workload": {
     "active_sources": 100,
