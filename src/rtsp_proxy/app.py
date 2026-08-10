@@ -2,7 +2,11 @@ from fastapi import FastAPI, Response, status
 from pydantic import BaseModel
 
 from rtsp_proxy.config import Settings
-from rtsp_proxy.health import MissingReadinessProvider, ReadinessProvider
+from rtsp_proxy.health import (
+    MissingReadinessProvider,
+    ReadinessProvider,
+    normalize_readiness_results,
+)
 
 
 class LiveStatus(BaseModel):
@@ -35,7 +39,10 @@ def create_app(
 
     @app.get("/health/ready", response_model=ReadyStatus)
     async def ready(response: Response) -> ReadyStatus:
-        results = await readiness_provider.check(settings.role)
+        results = normalize_readiness_results(
+            settings.role,
+            await readiness_provider.check(settings.role),
+        )
         is_ready = all(result.ready for result in results)
         if not is_ready:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE

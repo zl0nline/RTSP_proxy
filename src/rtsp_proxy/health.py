@@ -34,3 +34,46 @@ class MissingReadinessProvider:
             )
             for dependency in ROLE_DEPENDENCIES[role]
         )
+
+
+def normalize_readiness_results(
+    role: RuntimeRole,
+    results: tuple[DependencyResult, ...],
+) -> tuple[DependencyResult, ...]:
+    grouped: dict[str, list[DependencyResult]] = {}
+    for result in results:
+        grouped.setdefault(result.name, []).append(result)
+
+    normalized: list[DependencyResult] = []
+    required = ROLE_DEPENDENCIES[role]
+    for name in required:
+        matches = grouped.get(name, [])
+        if not matches:
+            normalized.append(
+                DependencyResult(
+                    name=name,
+                    ready=False,
+                    reason="readiness_check_missing",
+                )
+            )
+        elif len(matches) > 1:
+            normalized.append(
+                DependencyResult(
+                    name=name,
+                    ready=False,
+                    reason="readiness_check_duplicate",
+                )
+            )
+        else:
+            normalized.append(matches[0])
+
+    for name in sorted(set(grouped).difference(required)):
+        normalized.append(
+            DependencyResult(
+                name=name,
+                ready=False,
+                reason="readiness_check_unexpected",
+            )
+        )
+
+    return tuple(normalized)

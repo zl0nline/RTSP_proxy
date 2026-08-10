@@ -50,7 +50,17 @@ def test_ready_reports_a_stable_reason_without_dependency_details() -> None:
                 "name": "database",
                 "status": "fail",
                 "reason": "database_unavailable",
-            }
+            },
+            {
+                "name": "schema",
+                "status": "fail",
+                "reason": "readiness_check_missing",
+            },
+            {
+                "name": "session_store",
+                "status": "fail",
+                "reason": "readiness_check_missing",
+            },
         ],
     }
 
@@ -102,6 +112,49 @@ def test_unwired_readiness_names_the_dependencies_required_by_each_role(
 
     assert response.status_code == 503
     assert {check["name"] for check in response.json()["checks"]} == required_checks
+
+
+@pytest.mark.parametrize(
+    ("provided", "expected_reason"),
+    [
+        ((), "readiness_check_missing"),
+        (
+            (
+                DependencyResult(name="database", ready=True),
+                DependencyResult(name="database", ready=True),
+                DependencyResult(name="schema", ready=True),
+                DependencyResult(name="session_store", ready=True),
+            ),
+            "readiness_check_duplicate",
+        ),
+        (
+            (
+                DependencyResult(name="database", ready=True),
+                DependencyResult(name="schema", ready=True),
+                DependencyResult(name="session_store", ready=True),
+                DependencyResult(name="unknown", ready=True),
+            ),
+            "readiness_check_unexpected",
+        ),
+    ],
+)
+def test_readiness_rejects_missing_duplicate_or_unexpected_provider_checks(
+    provided: tuple[DependencyResult, ...],
+    expected_reason: str,
+) -> None:
+    class InvalidProvider(ReadinessProvider):
+        async def check(self, role: RuntimeRole) -> tuple[DependencyResult, ...]:
+            return provided
+
+    response = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            readiness=InvalidProvider(),
+        )
+    ).get("/health/ready")
+
+    assert response.status_code == 503
+    assert expected_reason in {check["reason"] for check in response.json()["checks"]}
 
 
 def test_systemd_environment_selects_the_runtime_role(monkeypatch: pytest.MonkeyPatch) -> None:
