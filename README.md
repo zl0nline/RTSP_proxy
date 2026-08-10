@@ -7,8 +7,10 @@ TCP endpoint.
 >
 > - Planning consensus: **COMPLETE** — issues #1–#14 согласованы, сквозные
 >   противоречия исправлены.
-> - Phase 0: **AWAITING OWNER AUTHORIZATION** — evidence/spikes ещё не запущены.
-> - Implementation: **NOT STARTED**.
+> - Phase 0: **IN PROGRESS** — owner authorization получено 10 августа 2026.
+> - Foundation implementation: **IN PROGRESS** — health API, release verifier,
+>   Python package и direct-Linux systemd artifacts созданы.
+> - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
 > - 10k: **NOT CLAIMED** — capacity определяется только измерениями.
@@ -57,7 +59,8 @@ External FFmpeg -> RTSP/TCP :9999 -> MediaMTX -> cameras
 ```
 
 - Control plane: Python 3.12, FastAPI, Jinja2/HTMX, PostgreSQL.
-- Media plane: pinned MediaMTX digest; Python не proxy/transcode media.
+- Media plane: pinned MediaMTX version/binary SHA-256; Python не
+  proxy/transcode media.
 - Delivery: synchronous desired+audit+outbox transaction и идемпотентный
   reconciler.
 - Health: MediaMTX signals + bounded `source_probe`/`path_probe` через pinned
@@ -67,6 +70,8 @@ External FFmpeg -> RTSP/TCP :9999 -> MediaMTX -> cameras
   authz epochs, no-oracle и append-only/WORM audit.
 - Operations: role health, expand-contract migrations, PITR,
   post-restore report-only, drain/quarantine и runbooks.
+- Deployment: напрямую на Linux hosts — versioned root-owned releases,
+  dedicated users и hardened `systemd` units; Docker не используется.
 
 ## Ключевые инварианты
 
@@ -140,7 +145,9 @@ L4 перед gateway допустим только потому, что люб�
 
 ## План реализации
 
-Реализация не начинается без отдельного owner decision.
+Phase 0 и foundation implementation явно разрешены владельцем 10 августа 2026.
+Product behavior, зависящий от неподтверждённых MediaMTX/auth/topology forks, не
+принимается как готовый до соответствующего evidence gate.
 
 ### Pre-Phase 0
 
@@ -151,7 +158,7 @@ L4 перед gateway допустим только потому, что люб�
 
 ### Phase 0 — evidence foundation
 
-- pin MediaMTX/FFmpeg/ffprobe versions and digests;
+- pin MediaMTX/FFmpeg/ffprobe versions and artifact checksums;
 - prove API/auth/hot-update/restart/metrics and transparent RTSP semantics;
 - build pull-mode RTSP load harness;
 - find single-node knee and publish safe envelope;
@@ -190,14 +197,43 @@ L4 перед gateway допустим только потому, что люб�
 
 ## Repository status
 
-Репозиторий пока содержит planning artifacts, а не реализованный сервис.
-Описание функции не означает наличие кода или доказанную production
-характеристику. Issue #10 остаётся evidence blocker для scale-out topology;
-issues #1–#14 — execution map.
+Репозиторий содержит исполняемый Phase 0 foundation: Python package, role-aware
+health API, checksum/path/architecture release verifier, тесты и direct-Linux
+  systemd artifacts. Catalog, PostgreSQL, MediaMTX adapter и полный внешний
+  FFmpeg RTSP contract ещё не реализованы; baseline effective-config contract
+  уже запускается против pinned MediaMTX. Наличие foundation-кода не означает
+  доказанную production характеристику. Issue #10 остаётся evidence blocker
+  для scale-out topology; issues #1–#14 — execution map.
+
+## Локальная разработка
+
+```sh
+uv sync --locked --all-groups
+uv run pytest
+uv run ruff check src tests
+uv run mypy
+uv build
+```
+
+External MediaMTX contract запускается отдельно с проверенным binary:
+
+```sh
+MEDIAMTX_BINARY=/path/to/mediamtx uv run pytest -m contract tests/contract
+```
+
+Direct-Linux layout и activation contract описаны в
+[deploy/README.md](deploy/README.md).
 
 ## Нормативные ссылки
 
 - [Production plan](docs/PRODUCTION_PLAN.md)
+- [Engineering context](CONTEXT.md)
+- [Initial SLI catalog](docs/SLI_CATALOG.md)
+- [Camera profile contract](docs/CAMERA_PROFILE.md)
+- [Capacity worksheet](docs/CAPACITY_WORKSHEET.md)
+- [Failure-domain matrix](docs/FAILURE_DOMAIN_MATRIX.md)
+- [Risk register](docs/RISK_REGISTER.md)
+- [Phase 0 MediaMTX candidate ADR](docs/adr/0001-mediamtx-v1.20.0-phase-0-candidate.md)
 - [EPIC #14](https://github.com/zl0nline/RTSP_proxy/issues/14)
 - [Architecture/SLO/capacity #1](https://github.com/zl0nline/RTSP_proxy/issues/1)
 - [Foundation #2](https://github.com/zl0nline/RTSP_proxy/issues/2)

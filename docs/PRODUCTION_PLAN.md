@@ -4,7 +4,7 @@
 > [issues #1–#14](https://github.com/zl0nline/RTSP_proxy/issues).
 >
 > **PLANNING CONSENSUS: COMPLETE · SPEC CORRECTIONS: COMPLETE · PHASE 0:
-> AWAITING OWNER AUTHORIZATION · PRODUCTION: NO-GO · 10K: NOT CLAIMED**
+> IN PROGRESS · FOUNDATION: IN PROGRESS · PRODUCTION: NO-GO · 10K: NOT CLAIMED**
 
 Этот документ — единая исполнимая спецификация проекта. Он описывает, что
 следует построить, в каком порядке принимать решения и какими артефактами
@@ -13,8 +13,10 @@
 потоков.
 
 Consensus означает, что согласованы инварианты, порядок экспериментов и
-acceptance criteria. Начало Phase 0, feature implementation, pilot и каждой
-следующей migration wave требует отдельного решения владельца проекта.
+acceptance criteria. Владелец разрешил Phase 0 и foundation implementation 10
+августа 2026. Product behavior, зависящий от неподтверждённых fork decisions,
+pilot и каждая следующая migration wave требуют прохождения своих gates и
+отдельного решения владельца проекта.
 
 ## 1. Иерархия решений
 
@@ -83,7 +85,7 @@ URL или handshake.
 В scope:
 
 - Python 3.12, FastAPI, Jinja2/HTMX и PostgreSQL для control plane;
-- pinned MediaMTX digest для media plane;
+- pinned MediaMTX version и binary SHA-256 для media plane;
 - on-demand pull источников;
 - RTSP-over-TCP interleaved снаружи и до камеры;
 - FFmpeg + supervisor как эталонный внешний consumer;
@@ -108,9 +110,10 @@ URL или handshake.
 | Уровень | Статус | Условие перехода |
 |---|---|---|
 | Planning consensus | COMPLETE | Issues согласованы, corrections внесены |
-| Phase 0 | AWAITING AUTHORIZATION | Явное owner decision со scope |
+| Phase 0 | IN PROGRESS | Owner authorization получено 2026-08-10 |
 | Scale-out topology | EVIDENCE BLOCKED | Провален single-node gate и пройден topology spike #10 |
-| Product implementation | NOT STARTED | Зелёные обязательные Phase 0 fork decisions |
+| Foundation implementation | IN PROGRESS | Health/release/package/Linux artifacts начаты |
+| Product behavior | EVIDENCE GATED | Зелёные обязательные Phase 0 fork decisions |
 | Production pilot | NO-GO | Зелёные artifacts #1–#12 и owner sign-off |
 | Scale after pilot 100 | NO-GO | 7-day exit gate #13 и опубликованный envelope |
 | 10k claim | NOT CLAIMED | Production-like evidence конкретного workload |
@@ -132,7 +135,8 @@ URL или handshake.
    обычная `rtsp://`; consumer не должен отличать proxy endpoint от прямой
    RTSP-камеры.
 3. Python не находится в media datapath и не proxy/remux/transcode video.
-4. MediaMTX запускается только по pinned digest и compatibility manifest.
+4. MediaMTX запускается только из release artifact с pinned version/SHA-256 и
+   compatibility manifest.
 5. PostgreSQL — единственный source of truth desired state. JSON/CSV используются
    только для import/export.
 6. API подтверждает `desired accepted`, а не ложно обещает `applied`.
@@ -153,8 +157,8 @@ URL или handshake.
     capacity forecast и отдельного spike.
 14. Security, audit, observability, restore, rollback и capacity — release
     gates, а не post-launch work.
-15. Неизвестные возможности MediaMTX подтверждаются executable tests конкретного
-    digest.
+15. Неизвестные возможности MediaMTX подтверждаются executable tests конкретных
+    version и binary SHA-256.
 16. Cold start = `proxy_overhead + wait_for_keyframe(GOP)`. SLO предъявляется к
     нашей части; GOP фиксируется в camera profile.
 
@@ -289,18 +293,23 @@ evidence.
 
 ## 9. Foundation и immutable deployment
 
-### 9.1 Build и supply chain
+### 9.1 Linux release и supply chain
 
-- production manifests use `image@sha256:...`; mutable tags запрещены;
-- CI проверяет digest allowlist, SBOM/signature, dependencies и compatibility;
-- dev/prod images разделены;
-- production image: multi-stage slim, locked dependencies, non-root,
-  read-only filesystem где возможно, без compiler/dev tools/hot reload;
-- startup smoke выполняется против реально запущенных images.
+- Docker/containers не используются; target — direct Linux deployment;
+- release manifest фиксирует application wheel/lock hash, MediaMTX binary
+  version/SHA-256, FFmpeg/ffprobe versions, schema/config compatibility;
+- CI проверяет checksums, provenance/signature где доступна, SBOM, dependencies,
+  wheel/sdist, lockfile и clean Linux install;
+- production release размещается root-owned в
+  `/opt/rtsp-proxy/releases/<version>` и не изменяется service users;
+- `/opt/rtsp-proxy/current` переключается atomic symlink; предыдущий release
+  сохраняется для rollback;
+- runtime host не требует compiler/dev tools/hot reload;
+- startup smoke выполняется против реально запущенных binaries.
 
 ### 9.2 MediaMTX contract levels
 
-1. **Build/deploy:** digest и release manifest immutable.
+1. **Build/deploy:** binary/wheel checksums и release manifest immutable.
 2. **Startup:** executable API/auth/metrics/RTSP compatibility probe.
 3. **Runtime:** readiness читает minimal effective contract конкретного node.
 
@@ -309,9 +318,23 @@ Readiness проверяет effective config через API:
 - TCP-only transport;
 - API/metrics не слушают внешний interface;
 - HLS/WebRTC/playback/record и ненужные listeners выключены;
-- version/digest соответствуют manifest.
+- reported version и SHA-256 установленного binary соответствуют manifest.
 
-### 9.3 Config classes
+### 9.3 Linux process layout
+
+- `uv sync --locked` используется в development; production устанавливает
+  проверенный wheel/venv из lockfile в versioned release directory;
+- web, worker, reconciler, probe, collector и MediaMTX — отдельные `systemd`
+  services под dedicated non-login users;
+- units фиксируют config/environment files, working directory, restart policy,
+  timeouts, `LimitNOFILE`, memory/CPU limits и dependencies;
+- hardening baseline: `NoNewPrivileges=yes`, `ProtectSystem=strict`,
+  `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictSUIDSGID=yes`, empty capability
+  set by default и allowlisted `ReadWritePaths`;
+- config/secrets root-managed; service получает только минимальный read access;
+- startup/readiness и journal logging не зависят от container runtime.
+
+### 9.4 Config classes
 
 | Класс | Примеры | Изменение |
 |---|---|---|
@@ -322,7 +345,7 @@ Readiness проверяет effective config через API:
 Смена `RTSP_PORT` — не CRUD. Она обрывает sessions узла и выполняется только по
 runbook #12.
 
-### 9.4 PostgreSQL connection budget
+### 9.5 PostgreSQL connection budget
 
 ```text
 sum(replicas_by_role * (pool_size + max_overflow))
@@ -337,7 +360,7 @@ reconciler использует отдельный direct/session-pooled DSN; st
 Обязательны bounded pool timeout, recycle/pre-ping, idle transaction timeout,
 role-specific statement timeout и pool metrics.
 
-### 9.5 Health и migrations
+### 9.6 Health и migrations
 
 - `/health/live` проверяет process/event loop; dependency failure не создаёт
   restart loop;
@@ -762,9 +785,9 @@ GStreamer fixtures control codec, audio, bitrate, packet rate and GOP. Load host
 are outside SUT and maintain ≥30% headroom; otherwise run invalid. At least two
 generator hosts confirm the generator knee is not mistaken for SUT capacity.
 
-Every run saves commit/digests, versions, hardware, kernel/sysctl/ulimit,
-network, topology, workload axes, seed, synchronized time, raw series/events and
-summary.
+Every run saves commit and release-artifact SHA-256 values, versions, hardware,
+kernel/sysctl/ulimit/systemd resource limits, network, topology, workload axes,
+seed, synchronized time, raw series/events and summary.
 
 ### 18.2 Test ladder
 
@@ -800,7 +823,8 @@ SERVING -> STOP_NEW -> DRAINING -> FORCE_BATCH -> UPDATING -> SMOKE -> SERVING
                                                      \-> ROLLBACK | QUARANTINED
 ```
 
-- preflight: N-1 capacity, config/API compatibility, backup and previous digest;
+- preflight: N-1 capacity, config/API compatibility, backup and previous release
+  artifacts/checksums;
 - `STOP_NEW` proven by connection test, not only LB removal;
 - initial drain deadline 15m;
 - force batch max one node and 5% fleet readers;
@@ -922,7 +946,9 @@ path and reversing client config; this asymmetry is a go/no-go input.
 
 ## 21. Implementation roadmap
 
-Implementation begins only after explicit owner authorization.
+Phase 0 and foundation implementation began after explicit owner authorization
+on 2026-08-10. The evidence gates below still control dependent product
+behavior, pilot and rollout.
 
 ### Pre-Phase 0 — specification bootstrap
 
@@ -938,7 +964,7 @@ Implementation begins only after explicit owner authorization.
 
 #### 0A. MediaMTX/FFmpeg/ffprobe compatibility lab
 
-- pin digests and versions;
+- pin versions and release-artifact checksums;
 - API create/update/delete/isolation/idempotency/read-back tests;
 - path persistence after node restart;
 - external callback vs static/runtime auth;
@@ -969,8 +995,8 @@ Implementation begins only after explicit owner authorization.
 
 ### Phase 1 — control/data/media vertical slices
 
-1. **#2 Foundation:** package, roles, typed config, CI, images, health, Alembic,
-   DB pools.
+1. **#2 Foundation:** package, roles, typed config, CI, immutable Linux release
+   artifacts, systemd units, health, Alembic and DB pools.
 2. **#3 Data:** IDs, profiles, lifecycle, groups, grants, sync audit/outbox,
    ordering, retention and migrations.
 3. **#4 Dashboard/RBAC:** sessions, authz epochs, no-oracle, CRUD, conflicts,
@@ -1010,8 +1036,10 @@ Multi-node and rollout never precede compatibility and Spike #0.
 
 ### Start Phase 0
 
-Explicit owner message with scope and permitted infrastructure. Until then
-`NO-GO`.
+**SATISFIED 2026-08-10:** explicit owner message authorized plan execution and
+foundation code. Permitted infrastructure is direct Linux/systemd deployment;
+Docker/containers are excluded. Production and evidence-dependent feature gates
+remain `NO-GO` until their own conditions pass.
 
 ### Start feature implementation
 
@@ -1043,7 +1071,7 @@ load harness and no architecture blocker in the topology being implemented.
 |---|---|---|
 | R1 single-node capacity | 10k is multidimensional | Spike #0 and published envelope |
 | R2 multi-node topology | L4 not path-aware; gateway is hypothesis | Spike #1/#2 and ADR |
-| R3 MediaMTX semantics | API/auth/delete/persistence/transparent RTSP depend on digest | pinned contract suite |
+| R3 MediaMTX semantics | API/auth/delete/persistence/transparent RTSP depend on binary version | pinned binary contract suite |
 | R4 client rollback | hardcoded external URL unmanaged | supervisor/service discovery/DNS/cohort mapping |
 | R5 environment drift | OMNY/WAN/NAT/kernel/NIC/overlap alter knee | preflight and production-like soak |
 | R6 auth/network fork | callback/static and VPN/L4 source-IP boundary unknown | Phase 0 security spike |

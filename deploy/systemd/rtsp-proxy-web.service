@@ -1,0 +1,46 @@
+[Unit]
+Description=RTSP Proxy web control plane
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rtsp-proxy
+Group=rtsp-proxy
+Environment=RTSP_PROXY_ROLE=web
+EnvironmentFile=/etc/rtsp-proxy/rtsp-proxy.env
+WorkingDirectory=/opt/rtsp-proxy/current
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/uvicorn --factory rtsp_proxy.runtime:create_app_from_environment --host ${RTSP_PROXY_HTTP_HOST} --port ${RTSP_PROXY_HTTP_PORT}
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0077
+
+RuntimeDirectory=rtsp-proxy
+StateDirectory=rtsp-proxy
+LogsDirectory=rtsp-proxy
+ReadWritePaths=/run/rtsp-proxy /var/lib/rtsp-proxy /var/log/rtsp-proxy
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

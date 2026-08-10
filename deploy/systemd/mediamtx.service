@@ -1,0 +1,44 @@
+[Unit]
+Description=RTSP Proxy MediaMTX media plane
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mediamtx
+Group=mediamtx
+WorkingDirectory=/var/lib/mediamtx
+ExecStart=/opt/rtsp-proxy/current/bin/mediamtx /etc/rtsp-proxy/mediamtx.yml
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0077
+
+RuntimeDirectory=mediamtx
+StateDirectory=mediamtx
+LogsDirectory=mediamtx
+ReadWritePaths=/run/mediamtx /var/lib/mediamtx /var/log/mediamtx
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

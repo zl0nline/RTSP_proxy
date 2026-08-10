@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Test with coverage
+        run: uv run pytest --cov=rtsp_proxy --cov-report=term-missing --cov-fail-under=90
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Build release artifacts
+        run: uv build
+
+  mediamtx-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Download and verify MediaMTX v1.20.0
+        run: |
+          mkdir -p .artifacts/mediamtx
+          curl --fail --location --silent --show-error \
+            --output .artifacts/mediamtx.tar.gz \
+            https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_amd64.tar.gz
+          echo "952d5f7d31d1b448ab4da4509550594c511d42636db9d7bb175d377f4ede81df  .artifacts/mediamtx.tar.gz" | sha256sum --check
+          tar -xzf .artifacts/mediamtx.tar.gz -C .artifacts/mediamtx
+          echo "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336  .artifacts/mediamtx/mediamtx" | sha256sum --check
+
+      - name: Verify effective listener contract
+        env:
+          MEDIAMTX_BINARY: .artifacts/mediamtx/mediamtx
+        run: uv run pytest -m contract tests/contract

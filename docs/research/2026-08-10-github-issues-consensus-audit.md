@@ -26,6 +26,7 @@
 | Отсутствующие gateway/legacy signals | В #7 добавлены conditional signals, provenance, staleness/cardinality и evidence gates |
 | Неопределённый legacy zero-session period | Минимум 30 дней compatibility + 7 consecutive full days fresh zero sessions |
 | Внешний `rtsps://` из security review против owner requirement прозрачного RTSP | Внешний contract возвращён на обычный `rtsp://`/RTSP-over-TCP; RTSPS/TLS listener исключён, недоверенный канал защищается внешним VPN/private L3 transport |
+| Docker/image assumptions против target deployment | Issues и docs переведены на direct Linux: immutable release directories, pinned binary SHA-256, dedicated users, hardened systemd units и atomic symlink rollback |
 
 Повторный автоматизированный поиск по всем 14 текущим телам не нашёл старые
 22-char ID, async normative audit, unconditional cold `≤3s`, API p95-as-SLO,
@@ -40,6 +41,17 @@ production readiness по-прежнему не заявлены.
 RTSP-камеру и не получает `rtsps://` либо proxy-specific handshake. Историческое
 замечание T6 ниже и прежний TLS/certificate fork сохранены только как запись
 исходного аудита и больше не являются рекомендацией проекта.
+
+Следующим owner clarification Docker/containers полностью исключены из target
+deployment. Актуальные #2/#5/#7/#8/#9/#11/#12/#13/#14 используют direct Linux
+artifacts и `systemd`; встречающиеся ниже historical `image/digest/container`
+формулировки относятся только к состоянию до remediation.
+
+После завершения remediation владелец отдельно разрешил Phase 0 и foundation
+implementation. В репозитории начаты Python package, health API, immutable
+release verifier, systemd artifacts и pinned MediaMTX effective-config contract.
+Исторические утверждения ниже об отсутствии owner authorization и кода относятся
+к моменту исходного аудита, а не к текущему состоянию ветки.
 
 Ниже сохранён исходный аудит до remediation как traceability record.
 
