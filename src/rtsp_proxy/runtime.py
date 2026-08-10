@@ -1,6 +1,7 @@
+import argparse
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -40,9 +41,15 @@ def create_app_from_environment() -> FastAPI:
     return create_app(load_settings())
 
 
-def create_background_app(settings: Settings) -> FastAPI:
-    if settings.role is RuntimeRole.WEB:
+def create_background_app(
+    settings: Settings,
+    *,
+    expected_role: RuntimeRole,
+) -> FastAPI:
+    if expected_role is RuntimeRole.WEB or settings.role is RuntimeRole.WEB:
         raise ConfigurationError("background_role_required")
+    if settings.role is not expected_role:
+        raise ConfigurationError("background_role_mismatch")
     return create_app(settings)
 
 
@@ -57,10 +64,23 @@ def run_web() -> None:
     )
 
 
-def run_background() -> None:
+def run_background(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="rtsp-proxy-role",
+        description="Run one validated RTSP Proxy background role.",
+    )
+    parser.add_argument(
+        "--expected-role",
+        choices=[role.value for role in RuntimeRole if role is not RuntimeRole.WEB],
+        required=True,
+    )
+    arguments = parser.parse_args(argv)
     settings = load_settings()
     uvicorn.run(
-        create_background_app(settings),
+        create_background_app(
+            settings,
+            expected_role=RuntimeRole(arguments.expected_role),
+        ),
         host=str(settings.http_host),
         port=settings.http_port,
     )

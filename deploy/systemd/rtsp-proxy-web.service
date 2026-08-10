@@ -20,6 +20,9 @@ UMask=0077
 RuntimeDirectory=rtsp-proxy
 StateDirectory=rtsp-proxy
 LogsDirectory=rtsp-proxy
+RuntimeDirectoryMode=0750
+StateDirectoryMode=0750
+LogsDirectoryMode=0750
 ReadWritePaths=/run/rtsp-proxy /var/lib/rtsp-proxy /var/log/rtsp-proxy
 
 NoNewPrivileges=yes

@@ -18,6 +18,9 @@ UMask=0077
 RuntimeDirectory=mediamtx
 StateDirectory=mediamtx
 LogsDirectory=mediamtx
+RuntimeDirectoryMode=0750
+StateDirectoryMode=0750
+LogsDirectoryMode=0750
 ReadWritePaths=/run/mediamtx /var/lib/mediamtx /var/log/mediamtx
 
 NoNewPrivileges=yes

@@ -10,7 +10,7 @@ Group=rtsp-proxy
 Environment=RTSP_PROXY_ROLE=%i
 EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env
 WorkingDirectory=/opt/rtsp-proxy/current
-ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
@@ -20,6 +20,9 @@ UMask=0077
 RuntimeDirectory=rtsp-proxy-%i
 StateDirectory=rtsp-proxy
 LogsDirectory=rtsp-proxy
+RuntimeDirectoryMode=0750
+StateDirectoryMode=0750
+LogsDirectoryMode=0750
 ReadWritePaths=/run/rtsp-proxy-%i /var/lib/rtsp-proxy /var/log/rtsp-proxy
 
 NoNewPrivileges=yes

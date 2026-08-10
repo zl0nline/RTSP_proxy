@@ -1122,5 +1122,6 @@ Product/release is ready only when:
 - pilot exits green and owner gives `GO`;
 - every 10k claim is bounded by the actually measured workload envelope.
 
-Until owner authorization, valid next decisions are `START PHASE 0`, scope
-change or continued `NO-GO`.
+Phase 0 is authorized and in progress. The next valid decision is its evidence
+gate: accept the pinned compatibility results and single-node baseline, change
+scope, or keep dependent product behavior and production rollout at `NO-GO`.

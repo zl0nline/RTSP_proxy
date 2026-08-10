@@ -135,6 +135,29 @@ jobs:
           test "$(.artifacts/ffmpeg/bin/ffmpeg -version | awk 'NR == 1 {print $3}')" = "$expected_version"
           test "$(.artifacts/ffmpeg/bin/ffprobe -version | awk 'NR == 1 {print $3}')" = "$expected_version"
 
+      - name: Verify native release manifest end to end
+        run: |
+          uv build
+          mkdir -p .artifacts/release/bin .artifacts/release/dist
+          install -m 0755 .artifacts/mediamtx/mediamtx .artifacts/release/bin/mediamtx
+          install -m 0755 .artifacts/ffmpeg/bin/ffmpeg .artifacts/release/bin/ffmpeg
+          install -m 0755 .artifacts/ffmpeg/bin/ffprobe .artifacts/release/bin/ffprobe
+          install -m 0644 uv.lock .artifacts/release/uv.lock
+          install -m 0644 dist/rtsp_proxy-0.1.0-py3-none-any.whl .artifacts/release/dist/
+          lock_sha256=$(sha256sum .artifacts/release/uv.lock | awk '{print $1}')
+          wheel_sha256=$(sha256sum .artifacts/release/dist/rtsp_proxy-0.1.0-py3-none-any.whl | awk '{print $1}')
+          git_commit=$(git rev-parse HEAD)
+          jq \
+            --arg lock_sha256 "$lock_sha256" \
+            --arg wheel_sha256 "$wheel_sha256" \
+            --arg git_commit "$git_commit" \
+            '.python.lock_sha256 = $lock_sha256
+             | .python.wheel_sha256 = $wheel_sha256
+             | .git_commit = $git_commit' \
+            "deploy/release-manifest.${{ matrix.arch }}.example.json" \
+            > .artifacts/release/release-manifest.json
+          uv run rtsp-proxy-verify-release --manifest .artifacts/release/release-manifest.json
+
       - name: Verify effective listener contract
         env:
           MEDIAMTX_BINARY: .artifacts/mediamtx/mediamtx

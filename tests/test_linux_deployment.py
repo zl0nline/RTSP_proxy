@@ -34,13 +34,25 @@ def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
         assert service["ProtectHome"] == "yes"
         assert service["CapabilityBoundingSet"] == ""
         assert "/opt/rtsp-proxy" not in service["ReadWritePaths"]
+        assert service["RuntimeDirectoryMode"] == "0750"
+        assert service["StateDirectoryMode"] == "0750"
+        assert service["LogsDirectoryMode"] == "0750"
 
 
 def test_background_roles_use_a_separate_systemd_template() -> None:
     service = read_unit("rtsp-proxy@.service")["Service"]
 
     assert service["Environment"] == "RTSP_PROXY_ROLE=%i"
-    assert service["ExecStart"] == "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role"
+    assert service["ExecStart"] == (
+        "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i"
+    )
     assert service["EnvironmentFile"] == (
         "/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env"
     )
+
+
+def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "Verify native release manifest end to end" in workflow
+    assert "uv run rtsp-proxy-verify-release --manifest" in workflow

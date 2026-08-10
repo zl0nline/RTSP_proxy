@@ -160,8 +160,22 @@ def test_environment_overrides_a_validated_json_config_file(tmp_path: Path) -> N
 
 
 def test_background_entrypoint_accepts_only_non_web_roles() -> None:
-    app = create_background_app(Settings(role=RuntimeRole.WORKER))
+    app = create_background_app(
+        Settings(role=RuntimeRole.WORKER),
+        expected_role=RuntimeRole.WORKER,
+    )
     assert TestClient(app).get("/health/live").json()["role"] == "worker"
 
     with pytest.raises(ValueError, match="background_role_required"):
-        create_background_app(Settings(role=RuntimeRole.WEB))
+        create_background_app(
+            Settings(role=RuntimeRole.WEB),
+            expected_role=RuntimeRole.WEB,
+        )
+
+
+def test_background_entrypoint_fails_closed_when_config_changes_instance_role() -> None:
+    with pytest.raises(ValueError, match="background_role_mismatch"):
+        create_background_app(
+            Settings(role=RuntimeRole.PROBE),
+            expected_role=RuntimeRole.WORKER,
+        )
