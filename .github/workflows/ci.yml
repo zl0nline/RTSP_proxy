@@ -164,3 +164,63 @@ jobs:
           FFMPEG_BINARY: .artifacts/ffmpeg/bin/ffmpeg
           FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest -m contract tests/contract
+
+  pull-load-generator-contract:
+    name: pull-load-generator-contract (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Install native GStreamer build and runtime packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libgstrtspserver-1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad
+
+      - name: Download and verify FFmpeg/ffprobe (${{ matrix.arch }})
+        run: |
+          archive_url=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.ffmpeg.architectures[$arch].archive_url' deploy/artifact-catalog.json)
+          archive_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.ffmpeg.architectures[$arch].archive_sha256' deploy/artifact-catalog.json)
+          ffmpeg_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.ffmpeg.architectures[$arch].ffmpeg_sha256' deploy/artifact-catalog.json)
+          ffprobe_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.ffmpeg.architectures[$arch].ffprobe_sha256' deploy/artifact-catalog.json)
+          mkdir -p .artifacts/ffmpeg
+          curl --fail --location --silent --show-error \
+            --output .artifacts/ffmpeg.tar.xz \
+            "$archive_url"
+          echo "$archive_sha256  .artifacts/ffmpeg.tar.xz" | sha256sum --check
+          tar -xJf .artifacts/ffmpeg.tar.xz -C .artifacts/ffmpeg --strip-components=1
+          echo "$ffmpeg_sha256  .artifacts/ffmpeg/bin/ffmpeg" | sha256sum --check
+          echo "$ffprobe_sha256  .artifacts/ffmpeg/bin/ffprobe" | sha256sum --check
+
+      - name: Build native GStreamer pull server
+        run: make -C tools/load
+
+      - name: Verify H264/H265 independent pull endpoints over RTSP/TCP
+        env:
+          RTSP_PULL_SERVER_BINARY: tools/load/rtsp-pull-server
+          FFMPEG_BINARY: .artifacts/ffmpeg/bin/ffmpeg
+          FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
+        run: uv run pytest tests/contract/test_rtsp_pull_generator.py
