@@ -15,19 +15,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Verify immutable RTSP Proxy release artifacts before activation.",
     )
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--python-version", required=True)
-    parser.add_argument(
-        "--arch",
-        choices=("amd64", "arm64"),
-        help="release architecture; defaults to the native Linux machine architecture",
-    )
     arguments = parser.parse_args(argv)
 
     try:
-        architecture = arguments.arch or normalize_linux_arch(platform.machine())
+        operating_system = platform.system().lower()
+        if operating_system != "linux":
+            raise ReleaseVerificationError(f"unsupported_platform:{operating_system}")
+        architecture = normalize_linux_arch(platform.machine())
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         release = verify_release(
             arguments.manifest,
-            expected_python=arguments.python_version,
+            expected_python=python_version,
             expected_arch=architecture,
         )
     except ReleaseVerificationError as error:

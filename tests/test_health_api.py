@@ -1,10 +1,13 @@
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.health import DependencyResult, ReadinessProvider
-from rtsp_proxy.runtime import create_app_from_environment
+from rtsp_proxy.runtime import create_app_from_environment, create_background_app, load_settings
 
 
 def test_live_reports_the_running_role_without_dependency_checks() -> None:
@@ -63,12 +66,42 @@ def test_ready_fails_closed_until_the_role_dependencies_are_wired() -> None:
         "role": "web",
         "checks": [
             {
-                "name": "readiness",
+                "name": "database",
                 "status": "fail",
-                "reason": "readiness_provider_missing",
-            }
+                "reason": "database_provider_missing",
+            },
+            {
+                "name": "schema",
+                "status": "fail",
+                "reason": "schema_provider_missing",
+            },
+            {
+                "name": "session_store",
+                "status": "fail",
+                "reason": "session_store_provider_missing",
+            },
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("role", "required_checks"),
+    [
+        (RuntimeRole.WEB, {"database", "schema", "session_store"}),
+        (RuntimeRole.WORKER, {"database", "schema", "outbox"}),
+        (RuntimeRole.RECONCILER, {"database", "schema", "media_adapter"}),
+        (RuntimeRole.PROBE, {"database", "schema", "probe_runtime"}),
+        (RuntimeRole.COLLECTOR, {"database", "schema", "media_metrics"}),
+    ],
+)
+def test_unwired_readiness_names_the_dependencies_required_by_each_role(
+    role: RuntimeRole,
+    required_checks: set[str],
+) -> None:
+    response = TestClient(create_app(Settings(role=role))).get("/health/ready")
+
+    assert response.status_code == 503
+    assert {check["name"] for check in response.json()["checks"]} == required_checks
 
 
 def test_systemd_environment_selects_the_runtime_role(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,3 +114,54 @@ def test_systemd_environment_selects_the_runtime_role(monkeypatch: pytest.Monkey
         "status": "ok",
         "role": "web",
     }
+
+
+def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
+    settings = load_settings(
+        {
+            "RTSP_PROXY_ROLE": "web",
+            "RTSP_PROXY_HTTP_HOST": "127.0.0.2",
+            "RTSP_PROXY_HTTP_PORT": "8080",
+        }
+    )
+
+    assert str(settings.http_host) == "127.0.0.2"
+    assert settings.http_port == 8080
+
+
+def test_invalid_http_port_fails_startup_validation() -> None:
+    with pytest.raises(ValidationError):
+        load_settings(
+            {
+                "RTSP_PROXY_ROLE": "web",
+                "RTSP_PROXY_HTTP_PORT": "70000",
+            }
+        )
+
+
+def test_environment_overrides_a_validated_json_config_file(tmp_path: Path) -> None:
+    config_file = tmp_path / "rtsp-proxy.json"
+    config_file.write_text(
+        '{"role":"worker","http_host":"127.0.0.3","http_port":8100}',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(
+        {
+            "RTSP_PROXY_CONFIG_FILE": str(config_file),
+            "RTSP_PROXY_ROLE": "web",
+            "RTSP_PROXY_HTTP_PORT": "8200",
+        }
+    )
+
+    assert settings.role is RuntimeRole.WEB
+    assert str(settings.http_host) == "127.0.0.3"
+    assert settings.http_port == 8200
+
+
+def test_background_entrypoint_accepts_only_non_web_roles() -> None:
+    app = create_background_app(Settings(role=RuntimeRole.WORKER))
+    assert TestClient(app).get("/health/live").json()["role"] == "worker"
+
+    with pytest.raises(ValueError, match="background_role_required"):
+        create_background_app(Settings(role=RuntimeRole.WEB))

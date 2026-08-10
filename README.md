@@ -8,9 +8,9 @@ TCP endpoint.
 > - Planning consensus: **COMPLETE** — issues #1–#14 согласованы, сквозные
 >   противоречия исправлены.
 > - Phase 0: **IN PROGRESS** — owner authorization получено 10 августа 2026.
-> - Foundation implementation: **IN PROGRESS** — health API, release verifier,
->   Python package, native amd64/arm64 CI и direct-Linux systemd artifacts
->   созданы.
+> - Foundation implementation: **IN PROGRESS** — fail-closed role readiness
+>   scaffold, release verifier, Python package, native amd64/arm64 CI и
+>   direct-Linux systemd artifacts созданы.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -201,14 +201,17 @@ Product behavior, зависящий от неподтверждённых Media
 
 ## Repository status
 
-Репозиторий содержит исполняемый Phase 0 foundation: Python package, role-aware
-health API, checksum/path/architecture release verifier, тесты и direct-Linux
-  systemd artifacts и native amd64/arm64 CI. Catalog, PostgreSQL, MediaMTX
-  adapter и полный внешний FFmpeg RTSP contract ещё не реализованы; baseline
-  effective-config contract запускается против pinned MediaMTX отдельно на
-  обеих архитектурах. Наличие foundation-кода не означает доказанную production
-  характеристику. Issue #10 остаётся evidence blocker для scale-out topology;
-  issues #1–#14 — execution map.
+Репозиторий содержит исполняемый Phase 0 foundation: Python package,
+role-specific fail-closed readiness scaffold, checksum/path/version/
+architecture release verifier, tests, direct-Linux systemd artifacts и native
+amd64/arm64 CI. Catalog, PostgreSQL, реальные dependency providers и task loops,
+MediaMTX adapter и полный внешний FFmpeg RTSP contract ещё не реализованы;
+baseline effective-config contract запускается против pinned MediaMTX отдельно
+на обеих архитектурах. FFmpeg/ffprobe зафиксированы как Phase 0 candidate, но их
+текущий upstream artifact не имеет GitHub attestation и ещё не прошёл security
+provenance gate. Наличие foundation-кода не означает доказанную production
+характеристику. Issue #10 остаётся evidence blocker для scale-out topology;
+issues #1–#14 — execution map.
 
 ## Локальная разработка
 

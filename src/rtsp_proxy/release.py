@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-Sha256 = str
+APPLICATION_SCHEMA = "base"
+CONFIG_SCHEMA_VERSION = 1
+
+
+class Sha256(RootModel[str]):
+    model_config = ConfigDict(frozen=True)
+
+    root: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class LinuxArch(StrEnum):
+    AMD64 = "amd64"
+    ARM64 = "arm64"
 
 
 class PythonArtifact(BaseModel):
@@ -15,24 +30,28 @@ class PythonArtifact(BaseModel):
 
     version: str = Field(min_length=1)
     lock: str = Field(min_length=1)
-    lock_sha256: Sha256 = Field(pattern=r"^[0-9a-f]{64}$")
+    lock_sha256: Sha256
     wheel: str = Field(min_length=1)
-    wheel_sha256: Sha256 = Field(pattern=r"^[0-9a-f]{64}$")
+    wheel_sha256: Sha256
 
 
 class MediaMtxArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: str = Field(min_length=1)
-    linux_arch: str = Field(min_length=1)
+    linux_arch: LinuxArch
     binary: str = Field(min_length=1)
-    binary_sha256: Sha256 = Field(pattern=r"^[0-9a-f]{64}$")
+    binary_sha256: Sha256
 
 
 class FfmpegArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: str = Field(min_length=1)
+    binary: str = Field(min_length=1)
+    binary_sha256: Sha256
+    ffprobe_binary: str = Field(min_length=1)
+    ffprobe_sha256: Sha256
 
 
 class SchemaCompatibility(BaseModel):
@@ -46,7 +65,7 @@ class ReleaseManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: int = Field(ge=1, le=1)
-    release_id: str = Field(min_length=1)
+    release_id: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
     git_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     python: PythonArtifact
     mediamtx: MediaMtxArtifact
@@ -61,19 +80,21 @@ class VerifiedRelease:
     git_commit: str
     wheel: Path
     mediamtx_binary: Path
+    ffmpeg_binary: Path
+    ffprobe_binary: Path
 
 
 class ReleaseVerificationError(ValueError):
     """A release cannot be trusted or is incompatible with this runtime."""
 
 
-def normalize_linux_arch(machine: str) -> str:
+def normalize_linux_arch(machine: str) -> LinuxArch:
     canonical = machine.strip().lower()
     aliases = {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
+        "x86_64": LinuxArch.AMD64,
+        "amd64": LinuxArch.AMD64,
+        "aarch64": LinuxArch.ARM64,
+        "arm64": LinuxArch.ARM64,
     }
     try:
         return aliases[canonical]
@@ -95,20 +116,38 @@ def verify_release(
         raise ReleaseVerificationError("python_version_mismatch")
     if manifest.mediamtx.linux_arch != expected_arch:
         raise ReleaseVerificationError("linux_arch_mismatch")
+    if manifest.config_schema_version != CONFIG_SCHEMA_VERSION:
+        raise ReleaseVerificationError("config_schema_mismatch")
+    if not (
+        manifest.schema_compatibility.minimum
+        == APPLICATION_SCHEMA
+        == manifest.schema_compatibility.maximum
+    ):
+        raise ReleaseVerificationError("database_schema_mismatch")
 
     lock = _artifact_path(root, manifest.python.lock, "python.lock")
     wheel = _artifact_path(root, manifest.python.wheel, "python.wheel")
     mediamtx = _artifact_path(root, manifest.mediamtx.binary, "mediamtx.binary")
+    ffmpeg = _artifact_path(root, manifest.ffmpeg.binary, "ffmpeg.binary")
+    ffprobe = _artifact_path(root, manifest.ffmpeg.ffprobe_binary, "ffmpeg.ffprobe")
 
     _verify_checksum(lock, manifest.python.lock_sha256, "python.lock")
     _verify_checksum(wheel, manifest.python.wheel_sha256, "python.wheel")
     _verify_checksum(mediamtx, manifest.mediamtx.binary_sha256, "mediamtx.binary")
+    _verify_checksum(ffmpeg, manifest.ffmpeg.binary_sha256, "ffmpeg.binary")
+    _verify_checksum(ffprobe, manifest.ffmpeg.ffprobe_sha256, "ffmpeg.ffprobe")
+
+    _verify_version(mediamtx, ("--version",), manifest.mediamtx.version, "mediamtx.binary")
+    _verify_version(ffmpeg, ("-version",), manifest.ffmpeg.version, "ffmpeg.binary")
+    _verify_version(ffprobe, ("-version",), manifest.ffmpeg.version, "ffmpeg.ffprobe")
 
     return VerifiedRelease(
         release_id=manifest.release_id,
         git_commit=manifest.git_commit,
         wheel=wheel,
         mediamtx_binary=mediamtx,
+        ffmpeg_binary=ffmpeg,
+        ffprobe_binary=ffprobe,
     )
 
 
@@ -146,5 +185,31 @@ def _verify_checksum(path: Path, expected: Sha256, label: str) -> None:
     except OSError as error:
         raise ReleaseVerificationError(f"artifact_unreadable:{label}") from error
 
-    if digest.hexdigest() != expected:
+    if digest.hexdigest() != expected.root:
         raise ReleaseVerificationError(f"checksum_mismatch:{label}")
+
+
+def _verify_version(path: Path, arguments: tuple[str, ...], expected: str, label: str) -> None:
+    try:
+        result = subprocess.run(
+            [path, *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env={"LC_ALL": "C", "PATH": os.defpath},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseVerificationError(f"version_probe_failed:{label}") from error
+
+    first_line = result.stdout.splitlines()[0].strip() if result.stdout else ""
+    if label == "mediamtx.binary":
+        version_matches = first_line == expected
+    else:
+        tokens = first_line.split()
+        version_matches = len(tokens) >= 3 and tokens[:3] == [path.name, "version", expected]
+    if result.returncode != 0 or not version_matches:
+        raise ReleaseVerificationError(f"version_mismatch:{label}")

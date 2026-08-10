@@ -36,11 +36,14 @@ our own internal modules or assert private call order.
 - Immutable root-owned releases under `/opt/rtsp-proxy/releases/<version>`.
 - Atomic `/opt/rtsp-proxy/current` symlink for activation and rollback.
 - Dedicated non-login Linux users and hardened systemd units.
-- MediaMTX is an official architecture-specific binary pinned by version and
-  SHA-256.
+- `deploy/artifact-catalog.json` is the single machine-readable candidate source
+  for architecture-specific MediaMTX, FFmpeg and ffprobe versions, URLs and
+  SHA-256 values. Release manifests copy those pins and are verified natively.
 
 ## Current implementation boundary
 
-The repository is in Phase 0/foundation. Implemented behavior must not imply
-that MediaMTX compatibility, PostgreSQL durability, capacity or production
-readiness have already been proven.
+The repository is in Phase 0/foundation. Role processes currently expose a
+fail-closed readiness scaffold, not their later task loops or dependency
+adapters. Implemented behavior must not imply that MediaMTX/FFmpeg
+compatibility, PostgreSQL durability, artifact provenance, capacity or
+production readiness have already been proven.

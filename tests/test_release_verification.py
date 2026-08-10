@@ -18,15 +18,22 @@ def sha256(payload: bytes) -> str:
 
 
 def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
+    mediamtx_payload = b"#!/bin/sh\nprintf 'v0.0.0-test\\n'\n"
+    ffmpeg_payload = b"#!/bin/sh\nprintf 'ffmpeg version test build\\n'\n"
+    ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version test build\\n'\n"
     artifacts = {
         "uv.lock": b"lock",
         "dist/rtsp_proxy-0.1.0-py3-none-any.whl": wheel_payload,
-        "bin/mediamtx": b"mediamtx",
+        "bin/mediamtx": mediamtx_payload,
+        "bin/ffmpeg": ffmpeg_payload,
+        "bin/ffprobe": ffprobe_payload,
     }
     for relative_path, payload in artifacts.items():
         path = tmp_path / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
+        if relative_path.startswith("bin/"):
+            path.chmod(0o750)
 
     manifest = {
         "schema_version": 1,
@@ -45,7 +52,13 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "binary": "bin/mediamtx",
             "binary_sha256": sha256(artifacts["bin/mediamtx"]),
         },
-        "ffmpeg": {"version": "test"},
+        "ffmpeg": {
+            "version": "test",
+            "binary": "bin/ffmpeg",
+            "binary_sha256": sha256(ffmpeg_payload),
+            "ffprobe_binary": "bin/ffprobe",
+            "ffprobe_sha256": sha256(ffprobe_payload),
+        },
         "schema_compatibility": {"minimum": "base", "maximum": "base"},
         "config_schema_version": 1,
     }
@@ -62,6 +75,8 @@ def test_verified_release_exposes_only_validated_artifact_paths(tmp_path: Path) 
     assert release.release_id == "0.1.0"
     assert release.wheel == tmp_path / "dist/rtsp_proxy-0.1.0-py3-none-any.whl"
     assert release.mediamtx_binary == tmp_path / "bin/mediamtx"
+    assert release.ffmpeg_binary == tmp_path / "bin/ffmpeg"
+    assert release.ffprobe_binary == tmp_path / "bin/ffprobe"
 
 
 def test_tampered_artifact_is_rejected_with_a_stable_reason(tmp_path: Path) -> None:
@@ -99,19 +114,11 @@ def test_release_for_a_different_linux_architecture_is_rejected(tmp_path: Path) 
 def test_release_verifier_cli_is_usable_by_linux_installation_automation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    native_linux_amd64: None,
 ) -> None:
     manifest_path = write_release(tmp_path)
 
-    exit_code = main(
-        [
-            "--manifest",
-            str(manifest_path),
-            "--python-version",
-            "3.12",
-            "--arch",
-            "amd64",
-        ]
-    )
+    exit_code = main(["--manifest", str(manifest_path)])
 
     assert exit_code == 0
     assert capsys.readouterr().out == "verified release 0.1.0\n"
@@ -120,20 +127,12 @@ def test_release_verifier_cli_is_usable_by_linux_installation_automation(
 def test_release_verifier_cli_fails_closed_on_tampering(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    native_linux_amd64: None,
 ) -> None:
     manifest_path = write_release(tmp_path)
     (tmp_path / "bin/mediamtx").write_bytes(b"tampered")
 
-    exit_code = main(
-        [
-            "--manifest",
-            str(manifest_path),
-            "--python-version",
-            "3.12",
-            "--arch",
-            "amd64",
-        ]
-    )
+    exit_code = main(["--manifest", str(manifest_path)])
 
     assert exit_code == 1
     captured = capsys.readouterr()
@@ -170,25 +169,67 @@ def test_unknown_linux_machine_architecture_fails_closed() -> None:
         normalize_linux_arch("riscv64")
 
 
-def test_cli_detects_the_native_linux_architecture_when_not_overridden(
+@pytest.fixture
+def native_linux_amd64(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("rtsp_proxy.cli.platform.system", lambda: "Linux")
+    monkeypatch.setattr("rtsp_proxy.cli.platform.machine", lambda: "x86_64")
+
+
+def test_cli_detects_the_native_linux_runtime(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    native_linux_amd64: None,
+) -> None:
+    manifest_path = write_release(tmp_path)
+
+    exit_code = main(["--manifest", str(manifest_path)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "verified release 0.1.0\n"
+
+
+def test_cli_rejects_a_non_linux_activation_host(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest_path = write_release(tmp_path)
-    monkeypatch.setattr("rtsp_proxy.cli.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("rtsp_proxy.cli.platform.system", lambda: "Darwin")
 
-    exit_code = main(
-        [
-            "--manifest",
-            str(manifest_path),
-            "--python-version",
-            "3.12",
-        ]
-    )
+    exit_code = main(["--manifest", str(manifest_path)])
 
-    assert exit_code == 0
-    assert capsys.readouterr().out == "verified release 0.1.0\n"
+    assert exit_code == 1
+    assert capsys.readouterr().err == "release verification failed: unsupported_platform:darwin\n"
+
+
+def test_declared_binary_version_must_match_the_verified_executable(tmp_path: Path) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["ffmpeg"]["version"] = "different"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match=r"version_mismatch:ffmpeg\.binary"):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
+
+
+def test_incompatible_config_schema_is_rejected(tmp_path: Path) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config_schema_version"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="config_schema_mismatch"):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
+
+
+def test_incompatible_database_schema_range_is_rejected(tmp_path: Path) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_compatibility"] = {"minimum": "future", "maximum": "future"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="database_schema_mismatch"):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
 
 def test_example_manifests_cover_both_supported_linux_architectures() -> None:
@@ -199,3 +240,19 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
     assert len({manifest.release_id for manifest in manifests}) == 2
+
+
+def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:
+    catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
+
+    for path in sorted(Path("deploy").glob("release-manifest.*.example.json")):
+        manifest = ReleaseManifest.model_validate_json(path.read_text(encoding="utf-8"))
+        architecture = manifest.mediamtx.linux_arch.value
+        mediamtx_pin = catalog["mediamtx"]["architectures"][architecture]
+        ffmpeg_pin = catalog["ffmpeg"]["architectures"][architecture]
+
+        assert manifest.mediamtx.version == catalog["mediamtx"]["version"]
+        assert manifest.mediamtx.binary_sha256.root == mediamtx_pin["binary_sha256"]
+        assert manifest.ffmpeg.version == catalog["ffmpeg"]["version"]
+        assert manifest.ffmpeg.binary_sha256.root == ffmpeg_pin["ffmpeg_sha256"]
+        assert manifest.ffmpeg.ffprobe_sha256.root == ffmpeg_pin["ffprobe_sha256"]

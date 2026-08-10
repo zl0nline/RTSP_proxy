@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "mediamtx": {
+    "version": "v1.20.0",
+    "source_repository": "https://github.com/bluenviron/mediamtx",
+    "architectures": {
+      "amd64": {
+        "archive_url": "https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_amd64.tar.gz",
+        "archive_sha256": "952d5f7d31d1b448ab4da4509550594c511d42636db9d7bb175d377f4ede81df",
+        "binary_sha256": "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336"
+      },
+      "arm64": {
+        "archive_url": "https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_arm64.tar.gz",
+        "archive_sha256": "6aa3c03da7b6477f1e110c8e18e819cf9ef121e8981b52b8f8219982dae35f2f",
+        "binary_sha256": "2da379972ba86627632aa7e3f779c680ba04a5ee26ef2a20dc61cefcc24f73b8"
+      }
+    }
+  },
+  "ffmpeg": {
+    "version": "n8.1.2-34-g9b6c8969e0",
+    "release_tag": "autobuild-2026-08-10-13-17",
+    "source_repository": "https://github.com/BtbN/FFmpeg-Builds",
+    "provenance": "archive SHA-256 published by GitHub; artifact attestation unavailable",
+    "architectures": {
+      "amd64": {
+        "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-10-13-17/ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1.tar.xz",
+        "archive_sha256": "7b0c2ad593860d8bb157e346777ac7d741b5bf25b456382051138aaa8256f92d",
+        "ffmpeg_sha256": "48a805177021feaa26ebaa2d0a9e31d7139b6bcfe1a180af17a98ca786a3c668",
+        "ffprobe_sha256": "0f7a6c43858e8123f09b2f2236e7084165d76642e618d8d0ec9304cff3135d95"
+      },
+      "arm64": {
+        "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-10-13-17/ffmpeg-n8.1.2-34-g9b6c8969e0-linuxarm64-gpl-8.1.tar.xz",
+        "archive_sha256": "4de38246590f87a959275ed359d9378acb46295b56851968b239763b4d481f3a",
+        "ffmpeg_sha256": "fa909ba4ebe3bc0c4d0476f39c036afb1fb6642febea0e154b403ba8410df8be",
+        "ffprobe_sha256": "974d21d84c3e8190223c9a5139298eb36e149506a48a1b82a83f5a6bc73933df"
+      }
+    }
+  }
+}

@@ -15,12 +15,22 @@ class ReadinessProvider(Protocol):
     async def check(self, role: RuntimeRole) -> tuple[DependencyResult, ...]: ...
 
 
+ROLE_DEPENDENCIES: dict[RuntimeRole, tuple[str, ...]] = {
+    RuntimeRole.WEB: ("database", "schema", "session_store"),
+    RuntimeRole.WORKER: ("database", "schema", "outbox"),
+    RuntimeRole.RECONCILER: ("database", "schema", "media_adapter"),
+    RuntimeRole.PROBE: ("database", "schema", "probe_runtime"),
+    RuntimeRole.COLLECTOR: ("database", "schema", "media_metrics"),
+}
+
+
 class MissingReadinessProvider:
     async def check(self, role: RuntimeRole) -> tuple[DependencyResult, ...]:
-        return (
+        return tuple(
             DependencyResult(
-                name="readiness",
+                name=dependency,
                 ready=False,
-                reason="readiness_provider_missing",
-            ),
+                reason=f"{dependency}_provider_missing",
+            )
+            for dependency in ROLE_DEPENDENCIES[role]
         )

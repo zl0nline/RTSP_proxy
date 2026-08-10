@@ -1,24 +1,26 @@
 [Unit]
-Description=RTSP Proxy MediaMTX media plane
+Description=RTSP Proxy %i role
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=mediamtx
-Group=mediamtx
-WorkingDirectory=/var/lib/mediamtx
-ExecStart=/opt/rtsp-proxy/current/bin/mediamtx /etc/rtsp-proxy/mediamtx/mediamtx.yml
+User=rtsp-proxy
+Group=rtsp-proxy
+Environment=RTSP_PROXY_ROLE=%i
+EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env
+WorkingDirectory=/opt/rtsp-proxy/current
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 UMask=0077
 
-RuntimeDirectory=mediamtx
-StateDirectory=mediamtx
-LogsDirectory=mediamtx
-ReadWritePaths=/run/mediamtx /var/lib/mediamtx /var/log/mediamtx
+RuntimeDirectory=rtsp-proxy-%i
+StateDirectory=rtsp-proxy
+LogsDirectory=rtsp-proxy
+ReadWritePaths=/run/rtsp-proxy-%i /var/lib/rtsp-proxy /var/log/rtsp-proxy
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -38,7 +40,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-LimitNOFILE=1048576
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

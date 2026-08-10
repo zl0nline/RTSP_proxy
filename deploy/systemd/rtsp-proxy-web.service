@@ -8,9 +8,9 @@ Type=simple
 User=rtsp-proxy
 Group=rtsp-proxy
 Environment=RTSP_PROXY_ROLE=web
-EnvironmentFile=/etc/rtsp-proxy/rtsp-proxy.env
+EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env
 WorkingDirectory=/opt/rtsp-proxy/current
-ExecStart=/opt/rtsp-proxy/current/.venv/bin/uvicorn --factory rtsp_proxy.runtime:create_app_from_environment --host ${RTSP_PROXY_HTTP_HOST} --port ${RTSP_PROXY_HTTP_PORT}
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-web
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s

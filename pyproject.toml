@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -17,12 +17,15 @@ dependencies = [
 
 [project.scripts]
 rtsp-proxy-verify-release = "rtsp_proxy.cli:main"
+rtsp-proxy-web = "rtsp_proxy.runtime:run_web"
+rtsp-proxy-role = "rtsp_proxy.runtime:run_background"
 
 [dependency-groups]
 dev = [
   "httpx2",
   "mypy>=1.17,<2",
-  "pytest>=8.4,<9",
+  "pip-audit>=2.9,<3",
+  "pytest>=9.0.3,<10",
   "pytest-cov>=6.2,<7",
   "ruff>=0.12,<1",
 ]
