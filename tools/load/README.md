@@ -17,7 +17,9 @@ direct camera.
 `rtsp-load-reader` consumes a strict TSV plan (`path`, reader count, first
 global reader ID, warm-anchor count, first measured schedule index), timestamps
 outgoing DESCRIBE and PLAY requests, and records
-the first parser-aligned non-header/non-delta video access unit. It therefore publishes separate
+the first parser-aligned IDR/IRAP random-access video unit. Header-only,
+delta, decode-only, corrupted and gap buffers are rejected. It therefore
+publishes separate
 `DESCRIBE→PLAY`, `PLAY→first decodable` and end-to-end values instead of
 mislabeling the first RTP buffer as the SLO. Stable global IDs allow a cold
 proxy run to be paired with the corresponding direct-control run.

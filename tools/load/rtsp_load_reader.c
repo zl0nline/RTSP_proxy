@@ -576,6 +576,53 @@ process_decodable(gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
+static gboolean
+buffer_contains_random_access_unit(GstBuffer *buffer)
+{
+    GstMapInfo map = GST_MAP_INFO_INIT;
+    gsize offset = 0;
+    gboolean found = FALSE;
+
+    /* HEADER can coexist with IDR/IRAP when an AU carries codec parameters. */
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        return FALSE;
+    }
+    while (offset + 3 < map.size) {
+        gsize nal_offset;
+        guint nal_type;
+
+        if (map.data[offset] != 0 || map.data[offset + 1] != 0) {
+            offset++;
+            continue;
+        }
+        if (map.data[offset + 2] == 1) {
+            nal_offset = offset + 3;
+        } else if (offset + 4 < map.size && map.data[offset + 2] == 0 &&
+                   map.data[offset + 3] == 1) {
+            nal_offset = offset + 4;
+        } else {
+            offset++;
+            continue;
+        }
+        if (nal_offset >= map.size) {
+            break;
+        }
+        if (g_str_equal(codec, "h264")) {
+            nal_type = map.data[nal_offset] & 0x1fU;
+            found = nal_type == 5U;
+        } else {
+            nal_type = (map.data[nal_offset] >> 1U) & 0x3fU;
+            found = nal_type >= 16U && nal_type <= 21U;
+        }
+        if (found) {
+            break;
+        }
+        offset = nal_offset + 1;
+    }
+    gst_buffer_unmap(buffer, &map);
+    return found;
+}
+
 static void
 on_handoff(GstElement *sink G_GNUC_UNUSED, GstBuffer *buffer,
            GstPad *pad G_GNUC_UNUSED, gpointer user_data)
@@ -587,11 +634,14 @@ on_handoff(GstElement *sink G_GNUC_UNUSED, GstBuffer *buffer,
     if (g_atomic_int_get(&run->stopping)) {
         return;
     }
+    if (g_atomic_int_get(&reader->decodable_seen)) {
+        return;
+    }
     if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT) ||
-        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_HEADER) ||
         GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DECODE_ONLY) ||
         GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED) ||
         GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_GAP) ||
+        !buffer_contains_random_access_unit(buffer) ||
         !g_atomic_int_compare_and_exchange(&reader->decodable_seen, FALSE, TRUE)) {
         return;
     }

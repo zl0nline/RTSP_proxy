@@ -17,7 +17,8 @@
 - source and reader processes force RTSP-over-TCP and the native contract scans
   every process-owned UDP/UDP6 socket;
 - many GStreamer readers run in one process and record the reader ID/path,
-  `DESCRIBE→PLAY`, first AU-aligned non-header/non-delta decodable access unit,
+  `DESCRIBE→PLAY`, first AU-aligned IDR/IRAP random-access unit (header-only,
+  delta, decode-only, corrupted and gap buffers are rejected),
   RTP packet count and
   stable error reason as raw JSONL;
 - video and configured Opus RTP pads are sequence-checked independently per

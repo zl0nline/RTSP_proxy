@@ -233,8 +233,8 @@ Production ffprobe runner намеренно не поставляется: пе
 Catalog продукта, PostgreSQL, grant verifier, reconciler/task loops и dashboard
 ещё не реализованы. Phase 0B load harness теперь связывает profile, fixture и
 SHA load binaries с точным per-host launch plan; reader измеряет отдельно
-`DESCRIBE→PLAY` и первый parser-aligned non-header decodable access unit,
-поддерживает steady/ramp/
+`DESCRIBE→PLAY` и первый parser-aligned IDR/IRAP random-access unit, отклоняет
+header-only, delta, decode-only, corrupted и gap buffers и поддерживает steady/ramp/
 burst/outage и парный direct-control. Все shards используют единые будущие UTC
 anchor/ramp/measurement/soak epochs; completion связан с profile/plan/host,
 точными lifecycle slots и clock-sync evidence, проверяемым до завершения

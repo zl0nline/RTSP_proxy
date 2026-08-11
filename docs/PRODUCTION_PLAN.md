@@ -1004,9 +1004,9 @@ Implementation status: native GStreamer pull sources/readers and a digest-bound
 orchestrator are present. A stored profile generates exact per-host source and
 reader plans; active paths and reader counts remain independent. Reader events
 separate outgoing `DESCRIBE→PLAY` from the first parser-aligned
-non-header/non-delta access unit,
-and cold pass/fail is accepted only from a compatible finalized direct-control
-pair; only handshake deltas are compared, while both GOP waits are published
+IDR/IRAP random-access unit; header-only, delta, decode-only, corrupted and gap
+buffers are rejected. Cold pass/fail is accepted only from a compatible
+finalized direct-control pair; only handshake deltas are compared, while both GOP waits are published
 separately. Seeded steady/ramp/burst/outage primitives, interruption
 fail-closed and owner-only credentials are implemented. Warm proxy profiles
 reserve one reader from `total_readers` per active path as an anchor, start the
