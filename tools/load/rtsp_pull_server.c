@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <gst/gst.h>
 #include <gst/rtsp-server/rtsp-server.h>
 #include <glib-unix.h>
