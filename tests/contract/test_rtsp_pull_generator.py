@@ -350,20 +350,11 @@ def test_opus_track_is_consumed_and_sequence_checked_with_video(tmp_path: Path) 
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env={
-            **os.environ,
-            "GST_DEBUG": (
-                "rtspmedia:7,rtspstream:7,clocksync:7,multifilesrc:7,audiotestsrc:7,GST_STATES:5"
-            ),
-        },
     )
     try:
         wait_for_listener(server, port)
         probe = probe_source(FFPROBE_BINARY, port, "source-00000", "tcp")
-        if probe.returncode != 0:
-            os.kill(server.pid, signal.SIGINT)
-            server_output, _ = server.communicate(timeout=10)
-            pytest.fail(f"{probe.stderr}\n[DEBUG-a4f2] clocksync trace:\n{server_output}")
+        assert probe.returncode == 0, probe.stderr
         assert {
             (stream["codec_type"], stream["codec_name"])
             for stream in json.loads(probe.stdout)["streams"]
@@ -401,16 +392,7 @@ def test_opus_track_is_consumed_and_sequence_checked_with_video(tmp_path: Path) 
             text=True,
             timeout=15,
         )
-        if reader.returncode != 0:
-            os.kill(server.pid, signal.SIGINT)
-            server_output, _ = server.communicate(timeout=10)
-            raw_events = (
-                events_file.read_text(encoding="utf-8") if events_file.exists() else "missing"
-            )
-            pytest.fail(
-                f"{reader.stdout}{reader.stderr}\n[DEBUG-a4f2] reader events:\n"
-                f"{raw_events}\n[DEBUG-a4f2] clocksync trace:\n{server_output}"
-            )
+        assert reader.returncode == 0, reader.stdout + reader.stderr
         events = [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
         phase = next(event for event in events if event["event"] == "reader_rtp_phase")
         assert phase["audio_expected"] is True

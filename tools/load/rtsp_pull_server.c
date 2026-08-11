@@ -28,6 +28,13 @@ static gint fps = 25;
 static gint rtp_mtu = 1200;
 static gboolean audio = FALSE;
 
+typedef struct {
+    GMutex mutex;
+    guint buffers_per_second;
+    guint64 epoch_ns;
+    guint64 next_index;
+} PaceContext;
+
 static GOptionEntry entries[] = {
     {"address", 'a', 0, G_OPTION_ARG_STRING, &listen_address,
      "Address to listen on", "ADDRESS"},
@@ -60,6 +67,104 @@ stop_main_loop(gpointer user_data)
     GMainLoop *loop = user_data;
     g_main_loop_quit(loop);
     return G_SOURCE_CONTINUE;
+}
+
+static void
+free_pace_context(gpointer user_data, GClosure *closure)
+{
+    PaceContext *context = user_data;
+
+    (void) closure;
+    g_mutex_clear(&context->mutex);
+    g_free(context);
+}
+
+static void
+pace_handoff(GstElement *identity, GstBuffer *buffer, gpointer user_data)
+{
+    PaceContext *context = user_data;
+    guint64 deadline_ns;
+    guint64 interval_ns;
+    guint64 now_ns;
+
+    (void) identity;
+    (void) buffer;
+    g_mutex_lock(&context->mutex);
+    now_ns = gst_util_get_timestamp();
+    if (context->next_index == 0) {
+        /* The first buffer must reach gst-rtsp-server's preroll probe without
+         * waiting for a pipeline clock that is not running yet. */
+        context->epoch_ns = now_ns;
+        context->next_index = 1;
+        g_mutex_unlock(&context->mutex);
+        return;
+    }
+
+    interval_ns = gst_util_uint64_scale(
+        1, GST_SECOND, context->buffers_per_second);
+    deadline_ns = context->epoch_ns + gst_util_uint64_scale(
+        context->next_index, GST_SECOND, context->buffers_per_second);
+    if (now_ns > deadline_ns && now_ns - deadline_ns > interval_ns) {
+        /* A downstream RTSP probe or a state transition held the stream for
+         * more than one period. Rebase instead of emitting a catch-up burst. */
+        context->epoch_ns = now_ns;
+        context->next_index = 1;
+        deadline_ns = now_ns + interval_ns;
+    }
+    context->next_index++;
+    g_mutex_unlock(&context->mutex);
+
+    while ((now_ns = gst_util_get_timestamp()) < deadline_ns) {
+        g_usleep((deadline_ns - now_ns + 999) / 1000);
+    }
+}
+
+static gboolean
+attach_pacer(GstElement *element, const gchar *name, guint buffers_per_second)
+{
+    PaceContext *context;
+    GstElement *identity;
+
+    if (!GST_IS_BIN(element)) {
+        return FALSE;
+    }
+    identity = gst_bin_get_by_name(GST_BIN(element), name);
+    if (identity == NULL ||
+        g_signal_lookup("handoff", G_OBJECT_TYPE(identity)) == 0) {
+        if (identity != NULL) {
+            gst_object_unref(identity);
+        }
+        return FALSE;
+    }
+    context = g_new0(PaceContext, 1);
+    g_mutex_init(&context->mutex);
+    context->buffers_per_second = buffers_per_second;
+    g_signal_connect_data(
+        identity, "handoff", G_CALLBACK(pace_handoff), context,
+        free_pace_context, 0);
+    gst_object_unref(identity);
+    return TRUE;
+}
+
+static void
+configure_media_pacing(GstRTSPMediaFactory *factory, GstRTSPMedia *media,
+                       gpointer user_data)
+{
+    GstElement *element;
+    gboolean configured;
+
+    (void) factory;
+    (void) user_data;
+    element = gst_rtsp_media_get_element(media);
+    configured = element != NULL &&
+                 attach_pacer(element, "video_pacer", (guint) fps) &&
+                 (!audio || attach_pacer(element, "audio_pacer", 50));
+    if (element != NULL) {
+        gst_object_unref(element);
+    }
+    if (!configured) {
+        g_error("pipeline_error: unable to configure media pacing");
+    }
 }
 
 static gboolean
@@ -185,6 +290,7 @@ static gchar *
 build_launch_line(void)
 {
     const gchar *media_caps;
+    const gchar *parsed_caps;
     const gchar *parser;
     const gchar *payloader;
     gchar *escaped_fixture;
@@ -193,10 +299,14 @@ build_launch_line(void)
 
     if (g_strcmp0(codec, "h264") == 0) {
         media_caps = "video/x-h264,stream-format=(string)byte-stream";
+        parsed_caps = "video/x-h264,stream-format=(string)byte-stream,"
+                      "alignment=(string)au";
         parser = "h264parse";
         payloader = "rtph264pay";
     } else {
         media_caps = "video/x-h265,stream-format=(string)byte-stream";
+        parsed_caps = "video/x-h265,stream-format=(string)byte-stream,"
+                      "alignment=(string)au";
         parser = "h265parse";
         payloader = "rtph265pay";
     }
@@ -205,14 +315,15 @@ build_launch_line(void)
     video = g_strdup_printf(
         "multifilesrc location=\"%s\" loop=true start-index=0 stop-index=0 "
         "do-timestamp=true caps=\"%s,framerate=(fraction)%d/1\" ! "
-        "%s ! clocksync sync=true sync-to-first=true ! "
+        "%s ! %s ! identity name=video_pacer signal-handoffs=true ! "
         "%s name=pay0 pt=96 config-interval=1 mtu=%d",
-        escaped_fixture, media_caps, fps, parser, payloader, rtp_mtu);
+        escaped_fixture, media_caps, fps, parser, parsed_caps, payloader,
+        rtp_mtu);
     if (audio) {
         launch = g_strdup_printf(
-            "( %s audiotestsrc is-live=false wave=silence ! "
+            "( %s audiotestsrc is-live=false samplesperbuffer=960 wave=silence ! "
             "audio/x-raw,format=S16LE,rate=48000,channels=1 ! "
-            "clocksync sync=true sync-to-first=true ! "
+            "identity name=audio_pacer signal-handoffs=true ! "
             "opusenc bitrate=64000 ! rtpopuspay name=pay1 pt=97 )",
             video);
     } else {
@@ -302,6 +413,8 @@ main(int argc, char *argv[])
         gst_rtsp_media_factory_set_launch(factory, launch);
         gst_rtsp_media_factory_set_shared(factory, TRUE);
         gst_rtsp_media_factory_set_protocols(factory, GST_RTSP_LOWER_TRANS_TCP);
+        g_signal_connect(factory, "media-configure",
+                         G_CALLBACK(configure_media_pacing), NULL);
         gst_rtsp_mount_points_add_factory(mounts, mount, factory);
         g_free(mount);
     }
