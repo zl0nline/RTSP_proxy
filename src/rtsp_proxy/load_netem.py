@@ -361,7 +361,7 @@ def install_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
     ]
     if ingress_special:
         raise ValueError("netem_ingress_qdisc_not_clean")
-    if any(item.get("kind") not in {"noqueue"} for item in kernel.qdiscs(plan.ifb_interface)):
+    if not _is_kernel_default_qdisc_inventory(kernel.qdiscs(plan.ifb_interface)):
         raise ValueError("netem_ifb_qdisc_not_clean")
 
     ifb_add_arguments = (
@@ -993,18 +993,17 @@ def _cleanup_owned_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
         and item.get("handle") == NETEM_QDISC_HANDLE
         and item.get("root") is True
     ]
-    foreign_ifb_qdiscs = [
-        item
-        for item in ifb_qdiscs
-        if item.get("kind") != "noqueue" and item not in owned_ifb_qdiscs
-    ]
-    if len(owned_ifb_qdiscs) > 1 or foreign_ifb_qdiscs:
+    if len(owned_ifb_qdiscs) > 1:
         raise ValueError("netem_cleanup_foreign_ifb_state")
     if owned_ifb_qdiscs:
+        if len(ifb_qdiscs) != 1:
+            raise ValueError("netem_cleanup_foreign_ifb_state")
         try:
             _validate_netem_options(owned_ifb_qdiscs[0].get("options"), plan)
         except ValueError as error:
             raise ValueError("netem_cleanup_foreign_ifb_state") from error
+    elif not _is_kernel_default_qdisc_inventory(ifb_qdiscs):
+        raise ValueError("netem_cleanup_foreign_ifb_state")
     if ingress_special and not observed_flow_keys and not owned_ifb_qdiscs:
         raise ValueError("netem_cleanup_foreign_ingress_state")
 
@@ -1031,11 +1030,22 @@ def _cleanup_owned_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
             kernel.mutate_tc(("qdisc", "del", "dev", plan.ifb_interface, "root"))
         except BaseException as error:
             ifb_error = error
-    remaining_ifb = [
-        item for item in kernel.qdiscs(plan.ifb_interface) if item.get("kind") != "noqueue"
-    ]
-    if remaining_ifb:
+    if not _is_kernel_default_qdisc_inventory(kernel.qdiscs(plan.ifb_interface)):
         raise ValueError("netem_cleanup_ifb_qdisc_remains") from ifb_error
+
+
+def _is_kernel_default_qdisc_inventory(items: list[dict[str, object]]) -> bool:
+    if len(items) != 1:
+        return False
+    item = items[0]
+    kind = item.get("kind")
+    return (
+        isinstance(kind, str)
+        and bool(kind)
+        and kind not in {"netem", "clsact", "ingress"}
+        and item.get("handle") == "0:"
+        and item.get("root") is True
+    )
 
 
 def _configuration_without_ifindices(plan: NetemSitePlan) -> tuple[object, ...]:

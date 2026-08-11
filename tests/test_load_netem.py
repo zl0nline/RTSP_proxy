@@ -923,6 +923,10 @@ def test_install_and_remove_own_only_clean_scoped_netem_state() -> None:
     assert kernel.filters == []
     assert str(kernel.ifb_qdiscs[0]["kind"]) == "noqueue"
 
+    kernel.ifb_qdiscs = [{"kind": "fq_codel", "handle": "0:", "root": True}]
+    install_netem(kernel, plan)
+    remove_netem(kernel, plan)
+
 
 def test_ifb_accepts_only_automatic_ipv6_link_local_address() -> None:
     plan = required_netem_site_plans(wan_profile())[0]
@@ -1564,7 +1568,7 @@ elif '-j' in args and 'qdisc' in args:
                                           'correlation': 0.0},
                                 'loss-random': {'loss': 0.005, 'correlation': 0.0},
                                 'ecn': False, 'gap': 0}}]
-                  if state['ifb'] else [{'kind': 'noqueue', 'root': True}])
+                  if state['ifb'] else [{'kind': 'noqueue', 'handle': '0:', 'root': True}])
     else:
         result = [{'kind': 'fq_codel', 'root': True}]
         if state['clsact']:
