@@ -800,8 +800,8 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
         (process_root / "cgroup").write_text("0::/rtsp-load.slice\n", encoding="utf-8")
         (process_root / "exe").symlink_to(executable)
         (process_root / "limits").write_text(
-            "Max open files            65536                65536                files\n"
-            "Max processes             unlimited             unlimited             processes\n",
+            "Max open files            65536                65536                files     \n"
+            "Max processes unlimited unlimited processes     \n",
             encoding="utf-8",
         )
         (process_root / "maps").write_text(

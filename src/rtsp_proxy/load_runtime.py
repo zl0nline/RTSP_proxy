@@ -555,7 +555,7 @@ def _read_process_runtime(root: Path, binding: RuntimeProcessBinding) -> Runtime
 
 def _read_limit(body: str, name: str) -> tuple[LimitValue, LimitValue]:
     match = re.search(
-        rf"^{re.escape(name)}\s+(\d+|unlimited)\s+(\d+|unlimited)(?:\s+\S+)?$",
+        rf"^{re.escape(name)}\s+(\d+|unlimited)\s+(\d+|unlimited)(?:\s+\S+)?[ \t]*$",
         body,
         re.MULTILINE,
     )

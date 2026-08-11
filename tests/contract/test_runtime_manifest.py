@@ -74,7 +74,7 @@ def _wait_for_main_pid(unit: str) -> int:
                 and last_rss_line is not None
                 and re.fullmatch(r"VmRSS:\s+\d+\s+kB", last_rss_line)
                 and last_nofile_line is not None
-                and re.fullmatch(r"Max open files\s+\d+\s+\d+\s+\S+", last_nofile_line)
+                and re.fullmatch(r"Max open files\s+\d+\s+\d+\s+\S+\s*", last_nofile_line)
             ):
                 return pid
         time.sleep(0.1)

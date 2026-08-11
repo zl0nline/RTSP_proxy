@@ -1597,7 +1597,7 @@ def _read_process_counters(root: Path, pid: int) -> ProcessCounters:
         re.MULTILINE,
     )
     limit_match = re.search(
-        r"^Max open files\s+(\d+)\s+\d+\s+\S+$",
+        r"^Max open files\s+(\d+)\s+\d+\s+\S+[ \t]*$",
         (process_root / "limits").read_text(encoding="utf-8"),
         re.MULTILINE,
     )

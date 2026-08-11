@@ -474,7 +474,7 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
 ) -> None:
     (tmp_path / "proc/123/fd").mkdir(parents=True)
     (tmp_path / "proc/123/limits").write_text(
-        "Max open files            1000                 1000                 files\n",
+        "Max open files            1000                 1000                 files     \n",
         encoding="utf-8",
     )
     (tmp_path / "proc/123/stat").write_text(
