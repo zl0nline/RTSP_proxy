@@ -352,7 +352,11 @@ def test_opus_track_is_consumed_and_sequence_checked_with_video(tmp_path: Path) 
         text=True,
         env={
             **os.environ,
-            "GST_DEBUG": "rtspmedia:7,rtspclient:6,rtspserver:6",
+            "GST_DEBUG": (
+                "rtspmedia:7,rtspclient:6,rtspserver:6,basesrc:7,identity:7,"
+                "audiotestsrc:7,multifilesrc:7,rtph264pay:7,rtpopuspay:7,"
+                "GST_SCHEDULING:6"
+            ),
         },
     )
     try:
