@@ -1626,7 +1626,7 @@ def _read_cgroup_counters(root: Path, cgroup: str) -> CgroupCounters:
     mount_root = root / "sys/fs/cgroup"
     chain: list[dict[str, str]] = []
     current = cgroup_root
-    while True:
+    while current != mount_root:
         try:
             relative = current.relative_to(mount_root).as_posix() or "/"
         except ValueError as error:
@@ -1642,8 +1642,6 @@ def _read_cgroup_counters(root: Path, cgroup: str) -> CgroupCounters:
                 .strip(),
             }
         )
-        if current == mount_root:
-            break
         current = current.parent
     chain.reverse()
     constraints: list[CgroupConstraintCounters] = []

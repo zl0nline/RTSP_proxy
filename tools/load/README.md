@@ -285,10 +285,12 @@ The PID set must equal `cgroup.procs`; every PID must report that cgroup in
 procfs and retain its pinned executable digest and process start time. Validation
 uses host CPU/RAM/NIC byte and packet rates, actual interface MTU, maximum
 per-process single-core CPU/RLIMIT_NOFILE consumption and finite cgroup
-CPU/memory/pids limits. The sampler walks the cgroup v2 chain through the mount
-root and gates CPU, memory and PID usage at every ancestor that shares a relevant
-constraint, so sibling usage in a limiting systemd slice cannot create false
-headroom. NIC speed, total RAM, effective limits, constraint chain and every
+CPU/memory/pids limits. The sampler walks every non-root cgroup v2 ancestor and
+gates CPU, memory and PID usage wherever a controller constraint exists, so
+sibling usage in a limiting systemd slice cannot create false headroom. The
+resource-control-exempt mount root is covered by the separate host CPU/RAM gates,
+as required by the kernel cgroup v2 contract. NIC speed, total RAM, effective
+limits, constraint chain and every
 process RLIMIT remain immutable across samples and must equal the runtime
 manifest. Machine/boot identity, sample cadence and coverage of
 the complete scheduled workload window are checked. Capacity runs require

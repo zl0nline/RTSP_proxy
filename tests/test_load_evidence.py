@@ -482,14 +482,14 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
         encoding="utf-8",
     )
     (tmp_path / "proc/123/status").write_text("VmRSS:\t200 kB\n", encoding="utf-8")
-    (tmp_path / "proc/123/cgroup").write_text("0::/load.slice\n", encoding="utf-8")
+    (tmp_path / "proc/123/cgroup").write_text("0::/tenant.slice/load.slice\n", encoding="utf-8")
     executable = tmp_path / "load-reader"
     executable.write_bytes(b"load-reader")
     (tmp_path / "proc/123/exe").symlink_to(executable)
     (tmp_path / "proc/123/fd/0").touch()
     (tmp_path / "proc/123/fd/1").touch()
     (tmp_path / "sys/class/net/camera0/statistics").mkdir(parents=True)
-    (tmp_path / "sys/fs/cgroup/load.slice").mkdir(parents=True)
+    (tmp_path / "sys/fs/cgroup/tenant.slice/load.slice").mkdir(parents=True)
     (tmp_path / "etc").mkdir()
     (tmp_path / "etc/machine-id").write_text("machine-a\n", encoding="utf-8")
     (tmp_path / "proc/sys/kernel/random").mkdir(parents=True)
@@ -521,7 +521,7 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
     (tmp_path / "sys/class/net/camera0/statistics/tx_packets").write_text("456\n", encoding="utf-8")
     (tmp_path / "sys/class/net/camera0/speed").write_text("1000\n", encoding="utf-8")
     (tmp_path / "sys/class/net/camera0/mtu").write_text("1500\n", encoding="utf-8")
-    cgroup = tmp_path / "sys/fs/cgroup/load.slice"
+    cgroup = tmp_path / "sys/fs/cgroup/tenant.slice/load.slice"
     (cgroup / "cpu.stat").write_text("usage_usec 1234\n", encoding="utf-8")
     (cgroup / "cpu.max").write_text("100000 100000\n", encoding="utf-8")
     (cgroup / "cpuset.cpus.effective").write_text("0-3\n", encoding="utf-8")
@@ -530,20 +530,20 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
     (cgroup / "pids.current").write_text("10\n", encoding="utf-8")
     (cgroup / "pids.max").write_text("100\n", encoding="utf-8")
     (cgroup / "cgroup.procs").write_text("123\n", encoding="utf-8")
-    cgroup_mount = tmp_path / "sys/fs/cgroup"
-    (cgroup_mount / "cpu.max").write_text("max 100000\n", encoding="utf-8")
-    (cgroup_mount / "memory.max").write_text("max\n", encoding="utf-8")
-    (cgroup_mount / "pids.max").write_text("max\n", encoding="utf-8")
-    (cgroup_mount / "cpuset.cpus.effective").write_text("0-7\n", encoding="utf-8")
-    (cgroup_mount / "cpu.stat").write_text("usage_usec 2234\n", encoding="utf-8")
-    (cgroup_mount / "memory.current").write_text("200000\n", encoding="utf-8")
-    (cgroup_mount / "pids.current").write_text("20\n", encoding="utf-8")
+    cgroup_parent = cgroup.parent
+    (cgroup_parent / "cpu.max").write_text("200000 100000\n", encoding="utf-8")
+    (cgroup_parent / "memory.max").write_text("2000000\n", encoding="utf-8")
+    (cgroup_parent / "pids.max").write_text("200\n", encoding="utf-8")
+    (cgroup_parent / "cpuset.cpus.effective").write_text("0-7\n", encoding="utf-8")
+    (cgroup_parent / "cpu.stat").write_text("usage_usec 2234\n", encoding="utf-8")
+    (cgroup_parent / "memory.current").write_text("200000\n", encoding="utf-8")
+    (cgroup_parent / "pids.current").write_text("20\n", encoding="utf-8")
 
     counters = read_linux_generator_counters(
         tmp_path,
         interface="camera0",
         pids=(123,),
-        cgroup="load.slice",
+        cgroup="tenant.slice/load.slice",
         expected_executables={123: hashlib.sha256(b"load-reader").hexdigest()},
         expected_mtu_bytes=1500,
     )

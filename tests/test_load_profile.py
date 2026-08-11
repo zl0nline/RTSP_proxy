@@ -759,19 +759,13 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
     cgroup_mount = tmp_path / "sys/fs/cgroup"
     cgroup = cgroup_mount / "rtsp-load.slice"
     cgroup.mkdir(parents=True)
-    for target, values in (
-        (cgroup_mount, ("max 100000", "max", "max", "0-7")),
-        (cgroup, ("400000 100000", str(8 * 1024**3), "100000", "0-7")),
-    ):
+    for target, values in ((cgroup, ("400000 100000", str(8 * 1024**3), "100000", "0-7")),):
         for name, value in zip(
             ("cpu.max", "memory.max", "pids.max", "cpuset.cpus.effective"),
             values,
             strict=True,
         ):
             (target / name).write_text(value + "\n", encoding="utf-8")
-    (cgroup_mount / "cpu.stat").write_text("usage_usec 2\n", encoding="utf-8")
-    (cgroup_mount / "memory.current").write_text("2048\n", encoding="utf-8")
-    (cgroup_mount / "pids.current").write_text("3\n", encoding="utf-8")
     (cgroup / "cpu.stat").write_text("usage_usec 1\n", encoding="utf-8")
     (cgroup / "memory.current").write_text("1024\n", encoding="utf-8")
     (cgroup / "pids.current").write_text("2\n", encoding="utf-8")
