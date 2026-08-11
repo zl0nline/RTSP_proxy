@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from rtsp_proxy.identifiers import InvalidPublicId, PublicId
 
-NO_ORACLE_PATH_MATCHER = "~^[a-z0-9]{25}$"
+NO_ORACLE_PATH_MATCHER = "~^[a-z2-7]{25}[aeimquy4]$"
 SOURCE_ON_DEMAND_CLOSE_AFTER = "10s"
 
 

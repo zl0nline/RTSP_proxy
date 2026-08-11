@@ -54,7 +54,8 @@ L3 transport, не меняющий `rtsp://` handshake.
 Camera создаётся с automatic placement по умолчанию или с manual node.
 Автоматический выбор:
 
-1. только RUNNING/healthy nodes вне maintenance/drain;
+1. только desired/runtime RUNNING, healthy nodes со свежим management
+   observation вне maintenance/drain;
 2. минимальное число registered cameras;
 3. минимальное число active sources;
 4. stable node id.
@@ -164,6 +165,13 @@ review, fixes и native amd64/arm64 CI.
 Уже реализованы:
 
 - Python package и role readiness scaffold;
+- Phase B candidate: typed node settings, packaged PostgreSQL/Alembic
+  migrations, node registry, random/manual port allocation, auto/manual camera
+  placement onto eligible provisioned nodes, 100-camera admission, append-only
+  placement history and transactional audit/outbox;
+- public node/camera HTTP commands with desired/applied revisions, strict
+  eligibility with DB-clock freshness expiry and PostgreSQL race tests;
+- release/startup schema gate bound to packaged Alembic head;
 - architecture/digest-aware release verifier;
 - direct-Linux systemd/sysusers/tmpfiles baseline;
 - typed MediaMTX v1.20.0 adapter;
@@ -172,10 +180,14 @@ review, fixes и native amd64/arm64 CI.
 - tamper-evident resource/runtime/fixture evidence;
 - scoped IFB/netem WAN evidence and direct-control comparison.
 
-Ещё не реализованы production node registry, database catalog/migrations,
-placement API, dashboard, one-reader admission, access policies, notifications
-и complete operations workflows. Наличие load harness не означает готовый
-product или published capacity.
+Phase B прошла independent Standards/Spec review; для phase exit остался
+green native amd64/arm64 CI. Credentialed/query-token source URLs сейчас fail
+closed: они не будут приниматься до encrypted secret-reference flow. Ещё не реализованы
+per-node systemd runtime и automatic missing-target provisioner; поэтому при
+отсутствии eligible RUNNING node camera create завершается fail closed без
+ghost placement. Также ещё не реализованы reconciler/move/drain, dashboard,
+one-reader admission, access policies, notifications и complete operations workflows.
+Наличие load harness не означает готовый product или published capacity.
 
 ## Локальная разработка
 

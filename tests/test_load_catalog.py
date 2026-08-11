@@ -25,7 +25,7 @@ def test_load_public_ids_are_deterministic_canonical_and_index_specific() -> Non
     second = load_public_id(seed=1234, index=1)
 
     assert isinstance(first, PublicId)
-    assert len(str(first)) == 25
+    assert len(str(first)) == 26
     assert first == repeated
     assert first != second
 

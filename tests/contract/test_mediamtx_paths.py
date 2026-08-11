@@ -81,8 +81,8 @@ def test_path_hot_update_and_delete_are_idempotent_and_isolated(tmp_path: Path) 
         encoding="utf-8",
     )
     process = start_mediamtx(config)
-    first_name = "a" * 25
-    second_name = "b" * 25
+    first_name = "a" * 26
+    second_name = "b" * 25 + "a"
     first_id = PublicId.parse(first_name)
     second_id = PublicId.parse(second_name)
     client = MediaMtxClient(api_url=api_url, timeout_seconds=2)
@@ -131,7 +131,7 @@ def test_runtime_paths_require_cold_restore_after_a_media_node_restart(tmp_path:
         encoding="utf-8",
     )
     path = MediaPathConfig(
-        name=PublicId.parse("e" * 25),
+        name=PublicId.parse("e" * 25 + "a"),
         source_url=f"rtsp://127.0.0.1:{source_port}/main",
     )
     client = MediaMtxClient(api_url=api_url, timeout_seconds=2)

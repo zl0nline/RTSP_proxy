@@ -32,6 +32,12 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
+      - name: Install native PostgreSQL test server
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql
+          echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
+
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
@@ -64,6 +70,19 @@ jobs:
           uv pip sync --python .artifacts/clean-venv/bin/python .artifacts/runtime-requirements.txt
           uv pip install --python .artifacts/clean-venv/bin/python --no-deps dist/rtsp_proxy-0.1.0-py3-none-any.whl
           RTSP_PROXY_ROLE=web .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.runtime import create_app_from_environment; assert create_app_from_environment().title == "RTSP Proxy Control Plane"'
+
+      - name: Verify packaged migrations against native PostgreSQL
+        run: |
+          migration_pgdata=$(mktemp -d)
+          migration_socket=$(mktemp -d)
+          migration_port=$(.artifacts/clean-venv/bin/python -c 'import socket; listener=socket.socket(); listener.bind(("127.0.0.1", 0)); print(listener.getsockname()[1]); listener.close()')
+          initdb --pgdata "$migration_pgdata" --username postgres --auth-local trust --auth-host trust --no-locale --encoding UTF8
+          pg_ctl --pgdata "$migration_pgdata" --options "-h 127.0.0.1 -p $migration_port -k $migration_socket" --log "$migration_pgdata/server.log" start
+          trap 'pg_ctl --pgdata "$migration_pgdata" --mode fast stop' EXIT
+          createdb --host 127.0.0.1 --port "$migration_port" --username postgres rtsp_proxy_migration_test
+          RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
+            .artifacts/clean-venv/bin/rtsp-proxy-migrate
+          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0004_management_freshness"
 
       - name: Validate systemd units
         run: |

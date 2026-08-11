@@ -169,6 +169,7 @@ max_nodes = 50                 # 1..100
 node_port_range_start
 node_port_range_end
 node_port_reserved = [...]
+node_management_freshness_seconds = 30
 management_https_bind
 mediamtx_api_loopback_range
 mediamtx_metrics_loopback_range
@@ -244,7 +245,8 @@ committed.
 Eligible automatic/manual target:
 
 - desired/runtime state is RUNNING;
-- health and management API freshness green;
+- health green and management observation newer than the configured
+  DB-clock freshness deadline;
 - not maintenance/draining/deleting;
 - registered count <100;
 - current release/config compatible.
@@ -655,28 +657,43 @@ implementation -> refactor -> full gates -> Standards/Spec review -> fixes.
 
 - [x] Rewrite issues #1–#14 for bounded-node topology.
 - [x] Update production plan, README, domain language and ADR.
-- [ ] Review documentation for stale single-port/gateway claims.
+- [x] Review documentation for stale single-port/gateway claims.
 
 Exit: one non-contradictory normative model.
 
 ### Phase B — node registry and placement foundation
 
-- extend typed settings (`max_nodes`, port range);
-- PostgreSQL/Alembic foundation;
-- `media_nodes`, `cameras`, `camera_placements`, audit/outbox migrations;
-- random/manual port allocator with transaction/concurrency tests;
-- node create/query commands;
-- auto/manual placement and 100-camera admission;
-- control API endpoints and error contracts.
+- [x] extend typed settings (`max_nodes`, port range/exclusions);
+- [x] packaged PostgreSQL/Alembic foundation and migration runner;
+- [x] `media_nodes`, `cameras`, current/append-only placement,
+  audit/outbox migrations;
+- [x] random/manual port allocator with bounded recheck and race tests;
+- [x] node create/query commands with desired/applied revisions;
+- [x] separate revisioned desired transitions from expiring runtime
+  observations;
+- [x] auto/manual placement onto already provisioned eligible nodes, full
+  eligibility and 100-camera admission;
+- [x] control API endpoints and error contracts.
 
 Exit: API tests prove max_nodes, port exhaustion/collisions, deterministic
 least-loaded placement and no 101st camera.
+
+Status: **implementation and independent Standards/Spec reviews passed;
+native amd64/arm64 CI pending**. Source credentials remain fail-closed until
+the encrypted secret-reference slice; this Phase B code never persists URL
+userinfo/query tokens. The binary and release manifest are bound to packaged
+Alembic head `0004_management_freshness`; startup rejects any other live database revision.
+Until Phase C supplies the typed process/config provisioner, absence of an
+eligible RUNNING node fails closed and no camera or ghost placement is
+committed.
 
 ### Phase C — per-node Linux runtime
 
 - per-node config renderer and secure directory layout;
 - systemd instance unit and narrow process adapter;
 - create/start/stop/restart/health smoke;
+- automatic missing-target reservation -> provision -> smoke -> camera
+  placement, with no placement committed before provisioning success;
 - unique loopback API/metrics allocation;
 - node lifecycle persistence/recovery;
 - native two-node isolation test amd64/arm64.

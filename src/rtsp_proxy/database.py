@@ -1,0 +1,649 @@
+from __future__ import annotations
+
+from collections.abc import Collection
+from datetime import timedelta
+from uuid import UUID, uuid4
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    Uuid,
+    create_engine,
+    func,
+    insert,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import Connection, RowMapping
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.nodes import (
+    CameraPlacement,
+    EligibleNodeMissing,
+    MaximumNodesReached,
+    MediaNode,
+    NodeCameraCapacityReached,
+    NodeHealth,
+    NodeIdFactory,
+    NodeNotFound,
+    NodePortInUse,
+    NodePortOutOfRange,
+    NodePortRangeExhausted,
+    NodeRuntimeObservation,
+    NodeState,
+    PlacementMode,
+    PortBindable,
+    PortChoice,
+    is_node_eligible,
+    validate_camera_source_url,
+)
+from rtsp_proxy.release import APPLICATION_SCHEMA
+
+metadata = MetaData()
+
+media_nodes = Table(
+    "media_nodes",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("external_port", Integer, nullable=False, unique=True),
+    Column("state", String(32), nullable=False),
+    Column("runtime_state", String(32), nullable=False),
+    Column("health", String(32), nullable=False),
+    Column("registered_cameras", Integer, nullable=False),
+    Column("camera_capacity", Integer, nullable=False),
+    Column("active_sources", Integer, nullable=False),
+    Column("maintenance", Boolean, nullable=False),
+    Column("management_fresh", Boolean, nullable=False),
+    Column("management_observed_at", DateTime(timezone=True), nullable=True),
+    Column("config_compatible", Boolean, nullable=False),
+    Column("desired_revision", BigInteger, nullable=False),
+    Column("applied_revision", BigInteger, nullable=False),
+    CheckConstraint("external_port BETWEEN 1 AND 65535"),
+    CheckConstraint("registered_cameras BETWEEN 0 AND 100"),
+    CheckConstraint("camera_capacity = 100"),
+    CheckConstraint("active_sources >= 0"),
+    CheckConstraint(
+        "state IN ('provisioning', 'stopped', 'stopping', 'starting', 'running', "
+        "'draining', 'maintenance', 'failed', 'deleting')"
+    ),
+    CheckConstraint(
+        "runtime_state IN ('provisioning', 'stopped', 'stopping', 'starting', 'running', "
+        "'draining', 'maintenance', 'failed', 'deleting')"
+    ),
+    CheckConstraint("health IN ('unknown', 'healthy', 'unhealthy')"),
+    CheckConstraint("desired_revision >= 1"),
+    CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+)
+
+cameras = Table(
+    "cameras",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("source_url", Text, nullable=False),
+    Column("public_id", String(26), nullable=False, unique=True),
+    Column("desired_revision", BigInteger, nullable=False),
+    Column("applied_revision", BigInteger, nullable=False),
+    CheckConstraint("public_id ~ '^[a-z2-7]{25}[aeimquy4]$'"),
+    CheckConstraint("desired_revision >= 1"),
+    CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+)
+
+camera_placements = Table(
+    "camera_placements",
+    metadata,
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column(
+        "node_id",
+        Uuid(as_uuid=True),
+        ForeignKey("media_nodes.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("placement_mode", String(16), nullable=False),
+    Column("generation", BigInteger, nullable=False),
+    CheckConstraint("generation >= 1"),
+    CheckConstraint("placement_mode IN ('automatic', 'manual')"),
+)
+
+camera_placement_history = Table(
+    "camera_placement_history",
+    metadata,
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column("generation", BigInteger, primary_key=True),
+    Column(
+        "node_id",
+        Uuid(as_uuid=True),
+        ForeignKey("media_nodes.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("placement_mode", String(16), nullable=False),
+    Column(
+        "placed_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    ),
+    CheckConstraint("generation >= 1"),
+    CheckConstraint("placement_mode IN ('automatic', 'manual')"),
+)
+
+audit_events = Table(
+    "audit_events",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column("aggregate_type", String(32), nullable=False),
+    Column("aggregate_id", Uuid(as_uuid=True), nullable=False),
+    Column("event_type", String(64), nullable=False),
+    Column("aggregate_revision", BigInteger, nullable=False),
+    Column("payload", JSONB, nullable=False),
+    Column(
+        "occurred_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    ),
+    CheckConstraint("aggregate_revision >= 1"),
+)
+
+outbox_messages = Table(
+    "outbox_messages",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column("aggregate_type", String(32), nullable=False),
+    Column("aggregate_id", Uuid(as_uuid=True), nullable=False),
+    Column("event_type", String(64), nullable=False),
+    Column("aggregate_revision", BigInteger, nullable=False),
+    Column("payload", JSONB, nullable=False),
+    Column("status", String(16), nullable=False, server_default="pending"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column(
+        "available_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    ),
+    Column(
+        "occurred_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    ),
+    Column("published_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint("attempts >= 0"),
+    CheckConstraint("aggregate_revision >= 1"),
+    CheckConstraint("status IN ('pending', 'processing', 'published', 'failed')"),
+)
+
+_NODE_REGISTRY_LOCK_KEY = 0x52545350524F5859
+_CAMERA_PLACEMENT_LOCK_KEY = 0x43414D504C414345
+
+
+class DatabaseSchemaMismatch(RuntimeError):
+    """The live PostgreSQL revision is incompatible with this application."""
+
+
+class PostgresNodeStore:
+    def __init__(self, database_url: str) -> None:
+        self._engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            hide_parameters=True,
+        )
+
+    def assert_schema_compatible(self) -> None:
+        try:
+            with self._engine.connect() as connection:
+                revisions = tuple(
+                    connection.scalars(text("SELECT version_num FROM alembic_version"))
+                )
+        except SQLAlchemyError:
+            raise DatabaseSchemaMismatch("database_schema_mismatch") from None
+        if revisions != (APPLICATION_SCHEMA,):
+            raise DatabaseSchemaMismatch("database_schema_mismatch")
+
+    def register_automatically(
+        self,
+        *,
+        name: str,
+        allowed_ports: Collection[int],
+        max_nodes: int,
+        preferred_port: int | None,
+        choose_port: PortChoice,
+        new_node_id: NodeIdFactory,
+        is_port_bindable: PortBindable | None = None,
+    ) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _NODE_REGISTRY_LOCK_KEY},
+            )
+            if preferred_port is not None and preferred_port not in allowed_ports:
+                raise NodePortOutOfRange("node_port_out_of_range")
+            node_count = connection.scalar(select(func.count()).select_from(media_nodes))
+            if node_count is None or node_count >= max_nodes:
+                raise MaximumNodesReached("max_nodes_reached")
+            occupied = set(connection.scalars(select(media_nodes.c.external_port)))
+            if preferred_port is not None and preferred_port in occupied:
+                raise NodePortInUse("node_port_in_use")
+            available = tuple(port for port in allowed_ports if port not in occupied)
+            if not available:
+                raise NodePortRangeExhausted("node_port_range_exhausted")
+            probe = is_port_bindable or (lambda port: True)
+            candidates = list(available)
+            node: MediaNode | None = None
+            for _ in range(len(candidates)):
+                selected = (
+                    preferred_port
+                    if preferred_port is not None
+                    else choose_port(tuple(candidates))
+                )
+                if selected not in candidates:
+                    raise RuntimeError("node_port_selector_invalid")
+                if not probe(selected):
+                    if preferred_port is not None:
+                        raise NodePortInUse("node_port_in_use")
+                    candidates.remove(selected)
+                    continue
+                candidate = MediaNode(id=new_node_id(), name=name, external_port=selected)
+                try:
+                    with connection.begin_nested():
+                        connection.execute(
+                            insert(media_nodes).values(
+                                id=candidate.id,
+                                name=candidate.name,
+                                external_port=candidate.external_port,
+                                state=candidate.state.value,
+                                runtime_state=candidate.runtime_state.value,
+                                health=candidate.health.value,
+                                registered_cameras=candidate.registered_cameras,
+                                camera_capacity=candidate.camera_capacity,
+                                active_sources=candidate.active_sources,
+                                maintenance=candidate.maintenance,
+                                management_fresh=candidate.management_fresh,
+                                management_observed_at=candidate.management_observed_at,
+                                config_compatible=candidate.config_compatible,
+                                desired_revision=candidate.desired_revision,
+                                applied_revision=candidate.applied_revision,
+                            )
+                        )
+                except IntegrityError as error:
+                    if not _is_external_port_conflict(error):
+                        raise
+                    if preferred_port is not None:
+                        raise NodePortInUse("node_port_in_use") from None
+                    candidates.remove(selected)
+                    continue
+                node = candidate
+                break
+            if node is None:
+                raise NodePortRangeExhausted("node_port_range_exhausted")
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node.id,
+                event_type="media_node.created",
+                payload={
+                    "name": node.name,
+                    "external_port": node.external_port,
+                    "camera_capacity": node.camera_capacity,
+                    "desired_revision": node.desired_revision,
+                },
+                aggregate_revision=node.desired_revision,
+            )
+            return node
+
+    def list_nodes(self) -> tuple[MediaNode, ...]:
+        with self._engine.connect() as connection:
+            rows = connection.execute(select(media_nodes).order_by(media_nodes.c.id)).mappings()
+            return tuple(_media_node(row) for row in rows)
+
+    def get_node(self, node_id: UUID) -> MediaNode | None:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                select(media_nodes).where(media_nodes.c.id == node_id)
+            ).mappings().one_or_none()
+            return None if row is None else _media_node(row)
+
+    def apply_runtime_observation(
+        self,
+        node_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode:
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                update(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .values(
+                    runtime_state=observation.state.value,
+                    health=observation.health.value,
+                )
+                .values(
+                    management_fresh=observation.management_fresh,
+                    management_observed_at=(
+                        func.clock_timestamp() if observation.management_fresh else None
+                    ),
+                    config_compatible=observation.config_compatible,
+                )
+                .returning(*media_nodes.c)
+            ).mappings().one_or_none()
+            if row is None:
+                raise NodeNotFound("node_not_found")
+            return _media_node(row)
+
+    def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            if node.state is state:
+                return node
+            desired_revision = node.desired_revision + 1
+            row = connection.execute(
+                update(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .values(state=state.value, desired_revision=desired_revision)
+                .returning(*media_nodes.c)
+            ).mappings().one()
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.desired_state_changed",
+                payload={
+                    "previous_state": node.state.value,
+                    "state": state.value,
+                    "desired_revision": desired_revision,
+                },
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def place_camera_automatically(
+        self,
+        *,
+        camera_id: UUID,
+        name: str,
+        source_url: str,
+        public_id: PublicId,
+        management_freshness_seconds: int = 30,
+    ) -> CameraPlacement:
+        source_url = validate_camera_source_url(source_url)
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            selected = connection.execute(
+                select(media_nodes)
+                .where(
+                    media_nodes.c.state == NodeState.RUNNING.value,
+                    media_nodes.c.runtime_state == NodeState.RUNNING.value,
+                    media_nodes.c.health == NodeHealth.HEALTHY.value,
+                    media_nodes.c.management_fresh.is_(True),
+                    media_nodes.c.management_observed_at
+                    >= func.clock_timestamp()
+                    - timedelta(seconds=management_freshness_seconds),
+                    media_nodes.c.config_compatible.is_(True),
+                    media_nodes.c.maintenance.is_(False),
+                    media_nodes.c.registered_cameras < media_nodes.c.camera_capacity,
+                )
+                .order_by(
+                    media_nodes.c.registered_cameras,
+                    media_nodes.c.active_sources,
+                    media_nodes.c.id,
+                )
+                .limit(1)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if selected is None:
+                raise EligibleNodeMissing("eligible_node_missing")
+            else:
+                selected_node = _media_node(selected)
+            return self._insert_camera(
+                connection=connection,
+                selected=selected_node,
+                camera_id=camera_id,
+                name=name,
+                source_url=source_url,
+                public_id=public_id,
+                placement_mode=PlacementMode.AUTOMATIC,
+            )
+
+    def place_camera_manually(
+        self,
+        *,
+        camera_id: UUID,
+        name: str,
+        source_url: str,
+        public_id: PublicId,
+        node_id: UUID,
+        management_freshness_seconds: int = 30,
+    ) -> CameraPlacement:
+        source_url = validate_camera_source_url(source_url)
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            selected = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if selected is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(selected)
+            if node.registered_cameras >= node.camera_capacity:
+                raise NodeCameraCapacityReached("node_camera_capacity_reached")
+            database_now = connection.scalar(select(func.clock_timestamp()))
+            if database_now is None or not is_node_eligible(
+                node,
+                management_freshness_seconds=management_freshness_seconds,
+                now=database_now,
+            ):
+                raise EligibleNodeMissing("manual_node_ineligible")
+            return self._insert_camera(
+                connection=connection,
+                selected=node,
+                camera_id=camera_id,
+                name=name,
+                source_url=source_url,
+                public_id=public_id,
+                placement_mode=PlacementMode.MANUAL,
+            )
+
+    def list_cameras(self) -> tuple[CameraPlacement, ...]:
+        statement = (
+            select(
+                cameras.c.id,
+                cameras.c.name,
+                cameras.c.source_url,
+                cameras.c.public_id,
+                cameras.c.desired_revision,
+                cameras.c.applied_revision,
+                camera_placements.c.node_id,
+                camera_placements.c.placement_mode,
+                media_nodes.c.external_port.label("node_port"),
+            )
+            .join(camera_placements, camera_placements.c.camera_id == cameras.c.id)
+            .join(media_nodes, media_nodes.c.id == camera_placements.c.node_id)
+            .order_by(cameras.c.id)
+        )
+        with self._engine.connect() as connection:
+            return tuple(_camera_placement(row) for row in connection.execute(statement).mappings())
+
+    def _lock_placements(self, connection: Connection) -> None:
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {"key": _CAMERA_PLACEMENT_LOCK_KEY},
+        )
+
+    def _insert_camera(
+        self,
+        *,
+        connection: Connection,
+        selected: MediaNode,
+        camera_id: UUID,
+        name: str,
+        source_url: str,
+        public_id: PublicId,
+        placement_mode: PlacementMode,
+    ) -> CameraPlacement:
+        connection.execute(
+            insert(cameras).values(
+                id=camera_id,
+                name=name,
+                source_url=source_url,
+                public_id=str(public_id),
+                desired_revision=1,
+                applied_revision=0,
+            )
+        )
+        connection.execute(
+            insert(camera_placements).values(
+                camera_id=camera_id,
+                node_id=selected.id,
+                placement_mode=placement_mode.value,
+                generation=1,
+            )
+        )
+        connection.execute(
+            insert(camera_placement_history).values(
+                camera_id=camera_id,
+                node_id=selected.id,
+                placement_mode=placement_mode.value,
+                generation=1,
+            )
+        )
+        connection.execute(
+            update(media_nodes)
+            .where(media_nodes.c.id == selected.id)
+            .values(registered_cameras=selected.registered_cameras + 1)
+        )
+        _record_normative_event(
+            connection,
+            aggregate_type="camera",
+            aggregate_id=camera_id,
+            event_type="camera.created",
+            payload={
+                "name": name,
+                "public_id": str(public_id),
+                "node_id": str(selected.id),
+                "placement_mode": placement_mode.value,
+                "placement_generation": 1,
+                "desired_revision": 1,
+            },
+            aggregate_revision=1,
+        )
+        return CameraPlacement(
+            id=camera_id,
+            name=name,
+            source_url=source_url,
+            public_id=public_id,
+            node_id=selected.id,
+            node_port=selected.external_port,
+            placement_mode=placement_mode,
+            desired_revision=1,
+            applied_revision=0,
+        )
+
+    def close(self) -> None:
+        self._engine.dispose()
+
+
+def _media_node(row: RowMapping) -> MediaNode:
+    return MediaNode(
+        id=_uuid(row["id"]),
+        name=str(row["name"]),
+        external_port=int(row["external_port"]),
+        state=NodeState(str(row["state"])),
+        runtime_state=NodeState(str(row["runtime_state"])),
+        health=NodeHealth(str(row["health"])),
+        registered_cameras=int(row["registered_cameras"]),
+        camera_capacity=int(row["camera_capacity"]),
+        active_sources=int(row["active_sources"]),
+        maintenance=bool(row["maintenance"]),
+        management_fresh=bool(row["management_fresh"]),
+        management_observed_at=row["management_observed_at"],
+        config_compatible=bool(row["config_compatible"]),
+        desired_revision=int(row["desired_revision"]),
+        applied_revision=int(row["applied_revision"]),
+    )
+
+
+def _uuid(value: object) -> UUID:
+    if isinstance(value, UUID):
+        return value
+    return UUID(str(value))
+
+
+def _camera_placement(row: RowMapping) -> CameraPlacement:
+    return CameraPlacement(
+        id=_uuid(row["id"]),
+        name=str(row["name"]),
+        source_url=str(row["source_url"]),
+        public_id=PublicId.parse(str(row["public_id"])),
+        node_id=_uuid(row["node_id"]),
+        node_port=int(row["node_port"]),
+        placement_mode=PlacementMode(str(row["placement_mode"])),
+        desired_revision=int(row["desired_revision"]),
+        applied_revision=int(row["applied_revision"]),
+    )
+
+
+def _record_normative_event(
+    connection: Connection,
+    *,
+    aggregate_type: str,
+    aggregate_id: UUID,
+    event_type: str,
+    payload: dict[str, object],
+    aggregate_revision: int,
+) -> None:
+    event_id = uuid4()
+    values = {
+        "id": event_id,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "event_type": event_type,
+        "aggregate_revision": aggregate_revision,
+        "payload": payload,
+    }
+    connection.execute(insert(audit_events).values(**values))
+    connection.execute(insert(outbox_messages).values(**values))
+
+
+def _require_synchronous_commit(connection: Connection) -> None:
+    connection.execute(text("SET LOCAL synchronous_commit = on"))
+
+
+def _is_external_port_conflict(error: IntegrityError) -> bool:
+    diagnostic = getattr(error.orig, "diag", None)
+    return getattr(diagnostic, "constraint_name", None) == "media_nodes_external_port_key"

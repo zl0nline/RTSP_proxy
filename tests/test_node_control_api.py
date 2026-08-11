@@ -1,0 +1,1692 @@
+import socket
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from threading import Barrier
+from typing import cast
+from uuid import UUID, uuid4
+
+import pytest
+from alembic import command
+from alembic.config import Config
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from httpx2 import Response
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
+
+from rtsp_proxy.app import create_app
+from rtsp_proxy.config import RuntimeRole, Settings
+from rtsp_proxy.database import PostgresNodeStore
+from rtsp_proxy.identifiers import PublicId, generate_public_id
+from rtsp_proxy.migrate import upgrade_database
+from rtsp_proxy.nodes import (
+    CameraControl,
+    InMemoryNodeStore,
+    InvalidCameraSource,
+    MediaNode,
+    NodeControl,
+    NodeHealth,
+    NodeRuntime,
+    NodeRuntimeObservation,
+    NodeState,
+    tcp_port_is_bindable,
+)
+from rtsp_proxy.runtime import create_app_from_environment, create_background_app, run_web
+
+
+def test_node_commands_fail_closed_when_the_control_store_is_not_configured() -> None:
+    response = TestClient(create_app(Settings(role=RuntimeRole.WEB))).post(
+        "/api/v1/nodes",
+        json={"name": "unavailable"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "node_control_unavailable"}}
+
+
+def test_operator_can_register_a_node_with_an_automatically_allocated_port() -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: 12001,
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+    )
+    app = create_app(
+        Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=12000,
+            node_port_range_end=12002,
+        ),
+        node_control=control,
+    )
+
+    response = TestClient(app).post("/api/v1/nodes", json={"name": "media-a"})
+
+    assert response.status_code == 201
+    assert response.headers["location"] == (
+        "/api/v1/nodes/00000000-0000-0000-0000-000000000001"
+    )
+    assert response.json() == {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "name": "media-a",
+        "external_port": 12001,
+        "state": "provisioning",
+        "runtime_state": "provisioning",
+        "health": "unknown",
+        "registered_cameras": 0,
+        "camera_capacity": 100,
+        "desired_revision": 1,
+        "applied_revision": 0,
+    }
+
+
+def test_port_allocator_rechecks_bindability_and_retries_a_raced_candidate() -> None:
+    observations: dict[int, int] = {}
+
+    def changing_bindability(port: int) -> bool:
+        observations[port] = observations.get(port, 0) + 1
+        return port != 12000 or observations[port] == 1
+
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        is_port_bindable=changing_bindability,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=2,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=control,
+        )
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "raced"})
+
+    assert response.status_code == 201
+    assert response.json()["external_port"] == 12001
+
+
+def test_port_allocator_proves_every_candidate_before_reporting_exhaustion() -> None:
+    observations: dict[int, int] = {}
+
+    def changing_bindability(port: int) -> bool:
+        observations[port] = observations.get(port, 0) + 1
+        if observations[port] == 1:
+            return True
+        return port == 12008
+
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        is_port_bindable=changing_bindability,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=1,
+                node_port_range_start=12000,
+                node_port_range_end=12008,
+            ),
+            node_control=control,
+        )
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "raced"})
+
+    assert response.status_code == 201
+    assert response.json()["external_port"] == 12008
+
+
+def test_automatic_port_allocation_excludes_configured_reserved_ports() -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=1,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+                node_port_reserved=(12000,),
+            ),
+            node_control=control,
+        )
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "media-a"})
+
+    assert response.status_code == 201
+    assert response.json()["external_port"] == 12001
+
+
+def test_registering_a_node_reports_the_required_error_when_ports_are_exhausted() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=2,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=control,
+        ),
+        raise_server_exceptions=False,
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+
+    response = client.post("/api/v1/nodes", json={"name": "media-b"})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "node_ports_exhausted",
+            "message": "нет свободных портов для регистрации новой ноды",
+        }
+    }
+
+
+def test_registering_a_node_cannot_exceed_the_configured_node_limit() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=1,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=control,
+        ),
+        raise_server_exceptions=False,
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+
+    response = client.post("/api/v1/nodes", json={"name": "media-b"})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "max_nodes_reached",
+            "message": "достигнуто максимальное количество нод",
+        }
+    }
+
+
+def test_operator_can_register_a_node_on_a_specific_free_port() -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/nodes",
+        json={"name": "media-a", "external_port": 12002},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["external_port"] == 12002
+
+
+def test_manual_node_port_must_be_inside_the_configured_range() -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/v1/nodes",
+        json={"name": "media-a", "external_port": 11999},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "code": "node_port_out_of_range",
+            "message": "порт ноды находится вне разрешенного диапазона",
+        }
+    }
+
+
+def test_manual_node_port_must_not_already_belong_to_another_node() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        ),
+        raise_server_exceptions=False,
+    )
+    assert (
+        client.post(
+            "/api/v1/nodes",
+            json={"name": "media-a", "external_port": 12001},
+        ).status_code
+        == 201
+    )
+
+    response = client.post(
+        "/api/v1/nodes",
+        json={"name": "media-b", "external_port": 12001},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "node_port_in_use",
+            "message": "порт уже используется другой нодой",
+        }
+    }
+
+
+def test_operator_can_list_registered_nodes_through_the_control_api() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=50,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+    assert client.post("/api/v1/nodes", json={"name": "media-b"}).status_code == 201
+
+    response = client.get("/api/v1/nodes")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "media-a",
+                "external_port": 12000,
+                    "state": "provisioning",
+                    "runtime_state": "provisioning",
+                "health": "unknown",
+                    "registered_cameras": 0,
+                    "camera_capacity": 100,
+                    "desired_revision": 1,
+                    "applied_revision": 0,
+            },
+            {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "name": "media-b",
+                "external_port": 12001,
+                    "state": "provisioning",
+                    "runtime_state": "provisioning",
+                "health": "unknown",
+                    "registered_cameras": 0,
+                    "camera_capacity": 100,
+                    "desired_revision": 1,
+                    "applied_revision": 0,
+            },
+        ],
+        "count": 2,
+        "max_nodes": 50,
+    }
+
+
+def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
+    observed_at = datetime.now(UTC)
+    nodes = (
+        MediaNode(
+            id=UUID("00000000-0000-0000-0000-000000000001"),
+            name="media-a",
+            external_port=12000,
+            state=NodeState.RUNNING,
+            runtime_state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=True,
+            registered_cameras=50,
+            active_sources=2,
+        ),
+        MediaNode(
+            id=UUID("00000000-0000-0000-0000-000000000002"),
+            name="media-b",
+            external_port=12001,
+            state=NodeState.RUNNING,
+            runtime_state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=True,
+            registered_cameras=10,
+            active_sources=5,
+        ),
+        MediaNode(
+            id=UUID("00000000-0000-0000-0000-000000000003"),
+            name="media-c",
+            external_port=12002,
+            state=NodeState.RUNNING,
+            runtime_state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=True,
+            registered_cameras=10,
+            active_sources=1,
+        ),
+    )
+    store = InMemoryNodeStore(nodes=nodes)
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=camera_control,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": "10000000-0000-0000-0000-000000000001",
+        "name": "entrance",
+        "public_id": "a234567a234567a234567a2344",
+        "node_id": "00000000-0000-0000-0000-000000000003",
+        "node_port": 12002,
+        "placement_mode": "automatic",
+        "desired_revision": 1,
+        "applied_revision": 0,
+    }
+
+
+def test_automatic_placement_skips_a_manually_created_provisioning_node() -> None:
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=UUID("00000000-0000-0000-0000-000000000001"),
+                name="manual-pending",
+                external_port=12000,
+            ),
+        )
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+                new_public_id=lambda: "a" * 26,
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "camera-a", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "eligible_node_missing"
+
+
+def test_automatic_placement_does_not_reuse_a_maintenance_provisioning_node() -> None:
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=UUID("00000000-0000-0000-0000-000000000001"),
+                name="maintenance-pending",
+                external_port=12000,
+                maintenance=True,
+            ),
+        )
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+                new_public_id=lambda: "a" * 26,
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "camera-a", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "eligible_node_missing"
+    assert client.get("/api/v1/cameras").json()["count"] == 0
+
+
+def test_automatic_placement_skips_maintenance_stale_or_incompatible_nodes() -> None:
+    observed_at = datetime.now(UTC)
+    blocked = (
+        MediaNode(
+            id=UUID("00000000-0000-0000-0000-000000000001"),
+            name="maintenance",
+            external_port=12000,
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            maintenance=True,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=True,
+        ),
+        MediaNode(
+            id=UUID("00000000-0000-0000-0000-000000000002"),
+            name="stale",
+            external_port=12001,
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at - timedelta(minutes=1),
+            config_compatible=True,
+        ),
+        MediaNode(
+            id=UUID("00000000-0000-0000-0000-000000000003"),
+            name="incompatible",
+            external_port=12002,
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=False,
+        ),
+    )
+    target = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000004"),
+        name="eligible",
+        external_port=12003,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        management_observed_at=observed_at,
+        config_compatible=True,
+        registered_cameras=10,
+    )
+    store = InMemoryNodeStore(nodes=(*blocked, target))
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+                new_public_id=lambda: "a" * 26,
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "camera-a", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["node_id"] == str(target.id)
+
+
+def test_operator_can_place_a_camera_on_a_specific_eligible_node() -> None:
+    observed_at = datetime.now(UTC)
+    first_node_id = UUID("00000000-0000-0000-0000-000000000001")
+    second_node_id = UUID("00000000-0000-0000-0000-000000000002")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=first_node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                registered_cameras=40,
+            ),
+            MediaNode(
+                id=second_node_id,
+                name="media-b",
+                external_port=12001,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                registered_cameras=1,
+            ),
+        )
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "b234567b234567b234567b2344",
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=camera_control,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={
+            "name": "entrance",
+            "source_url": "rtsp://camera.local/main",
+            "node_id": str(first_node_id),
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["node_id"] == str(first_node_id)
+    assert response.json()["node_port"] == 12000
+    assert response.json()["placement_mode"] == "manual"
+
+
+def test_camera_source_credentials_are_rejected_before_persistence() -> None:
+    node = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000001"),
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        config_compatible=True,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+                new_public_id=lambda: "a234567a234567a234567a2344",
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={
+            "name": "secret-camera",
+            "source_url": "rtsp://operator:never-log-this@camera.local/main",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "never-log-this" not in response.text
+    assert client.get("/api/v1/cameras").json()["count"] == 0
+
+
+def test_manual_camera_placement_reports_missing_node_consistently() -> None:
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=InMemoryNodeStore(),
+                new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+                new_public_id=lambda: "a" * 26,
+            ),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={
+            "name": "missing-target",
+            "source_url": "rtsp://camera.local/main",
+            "node_id": "00000000-0000-0000-0000-000000000099",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": {"code": "node_not_found"}}
+
+
+def test_manual_camera_placement_cannot_create_a_101st_registered_camera() -> None:
+    full_node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=full_node_id,
+                name="media-full",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                registered_cameras=100,
+            ),
+        )
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "c234567c234567c234567c2344",
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=camera_control,
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={
+            "name": "overflow",
+            "source_url": "rtsp://camera.local/main",
+            "node_id": str(full_node_id),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "node_camera_capacity_reached",
+            "message": "нода уже содержит 100 зарегистрированных камер",
+        }
+    }
+
+
+def test_registered_node_survives_control_application_restart(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_START", "12000")
+    monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_END", "12002")
+
+    create_response = TestClient(create_app_from_environment()).post(
+        "/api/v1/nodes",
+        json={"name": "persistent-node"},
+    )
+    assert create_response.status_code == 201
+
+    list_response = TestClient(create_app_from_environment()).get("/api/v1/nodes")
+
+    assert list_response.status_code == 200
+    assert list_response.json()["count"] == 1
+    assert list_response.json()["items"] == [create_response.json()]
+
+
+def test_packaged_migration_runner_upgrades_an_empty_database(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+        table_count = connection.scalar(
+            text(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = 'public' "
+                "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
+            )
+        )
+    assert revision == "0004_management_freshness"
+    assert table_count == 4
+
+
+def test_management_freshness_migration_fails_closed_until_a_new_observation(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0003_audit_outbox_history")
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO media_nodes (
+                    id, name, external_port, state, runtime_state, health,
+                    registered_cameras, camera_capacity, active_sources,
+                    maintenance, management_fresh, config_compatible,
+                    desired_revision, applied_revision
+                ) VALUES (
+                    '00000000-0000-0000-0000-000000000001', 'stale', 12000,
+                    'running', 'running', 'healthy', 0, 100, 0, false, true,
+                    true, 1, 0
+                )
+                """
+            )
+        )
+
+    command.upgrade(migration, "head")
+
+    with engine.connect() as connection:
+        observation = connection.execute(
+            text(
+                "SELECT management_fresh, management_observed_at "
+                "FROM media_nodes"
+            )
+        ).one()
+    assert observation == (False, None)
+
+
+def test_control_plane_refuses_to_start_on_an_older_database_revision(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0003_audit_outbox_history")
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+
+    with pytest.raises(RuntimeError, match="database_schema_mismatch"):
+        create_app_from_environment()
+
+
+def test_control_plane_refuses_multiple_alembic_heads(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES ('foreign_head')")
+        )
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+
+    with pytest.raises(RuntimeError, match="database_schema_mismatch"):
+        create_app_from_environment()
+
+
+def test_background_role_refuses_an_incompatible_database_revision(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0003_audit_outbox_history")
+
+    with pytest.raises(RuntimeError, match="database_schema_mismatch"):
+        create_background_app(
+            Settings(
+                role=RuntimeRole.RECONCILER,
+                database_url=postgres_database_url,
+            ),
+            expected_role=RuntimeRole.RECONCILER,
+        )
+
+
+def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    store = PostgresNodeStore(postgres_database_url)
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+            ),
+        )
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "audited"})
+
+    assert response.status_code == 201
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                "SELECT aggregate_id, event_type, payload "
+                "FROM audit_events ORDER BY occurred_at, id"
+            )
+        ).mappings().one()
+        outbox = connection.execute(
+            text(
+                "SELECT aggregate_id, event_type, payload, status "
+                "FROM outbox_messages ORDER BY occurred_at, id"
+            )
+        ).mappings().one()
+    expected_payload = {
+        "name": "audited",
+        "external_port": 12000,
+        "camera_capacity": 100,
+        "desired_revision": 1,
+    }
+    assert audit == {
+        "aggregate_id": UUID("00000000-0000-0000-0000-000000000001"),
+        "event_type": "media_node.created",
+        "payload": expected_payload,
+    }
+    assert outbox == {
+        "aggregate_id": UUID("00000000-0000-0000-0000-000000000001"),
+        "event_type": "media_node.created",
+        "payload": expected_payload,
+        "status": "pending",
+    }
+
+
+def test_node_start_commits_revisioned_desired_state_before_runtime_observation(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = PostgresNodeStore(postgres_database_url)
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: node_id,
+                node_runtime=StartingNodeRuntime(),
+            ),
+            shutdown=store.close,
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+
+    response = client.post(f"/api/v1/nodes/{node_id}/start")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "running"
+    assert response.json()["runtime_state"] == "starting"
+    assert response.json()["desired_revision"] == 2
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        events = connection.execute(
+            text(
+                "SELECT event_type, aggregate_revision FROM audit_events "
+                "ORDER BY aggregate_revision"
+            )
+        ).tuples().all()
+        outbox = connection.execute(
+            text(
+                "SELECT event_type, aggregate_revision FROM outbox_messages "
+                "ORDER BY aggregate_revision"
+            )
+        ).tuples().all()
+    assert events == [
+        ("media_node.created", 1),
+        ("media_node.desired_state_changed", 2),
+    ]
+    assert outbox == events
+
+
+def test_node_registry_persists_the_canonical_stopping_state(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = PostgresNodeStore(postgres_database_url)
+    store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+    )
+
+    updated = store.request_desired_state(node_id, NodeState("stopping"))
+
+    assert updated.state.value == "stopping"
+    assert updated.desired_revision == 2
+    assert store.get_node(node_id) == updated
+    store.close()
+
+
+def test_normative_mutation_forces_synchronous_durability(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE FUNCTION reject_async_normative_write()
+                RETURNS trigger AS $$
+                BEGIN
+                    IF current_setting('synchronous_commit') = 'off' THEN
+                        RAISE EXCEPTION 'normative write is asynchronous';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TRIGGER audit_requires_sync
+                BEFORE INSERT ON audit_events
+                FOR EACH ROW EXECUTE FUNCTION reject_async_normative_write()
+                """
+            )
+        )
+    asynchronous_default_url = (
+        postgres_database_url + "?options=-c%20synchronous_commit%3Doff"
+    )
+    store = PostgresNodeStore(asynchronous_default_url)
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+            ),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "durable"})
+
+    assert response.status_code == 201
+
+
+def test_database_constraint_errors_never_render_camera_source_credentials(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+    )
+    store.request_desired_state(node_id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        node_id,
+        NodeRuntimeObservation(
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            config_compatible=True,
+        ),
+    )
+    duplicate_public_id = "a" * 26
+    store.place_camera_manually(
+        camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+        name="first",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse(duplicate_public_id),
+        node_id=node_id,
+    )
+
+    with pytest.raises(IntegrityError) as captured:
+        store.place_camera_manually(
+            camera_id=UUID("10000000-0000-0000-0000-000000000002"),
+            name="second",
+            source_url="rtsp://camera.local/never-render-this",
+            public_id=PublicId.parse(duplicate_public_id),
+            node_id=node_id,
+        )
+
+    assert "never-render-this" not in str(captured.value)
+
+
+def test_postgresql_adapter_rejects_credentialed_source_urls_if_called_directly(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+    )
+    store.apply_runtime_observation(
+        node_id,
+        NodeRuntimeObservation(
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            config_compatible=True,
+        ),
+    )
+
+    with pytest.raises(InvalidCameraSource):
+        store.place_camera_manually(
+            camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+            name="secret",
+            source_url="rtsp://operator:never-store-this@camera.local/main",
+            public_id=PublicId.parse("a" * 26),
+            node_id=node_id,
+        )
+
+    assert store.list_cameras() == ()
+
+
+def test_systemd_web_entrypoint_wires_the_persistent_node_control(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_START", "12000")
+    monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_END", "12002")
+    launched: dict[str, object] = {}
+
+    def capture_run(app: object, *, host: str, port: int) -> None:
+        launched.update(app=app, host=host, port=port)
+
+    monkeypatch.setattr("rtsp_proxy.runtime.uvicorn.run", capture_run)
+
+    run_web()
+
+    assert launched["host"] == "127.0.0.1"
+    assert launched["port"] == 8000
+    response = TestClient(cast(FastAPI, launched["app"])).post(
+        "/api/v1/nodes",
+        json={"name": "entrypoint-node"},
+    )
+    assert response.status_code == 201
+
+
+def test_application_shutdown_closes_its_postgresql_pool(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upgrade_database(postgres_database_url)
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    database_name = postgres_database_url.rsplit("/", 1)[1]
+    admin_engine = create_engine(postgres_database_url.rsplit("/", 1)[0] + "/postgres")
+
+    def application_connections() -> int:
+        with admin_engine.connect() as connection:
+            value = connection.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = :database_name AND pid <> pg_backend_pid()"
+                ),
+                {"database_name": database_name},
+            )
+        assert value is not None
+        return int(value)
+
+    with TestClient(create_app_from_environment()) as client:
+        assert client.get("/api/v1/nodes").status_code == 200
+        assert application_connections() >= 1
+
+    assert application_connections() == 0
+
+
+def test_automatic_port_allocation_rejects_a_port_already_bound_on_the_server(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        occupied_port = int(listener.getsockname()[1])
+        monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+        monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+        monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_START", str(occupied_port))
+        monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_END", str(occupied_port))
+
+        response = TestClient(create_app_from_environment()).post(
+            "/api/v1/nodes",
+            json={"name": "cannot-bind"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "node_ports_exhausted"
+
+
+def test_linux_port_probe_rejects_a_port_bound_only_on_ipv6() -> None:
+    if not socket.has_ipv6:
+        pytest.skip("IPv6 is not available")
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            listener.bind(("::", 0))
+        except OSError:
+            pytest.skip("IPv6 wildcard bind is not available")
+        occupied_port = int(listener.getsockname()[1])
+
+        assert tcp_port_is_bindable(occupied_port) is False
+
+
+class SuccessfulNodeRuntime(NodeRuntime):
+    def start(self, node: MediaNode) -> NodeRuntimeObservation:
+        return NodeRuntimeObservation(
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            config_compatible=True,
+        )
+
+
+class StartingNodeRuntime(NodeRuntime):
+    def start(self, node: MediaNode) -> NodeRuntimeObservation:
+        assert node.state is NodeState.RUNNING
+        assert node.desired_revision == 2
+        return NodeRuntimeObservation(
+            state=NodeState.STARTING,
+            health=NodeHealth.UNKNOWN,
+            management_fresh=False,
+            config_compatible=False,
+        )
+
+
+def test_node_start_keeps_desired_and_observed_lifecycle_separate() -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        node_runtime=StartingNodeRuntime(),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        )
+    )
+    created = client.post("/api/v1/nodes", json={"name": "media-a"}).json()
+
+    response = client.post(f"/api/v1/nodes/{created['id']}/start")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        **created,
+        "state": "running",
+        "runtime_state": "starting",
+        "desired_revision": 2,
+    }
+
+
+def test_operator_can_start_a_registered_node_through_the_linux_runtime_boundary() -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        node_runtime=SuccessfulNodeRuntime(),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        )
+    )
+    created = client.post("/api/v1/nodes", json={"name": "media-a"}).json()
+
+    response = client.post(f"/api/v1/nodes/{created['id']}/start")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        **created,
+        "state": "running",
+        "runtime_state": "running",
+        "health": "healthy",
+        "desired_revision": 2,
+    }
+
+
+def test_camera_placement_survives_control_application_restart(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    first_store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=first_store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=SuccessfulNodeRuntime(),
+    )
+    camera_control = CameraControl(
+        store=first_store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "d234567d234567d234567d2344",
+    )
+    first_client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=node_control,
+            camera_control=camera_control,
+        )
+    )
+    assert first_client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+    assert first_client.post(f"/api/v1/nodes/{node_id}/start").status_code == 200
+    created = first_client.post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
+    )
+    assert created.status_code == 201
+
+    second_store = PostgresNodeStore(postgres_database_url)
+    second_client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=second_store,
+                new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000002"),
+                new_public_id=lambda: "e234567e234567e234567e2344",
+            ),
+        )
+    )
+    response = second_client.get("/api/v1/cameras")
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [created.json()], "count": 1}
+
+
+def test_postgresql_placement_expires_a_stale_management_observation(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    with TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: node_id,
+                node_runtime=SuccessfulNodeRuntime(),
+            ),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=uuid4,
+                new_public_id=generate_public_id,
+                management_freshness_seconds=1,
+            ),
+            shutdown=store.close,
+        )
+    ) as client:
+        assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+        assert client.post(f"/api/v1/nodes/{node_id}/start").status_code == 200
+        time.sleep(1.1)
+
+        response = client.post(
+            "/api/v1/cameras",
+            json={
+                "name": "camera-a",
+                "source_url": "rtsp://camera.local/main",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "eligible_node_missing"
+
+
+def test_automatic_camera_placement_does_not_commit_before_node_provisioning() -> None:
+    full_node = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000001"),
+        name="media-full",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        registered_cameras=100,
+    )
+    store = InMemoryNodeStore(nodes=(full_node,))
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000099"),
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "f234567f234567f234567f2344",
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=node_control,
+            camera_control=camera_control,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "overflow", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "eligible_node_missing"
+    listed = client.get("/api/v1/nodes").json()
+    assert listed["count"] == 1
+    assert client.get("/api/v1/cameras").json()["count"] == 0
+
+
+def test_concurrent_automatic_placements_do_not_create_ghost_placements(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    store = PostgresNodeStore(postgres_database_url)
+    full_node_id = UUID("00000000-0000-0000-0000-000000000001")
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: full_node_id,
+        node_runtime=SuccessfulNodeRuntime(),
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=uuid4,
+        new_public_id=generate_public_id,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=node_control,
+            camera_control=camera_control,
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "full"}).status_code == 201
+    assert client.post(f"/api/v1/nodes/{full_node_id}/start").status_code == 200
+    for index in range(100):
+        response = client.post(
+            "/api/v1/cameras",
+            json={
+                "name": f"seed-{index}",
+                "source_url": f"rtsp://camera-{index}.local/main",
+                "node_id": str(full_node_id),
+            },
+        )
+        assert response.status_code == 201
+
+    def place_overflow_camera(index: int) -> Response:
+        return client.post(
+            "/api/v1/cameras",
+            json={
+                "name": f"overflow-{index}",
+                "source_url": f"rtsp://overflow-{index}.local/main",
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = tuple(executor.map(place_overflow_camera, range(2)))
+
+    assert [response.status_code for response in responses] == [409, 409]
+    assert all(
+        response.json()["detail"]["code"] == "eligible_node_missing"
+        for response in responses
+    )
+    listed = client.get("/api/v1/nodes").json()
+    assert listed["count"] == 1
+    assert listed["items"][0]["registered_cameras"] == 100
+    assert client.get("/api/v1/cameras").json()["count"] == 100
+
+
+def test_concurrent_manual_placements_cannot_cross_100_camera_limit(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=1,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: node_id,
+                node_runtime=SuccessfulNodeRuntime(),
+            ),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=uuid4,
+                new_public_id=generate_public_id,
+            ),
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+    assert client.post(f"/api/v1/nodes/{node_id}/start").status_code == 200
+    for index in range(99):
+        response = client.post(
+            "/api/v1/cameras",
+            json={
+                "name": f"seed-{index}",
+                "source_url": f"rtsp://camera-{index}.local/main",
+                "node_id": str(node_id),
+            },
+        )
+        assert response.status_code == 201
+    barrier = Barrier(2)
+
+    def place_last_camera(index: int) -> Response:
+        barrier.wait()
+        return client.post(
+            "/api/v1/cameras",
+            json={
+                "name": f"racer-{index}",
+                "source_url": f"rtsp://racer-{index}.local/main",
+                "node_id": str(node_id),
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = tuple(executor.map(place_last_camera, range(2)))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert client.get("/api/v1/nodes").json()["items"][0]["registered_cameras"] == 100
+    assert client.get("/api/v1/cameras").json()["count"] == 100
+
+
+def test_concurrent_node_creation_serializes_the_last_available_port(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=2,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=uuid4,
+                is_port_bindable=lambda port: True,
+            ),
+        )
+    )
+    barrier = Barrier(2)
+
+    def create_node(index: int) -> Response:
+        barrier.wait()
+        return client.post("/api/v1/nodes", json={"name": f"racer-{index}"})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = tuple(executor.map(create_node, range(2)))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    failed = next(response for response in responses if response.status_code == 409)
+    assert failed.json()["detail"]["code"] == "node_ports_exhausted"
+    assert client.get("/api/v1/nodes").json()["count"] == 1
+
+
+def test_concurrent_manual_and_automatic_node_creation_cannot_exceed_max_nodes(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=1,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=uuid4,
+                is_port_bindable=lambda port: True,
+            ),
+            shutdown=store.close,
+        )
+    )
+    barrier = Barrier(2)
+
+    def create_node(request: dict[str, object]) -> Response:
+        barrier.wait()
+        return client.post("/api/v1/nodes", json=request)
+
+    requests = (
+        {"name": "automatic"},
+        {"name": "manual", "external_port": 12001},
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = tuple(executor.map(create_node, requests))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    failed = next(response for response in responses if response.status_code == 409)
+    assert failed.json()["detail"]["code"] == "max_nodes_reached"
+    assert client.get("/api/v1/nodes").json()["count"] == 1

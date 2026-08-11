@@ -116,18 +116,18 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
             )
             return
         name = self.path.removeprefix("/v3/config/paths/get/")
-        if name == "c" * 25:
+        if name == "c" * 25 + "a":
             self._respond(200, b"not-json")
             return
-        if name == "d" * 25:
+        if name == "d" * 25 + "a":
             self._respond(400, b'{"error":"request contained rtsp://secret@camera"}')
             return
-        if name == "e" * 25:
+        if name == "e" * 25 + "a":
             self._respond(
                 200,
                 json.dumps(
                     {
-                        "name": "f" * 25,
+                        "name": "f" * 25 + "a",
                         "source": "rtsp://camera.invalid/main",
                         "sourceOnDemand": True,
                         "sourceOnDemandCloseAfter": "10s",
@@ -135,7 +135,7 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
                 ).encode("utf-8"),
             )
             return
-        if name == "g" * 25:
+        if name == "g" * 25 + "a":
             self._respond(
                 200,
                 json.dumps(
@@ -195,7 +195,7 @@ def media_api() -> Iterator[str]:
 def test_media_path_operations_converge_without_exposing_http_routes(media_api: str) -> None:
     client = MediaMtxClient(api_url=media_api, timeout_seconds=1)
     path = MediaPathConfig(
-        name=PublicId.parse("a" * 25),
+        name=PublicId.parse("a" * 26),
         source_url="rtsp://camera.invalid/main",
     )
 
@@ -392,17 +392,17 @@ def test_media_adapter_rejects_invalid_or_rejected_responses_without_secrets(
     client = MediaMtxClient(api_url=media_api, timeout_seconds=1)
 
     with pytest.raises(MediaNodeProtocolError, match="mediamtx_invalid_json"):
-        client.get_path(PublicId.parse("c" * 25))
+        client.get_path(PublicId.parse("c" * 25 + "a"))
 
     with pytest.raises(MediaNodeRejected, match="mediamtx_http_400") as rejected:
-        client.get_path(PublicId.parse("d" * 25))
+        client.get_path(PublicId.parse("d" * 25 + "a"))
     assert "secret" not in str(rejected.value)
 
     with pytest.raises(MediaNodeProtocolError, match="mediamtx_path_identity_mismatch"):
-        client.get_path(PublicId.parse("e" * 25))
+        client.get_path(PublicId.parse("e" * 25 + "a"))
 
     with pytest.raises(MediaNodeProtocolError, match="mediamtx_path_not_on_demand"):
-        client.get_path(PublicId.parse("g" * 25))
+        client.get_path(PublicId.parse("g" * 25 + "a"))
 
     MediaMtxFixtureHandler.paths["~^vendor-detail$"] = {
         "name": "~^vendor-detail$",
@@ -420,4 +420,4 @@ def test_media_adapter_reports_an_unreachable_node_with_a_stable_reason() -> Non
 
     client = MediaMtxClient(api_url=f"http://{host}:{port}", timeout_seconds=0.1)
     with pytest.raises(MediaNodeUnavailable, match="mediamtx_unavailable"):
-        client.get_path(PublicId.parse("a" * 25))
+        client.get_path(PublicId.parse("a" * 26))

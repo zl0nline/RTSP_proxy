@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import re
+import secrets
 from dataclasses import dataclass
 
-_PUBLIC_ID_PATTERN = re.compile(r"[a-z0-9]{25}\Z")
+_PUBLIC_ID_PATTERN = re.compile(r"[a-z2-7]{25}[aeimquy4]\Z")
 
 
 class InvalidPublicId(ValueError):
@@ -12,7 +14,7 @@ class InvalidPublicId(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class PublicId:
-    """Canonical external path identifier with more than 128 bits of space."""
+    """Canonical lowercase base32 encoding of a 128-bit external path ID."""
 
     value: str
 
@@ -26,3 +28,7 @@ class PublicId:
 
     def __str__(self) -> str:
         return self.value
+
+
+def generate_public_id() -> str:
+    return base64.b32encode(secrets.token_bytes(16)).decode("ascii").lower().rstrip("=")

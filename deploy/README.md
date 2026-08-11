@@ -55,6 +55,7 @@ they must not be interpreted as the final multi-node installer.
 Typed control config includes:
 
 - external node port range and reserved ports;
+- management observation freshness deadline (30 seconds by default);
 - `max_nodes=50`, configurable to at most 100;
 - management HTTPS bind;
 - PostgreSQL pools;
@@ -100,6 +101,20 @@ Before changing `current`, run from candidate environment:
 Verifier reads actual Linux architecture, validates artifact paths/digests and
 version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
 activation.
+
+Before starting a control-plane release, apply the migrations packaged inside
+that exact wheel environment:
+
+```sh
+RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_proxy' \
+  /opt/rtsp-proxy/releases/<release-id>/.venv/bin/rtsp-proxy-migrate
+```
+
+The runner upgrades to the packaged `head` and uses the same direct native
+PostgreSQL contract on amd64 and arm64. The release manifest and application
+are bound to that exact head; startup reads live `alembic_version` and fails
+closed on an older or newer revision. Backup/restore and rollback gates still
+apply; an older binary must never start against an unsupported newer schema.
 
 Activation atomically switches `current`, reloads systemd and updates control
 roles. It does not restart healthy media nodes unless the release procedure

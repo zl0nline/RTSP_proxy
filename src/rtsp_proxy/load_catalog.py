@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -22,7 +23,6 @@ from rtsp_proxy.load_profile import (
 )
 from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
 
-_BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 COLD_PREFLIGHT_MAX_LEAD_MS = 30_000
 WARM_PREFLIGHT_MAX_LEAD_MS = 30_000
 WARM_PREFLIGHT_MAX_END_LATENESS_MS = 2_000
@@ -48,7 +48,7 @@ class LoadPath(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     index: Annotated[int, Field(ge=0, lt=10000)]
-    public_id: Annotated[str, StringConstraints(pattern=r"^[a-z0-9]{25}$")]
+    public_id: Annotated[str, StringConstraints(pattern=r"^[a-z2-7]{25}[aeimquy4]$")]
     source_url: str
 
 
@@ -110,19 +110,11 @@ class LoadCatalogApplyError(RuntimeError):
     """The load catalog did not converge to the expected isolated lab state."""
 
 
-def _base36(value: int) -> str:
-    encoded = ""
-    while value:
-        value, remainder = divmod(value, 36)
-        encoded = _BASE36_ALPHABET[remainder] + encoded
-    return encoded or "0"
-
-
 def load_public_id(*, seed: int, index: int) -> PublicId:
     if seed < 0 or not 0 <= index < 10000:
         raise ValueError("load_public_id_input_out_of_range")
     digest = hashlib.sha256(f"rtsp-proxy-load:{seed}:{index}".encode()).digest()
-    encoded = _base36(int.from_bytes(digest[:16], "big")).rjust(25, "0")
+    encoded = base64.b32encode(digest[:16]).decode("ascii").lower().rstrip("=")
     return PublicId.parse(encoded)
 
 

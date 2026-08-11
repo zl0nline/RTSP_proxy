@@ -10,8 +10,11 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }
 dependencies = [
+  "alembic>=1.16,<2",
   "fastapi>=0.116,<1",
   "pydantic-settings>=2.10,<3",
+  "psycopg[binary]>=3.2,<4",
+  "sqlalchemy>=2.0,<3",
   "uvicorn>=0.35,<1",
 ]
 
@@ -20,6 +23,7 @@ rtsp-proxy-verify-release = "rtsp_proxy.cli:main"
 rtsp-proxy-web = "rtsp_proxy.runtime:run_web"
 rtsp-proxy-role = "rtsp_proxy.runtime:run_background"
 rtsp-proxy-load = "rtsp_proxy.load_cli:main"
+rtsp-proxy-migrate = "rtsp_proxy.migrate:run_migrations"
 
 [dependency-groups]
 dev = [
@@ -52,3 +56,6 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 packages = ["rtsp_proxy"]
+
+[tool.coverage.run]
+omit = ["src/rtsp_proxy/migrations/*"]

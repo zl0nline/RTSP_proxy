@@ -349,11 +349,11 @@ def test_external_rtsp_tcp_is_transparent_and_unrelated_hot_update_isolated(
         timeout_api_port,
         timeout_rtsp_port,
     ) = unused_tcp_ports(8)
-    public_id = "f" * 25
-    other_public_id = "g" * 25
-    race_public_id = "h" * 25
-    failing_source_public_id = "i" * 25
-    unknown_public_id = "j" * 25
+    public_id = "f" * 25 + "a"
+    other_public_id = "g" * 25 + "a"
+    race_public_id = "h" * 25 + "a"
+    failing_source_public_id = "k" * 25 + "a"
+    unknown_public_id = "j" * 25 + "a"
 
     origin_config = tmp_path / "origin.yml"
     origin_config.write_text(
@@ -435,7 +435,7 @@ paths: {{}}
             "authHTTPExclude:\n"
             "  - action: api\n"
             "  - action: metrics",
-        ).replace("paths: {}", 'paths:\n  "~^[a-z0-9]{25}$": {}')
+        ).replace("paths: {}", 'paths:\n  "~^[a-z2-7]{25}[aeimquy4]$": {}')
     proxy_config = tmp_path / "proxy.yml"
     proxy_config.write_text(
         template.replace("127.0.0.1:9997", f"127.0.0.1:{proxy_api_port}")

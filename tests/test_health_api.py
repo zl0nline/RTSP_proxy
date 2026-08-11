@@ -182,6 +182,47 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
     assert settings.http_port == 8080
 
 
+def test_node_limits_and_port_range_are_environment_driven() -> None:
+    settings = load_settings(
+        {
+            "RTSP_PROXY_ROLE": "web",
+            "RTSP_PROXY_MAX_NODES": "100",
+            "RTSP_PROXY_NODE_PORT_RANGE_START": "12000",
+            "RTSP_PROXY_NODE_PORT_RANGE_END": "12199",
+            "RTSP_PROXY_NODE_PORT_RESERVED": "12005,12007",
+            "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": "45",
+        }
+    )
+
+    assert settings.max_nodes == 100
+    assert settings.node_port_range_start == 12000
+    assert settings.node_port_range_end == 12199
+    assert settings.node_port_reserved == (12005, 12007)
+    assert settings.node_management_freshness_seconds == 45
+
+
+def test_node_port_configuration_requires_capacity_after_exclusions() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            role=RuntimeRole.WEB,
+            max_nodes=2,
+            node_port_range_start=12000,
+            node_port_range_end=12001,
+            node_port_reserved=(12000, 12001),
+        )
+
+
+def test_external_node_ports_cannot_overlap_the_control_listener() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            role=RuntimeRole.WEB,
+            http_port=12000,
+            max_nodes=1,
+            node_port_range_start=12000,
+            node_port_range_end=12000,
+        )
+
+
 def test_invalid_http_port_fails_startup_validation() -> None:
     with pytest.raises(ValidationError):
         load_settings(

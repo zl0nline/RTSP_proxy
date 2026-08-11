@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-APPLICATION_SCHEMA = "base"
+APPLICATION_SCHEMA = "0004_management_freshness"
 CONFIG_SCHEMA_VERSION = 1
 
 

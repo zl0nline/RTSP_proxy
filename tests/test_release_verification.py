@@ -1,5 +1,6 @@
 import hashlib
 import json
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,17 @@ from rtsp_proxy.release import (
     normalize_linux_arch,
     verify_release,
 )
+
+
+def test_database_migrations_are_packaged_with_the_application() -> None:
+    package_root = files("rtsp_proxy")
+
+    assert package_root.joinpath("migrations", "env.py").is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0004_management_freshness.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -59,7 +71,10 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_binary": "bin/ffprobe",
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
-        "schema_compatibility": {"minimum": "base", "maximum": "base"},
+        "schema_compatibility": {
+            "minimum": "0004_management_freshness",
+            "maximum": "0004_management_freshness",
+        },
         "config_schema_version": 1,
     }
     manifest_path = tmp_path / "release-manifest.json"
