@@ -47,6 +47,9 @@ def _command_stdout(argv: list[str]) -> str:
 
 def _wait_for_main_pid(unit: str) -> int:
     deadline = time.monotonic() + 15
+    last_maps_ready = False
+    last_rss_line: str | None = None
+    last_nofile_line: str | None = None
     while time.monotonic() < deadline:
         raw = _command_stdout(["sudo", "systemctl", "show", "--property=MainPID", "--value", unit])
         if raw.isdigit() and int(raw) > 0:
@@ -59,14 +62,26 @@ def _wait_for_main_pid(unit: str) -> int:
             except FileNotFoundError:
                 time.sleep(0.1)
                 continue
+            last_maps_ready = "libgstreamer-1.0.so" in maps
+            last_rss_line = next(
+                (line for line in status.splitlines() if line.startswith("VmRSS:")), None
+            )
+            last_nofile_line = next(
+                (line for line in limits.splitlines() if line.startswith("Max open files")), None
+            )
             if (
-                "libgstreamer-1.0.so" in maps
-                and re.search(r"^VmRSS:\s+\d+\s+kB$", status, re.MULTILINE)
-                and re.search(r"^Max open files\s+\d+\s+\d+\s+\S+$", limits, re.MULTILINE)
+                last_maps_ready
+                and last_rss_line is not None
+                and re.fullmatch(r"VmRSS:\s+\d+\s+kB", last_rss_line)
+                and last_nofile_line is not None
+                and re.fullmatch(r"Max open files\s+\d+\s+\d+\s+\S+", last_nofile_line)
             ):
                 return pid
         time.sleep(0.1)
-    raise AssertionError("native runtime contract service did not become ready")
+    raise AssertionError(
+        "native runtime contract service did not become ready: "
+        f"maps={last_maps_ready} rss={last_rss_line!r} nofile={last_nofile_line!r}"
+    )
 
 
 def _native_profile(*, interface: str, mtu: int, executable_sha256: str) -> LoadProfile:
