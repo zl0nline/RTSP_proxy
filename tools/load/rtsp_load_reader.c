@@ -1566,10 +1566,6 @@ main(int argc, char *argv[])
     run.measurement_start_unix_ms = measurement_start_unix_ms == 0
                                         ? run.lifecycle_start_unix_ms
                                         : measurement_start_unix_ms;
-    run.measurement_end_unix_ms = measurement_end_unix_ms == 0
-                                      ? run.scheduled_start_unix_ms +
-                                            (gint64) hold_seconds * 1000
-                                      : measurement_end_unix_ms;
     if (workload_end_unix_ms == 0) {
         gint64 ramp_ms =
             connect_rate == 0
@@ -1581,6 +1577,9 @@ main(int argc, char *argv[])
     } else {
         run.scheduled_workload_end_unix_ms = workload_end_unix_ms;
     }
+    run.measurement_end_unix_ms = measurement_end_unix_ms == 0
+                                      ? run.scheduled_workload_end_unix_ms
+                                      : measurement_end_unix_ms;
     if (run.process_start_unix_ms > run.anchor_start_unix_ms ||
         run.anchor_start_unix_ms > run.scheduled_start_unix_ms ||
         run.ramp_end_unix_ms < run.scheduled_start_unix_ms ||
