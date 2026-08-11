@@ -209,8 +209,8 @@ build_launch_line(void)
         escaped_fixture, media_caps, fps, parser, payloader, rtp_mtu);
     if (audio) {
         launch = g_strdup_printf(
-            "( %s audiotestsrc is-live=true wave=silence ! "
-            "audio/x-raw,format=S16LE,rate=48000,channels=1 ! "
+            "( %s audiotestsrc is-live=false wave=silence ! "
+            "audio/x-raw,format=S16LE,rate=48000,channels=1 ! identity sync=true ! "
             "opusenc bitrate=64000 ! rtpopuspay name=pay1 pt=97 )",
             video);
     } else {
