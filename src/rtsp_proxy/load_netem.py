@@ -828,11 +828,16 @@ def _validate_kernel_state(
     ]
     if len(ingress_special) != 1 or ingress_special[0].get("kind") != "clsact":
         raise ValueError("netem_clsact_invalid")
-    filters = kernel.ingress_filters(plan.ingress_interface)
+    raw_filters = kernel.ingress_filters(plan.ingress_interface)
     if kernel.egress_filters(plan.ingress_interface):
         raise ValueError("netem_egress_filter_set_invalid")
+    try:
+        filters = _normalize_filter_inventory(raw_filters)
+    except ValueError as error:
+        inventory = json.dumps(raw_filters, sort_keys=True, separators=(",", ":"))[:4096]
+        raise ValueError(f"netem_filter_set_invalid:{inventory}") from error
     if len(filters) != len(plan.flows):
-        inventory = json.dumps(filters, sort_keys=True, separators=(",", ":"))[:4096]
+        inventory = json.dumps(raw_filters, sort_keys=True, separators=(",", ":"))[:4096]
         raise ValueError(f"netem_filter_set_invalid:{inventory}")
     observed_counters = tuple(
         sorted(
@@ -847,6 +852,27 @@ def _validate_kernel_state(
     if observed != expected:
         raise ValueError("netem_filter_set_invalid")
     return netem[0], observed_counters
+
+
+def _normalize_filter_inventory(
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    details = [item for item in items if "options" in item]
+    headers = [item for item in items if "options" not in item]
+    if not headers:
+        return details
+    allowed_header_keys = {"protocol", "pref", "kind", "chain"}
+    if len(headers) != len(details) or any(set(item) != allowed_header_keys for item in headers):
+        raise ValueError("netem_filter_header_set_invalid")
+
+    def classifier_key(item: dict[str, object]) -> tuple[object, ...]:
+        return tuple(item.get(key) for key in ("protocol", "pref", "kind", "chain"))
+
+    header_keys = sorted((classifier_key(item) for item in headers), key=repr)
+    detail_keys = sorted((classifier_key(item) for item in details), key=repr)
+    if header_keys != detail_keys:
+        raise ValueError("netem_filter_header_set_invalid")
+    return details
 
 
 def _validate_netem_options(options: object, plan: NetemSitePlan) -> None:
@@ -960,9 +986,13 @@ def _filter_add_arguments(plan: NetemSitePlan, flow: NetemFlow) -> tuple[str, ..
 def _cleanup_owned_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
     """Remove this plan's complete or partial state and prove that it is gone."""
 
-    filters = kernel.ingress_filters(plan.ingress_interface)
+    raw_filters = kernel.ingress_filters(plan.ingress_interface)
     if kernel.egress_filters(plan.ingress_interface):
         raise ValueError("netem_cleanup_foreign_egress_state")
+    try:
+        filters = _normalize_filter_inventory(raw_filters)
+    except ValueError as error:
+        raise ValueError("netem_cleanup_foreign_ingress_state") from error
     ingress_special = [
         item
         for item in kernel.qdiscs(plan.ingress_interface)

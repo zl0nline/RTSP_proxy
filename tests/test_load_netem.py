@@ -904,7 +904,7 @@ def test_public_wan_cold_pair_copies_recomputes_finalizes_and_verifies(
     verify_run_directory(proxy_run)
 
 
-def test_install_and_remove_own_only_clean_scoped_netem_state() -> None:
+def test_install_and_remove_own_only_clean_scoped_netem_state(tmp_path: Path) -> None:
     plan = required_netem_site_plans(wan_profile())[0]
     kernel = FakeNetemKernel()
 
@@ -925,6 +925,25 @@ def test_install_and_remove_own_only_clean_scoped_netem_state() -> None:
 
     kernel.ifb_qdiscs = [{"kind": "fq_codel", "handle": "0:", "root": True}]
     install_netem(kernel, plan)
+    remove_netem(kernel, plan)
+
+    install_netem(kernel, plan)
+    details = tuple(kernel.filters)
+    kernel.filters = [
+        item
+        for detail in details
+        for item in (
+            {
+                "protocol": detail["protocol"],
+                "pref": detail["pref"],
+                "kind": detail["kind"],
+                "chain": detail["chain"],
+            },
+            detail,
+        )
+    ]
+    write_host_identity(tmp_path)
+    capture_netem_observation(kernel, plan, root=tmp_path, clock_proof=lambda _: clock(1))
     remove_netem(kernel, plan)
 
 
