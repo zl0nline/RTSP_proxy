@@ -1048,12 +1048,16 @@ def _configuration_without_ifindices_from_observation(
 
 
 def _require_executable(path: Path) -> Path:
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute():
         raise ValueError("netem_tool_must_be_absolute_regular_file")
-    mode = path.stat().st_mode
+    try:
+        resolved = path.resolve(strict=True)
+        mode = resolved.stat().st_mode
+    except (OSError, RuntimeError):
+        raise ValueError("netem_tool_must_be_absolute_regular_file") from None
     if not stat.S_ISREG(mode) or mode & 0o111 == 0:
         raise ValueError("netem_tool_must_be_absolute_regular_file")
-    return path
+    return resolved
 
 
 def _tool_identity(path: Path, version_arguments: tuple[str, ...]) -> NetemToolIdentity:

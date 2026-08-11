@@ -1383,6 +1383,17 @@ elif 'filter' in args:
     with pytest.raises(ValueError, match="netem_tool_must_be_absolute_regular_file"):
         SubprocessNetemKernel(tc_binary=non_executable, ip_binary=ip_binary)
 
+    tc_symlink = tmp_path / "tc-symlink"
+    tc_symlink.symlink_to(tc_binary)
+    symlinked_kernel = SubprocessNetemKernel(tc_binary=tc_symlink, ip_binary=ip_binary)
+    assert symlinked_kernel.tc_identity.path == str(tc_binary.resolve())
+    assert symlinked_kernel.tc_identity.sha256 == hashlib.sha256(tool_body.encode()).hexdigest()
+
+    broken_symlink = tmp_path / "broken-tc"
+    broken_symlink.symlink_to(tmp_path / "missing-tc")
+    with pytest.raises(ValueError, match="netem_tool_must_be_absolute_regular_file"):
+        SubprocessNetemKernel(tc_binary=broken_symlink, ip_binary=ip_binary)
+
 
 def test_lan_has_no_netem_sites() -> None:
     lan = LoadProfile.model_validate(valid_profile())
