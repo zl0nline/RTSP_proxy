@@ -205,12 +205,14 @@ build_launch_line(void)
     video = g_strdup_printf(
         "multifilesrc location=\"%s\" loop=true start-index=0 stop-index=0 "
         "do-timestamp=true caps=\"%s,framerate=(fraction)%d/1\" ! "
-        "%s ! identity sync=true ! %s name=pay0 pt=96 config-interval=1 mtu=%d",
+        "%s ! clocksync sync=true sync-to-first=true ! "
+        "%s name=pay0 pt=96 config-interval=1 mtu=%d",
         escaped_fixture, media_caps, fps, parser, payloader, rtp_mtu);
     if (audio) {
         launch = g_strdup_printf(
             "( %s audiotestsrc is-live=false wave=silence ! "
-            "audio/x-raw,format=S16LE,rate=48000,channels=1 ! identity sync=true ! "
+            "audio/x-raw,format=S16LE,rate=48000,channels=1 ! "
+            "clocksync sync=true sync-to-first=true ! "
             "opusenc bitrate=64000 ! rtpopuspay name=pay1 pt=97 )",
             video);
     } else {
@@ -269,10 +271,15 @@ main(int argc, char *argv[])
     }
 
     launch = build_launch_line();
-    parsed_launch = gst_parse_launch(launch, &error);
-    if (parsed_launch == NULL) {
-        g_printerr("pipeline_error: %s\n", error->message);
+    parsed_launch = gst_parse_launch_full(
+        launch, NULL, GST_PARSE_FLAG_FATAL_ERRORS, &error);
+    if (parsed_launch == NULL || error != NULL) {
+        g_printerr("pipeline_error: %s\n",
+                   error != NULL ? error->message : "unable to parse pipeline");
         g_clear_error(&error);
+        if (parsed_launch != NULL) {
+            gst_object_unref(parsed_launch);
+        }
         g_free(launch);
         close(fixture_fd);
         g_free(verified_fixture_path);
