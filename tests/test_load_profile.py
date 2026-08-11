@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,23 +10,84 @@ import pytest
 from pydantic import ValidationError
 
 import rtsp_proxy.load_cli as load_cli_module
-from rtsp_proxy.load_catalog import build_proxy_reader_plan
+from rtsp_proxy.load_catalog import build_direct_reader_plan
 from rtsp_proxy.load_cli import main as load_cli_main
-from rtsp_proxy.load_evidence import ResourceObservation, summarize_generator_headroom
+from rtsp_proxy.load_evidence import (
+    ResourceObservation,
+    RuntimeProcessBinding,
+    summarize_generator_headroom,
+)
 from rtsp_proxy.load_profile import (
     LoadProfile,
     canonical_profile_bytes,
+    finalize_run_directory,
     initialize_run_directory,
+    lifecycle_start_unix_ms,
+    measurement_end_unix_ms,
+    measurement_start_unix_ms,
+    ramp_end_unix_ms,
     validate_comparison_pair,
     verify_run_directory,
+    warm_anchor_start_unix_ms,
+    workload_end_unix_ms,
 )
 from rtsp_proxy.load_results import summarize_reader_events
 from rtsp_proxy.load_run import (
+    FixtureManifest,
+    inspect_fixture,
     load_stored_profile,
     prepare_run_directory,
     sha256_file,
+    validate_fixture_manifest,
     write_summary,
 )
+
+
+def runtime_process_bindings(count: int = 2) -> tuple[RuntimeProcessBinding, ...]:
+    return tuple(
+        RuntimeProcessBinding(
+            pid=100 + index,
+            executable_sha256=("a" if index == 0 else "b") * 64,
+            start_time_ticks=1000 + index,
+        )
+        for index in range(count)
+    )
+
+
+def runtime_process_bindings_sha256(bindings: tuple[RuntimeProcessBinding, ...]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [item.model_dump(mode="json") for item in bindings],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def write_fixture_manifest(profile: LoadProfile) -> None:
+    fixture_path = Path(profile.fixture.path)
+    manifest = FixtureManifest(
+        schema_version=1,
+        fixture_sha256=profile.fixture.sha256,
+        fixture_size_bytes=fixture_path.stat().st_size,
+        codec=profile.fixture.codec,
+        fps=profile.fixture.fps,
+        frame_count=profile.fixture.gop_frames * 2,
+        duration_seconds=(profile.fixture.gop_frames * 2) / profile.fixture.fps,
+        measured_bitrate_bps=profile.fixture.bitrate_bps,
+        keyframe_indices=(0, profile.fixture.gop_frames),
+        keyframe_intervals=(profile.fixture.gop_frames,),
+        loop_keyframe_interval_frames=profile.fixture.gop_frames,
+        audio=profile.fixture.audio,
+        ffmpeg_version=profile.artifacts.ffmpeg_version,
+        ffmpeg_sha256=profile.artifacts.ffmpeg_sha256,
+        ffprobe_version="ffprobe test build",
+        ffprobe_sha256=profile.artifacts.ffprobe_sha256,
+    )
+    Path(f"{fixture_path}.manifest.json").write_text(
+        json.dumps(manifest.model_dump(mode="json")),
+        encoding="utf-8",
+    )
 
 
 def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
@@ -84,6 +146,7 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
             "bitrate_bps": 2_000_000,
             "fps": 25,
             "gop_frames": 50,
+            "rtp_mtu_bytes": 1200,
             "audio": "none",
         },
         "generator_hosts": hosts,
@@ -118,6 +181,7 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
             "interval_seconds": 1,
             "maximum_gap_factor": 1.5,
             "maximum_clock_error_ms": 10,
+            "maximum_start_lateness_ms": 250,
         },
         "duration": duration,
     }
@@ -131,6 +195,85 @@ def test_valid_profile_keeps_independent_load_axes_and_pull_contract() -> None:
     assert profile.workload.active_sources == 4
     assert profile.workload.total_readers == 8
     assert profile.fixture.gop_seconds == 2
+
+
+def test_run_phase_epochs_are_explicit_and_non_overlapping() -> None:
+    profile = LoadProfile.model_validate(valid_profile())
+    start = 2_000_000
+
+    assert ramp_end_unix_ms(profile, start) == start + 300
+    assert measurement_start_unix_ms(profile, start) == start + 300 + 5_000
+    assert measurement_end_unix_ms(profile, start) == start + 300 + 15_000
+    assert lifecycle_start_unix_ms(profile, start) == measurement_start_unix_ms(profile, start)
+    assert workload_end_unix_ms(profile, start) == measurement_end_unix_ms(profile, start)
+
+
+@pytest.mark.parametrize(
+    ("duration_field", "value", "error"),
+    [
+        ("warmup_seconds", 899, "capacity_requires_15m_warmup"),
+        ("measurement_seconds", 1799, "capacity_requires_30m_measurement"),
+    ],
+)
+def test_capacity_profile_rejects_short_evidence_windows(
+    duration_field: str, value: int, error: str
+) -> None:
+    raw = valid_profile(tier="capacity")
+    duration = raw["duration"]
+    assert isinstance(duration, dict)
+    duration[duration_field] = value
+
+    with pytest.raises(ValidationError, match=error):
+        LoadProfile.model_validate(raw)
+
+
+def test_lifecycle_window_must_cover_ready_budget_and_backoff() -> None:
+    raw = valid_profile()
+    lifecycle = raw["reader_lifecycle"]
+    assert isinstance(lifecycle, dict)
+    lifecycle.update(
+        mode="outage",
+        reconnect_attempts=1,
+        backoff_max_ms=9000,
+        outage_percent=25,
+    )
+
+    with pytest.raises(
+        ValidationError, match="lifecycle_window_does_not_cover_ready_budget_and_backoff"
+    ):
+        LoadProfile.model_validate(raw)
+
+
+def test_cold_profile_is_one_single_lifecycle_reader_per_active_path() -> None:
+    raw = valid_profile()
+    workload = raw["workload"]
+    assert isinstance(workload, dict)
+    workload["session_temperature"] = "cold"
+    with pytest.raises(ValidationError, match="cold_requires_one_reader_per_active_source"):
+        LoadProfile.model_validate(raw)
+
+    workload["total_readers"] = workload["active_sources"]
+    lifecycle = raw["reader_lifecycle"]
+    assert isinstance(lifecycle, dict)
+    lifecycle.update(
+        mode="steady",
+        disconnect_rate_per_second=10,
+        reconnect_attempts=1,
+        backoff_max_ms=1000,
+    )
+    with pytest.raises(ValidationError, match="cold_requires_single_lifecycle"):
+        LoadProfile.model_validate(raw)
+
+    warm_without_measured = valid_profile()
+    warm_workload = warm_without_measured["workload"]
+    assert isinstance(warm_workload, dict)
+    warm_workload["total_readers"] = warm_workload["active_sources"]
+    with pytest.raises(ValidationError, match="warm_requires_anchor_and_measured_readers"):
+        LoadProfile.model_validate(warm_without_measured)
+
+    warm_workload["endpoint_mode"] = "direct-control"
+    with pytest.raises(ValidationError, match="warm_requires_anchor_and_measured_readers"):
+        LoadProfile.model_validate(warm_without_measured)
 
 
 @pytest.mark.parametrize(
@@ -201,6 +344,17 @@ def test_capacity_profile_requires_two_generator_hosts_and_full_soak() -> None:
     with pytest.raises(ValidationError, match="capacity_requires_24h_soak"):
         LoadProfile.model_validate(short_soak)
 
+    empty_load = valid_profile(tier="capacity")
+    workload = empty_load["workload"]
+    assert isinstance(workload, dict)
+    workload.update(
+        active_sources=0,
+        total_readers=0,
+        minimum_rtp_packets_per_second=0,
+    )
+    with pytest.raises(ValidationError, match="capacity_requires_reader_load"):
+        LoadProfile.model_validate(empty_load)
+
 
 @pytest.mark.parametrize(
     ("mode", "connect_rate", "disconnect_rate", "outage_percent"),
@@ -224,7 +378,7 @@ def test_consensus_reader_lifecycle_profiles_are_executable(
     assert isinstance(lifecycle, dict)
     workload["connect_rate_per_second"] = connect_rate
     if mode == "burst":
-        workload["total_readers"] = 1000
+        workload["total_readers"] = 1004
     if mode == "outage":
         workload["total_readers"] = 100
     lifecycle.update(
@@ -234,6 +388,9 @@ def test_consensus_reader_lifecycle_profiles_are_executable(
         backoff_max_ms=5000,
         outage_percent=outage_percent,
     )
+    duration = raw["duration"]
+    assert isinstance(duration, dict)
+    duration["warmup_seconds"] = 7
 
     assert LoadProfile.model_validate(raw).reader_lifecycle.mode == mode
 
@@ -245,6 +402,39 @@ def test_invalid_lifecycle_shape_fails_closed() -> None:
     lifecycle.update(mode="outage", outage_percent=12, reconnect_attempts=3)
 
     with pytest.raises(ValidationError):
+        LoadProfile.model_validate(raw)
+
+
+def test_ipv6_sut_literal_fails_closed_until_native_sources_are_dual_stack() -> None:
+    raw = valid_profile()
+    raw["sut_rtsp_host"] = "2001:db8::10"
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        LoadProfile.model_validate(raw)
+
+
+def test_ipv6_generator_literal_fails_closed_until_native_sources_are_dual_stack() -> None:
+    raw = valid_profile()
+    hosts = raw["generator_hosts"]
+    assert isinstance(hosts, list) and isinstance(hosts[0], dict)
+    hosts[0]["rtsp_host"] = "2001:db8::20"
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        LoadProfile.model_validate(raw)
+
+
+def test_cold_preflight_rejects_path_sets_above_proven_parallel_bound() -> None:
+    raw = valid_profile()
+    workload = raw["workload"]
+    hosts = raw["generator_hosts"]
+    assert isinstance(workload, dict) and isinstance(hosts, list)
+    assert isinstance(hosts[0], dict)
+    workload.update(
+        session_temperature="cold",
+        registered_paths=513,
+        active_sources=513,
+        total_readers=513,
+    )
+    hosts[0]["source_count"] = 513
+    with pytest.raises(ValidationError, match="cold_preflight_path_count_exceeds_safety_cap"):
         LoadProfile.model_validate(raw)
 
 
@@ -445,6 +635,288 @@ def test_canonical_profile_and_digest_are_stable() -> None:
     assert json.loads(first_body)["fixture"]["source_mode"] == "rtsp-pull"
 
 
+def test_fixture_inspector_binds_probe_semantics_and_pinned_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ffmpeg = tmp_path / "ffmpeg"
+    ffprobe = tmp_path / "ffprobe"
+    fixture = tmp_path / "fixture.h264"
+    ffmpeg.write_bytes(b"ffmpeg")
+    ffprobe.write_bytes(b"ffprobe")
+    fixture.write_bytes(b"x" * 1_000_000)
+    ffmpeg.chmod(0o750)
+    ffprobe.chmod(0o750)
+    raw = valid_profile()
+    artifacts = raw["artifacts"]
+    fixture_profile = raw["fixture"]
+    assert isinstance(artifacts, dict)
+    assert isinstance(fixture_profile, dict)
+    artifacts.update(
+        ffmpeg_version="test-ffmpeg",
+        ffmpeg_sha256=hashlib.sha256(b"ffmpeg").hexdigest(),
+        ffprobe_sha256=hashlib.sha256(b"ffprobe").hexdigest(),
+    )
+    fixture_profile.update(
+        path=str(fixture),
+        sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
+    )
+    profile = LoadProfile.model_validate(raw)
+
+    def fake_run(
+        argv: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, capture_output, text, timeout
+        if "-show_frames" in argv:
+            frames = [{"key_frame": 1 if index in {0, 50} else 0} for index in range(100)]
+            stdout = json.dumps(
+                {
+                    "streams": [{"codec_name": "h264", "r_frame_rate": "25/1"}],
+                    "frames": frames,
+                }
+            )
+        elif argv[0] == str(ffmpeg):
+            stdout = "ffmpeg version test-ffmpeg\n"
+        else:
+            stdout = "ffprobe version test-build\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    destination = tmp_path / "fixture-manifest.json"
+
+    manifest = inspect_fixture(
+        profile,
+        ffmpeg_binary=ffmpeg,
+        ffprobe_binary=ffprobe,
+        destination=destination,
+    )
+
+    assert manifest.measured_bitrate_bps == 2_000_000
+    assert manifest.keyframe_intervals == (50,)
+    assert manifest.loop_keyframe_interval_frames == 50
+    assert FixtureManifest.model_validate_json(destination.read_text(encoding="utf-8")) == manifest
+    with pytest.raises(ValueError, match="fixture_manifest_does_not_match_profile"):
+        validate_fixture_manifest(
+            profile,
+            manifest.model_copy(update={"measured_bitrate_bps": 1}),
+        )
+    with pytest.raises(ValidationError, match="fixture_manifest_semantics_invalid"):
+        FixtureManifest.model_validate(
+            {**manifest.model_dump(mode="json"), "keyframe_intervals": [49]}
+        )
+    cyclic_tail = FixtureManifest.model_validate(
+        {
+            **manifest.model_dump(mode="json"),
+            "frame_count": 200,
+            "duration_seconds": 8,
+            "loop_keyframe_interval_frames": 150,
+        }
+    )
+    with pytest.raises(ValueError, match="fixture_manifest_does_not_match_profile"):
+        validate_fixture_manifest(
+            profile,
+            cyclic_tail,
+        )
+
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_bytes(canonical_profile_bytes(profile)[0])
+    cli_destination = tmp_path / "fixture-manifest-cli.json"
+    assert (
+        load_cli_main(
+            [
+                "inspect-fixture",
+                str(profile_path),
+                "--ffmpeg-binary",
+                str(ffmpeg),
+                "--ffprobe-binary",
+                str(ffprobe),
+                "--output",
+                str(cli_destination),
+            ]
+        )
+        == 0
+    )
+    assert cli_destination.is_file()
+
+
+def test_load_cli_samples_and_summarizes_required_capacity_sut_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = LoadProfile.model_validate(valid_profile(tier="capacity"))
+    run_directory = tmp_path / "capacity-run"
+    initialize_run_directory(profile, run_directory)
+    raw_directory = run_directory / "raw"
+    summary_directory = run_directory / "summary"
+    raw_directory.mkdir()
+    summary_directory.mkdir()
+    scheduled_start = 4_102_444_800_000
+    (run_directory / "launch-plan.json").write_text(
+        json.dumps({"coordinated_start_unix_ms": scheduled_start}),
+        encoding="utf-8",
+    )
+    sampled: dict[str, object] = {}
+
+    def fake_sample(**kwargs: object) -> int:
+        sampled.update(kwargs)
+        return 7
+
+    class FakeSummary:
+        valid = True
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {"valid": True}
+
+    monkeypatch.setattr(load_cli_module, "sample_linux_sut_resources", fake_sample)
+    output = raw_directory / "sut.jsonl"
+    assert (
+        load_cli_main(
+            [
+                "sample-sut",
+                str(run_directory),
+                str(output),
+                "--mediamtx-pid",
+                "321",
+                "--cgroup",
+                "mediamtx.service",
+                "--metrics-url",
+                "http://127.0.0.1:9998/metrics",
+            ]
+        )
+        == 0
+    )
+    assert sampled["mediamtx_pid"] == 321
+    assert sampled["expected_mediamtx_sha256"] == profile.artifacts.mediamtx_sha256
+    capsys.readouterr()
+
+    output.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(load_cli_module, "load_sut_observations", lambda path: ())
+    monkeypatch.setattr(
+        load_cli_module, "summarize_sut_capacity", lambda *args, **kwargs: FakeSummary()
+    )
+    summary = summary_directory / "sut.json"
+    assert (
+        load_cli_main(
+            [
+                "summarize-sut",
+                str(run_directory),
+                str(output),
+                str(summary),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(summary.read_text(encoding="utf-8")) == {"valid": True}
+
+
+def test_load_cli_copies_and_binds_cold_direct_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxy_raw = valid_profile()
+    proxy_workload = proxy_raw["workload"]
+    assert isinstance(proxy_workload, dict)
+    proxy_workload.update(
+        active_sources=4,
+        total_readers=4,
+        session_temperature="cold",
+        endpoint_mode="proxy",
+    )
+    direct_raw = json.loads(json.dumps(proxy_raw))
+    direct_workload = direct_raw["workload"]
+    assert isinstance(direct_workload, dict)
+    direct_workload["endpoint_mode"] = "direct-control"
+    proxy = LoadProfile.model_validate(proxy_raw)
+    direct = LoadProfile.model_validate(direct_raw)
+    proxy_run = tmp_path / "proxy"
+    direct_run = tmp_path / "direct"
+    initialize_run_directory(proxy, proxy_run)
+    initialize_run_directory(direct, direct_run)
+    (proxy_run / "raw").mkdir()
+    (proxy_run / "summary").mkdir()
+    (direct_run / "raw").mkdir()
+    proxy_events = proxy_run / "raw" / "readers.jsonl"
+    direct_events = direct_run / "raw" / "readers.jsonl"
+    proxy_events.write_text("{}\n", encoding="utf-8")
+    direct_events.write_text("{}\n", encoding="utf-8")
+    (direct_run / "final-manifest.json").write_text("{}\n", encoding="utf-8")
+
+    class FakeComparison:
+        valid = True
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {"valid": True}
+
+    monkeypatch.setattr(load_cli_module, "verify_run_directory", lambda path: {})
+    monkeypatch.setattr(
+        load_cli_module,
+        "summarize_cold_comparison",
+        lambda *args, **kwargs: FakeComparison(),
+    )
+    output = proxy_run / "summary" / "cold-comparison.json"
+
+    assert (
+        load_cli_main(
+            [
+                "compare-cold",
+                str(proxy_run),
+                str(proxy_events),
+                str(direct_run),
+                str(direct_events),
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(output.read_text(encoding="utf-8")) == {"valid": True}
+    assert (proxy_run / "reference" / "direct-final-manifest.json").is_file()
+
+
+def test_cold_finalization_requires_typed_inactive_path_preflight(tmp_path: Path) -> None:
+    pull_server = tmp_path / "rtsp-pull-server"
+    load_reader = tmp_path / "rtsp-load-reader"
+    fixture = tmp_path / "fixture.h264"
+    pull_server.write_bytes(b"pull-server")
+    load_reader.write_bytes(b"load-reader")
+    fixture.write_bytes(b"fixture")
+    pull_server.chmod(0o750)
+    load_reader.chmod(0o750)
+    raw = valid_profile()
+    artifacts = raw["artifacts"]
+    fixture_profile = raw["fixture"]
+    workload = raw["workload"]
+    assert isinstance(artifacts, dict)
+    assert isinstance(fixture_profile, dict)
+    assert isinstance(workload, dict)
+    artifacts["pull_server_sha256"] = hashlib.sha256(b"pull-server").hexdigest()
+    artifacts["load_reader_sha256"] = hashlib.sha256(b"load-reader").hexdigest()
+    fixture_profile.update(path=str(fixture), sha256=hashlib.sha256(b"fixture").hexdigest())
+    workload.update(session_temperature="cold", total_readers=4)
+    profile = LoadProfile.model_validate(raw)
+    write_fixture_manifest(profile)
+    run_directory = tmp_path / "cold-run"
+    prepare_run_directory(
+        profile,
+        run_directory,
+        pull_server_binary=pull_server,
+        load_reader_binary=load_reader,
+        coordinated_start_unix_ms=4_102_444_800_000,
+    )
+    (run_directory / "raw" / "placeholder.jsonl").write_text("{}\n", encoding="utf-8")
+    (run_directory / "summary" / "placeholder.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cold_preflight_evidence_missing"):
+        finalize_run_directory(run_directory)
+
+    (run_directory / "raw" / "cold-preflight.json").write_text("[]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="cold_preflight_evidence_invalid"):
+        finalize_run_directory(run_directory)
+
+
 def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -469,12 +941,15 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     fixture_profile["path"] = str(fixture)
     fixture_profile["sha256"] = hashlib.sha256(b"fixture").hexdigest()
     workload["total_readers"] = 4
+    workload["endpoint_mode"] = "direct-control"
+    workload["session_temperature"] = "cold"
     raw_profile["duration"] = {
         "warmup_seconds": 0,
         "measurement_seconds": 1,
         "soak_seconds": 0,
     }
     profile = LoadProfile.model_validate(raw_profile)
+    write_fixture_manifest(profile)
     run_directory = tmp_path / "run-001"
     scheduled_start_ms = 4_102_444_800_000
     prepare_run_directory(
@@ -492,7 +967,7 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     assert run_directory.stat().st_mode & 0o777 == 0o750
     assert (run_directory / "profile.json").stat().st_mode & 0o777 == 0o640
 
-    plan = build_proxy_reader_plan(profile, "generator-a")
+    plan = build_direct_reader_plan(profile, "generator-a")
     expected_paths = {
         reader_id: target.path
         for target in plan.targets
@@ -528,8 +1003,50 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
                     "at_monotonic_ms": reader_id * 100 + handshake + 100,
                     "describe_to_first_decodable_ms": handshake + 100,
                     "play_to_first_decodable_ms": 100,
+                    "access_unit": True,
                 },
             ]
+        )
+        events.append(
+            {
+                "event": "reader_rtp_segment",
+                "reader_id": reader_id,
+                "cycle": 0,
+                    "path": path,
+                    "track": "video",
+                    "phase": "measurement",
+                    "first_at_monotonic_ms": max(
+                        measurement_start_unix_ms(profile, scheduled_start_ms)
+                        - scheduled_start_ms,
+                        reader_id * 100 + handshake + 100,
+                    ),
+                "last_at_monotonic_ms": measurement_end_unix_ms(profile, scheduled_start_ms)
+                - scheduled_start_ms
+                - 1,
+                "received_packets": 250,
+                "sequence_expected_packets": 250,
+                "sequence_gaps": 0,
+            }
+        )
+        events.append(
+            {
+                "event": "reader_rtp_phase",
+                "reader_id": reader_id,
+                "path": path,
+                "at_monotonic_ms": 1000,
+                "audio_expected": False,
+                "quiesced": True,
+                "video_parse_failures": 0,
+                "audio_parse_failures": 0,
+                "measurement_video_rtp_packets": 250,
+                "measurement_video_rtp_sequence_gaps": 0,
+                "soak_video_rtp_packets": 0,
+                "soak_video_rtp_sequence_gaps": 0,
+                "measurement_audio_rtp_packets": 0,
+                "measurement_audio_rtp_sequence_gaps": 0,
+                "soak_audio_rtp_packets": 0,
+                "soak_audio_rtp_sequence_gaps": 0,
+            }
         )
     events.append(
         {
@@ -546,13 +1063,26 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
             "schedule_shards": 1,
             "generator_host": "generator-a",
             "profile_sha256": canonical_profile_bytes(profile)[1],
-            "reader_plan_sha256": sha256_file(run_directory / "reader-plan.tsv"),
+            "reader_plan_sha256": sha256_file(run_directory / "reader-plan-generator-a.tsv"),
+            "anchor_start_unix_ms": warm_anchor_start_unix_ms(profile, scheduled_start_ms),
             "scheduled_start_unix_ms": scheduled_start_ms,
+            "ramp_end_unix_ms": ramp_end_unix_ms(profile, scheduled_start_ms),
+            "lifecycle_start_unix_ms": lifecycle_start_unix_ms(profile, scheduled_start_ms),
+            "measurement_start_unix_ms": measurement_start_unix_ms(profile, scheduled_start_ms),
+            "measurement_end_unix_ms": measurement_end_unix_ms(profile, scheduled_start_ms),
+            "scheduled_workload_end_unix_ms": workload_end_unix_ms(profile, scheduled_start_ms),
             "process_start_unix_ms": scheduled_start_ms - 100,
-            "process_end_unix_ms": scheduled_start_ms + 1000,
+            "workload_end_unix_ms": workload_end_unix_ms(profile, scheduled_start_ms),
+            "process_end_unix_ms": workload_end_unix_ms(profile, scheduled_start_ms) + 100,
             "clock_synchronized": True,
             "clock_max_error_ms": 1,
+            "lifecycle_scheduled_slots": 0,
+            "injected_disconnects": 0,
             "rtp_packets": 1000,
+            "measurement_rtp_packets": 1000,
+            "soak_rtp_packets": 0,
+            "measurement_rtp_sequence_gaps": 0,
+            "soak_rtp_sequence_gaps": 0,
         }
     )
     reader_events = run_directory / "raw" / "readers.jsonl"
@@ -564,6 +1094,18 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
         summarize_reader_events(profile, reader_events),
     )
 
+    process_bindings = (
+        RuntimeProcessBinding(
+            pid=100,
+            executable_sha256=profile.artifacts.pull_server_sha256,
+            start_time_ticks=1000,
+        ),
+        RuntimeProcessBinding(
+            pid=101,
+            executable_sha256=profile.artifacts.load_reader_sha256,
+            start_time_ticks=1001,
+        ),
+    )
     observations = [
         ResourceObservation(
             generator_host="generator-a",
@@ -579,16 +1121,22 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
             cgroup_cpu_percent=10,
             cgroup_ram_percent=20,
             max_process_fd_percent=10,
+            socket_percent=10,
+            ephemeral_port_start=32768,
+            ephemeral_port_end=60999,
+            ephemeral_port_capacity=28232,
+            reserved_ports_sha256="d" * 64,
             cgroup_pids_percent=10,
             network_percent=10,
             network_packets_per_second=1000,
             packet_rate_percent=10,
             interface_mtu_bytes=1500,
             process_count=2,
-            workload_processes_sha256="b" * 64,
+            workload_processes=process_bindings,
+            workload_processes_sha256=runtime_process_bindings_sha256(process_bindings),
             cgroup_path_sha256="c" * 64,
         )
-        for offset in (0, 1)
+        for offset in (0, 1, 2)
     ]
     generator_events = run_directory / "raw" / "generator-generator-a.jsonl"
     generator_events.write_text(
@@ -604,9 +1152,66 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
             expected_interval_seconds=1,
             maximum_gap_factor=1.5,
             observations_sha256=sha256_file(generator_events),
+            measurement_start_unix_ms=measurement_start_unix_ms(profile, scheduled_start_ms),
+            measurement_end_unix_ms=measurement_end_unix_ms(profile, scheduled_start_ms),
+            soak_end_unix_ms=workload_end_unix_ms(profile, scheduled_start_ms),
         ),
     )
 
+    wrong_bindings = (
+        process_bindings[0].model_copy(update={"executable_sha256": "0" * 64}),
+        process_bindings[1],
+    )
+    wrong_observations = [
+        item.model_copy(
+            update={
+                "workload_processes": wrong_bindings,
+                "workload_processes_sha256": runtime_process_bindings_sha256(wrong_bindings),
+            }
+        )
+        for item in observations
+    ]
+    generator_events.write_text(
+        "".join(json.dumps(item.model_dump(mode="json")) + "\n" for item in wrong_observations),
+        encoding="utf-8",
+    )
+    wrong_summary = summarize_generator_headroom(
+        wrong_observations,
+        expected_generator_host="generator-a",
+        minimum_duration_seconds=1,
+        expected_interval_seconds=1,
+        maximum_gap_factor=1.5,
+        observations_sha256=sha256_file(generator_events),
+        measurement_start_unix_ms=measurement_start_unix_ms(profile, scheduled_start_ms),
+        measurement_end_unix_ms=measurement_end_unix_ms(profile, scheduled_start_ms),
+        soak_end_unix_ms=workload_end_unix_ms(profile, scheduled_start_ms),
+    )
+    (run_directory / "summary" / "generator-generator-a.json").write_text(
+        wrong_summary.model_dump_json() + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="generator_workload_process_count_mismatch"):
+        finalize_run_directory(run_directory)
+
+    generator_events.write_text(
+        "".join(json.dumps(item.model_dump(mode="json")) + "\n" for item in observations),
+        encoding="utf-8",
+    )
+    restored_summary = summarize_generator_headroom(
+        observations,
+        expected_generator_host="generator-a",
+        minimum_duration_seconds=1,
+        expected_interval_seconds=1,
+        maximum_gap_factor=1.5,
+        observations_sha256=sha256_file(generator_events),
+        measurement_start_unix_ms=measurement_start_unix_ms(profile, scheduled_start_ms),
+        measurement_end_unix_ms=measurement_end_unix_ms(profile, scheduled_start_ms),
+        soak_end_unix_ms=workload_end_unix_ms(profile, scheduled_start_ms),
+    )
+    (run_directory / "summary" / "generator-generator-a.json").write_text(
+        restored_summary.model_dump_json() + "\n", encoding="utf-8"
+    )
+
+    (run_directory / "final-manifest.json").write_text('{"schema_version":', encoding="utf-8")
     assert load_cli_main(["finalize", str(run_directory)]) == 0
     finalized_output = capsys.readouterr()
     assert finalized_output.out == f"FINALIZED directory={run_directory}\n"
@@ -614,7 +1219,7 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
 
     assert final_manifest["status"] == "finalized"
     assert {
-        "reader-plan.tsv",
+        "reader-plan-generator-a.tsv",
         "raw/generator-generator-a.jsonl",
         "raw/readers.jsonl",
         "summary/generator-generator-a.json",
@@ -626,6 +1231,18 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     assert load_cli_main(["verify", str(run_directory)]) == 0
     verified_output = capsys.readouterr()
     assert verified_output.out == f"VERIFIED directory={run_directory}\n"
+    verify_run_directory(run_directory)
+
+    (run_directory / "raw" / "readers.jsonl").chmod(0o640)
+    with pytest.raises(ValueError, match="evidence_file_mode_invalid"):
+        verify_run_directory(run_directory)
+    (run_directory / "raw" / "readers.jsonl").chmod(0o440)
+
+    run_directory.chmod(0o750)
+    with pytest.raises(ValueError, match="evidence_directory_mode_invalid"):
+        verify_run_directory(run_directory)
+    finalize_run_directory(run_directory)
+    assert run_directory.stat().st_mode & 0o777 == 0o550
     verify_run_directory(run_directory)
 
     (run_directory / "summary" / "readers.json").chmod(0o640)
@@ -703,6 +1320,7 @@ def test_load_cli_validates_and_prepares_a_digest_bound_run_without_overwrite(
     fixture_profile["path"] = str(fixture)
     fixture_profile["sha256"] = hashlib.sha256(b"fixture").hexdigest()
     profile_path = tmp_path / "profile.json"
+    write_fixture_manifest(LoadProfile.model_validate(raw))
     profile_path.write_text(json.dumps(raw), encoding="utf-8")
     run_directory = tmp_path / "run-001"
 
@@ -762,6 +1380,7 @@ def test_direct_control_prepare_writes_one_coordinated_reader_shard_per_host(
     fixture_profile["sha256"] = hashlib.sha256(b"fixture").hexdigest()
     workload["endpoint_mode"] = "direct-control"
     profile = LoadProfile.model_validate(raw)
+    write_fixture_manifest(profile)
     run_directory = tmp_path / "direct-run"
 
     launch_plan = prepare_run_directory(
@@ -838,7 +1457,15 @@ def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid
     initialize_run_directory(profile, run_directory)
     (run_directory / "raw").mkdir()
     (run_directory / "summary").mkdir()
+    coordinated_start_ms = int(datetime(2026, 8, 10, 12, 0, tzinfo=UTC).timestamp() * 1000)
+    (run_directory / "launch-plan.json").write_text(
+        json.dumps({"coordinated_start_unix_ms": coordinated_start_ms}),
+        encoding="utf-8",
+    )
     observations_path = run_directory / "raw" / "generator.jsonl"
+    process_bindings = runtime_process_bindings()
+    process_binding_payload = [item.model_dump(mode="json") for item in process_bindings]
+    process_binding_sha256 = runtime_process_bindings_sha256(process_bindings)
 
     def write_observations(network_percent: float) -> None:
         observations_path.write_text(
@@ -856,13 +1483,19 @@ def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid
                         "cgroup_cpu_percent": 10,
                         "cgroup_ram_percent": 20,
                         "max_process_fd_percent": 30,
+                        "socket_percent": 10,
+                        "ephemeral_port_start": 32768,
+                        "ephemeral_port_end": 60999,
+                        "ephemeral_port_capacity": 28232,
+                        "reserved_ports_sha256": "d" * 64,
                         "cgroup_pids_percent": 30,
                         "network_percent": network_percent,
                         "network_packets_per_second": 1000,
                         "packet_rate_percent": 10,
                         "interface_mtu_bytes": 1500,
                         "process_count": 2,
-                        "workload_processes_sha256": "b" * 64,
+                        "workload_processes": process_binding_payload,
+                        "workload_processes_sha256": process_binding_sha256,
                         "cgroup_path_sha256": "c" * 64,
                     }
                 )
@@ -870,6 +1503,7 @@ def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid
                 for timestamp in (
                     "2026-08-10T12:00:00Z",
                     "2026-08-10T12:00:01Z",
+                    "2026-08-10T12:00:02Z",
                 )
             ),
             encoding="utf-8",
@@ -966,7 +1600,9 @@ def test_load_cli_binds_generator_sampler_to_launch_processes_and_mtu(
         202: profile.artifacts.load_reader_sha256,
     }
     assert captured["expected_mtu_bytes"] == 1500
-    assert captured["duration_seconds"] > profile.duration.total_seconds
+    captured_duration = captured["duration_seconds"]
+    assert isinstance(captured_duration, int)
+    assert captured_duration > profile.duration.total_seconds
 
 
 def test_versioned_smoke_profile_example_fails_until_placeholders_are_replaced() -> None:

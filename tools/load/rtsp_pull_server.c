@@ -1,9 +1,14 @@
 #include <gst/gst.h>
 #include <gst/rtsp-server/rtsp-server.h>
 #include <glib-unix.h>
+#include <glib/gstdio.h>
 
+#include <fcntl.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_SOURCES 10000
 
@@ -13,8 +18,12 @@ static gchar *mount_prefix = NULL;
 static gint source_start = 0;
 static gint source_count = 1;
 static gchar *fixture_path = NULL;
+static gchar *fixture_sha256 = NULL;
+static gchar *verified_fixture_path = NULL;
+static gint fixture_fd = -1;
 static gchar *codec = NULL;
 static gint fps = 25;
+static gint rtp_mtu = 1200;
 static gboolean audio = FALSE;
 
 static GOptionEntry entries[] = {
@@ -30,10 +39,14 @@ static GOptionEntry entries[] = {
      "Number of independent RTSP source endpoints", "COUNT"},
     {"fixture", 'f', 0, G_OPTION_ARG_FILENAME, &fixture_path,
      "Absolute path to a prepared elementary-stream fixture", "PATH"},
+    {"fixture-sha256", 0, 0, G_OPTION_ARG_STRING, &fixture_sha256,
+     "Expected fixture SHA-256 on this generator host", "SHA256"},
     {"codec", 'c', 0, G_OPTION_ARG_STRING, &codec,
      "Fixture codec: h264 or h265", "CODEC"},
     {"fps", 0, 0, G_OPTION_ARG_INT, &fps,
      "Fixture frame rate", "FPS"},
+    {"rtp-mtu", 0, 0, G_OPTION_ARG_INT, &rtp_mtu,
+     "Maximum RTP packet size produced by the payloader", "BYTES"},
     {"audio", 0, 0, G_OPTION_ARG_NONE, &audio,
      "Add a controlled 48 kHz mono Opus track", NULL},
     {NULL}
@@ -44,7 +57,7 @@ stop_main_loop(gpointer user_data)
 {
     GMainLoop *loop = user_data;
     g_main_loop_quit(loop);
-    return G_SOURCE_REMOVE;
+    return G_SOURCE_CONTINUE;
 }
 
 static gboolean
@@ -60,6 +73,60 @@ valid_mount_prefix(const gchar *value)
             return FALSE;
         }
     }
+    return TRUE;
+}
+
+static gboolean
+safe_sha256(const gchar *value)
+{
+    guint index;
+    if (value == NULL || strlen(value) != 64) {
+        return FALSE;
+    }
+    for (index = 0; index < 64; index++) {
+        if (!g_ascii_isxdigit(value[index]) || g_ascii_isupper(value[index])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static gboolean
+verify_fixture_digest(GError **error)
+{
+    GChecksum *checksum;
+    guint8 buffer[65536];
+    ssize_t received;
+    struct stat metadata;
+    gboolean valid;
+
+    fixture_fd = open(fixture_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fixture_fd < 0 || fstat(fixture_fd, &metadata) != 0 ||
+        !S_ISREG(metadata.st_mode)) {
+        if (fixture_fd >= 0) {
+            close(fixture_fd);
+            fixture_fd = -1;
+        }
+        g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_FAILED,
+                            "fixture_digest_read_failed");
+        return FALSE;
+    }
+    checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    while ((received = read(fixture_fd, buffer, sizeof(buffer))) > 0) {
+        g_checksum_update(checksum, buffer, (gsize) received);
+    }
+    valid = received == 0 &&
+            g_strcmp0(g_checksum_get_string(checksum), fixture_sha256) == 0 &&
+            lseek(fixture_fd, 0, SEEK_SET) == 0;
+    g_checksum_free(checksum);
+    if (!valid) {
+        close(fixture_fd);
+        fixture_fd = -1;
+        g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_FAILED,
+                            "fixture_digest_mismatch");
+        return FALSE;
+    }
+    verified_fixture_path = g_strdup_printf("/proc/self/fd/%d", fixture_fd);
     return TRUE;
 }
 
@@ -82,6 +149,11 @@ validate_options(GError **error)
                             "fps_out_of_range");
         return FALSE;
     }
+    if (rtp_mtu < 256 || rtp_mtu > 9000) {
+        g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
+                            "rtp_mtu_out_of_range");
+        return FALSE;
+    }
     if (!valid_mount_prefix(mount_prefix)) {
         g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
                             "invalid_mount_prefix");
@@ -89,9 +161,14 @@ validate_options(GError **error)
     }
     if (fixture_path == NULL || !g_path_is_absolute(fixture_path) ||
         strstr(fixture_path, "..") != NULL ||
-        !g_file_test(fixture_path, G_FILE_TEST_IS_REGULAR)) {
+        fixture_path[0] == '\0') {
         g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
                             "fixture_must_be_an_absolute_regular_file");
+        return FALSE;
+    }
+    if (!safe_sha256(fixture_sha256)) {
+        g_set_error_literal(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
+                            "fixture_sha256_invalid");
         return FALSE;
     }
     if (g_strcmp0(codec, "h264") != 0 && g_strcmp0(codec, "h265") != 0) {
@@ -122,12 +199,12 @@ build_launch_line(void)
         payloader = "rtph265pay";
     }
 
-    escaped_fixture = g_strescape(fixture_path, NULL);
+    escaped_fixture = g_strescape(verified_fixture_path, NULL);
     video = g_strdup_printf(
         "multifilesrc location=\"%s\" loop=true start-index=0 stop-index=0 "
         "do-timestamp=true caps=\"%s,framerate=(fraction)%d/1\" ! "
-        "%s ! identity sync=true ! %s name=pay0 pt=96 config-interval=1",
-        escaped_fixture, media_caps, fps, parser, payloader);
+        "%s ! identity sync=true ! %s name=pay0 pt=96 config-interval=1 mtu=%d",
+        escaped_fixture, media_caps, fps, parser, payloader, rtp_mtu);
     if (audio) {
         launch = g_strdup_printf(
             "( %s audiotestsrc is-live=true wave=silence ! "
@@ -154,6 +231,8 @@ main(int argc, char *argv[])
     gchar *launch;
     GstElement *parsed_launch;
     guint source_id;
+    guint signal_int_id;
+    guint signal_term_id;
     gint index;
 
     context = g_option_context_new("- prepared-fixture RTSP pull-source server");
@@ -177,9 +256,13 @@ main(int argc, char *argv[])
         codec = g_strdup("h264");
     }
 
-    if (!validate_options(&error)) {
+    if (!validate_options(&error) || !verify_fixture_digest(&error)) {
         g_printerr("configuration_error: %s\n", error->message);
         g_clear_error(&error);
+        if (fixture_fd >= 0) {
+            close(fixture_fd);
+        }
+        g_free(verified_fixture_path);
         return 2;
     }
 
@@ -189,6 +272,8 @@ main(int argc, char *argv[])
         g_printerr("pipeline_error: %s\n", error->message);
         g_clear_error(&error);
         g_free(launch);
+        close(fixture_fd);
+        g_free(verified_fixture_path);
         return 3;
     }
     gst_object_unref(parsed_launch);
@@ -219,23 +304,34 @@ main(int argc, char *argv[])
         g_printerr("listen_error: unable to attach RTSP server\n");
         g_object_unref(server);
         g_main_loop_unref(loop);
+        close(fixture_fd);
+        g_free(verified_fixture_path);
         return 4;
     }
 
-    g_unix_signal_add(SIGINT, stop_main_loop, loop);
-    g_unix_signal_add(SIGTERM, stop_main_loop, loop);
+    signal_int_id = g_unix_signal_add(SIGINT, stop_main_loop, loop);
+    signal_term_id = g_unix_signal_add(SIGTERM, stop_main_loop, loop);
     g_print(
         "READY address=%s port=%d source_start=%d source_count=%d "
         "codec=%s transport=tcp\n",
         listen_address, listen_port, source_start, source_count, codec);
     g_main_loop_run(loop);
 
+    if (signal_int_id != 0) {
+        g_source_remove(signal_int_id);
+    }
+    if (signal_term_id != 0) {
+        g_source_remove(signal_term_id);
+    }
     g_source_remove(source_id);
     g_object_unref(server);
     g_main_loop_unref(loop);
     g_free(listen_address);
     g_free(mount_prefix);
     g_free(fixture_path);
+    g_free(fixture_sha256);
+    g_free(verified_fixture_path);
+    close(fixture_fd);
     g_free(codec);
     return 0;
 }

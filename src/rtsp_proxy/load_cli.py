@@ -9,17 +9,30 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from rtsp_proxy.load_catalog import apply_load_catalog, build_load_catalog
+from rtsp_proxy.load_catalog import (
+    apply_load_catalog,
+    build_load_catalog,
+    capture_cold_preflight,
+    capture_warm_preflight,
+)
 from rtsp_proxy.load_evidence import (
     load_observations,
+    load_sut_observations,
     sample_linux_generator_resources,
+    sample_linux_sut_resources,
     summarize_generator_headroom,
+    summarize_sut_capacity,
 )
 from rtsp_proxy.load_profile import (
     LoadProfile,
     canonical_profile_bytes,
     finalize_run_directory,
+    generator_sampling_end_unix_ms,
+    measurement_end_unix_ms,
+    measurement_start_unix_ms,
+    sut_sampling_end_unix_ms,
     verify_run_directory,
+    workload_end_unix_ms,
 )
 from rtsp_proxy.load_results import (
     merge_reader_event_files,
@@ -27,6 +40,7 @@ from rtsp_proxy.load_results import (
     summarize_reader_events,
 )
 from rtsp_proxy.load_run import (
+    inspect_fixture,
     load_stored_profile,
     prepare_run_directory,
     sha256_file,
@@ -41,6 +55,12 @@ def _parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate")
     validate.add_argument("profile", type=Path)
 
+    inspect = commands.add_parser("inspect-fixture")
+    inspect.add_argument("profile", type=Path)
+    inspect.add_argument("--ffmpeg-binary", required=True, type=Path)
+    inspect.add_argument("--ffprobe-binary", required=True, type=Path)
+    inspect.add_argument("--output", type=Path)
+
     prepare = commands.add_parser("prepare")
     prepare.add_argument("profile", type=Path)
     prepare.add_argument("destination", type=Path)
@@ -52,6 +72,16 @@ def _parser() -> argparse.ArgumentParser:
     apply_paths.add_argument("run_directory", type=Path)
     apply_paths.add_argument("--api-url", required=True)
     apply_paths.add_argument("--timeout", type=float, default=2)
+
+    cold_preflight = commands.add_parser("preflight-cold")
+    cold_preflight.add_argument("run_directory", type=Path)
+    cold_preflight.add_argument("--api-url", required=True)
+    cold_preflight.add_argument("--timeout", type=float, default=2)
+
+    warm_preflight = commands.add_parser("preflight-warm")
+    warm_preflight.add_argument("run_directory", type=Path)
+    warm_preflight.add_argument("--api-url", required=True)
+    warm_preflight.add_argument("--timeout", type=float, default=2)
 
     sample = commands.add_parser("sample-generator")
     sample.add_argument("run_directory", type=Path)
@@ -66,6 +96,18 @@ def _parser() -> argparse.ArgumentParser:
     summarize.add_argument("observations", type=Path)
     summarize.add_argument("output", type=Path)
     summarize.add_argument("--generator-host", required=True)
+
+    sample_sut = commands.add_parser("sample-sut")
+    sample_sut.add_argument("run_directory", type=Path)
+    sample_sut.add_argument("output", type=Path)
+    sample_sut.add_argument("--mediamtx-pid", required=True, type=int)
+    sample_sut.add_argument("--cgroup", required=True)
+    sample_sut.add_argument("--metrics-url", required=True)
+
+    summarize_sut = commands.add_parser("summarize-sut")
+    summarize_sut.add_argument("run_directory", type=Path)
+    summarize_sut.add_argument("observations", type=Path)
+    summarize_sut.add_argument("output", type=Path)
 
     summarize_readers = commands.add_parser("summarize-readers")
     summarize_readers.add_argument("run_directory", type=Path)
@@ -119,6 +161,22 @@ def _loopback_api_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def _loopback_metrics_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/metrics"
+        or parsed.port is None
+    ):
+        raise ValueError("metrics_must_be_literal_loopback_http")
+    return value
+
+
 def _copy_reference_exclusive(source: Path, destination: Path) -> None:
     if source.is_symlink() or not source.is_file():
         raise ValueError("reference_source_must_be_regular_file")
@@ -137,6 +195,20 @@ def main(argv: list[str] | None = None) -> int:
             profile = _load_profile(arguments.profile)
             _, profile_sha256 = canonical_profile_bytes(profile)
             print(f"VALID profile_sha256={profile_sha256} tier={profile.tier}")
+            return 0
+        if arguments.command == "inspect-fixture":
+            profile = _load_profile(arguments.profile)
+            manifest = inspect_fixture(
+                profile,
+                ffmpeg_binary=arguments.ffmpeg_binary,
+                ffprobe_binary=arguments.ffprobe_binary,
+                destination=arguments.output,
+            )
+            output = arguments.output or Path(f"{profile.fixture.path}.manifest.json")
+            print(
+                f"INSPECTED_FIXTURE frames={manifest.frame_count} "
+                f"keyframes={len(manifest.keyframe_indices)} output={output}"
+            )
             return 0
         if arguments.command == "prepare":
             profile = _load_profile(arguments.profile)
@@ -178,6 +250,52 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"APPLIED paths={result.applied_paths} verified={result.verified_paths}")
             return 0
+        if arguments.command in {"preflight-cold", "preflight-warm"}:
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            scheduled_start = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(scheduled_start, int) or isinstance(scheduled_start, bool):
+                raise ValueError("launch_plan_start_invalid")
+            client = MediaMtxClient(
+                api_url=_loopback_api_url(arguments.api_url),
+                timeout_seconds=arguments.timeout,
+            )
+            payload = (
+                capture_cold_preflight(
+                    profile,
+                    client,
+                    scheduled_start_unix_ms=scheduled_start,
+                )
+                if arguments.command == "preflight-cold"
+                else capture_warm_preflight(
+                    profile,
+                    client,
+                    scheduled_start_unix_ms=scheduled_start,
+                )
+            )
+            output = (
+                run_directory
+                / "raw"
+                / (
+                    "cold-preflight.json"
+                    if arguments.command == "preflight-cold"
+                    else "warm-preflight.json"
+                )
+            )
+            write_summary(output, payload)
+            paths = payload[
+                "unavailable_paths" if arguments.command == "preflight-cold" else "ready_paths"
+            ]
+            if not isinstance(paths, list):
+                raise ValueError("preflight_evidence_invalid")
+            label = (
+                "COLD_PREFLIGHT inactive"
+                if arguments.command == "preflight-cold"
+                else "WARM_PREFLIGHT ready"
+            )
+            print(f"{label}={len(paths)} output={output}")
+            return 0
         if arguments.command == "sample-generator":
             if arguments.generator_host not in {host.name for host in profile.generator_hosts}:
                 raise ValueError("unknown_generator_host")
@@ -207,17 +325,7 @@ def main(argv: list[str] | None = None) -> int:
             coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
             if not isinstance(coordinated_start_ms, int):
                 raise ValueError("launch_plan_start_invalid")
-            rate = profile.workload.connect_rate_per_second
-            ramp_seconds = (
-                0
-                if rate == 0 or profile.workload.total_readers < 2
-                else (profile.workload.total_readers - 1) / rate
-            )
-            sample_until_ms = (
-                coordinated_start_ms
-                + math.ceil(ramp_seconds * 1000)
-                + profile.duration.total_seconds * 1000
-            )
+            sample_until_ms = generator_sampling_end_unix_ms(profile, coordinated_start_ms)
             duration_seconds = math.ceil((sample_until_ms - time.time_ns() // 1_000_000) / 1000)
             if duration_seconds < 1:
                 raise ValueError("generator_sampling_window_already_expired")
@@ -235,21 +343,87 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"SAMPLED observations={count} output={arguments.output}")
             return 0
+        if arguments.command == "sample-sut":
+            if profile.tier != "capacity":
+                raise ValueError("sut_sampler_requires_capacity_profile")
+            _require_run_path(run_directory, arguments.output)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start_ms, int):
+                raise ValueError("launch_plan_start_invalid")
+            sample_until_ms = sut_sampling_end_unix_ms(profile, coordinated_start_ms)
+            duration_seconds = math.ceil((sample_until_ms - time.time_ns() // 1_000_000) / 1000)
+            if duration_seconds < 1:
+                raise ValueError("sut_sampling_window_already_expired")
+            count = sample_linux_sut_resources(
+                root=Path("/"),
+                sut_host=profile.sut_rtsp_host,
+                interface=profile.network.interface,
+                mediamtx_pid=arguments.mediamtx_pid,
+                cgroup=arguments.cgroup,
+                expected_mediamtx_sha256=profile.artifacts.mediamtx_sha256,
+                expected_mtu_bytes=profile.network.mtu_bytes,
+                metrics_url=_loopback_metrics_url(arguments.metrics_url),
+                output=arguments.output,
+                duration_seconds=duration_seconds,
+                interval_seconds=profile.evidence_sampling.interval_seconds,
+                maximum_clock_error_ms=profile.evidence_sampling.maximum_clock_error_ms,
+            )
+            print(f"SAMPLED_SUT observations={count} output={arguments.output}")
+            return 0
         if arguments.command == "summarize-generator":
             _require_run_path(run_directory, arguments.observations)
             _require_run_path(run_directory, arguments.output)
             observations = load_observations(arguments.observations)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start_ms, int):
+                raise ValueError("launch_plan_start_invalid")
             generator_summary = summarize_generator_headroom(
                 observations,
                 expected_generator_host=arguments.generator_host,
-                minimum_duration_seconds=profile.duration.total_seconds,
+                minimum_duration_seconds=profile.duration.measurement_seconds,
                 expected_interval_seconds=profile.evidence_sampling.interval_seconds,
                 maximum_gap_factor=profile.evidence_sampling.maximum_gap_factor,
                 observations_sha256=sha256_file(arguments.observations),
+                capacity_gate=profile.tier == "capacity",
+                measurement_start_unix_ms=measurement_start_unix_ms(profile, coordinated_start_ms),
+                measurement_end_unix_ms=measurement_end_unix_ms(profile, coordinated_start_ms),
+                soak_end_unix_ms=workload_end_unix_ms(profile, coordinated_start_ms),
             )
             write_summary(arguments.output, generator_summary)
             print(f"SUMMARIZED_GENERATOR output={arguments.output}")
             return 0 if generator_summary.valid else 3
+        if arguments.command == "summarize-sut":
+            if profile.tier != "capacity":
+                raise ValueError("sut_summary_requires_capacity_profile")
+            _require_run_path(run_directory, arguments.observations)
+            _require_run_path(run_directory, arguments.output)
+            sut_observations = load_sut_observations(arguments.observations)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start_ms, int):
+                raise ValueError("launch_plan_start_invalid")
+            sut_summary = summarize_sut_capacity(
+                sut_observations,
+                expected_sut_host=profile.sut_rtsp_host,
+                expected_interval_seconds=profile.evidence_sampling.interval_seconds,
+                maximum_gap_factor=profile.evidence_sampling.maximum_gap_factor,
+                observations_sha256=sha256_file(arguments.observations),
+                measurement_start_unix_ms=measurement_start_unix_ms(profile, coordinated_start_ms),
+                measurement_end_unix_ms=measurement_end_unix_ms(profile, coordinated_start_ms),
+                soak_end_unix_ms=workload_end_unix_ms(profile, coordinated_start_ms),
+                maximum_clock_error_ms=profile.evidence_sampling.maximum_clock_error_ms,
+            )
+            write_summary(arguments.output, sut_summary)
+            print(f"SUMMARIZED_SUT output={arguments.output}")
+            return 0 if sut_summary.valid else 3
         if arguments.command == "summarize-readers":
             _require_run_path(run_directory, arguments.events)
             _require_run_path(run_directory, arguments.output)

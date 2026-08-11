@@ -114,6 +114,7 @@ URL или handshake.
 | Planning consensus | COMPLETE | Issues согласованы, corrections внесены |
 | Phase 0 | IN PROGRESS | Owner authorization получено 2026-08-10 |
 | Phase 0A compatibility | COMPLETE | Standards/Spec PASS; native amd64/arm64 contract CI |
+| Phase 0B harness / Spike #0 | IN PROGRESS | Harness hardening in repeat review; dedicated hardware evidence absent |
 | Scale-out topology | EVIDENCE BLOCKED | Провален single-node gate и пройден topology spike #10 |
 | Foundation implementation | REVIEWED | Health/release/package/Linux artifacts прошли exit review |
 | Product behavior | EVIDENCE GATED | Зелёные обязательные Phase 0 fork decisions |
@@ -803,7 +804,9 @@ seed, synchronized time, raw series/events and summary.
 - untuned baseline 100/500/1000;
 - registered 100 → 500 → 1k → 5k → 10k;
 - active sources and readers grow independently;
-- warm-up 15m, measurement 30m, candidate soak 24h;
+- one warm anchor per active path is included in total reader load; measured
+  ramp, 15m warm-up, 30m measurement and candidate 24h soak are immutable,
+  separately evidenced epochs;
 - LAN and WAN/netem 50ms RTT, 0.5% loss, 10ms jitter;
 - extended DNS/half-open/150ms+2% loss/bandwidth/DB/auth/node/L4 chaos;
 - churn 10/s and 100/s, ramp 100/s, burst 1000/s;
@@ -812,7 +815,7 @@ seed, synchronized time, raw series/events and summary.
 Pass/fail uses p99 SLO from §8. Additional gates:
 
 - zero unexpected healthy-cohort disconnects;
-- RSS slope `≤1%/h` over 6h;
+- maximum rolling RSS slope `≤1%/h` over every covered 6h window;
 - leaked FD/sessions `≤0.1%` or `≤10`;
 - added packet loss in healthy topology = 0;
 - A/B probes/CRUD/dashboard/observability within `5% / 10% / 0.1pp`.
@@ -1000,15 +1003,73 @@ Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
 Implementation status: native GStreamer pull sources/readers and a digest-bound
 orchestrator are present. A stored profile generates exact per-host source and
 reader plans; active paths and reader counts remain independent. Reader events
-separate outgoing `DESCRIBE→PLAY` from the first parsed non-delta access unit,
+separate outgoing `DESCRIBE→PLAY` from the first parser-aligned
+non-header/non-delta access unit,
 and cold pass/fail is accepted only from a compatible finalized direct-control
-pair. Seeded steady/ramp/burst/outage primitives, interruption fail-closed,
-owner-only credentials, per-process/RLIMIT/cgroup generator headroom and a
-hash-complete read-only final bundle are implemented. The bundle is moved to
-root-owned immutable/WORM storage after local finalization.
+pair; only handshake deltas are compared, while both GOP waits are published
+separately. Seeded steady/ramp/burst/outage primitives, interruption
+fail-closed and owner-only credentials are implemented. Warm proxy profiles
+reserve one reader from `total_readers` per active path as an anchor, start the
+anchors 60 seconds before measured ramp and require typed MediaMTX runtime
+polling through the ramp boundary. Anchors remain normal downstream sessions in
+the same reader processes/cgroups and therefore cannot hide generator or SUT
+load. Shards share future UTC anchor/ramp/measurement/soak epochs; completion records exact
+per-host reader counts/lifecycle slots, host/profile/reader-plan digests and
+kernel clock proof through workload end. A derived post-workload grace keeps
+PIDs observable for the final sampler interval without extending media load.
+Every injected disconnect binds the deterministic backoff to its same-cycle
+schedule and ordered next-cycle start→PLAY→first-decodable chain; orphan or
+skipped cycles fail finalization.
+Cold profiles use one reader per active path and require a typed reset/recreate
+plus unavailable-path preflight within 30 seconds of start. Until a bulk
+MediaMTX reset/snapshot path is proven, cold evidence uses a conservative
+implementation safety cap of 512 paths and 32 concurrent API workers; larger
+profiles fail validation. Generator evidence
+requires exact PID/cgroup membership, pinned executable digests/start times,
+NIC packet/MTU measurements, effective ephemeral-port capacity after reserved
+ports and finite CPU/memory/pids limits. Capacity policy enforces CPU `<=65%`,
+NIC byte/packet rate `<=60%`, and RAM/FD/socket/cgroup-pids `<70%`; measurement
+and soak are recomputed and gated separately. Finalization regenerates catalog/plans and exact typed
+summaries from raw evidence before sealing a hash-complete read-only bundle,
+which is then moved to root-owned immutable/WORM storage.
 
-The hardened harness is undergoing repeat Standards/Spec exit review and native
-amd64/arm64 CI. CI is not capacity evidence; dedicated LAN/WAN hardware,
+Fixture bytes alone are insufficient evidence: `prepare` requires a typed
+manifest produced with the pinned FFmpeg/ffprobe binaries and matching probed
+codec, FPS, bitrate, every internal GOP interval and the cyclic loop boundary.
+The Phase 0B harness is IPv4-only and rejects IPv6 literals until its native
+source/evidence path is fully dual-stack. Every capacity bundle also requires
+a typed SUT series bound to the single MediaMTX PID/systemd cgroup and relevant
+NIC. Each SUT sample and loopback preflight carries Linux kernel clock proof;
+session/path counters remain cumulative across churn and use a pre-measurement
+baseline. Exact empty-family zero sentinels and active identities are bound;
+session history stays stable on `id+remoteAddr` across idle/read path changes,
+while every sample requires equal `id/path/remoteAddr/state` labels across
+selected families. State-specific RTP/RTCP/path-error fields and recomputed
+cumulative totals are bound; an observed path ready/notReady transition starts
+a counter generation, while a decrease within one continuously observed state
+fails closed. Reader
+completions independently reconcile per-reader/per-track video and configured
+Opus phase RTP with shard totals, compare successfully parsed receives with the
+sender RTP sequence-number span per cycle/track/phase, require video progress
+of at least 80% of pinned fixture FPS (Opus: 40 packets/s) during typed
+connected intervals, require first/last successful packets within one second
+of the interval boundaries and reject every gap, including one spanning
+measurement into soak.
+Recomputed gates enforce SUT headroom, maximum rolling RSS slope `<=1%/h` for
+every covered 6h window, including cross-phase windows,
+bounded FD delta, zero RTSP sessions and ready runtime paths after the pinned
+on-demand close/drain interval, and zero inbound/outbound RTP, RTCP and path
+loss/error delta.
+Missing SUT or fixture evidence
+fails finalization rather than downgrading the claim.
+
+Previous native amd64/arm64 CI run `31417242196` is green; the current hardened
+harness awaits a fresh native run and repeat Standards/Spec exit review.
+Per-host hardware/architecture and dynamically linked GStreamer package/build
+evidence remains an explicit Phase 0B exit artifact; profile labels and
+executable hashes alone do not prove it. WAN/netem and non-zero probe/CRUD
+profiles currently fail closed until typed drivers and their evidence verifiers
+are implemented. CI is not capacity evidence; dedicated LAN/WAN hardware,
 untuned baselines, saturation knee, complete fault matrix and 24h soak remain
 mandatory before the Phase 0B exit decision.
 
@@ -1141,6 +1202,8 @@ Product/release is ready only when:
 - pilot exits green and owner gives `GO`;
 - every 10k claim is bounded by the actually measured workload envelope.
 
-Phase 0 is authorized and in progress. The next valid decision is its evidence
-gate: accept the pinned compatibility results and single-node baseline, change
-scope, or keep dependent product behavior and production rollout at `NO-GO`.
+Phase 0 is authorized and in progress. The next valid action is to finish the
+remaining typed Phase 0B drivers, execute Spike #0 on production-equivalent
+amd64/arm64 stands, and then decide `SINGLE_NODE BASELINE` or authorize the
+conditional topology spike. Until those artifacts exist, dependent product
+behavior and production rollout remain `NO-GO`.

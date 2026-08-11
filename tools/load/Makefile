@@ -1,8 +1,8 @@
 CC ?= cc
 CFLAGS ?= -O2
-CPPFLAGS += $(shell pkg-config --cflags gstreamer-rtsp-server-1.0 gstreamer-rtsp-1.0)
+CPPFLAGS += $(shell pkg-config --cflags gstreamer-rtsp-server-1.0 gstreamer-rtsp-1.0 gstreamer-rtp-1.0)
 CFLAGS += -std=c11 -Wall -Wextra -Werror -Wpedantic
-LDLIBS += $(shell pkg-config --libs gstreamer-rtsp-server-1.0 gstreamer-rtsp-1.0)
+LDLIBS += $(shell pkg-config --libs gstreamer-rtsp-server-1.0 gstreamer-rtsp-1.0 gstreamer-rtp-1.0)
 
 .PHONY: all clean
 

@@ -6,13 +6,18 @@ compile and execute the same source natively on Linux `amd64` and `arm64`;
 capacity envelopes are measured and published separately for each architecture.
 
 The source side is pull-only. `rtsp-pull-server` exposes prepared H.264/H.265
-fixtures as camera-like RTSP endpoints and MediaMTX connects on demand. The
+fixtures as camera-like RTSP endpoints and MediaMTX connects on demand. Every
+remote source process verifies the profile-pinned fixture SHA-256 before
+announcing `READY`, so same-path/different-byte drift fails closed. The
 external reader always uses ordinary `rtsp://` with interleaved TCP. Neither a
-publisher into MediaMTX nor `rtsps://` is part of the primary test path.
+publisher into MediaMTX nor a different external protocol is part of the test
+path: the remote consumer sees the same ordinary RTSP server contract as a
+direct camera.
 
 `rtsp-load-reader` consumes a strict TSV plan (`path`, reader count, first
-global reader ID), timestamps outgoing DESCRIBE and PLAY requests, and records
-the first parsed non-delta video access unit. It therefore publishes separate
+global reader ID, warm-anchor count, first measured schedule index), timestamps
+outgoing DESCRIBE and PLAY requests, and records
+the first parser-aligned non-header/non-delta video access unit. It therefore publishes separate
 `DESCRIBE→PLAY`, `PLAY→first decodable` and end-to-end values instead of
 mislabeling the first RTP buffer as the SLO. Stable global IDs allow a cold
 proxy run to be paired with the corresponding direct-control run.
@@ -46,6 +51,23 @@ bash tools/load/prepare_fixture.sh \
   h264 2000000 25 50 120
 ```
 
+Replace the fixture SHA-256 in the immutable run profile, then generate the
+mandatory typed sidecar with the pinned tools:
+
+```sh
+rtsp-proxy-load inspect-fixture /srv/rtsp-load/profiles/run.json \
+  --ffmpeg-binary /opt/rtsp-proxy/current/bin/ffmpeg \
+  --ffprobe-binary /opt/rtsp-proxy/current/bin/ffprobe
+```
+
+The exclusive `<fixture>.manifest.json` binds the fixture bytes and tool hashes
+to probed codec/FPS, frame count, bitrate and every keyframe interval. `prepare`
+copies and hashes it as `fixture-manifest.json`; missing, stale or semantically
+incompatible fixture evidence fails before any process is launched. The final
+keyframe-to-loop-restart interval is checked as part of the GOP contract; a
+finite file with a valid internal cadence but a shortened/extended loop boundary
+is rejected.
+
 Create separate compatible profile pairs for typical and worst measured OMNY
 GOP. The schema accepts only `none` or `opus`, matching the native source
 server; unsupported AAC cannot silently become Opus.
@@ -58,19 +80,30 @@ profile, catalog, per-host reader plans and exact argv-only launch plan with
 exclusive writes:
 
 ```sh
+LOAD_START_MS=$(( ($(date +%s) + 180) * 1000 ))
 rtsp-proxy-load validate /srv/rtsp-load/profiles/run.json
 rtsp-proxy-load prepare \
   /srv/rtsp-load/profiles/run.json \
   /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
   --pull-server-binary /opt/rtsp-load/bin/rtsp-pull-server \
-  --load-reader-binary /opt/rtsp-load/bin/rtsp-load-reader
+  --load-reader-binary /opt/rtsp-load/bin/rtsp-load-reader \
+  --start-unix-ms "$LOAD_START_MS"
 ```
 
 Do not reconstruct reader/source arguments manually. Execute each `argv` from
 `launch-plan.json` on its named generator host under a dedicated systemd scope.
-Reader shards use global IDs and coordinated schedule indexes, so proxy and
-direct-control runs have the same path/readers distribution and aggregate
-connect/disconnect rate.
+Reader shards use global IDs, common future Unix-millisecond start/lifecycle
+epochs, a derived warm-anchor start, ramp end, measurement start/end, one
+absolute soak/workload end and coordinated schedule indexes. Completion
+evidence carries exact per-shard counts and lifecycle slots, profile/plan
+digests, host, actual/scheduled workload windows and Linux `adjtimex` proof
+sampled through workload completion. Finalization rejects early or late shard
+launches, clock loss, missing 10/100 disconnect slots, a shifted/wrong seeded
+outage cohort and any shortened shard workload.
+
+Phase 0B profiles are intentionally IPv4-only. DNS names and IPv4 literals are
+accepted, while IPv6 literals fail profile validation until both native source
+listeners and every evidence identity are proven dual-stack.
 
 For a proxy run, apply paths only through a literal loopback HTTP management
 listener on the SUT; DNS names, userinfo and non-loopback addresses fail closed:
@@ -80,6 +113,52 @@ rtsp-proxy-load apply-paths \
   /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
   --api-url http://127.0.0.1:9997
 ```
+
+A cold proxy profile is deliberately limited to one reader per active path and
+the `single` lifecycle. The current implementation safety cap is 512 active
+paths and 32 concurrent API workers; it is not a proven scale claim. Larger
+cold profiles fail validation until a bulk MediaMTX snapshot/reset path is
+proven. After `apply-paths`, run the mandatory reset preflight
+on the SUT no more than 30 seconds before the coordinated start:
+
+```sh
+rtsp-proxy-load preflight-cold \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
+  --api-url http://127.0.0.1:9997
+```
+
+The command deletes and recreates each exact target with its pinned on-demand
+source mapping using at most 32 concurrent API workers, reads every mapping
+back, then requires every recreated path to remain unavailable. It
+writes typed, profile/start-bound `raw/cold-preflight.json` containing both the
+reset and unavailable sets. Cold finalization rejects a missing, stale, altered
+or post-reset-ready preflight; this prevents a previous/partially started pull
+or warm fan-out sample from being mislabeled as cold establishment. Both cold
+and warm preflights run against loopback on the SUT and bind fail-closed Linux
+kernel clock proofs before and after their bounded observation windows.
+
+A warm proxy run reserves exactly one reader from `total_readers` per active
+path as an anchor; therefore every warm run requires
+`total_readers > active_sources`. Anchors start 60 seconds before the measured
+ramp and must deliver a decodable access unit before that boundary. They remain
+ordinary downstream sessions: after the measured cohort is active, steady and
+outage lifecycles may select them like any other reader. Launch every prepared reader process
+and its sampler immediately after `prepare`, before the anchor epoch. During the
+last 30 seconds before ramp start, run the blocking warm preflight on the SUT:
+
+```sh
+rtsp-proxy-load preflight-warm \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
+  --api-url http://127.0.0.1:9997
+```
+
+It uses bounded bulk MediaMTX runtime sweeps through the coordinated ramp boundary
+and requires `ready=true` plus at least one downstream reader on every path at
+every sample. The typed `raw/warm-preflight.json` is profile/start-bound;
+and records each sweep start/end, exact path-set digest, reader-count digest and
+maximum gap. Missing, stale, slow or interrupted anchor evidence makes warm proxy finalization
+fail closed. Anchors are not extra hidden load: they are part of
+`workload.total_readers`, the same reader process/cgroup and generator headroom.
 
 The optional external Basic Auth file is not included in argv contents. It
 must be an owner-owned regular file, mode `0600`/`0400`, no symlink, and contain
@@ -92,43 +171,109 @@ One immutable profile selects one lifecycle:
 - `single`: functional or steady-state hold without injected disconnects;
 - `steady`: aggregate 10/s or 100/s connect/disconnect;
 - `ramp`: controlled 100 readers/s;
-- `burst`: 1000 readers/s with bounded retry/backoff/jitter;
+- `burst`: at least 1000 measured readers at 1000 readers/s after warm anchors
+  are reserved, with bounded retry/backoff/jitter;
 - `outage`: an exact global 10%, 25% or 100% cohort, followed by deterministic
   jitter across the configured backoff window.
 
-Raw events include start, PLAY, first-decodable, error, injected disconnect and
+Raw events include anchor/ramp start, PLAY, first-decodable, error, injected disconnect and
 scheduled reconnect points. SIGINT/SIGTERM, incomplete initial starts, missing
 decodable readers or an unrecovered injected cohort always return non-zero;
 `--allow-failures` cannot turn an interrupted run into valid evidence.
+Every injected disconnect binds the deterministic configured backoff to the
+same cycle's `reconnect_scheduled` event and the next cycle's ordered
+start→PLAY→first-decodable chain within the profile lateness budget. Orphan or
+skipped cycles fail finalization.
+Video and configured Opus RTP pads are sequence-checked independently per
+reader and reconnect generation. Completion publishes phase-bound received
+packet/gap counts for every reader/track and reconciles them with shard totals.
+Measurement and soak are checked separately, including the packet spanning
+their boundary. Every reader must make progress during its typed connected
+portion of each phase; only intervals bounded by an injected-disconnect and its
+matching reconnect event are exempt. A stalled track, aggregate mismatch or
+any sequence gap invalidates the run even if the total packet rate is healthy.
+The receiver treats the RTP sequence-number span as sent packets and compares
+it with successfully parsed received packets for each cycle/track/phase
+segment. Video must also sustain at least 80% of the pinned fixture FPS (and
+Opus 40 packets/s), and the first/last successful packet must remain within one
+second of the typed connected interval boundaries. A trailing full-stream
+stall cannot hide behind a gap-free final sequence number.
 
 ## Generator headroom
 
 Run every source and reader process inside one finite-limit cgroup per generator
 host. The sampler has no public fake-root or free-form cadence option: cadence
 comes from the stored profile, `/proc` and cgroup v2 come from the real host,
-and every workload PID is explicit.
+and every workload PID is explicit. It also binds the stable Linux ephemeral
+port range, subtracts `ip_local_reserved_ports`, and counts in-use non-listening TCP ports, so socket exhaustion cannot
+be misattributed to the SUT. Capacity profiles enforce CPU `<=65%`, NIC byte and
+packet rate `<=60%`, and RAM/FD/socket/cgroup-pids `<70%`; functional profiles
+retain the generic `<70%` safety gate.
 
 The argument order is `sample-generator RUN_DIR OUTPUT`; for example:
 
 ```sh
 rtsp-proxy-load sample-generator \
   /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-a.jsonl \
-  --generator-host generator-a --pid 1234 --pid 1235 \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-generator-a.jsonl \
+  --generator-host generator-a \
+  --source-pid 1234 --reader-pid 1235 \
   --cgroup rtsp-load.slice
 
 rtsp-proxy-load summarize-generator \
   /srv/rtsp-load/runs/2026-08-10T180000Z-amd64 \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-a.jsonl \
-  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/summary/generator-a.json \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/raw/generator-generator-a.jsonl \
+  /srv/rtsp-load/runs/2026-08-10T180000Z-amd64/summary/generator-generator-a.json \
   --generator-host generator-a
 ```
 
-Validation uses host CPU/RAM/NIC plus maximum per-process single-core CPU and
-RLIMIT_NOFILE consumption and cgroup CPU/memory/pids hard limits. Identity,
-boot ID, expected sample count and maximum cadence gap are checked. Any hard
-resource reaching 70%, a missing host summary or a short/gapped sample window
-invalidates finalization.
+The PID set must equal `cgroup.procs`; every PID must report that cgroup in
+procfs and retain its pinned executable digest and process start time. Validation
+uses host CPU/RAM/NIC byte and packet rates, actual interface MTU, maximum
+per-process single-core CPU/RLIMIT_NOFILE consumption and finite cgroup
+CPU/memory/pids limits. Machine/boot identity, sample cadence and coverage of
+the complete scheduled workload window are checked. Capacity runs require
+different machine IDs for their generator hosts. Crossing the tier-specific
+ceiling (CPU `>65%`, NIC bytes/packets `>60%`, or any other hard resource
+`>=70%`), a missing host summary or a short/gapped sample window invalidates
+finalization.
+The finalizer also compares the executable-digest multiset with the exact
+prepared source/reader roles; a self-consistent raw series from different
+binaries is rejected.
+
+## Capacity SUT evidence
+
+Every `capacity` run additionally requires a dedicated MediaMTX systemd cgroup,
+the exact MediaMTX PID and loopback metrics listener:
+
+```sh
+rtsp-proxy-load sample-sut RUN_DIR RUN_DIR/raw/sut.jsonl \
+  --mediamtx-pid 4321 --cgroup mediamtx.service \
+  --metrics-url http://127.0.0.1:9998/metrics
+rtsp-proxy-load summarize-sut \
+  RUN_DIR RUN_DIR/raw/sut.jsonl RUN_DIR/summary/sut.json
+```
+
+The typed series binds PID/start time/executable SHA/cgroup, CPU/RAM/FD/NIC and
+the pinned MediaMTX session/path RTP/RTCP error families. Every sample carries
+its own Linux kernel clock proof. Per-session and per-path counters are retained
+cumulatively across churn and gated as monotonic deltas from the
+pre-measurement baseline. Exact unlabeled `0` is accepted only as an empty-family
+sentinel for a family with no labeled members. Session history uses stable
+`id+remoteAddr` identity across legal `idle(path="") → read(path=...)`
+transitions, while every sample still requires exact matching `id`, `path`,
+`remoteAddr` and `state` labels across all selected families. State-specific
+counter sets and top-level totals must reconcile exactly. An observed path
+`ready ↔ notReady` transition starts a new counter generation; a decrease while
+the same path state remains continuously observed fails closed. Reader RTP
+sequence evidence covers sessions that begin and end between MediaMTX scrapes.
+Sampling continues past the pinned 10-second on-demand close
+timer plus a 30-second drain budget and final cadence interval. Capacity finalization rejects a
+missing SUT series, generator/SUT machine overlap, resource ceiling breach,
+RSS growth above `1%/h` in any 6h+ window, including windows crossing the
+measurement/soak boundary, FD leak above `0.1%` or 10, non-zero
+post-workload RTSP sessions or ready runtime paths, and any positive
+measurement/soak RTP loss/error delta.
 
 ## Reader and cold A/B summaries
 
@@ -143,7 +288,9 @@ rtsp-proxy-load summarize-readers RUN_DIR RUN_DIR/raw/readers.jsonl \
   RUN_DIR/summary/readers.json
 ```
 
-Warm proxy pass/fail uses p99 `DESCRIBE→PLAY ≤500 ms`; first-decodable
+Warm proxy pass/fail uses p99 `DESCRIBE→PLAY ≤500 ms` only from the measured
+ramp readers after the per-path anchors are active; anchor establishment is
+excluded from that percentile. First-decodable
 percentiles remain separate diagnostics. Cold proxy output has no standalone
 latency pass. First finalize and verify the compatible direct-control run, then
 bind its final-manifest digest into the proxy comparison:
@@ -158,8 +305,10 @@ rtsp-proxy-load compare-cold \
 ```
 
 The paired profiles must match byte-for-byte except `endpoint_mode`. Cold p99
-`proxy_overhead` is gated at 1 second; the direct path's
-PLAY-to-first-decodable value publishes the GOP/keyframe contribution.
+`proxy_overhead` is the proxy-minus-direct difference of `DESCRIBE→PLAY`, gated
+at one second. Direct and proxy `PLAY→first-decodable` percentiles are published
+separately as GOP/keyframe contributions; unsynchronized source GOP phases are
+never subtracted from one another.
 
 ## Finalization and evidence boundary
 
@@ -168,17 +317,37 @@ rtsp-proxy-load finalize RUN_DIR
 rtsp-proxy-load verify RUN_DIR
 ```
 
-Finalization requires a green reader summary (when readers are configured), a
-green digest-bound headroom summary for every generator host, and the cold A/B
-summary when applicable. It hashes every input/raw/summary file, creates an
-exclusive final manifest, then changes files/directories to `0440`/`0550`.
+Finalization does not trust stored `valid` flags. It regenerates the catalog,
+reader plans and launch arguments from the canonical profile, re-parses raw
+reader/generator/SUT evidence into exact typed summaries, checks the shard/process/
+machine/time-window sets, checks cold inactivity or warm anchor evidence, and
+reproduces cold A/B from a copied finalized direct reference. Only then does it
+hash every input/raw/summary file, seal files/directories to `0440`/`0550`, and
+write the final manifest as the completion marker. Verification checks both
+hashes and exact modes; an interrupted last chmod remains unverifiable but can
+be safely completed by rerunning `finalize`. The completion marker itself is
+fsynced off-path and atomically linked into the run directory, followed by a
+directory fsync; a partial marker left by an older finalizer is recoverable by
+rerunning the complete semantic finalizer.
 This is locally tamper-evident and read-only, not magical WORM: production
 evidence must then be transferred to root-owned immutable storage or the
 approved WORM target.
 
-The current CI smoke proves native compilation, H.264/H.265 decodability,
-independent paths, fan-out, timing events, interruption failure and TCP-only
-sockets on Linux amd64/arm64. It does not prove production capacity. Spike #0
+Previous native amd64/arm64 CI run `31417242196` proves compilation,
+H.264/H.265 decodability, independent paths, fan-out, timing events,
+interruption failure and TCP-only sockets on Linux amd64/arm64. A fresh run is
+required for the current lifecycle/barrier hardening. It does not prove
+production capacity. Spike #0
 still requires dedicated hardware, LAN and camera-side WAN/netem, typical and
 worst GOP, untuned 100/500/1000 baselines, the full lifecycle/fault matrix and
-a 24-hour production-equivalent soak.
+a 24-hour production-equivalent soak. Until a typed netem verifier and probe/
+CRUD drivers land, profiles containing those axes fail closed instead of
+silently producing partial evidence.
+
+Run durations are not one undifferentiated hold: `ramp_end`,
+`measurement_start`, `measurement_end` and `soak_end` are deterministic launch
+and completion fields. Injected steady/outage work begins at measurement start;
+the profile is rejected when warm-up cannot cover the pinned GOP plus readiness
+budget. Reader health, phase RTP rates and generator/SUT headroom report/gate
+measurement and soak separately, so anchor/warm-up traffic cannot silently
+become measurement evidence.

@@ -4,9 +4,14 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import time
+from fractions import Fraction
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, Literal, Self, cast
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from rtsp_proxy.load_catalog import (
     ReaderPlan,
@@ -19,8 +24,185 @@ from rtsp_proxy.load_catalog import (
 from rtsp_proxy.load_profile import (
     LoadProfile,
     canonical_profile_bytes,
+    evidence_grace_seconds,
     initialize_run_directory,
+    lifecycle_start_unix_ms,
+    measurement_end_unix_ms,
+    measurement_start_unix_ms,
+    ramp_end_unix_ms,
+    warm_anchor_start_unix_ms,
+    workload_end_unix_ms,
 )
+
+Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
+class FixtureManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    schema_version: Literal[1]
+    fixture_sha256: Sha256
+    fixture_size_bytes: Annotated[int, Field(gt=0)]
+    codec: Literal["h264", "h265"]
+    fps: Annotated[int, Field(gt=0, le=240)]
+    frame_count: Annotated[int, Field(gt=1)]
+    duration_seconds: Annotated[float, Field(gt=0)]
+    measured_bitrate_bps: Annotated[int, Field(gt=0)]
+    keyframe_indices: tuple[Annotated[int, Field(ge=0)], ...]
+    keyframe_intervals: tuple[Annotated[int, Field(gt=0)], ...]
+    loop_keyframe_interval_frames: Annotated[int, Field(gt=0)]
+    audio: Literal["none", "opus"]
+    ffmpeg_version: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    ffmpeg_sha256: Sha256
+    ffprobe_version: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    ffprobe_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_keyframe_proof(self) -> Self:
+        if (
+            len(self.keyframe_indices) < 2
+            or self.keyframe_indices[0] != 0
+            or tuple(sorted(set(self.keyframe_indices))) != self.keyframe_indices
+            or self.keyframe_indices[-1] >= self.frame_count
+            or tuple(current - previous for previous, current in pairwise(self.keyframe_indices))
+            != self.keyframe_intervals
+            or self.loop_keyframe_interval_frames != self.frame_count - self.keyframe_indices[-1]
+            or abs(self.duration_seconds - self.frame_count / self.fps) > 1 / self.fps
+        ):
+            raise ValueError("fixture_manifest_semantics_invalid")
+        return self
+
+
+def _fixture_manifest_path(profile: LoadProfile) -> Path:
+    return Path(f"{profile.fixture.path}.manifest.json")
+
+
+def _load_fixture_manifest(path: Path) -> FixtureManifest:
+    if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError("fixture_manifest_must_be_regular_file")
+    return FixtureManifest.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def validate_fixture_manifest(profile: LoadProfile, manifest: FixtureManifest) -> None:
+    bitrate_error = abs(manifest.measured_bitrate_bps - profile.fixture.bitrate_bps)
+    if (
+        manifest.fixture_sha256 != profile.fixture.sha256
+        or manifest.codec != profile.fixture.codec
+        or manifest.fps != profile.fixture.fps
+        or manifest.audio != profile.fixture.audio
+        or manifest.ffmpeg_version != profile.artifacts.ffmpeg_version
+        or manifest.ffmpeg_sha256 != profile.artifacts.ffmpeg_sha256
+        or manifest.ffprobe_sha256 != profile.artifacts.ffprobe_sha256
+        or not manifest.keyframe_intervals
+        or any(interval != profile.fixture.gop_frames for interval in manifest.keyframe_intervals)
+        or manifest.loop_keyframe_interval_frames != profile.fixture.gop_frames
+        or bitrate_error > profile.fixture.bitrate_bps * 0.15
+    ):
+        raise ValueError("fixture_manifest_does_not_match_profile")
+
+
+def inspect_fixture(
+    profile: LoadProfile,
+    *,
+    ffmpeg_binary: Path,
+    ffprobe_binary: Path,
+    destination: Path | None = None,
+) -> FixtureManifest:
+    _require_pinned_file(ffmpeg_binary, profile.artifacts.ffmpeg_sha256, executable=True)
+    _require_pinned_file(ffprobe_binary, profile.artifacts.ffprobe_sha256, executable=True)
+    fixture_path = Path(profile.fixture.path)
+    _require_pinned_file(fixture_path, profile.fixture.sha256, executable=False)
+
+    ffmpeg_version_output = subprocess.run(
+        [str(ffmpeg_binary), "-version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout.splitlines()
+    ffprobe_version_output = subprocess.run(
+        [str(ffprobe_binary), "-version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout.splitlines()
+    if (
+        not ffmpeg_version_output
+        or profile.artifacts.ffmpeg_version not in ffmpeg_version_output[0]
+        or not ffprobe_version_output
+    ):
+        raise ValueError("fixture_tool_version_mismatch")
+    probe = subprocess.run(
+        [
+            str(ffprobe_binary),
+            "-v",
+            "error",
+            "-f",
+            "h264" if profile.fixture.codec == "h264" else "hevc",
+            "-select_streams",
+            "v:0",
+            "-show_streams",
+            "-show_frames",
+            "-show_entries",
+            "stream=codec_name,r_frame_rate:frame=key_frame",
+            "-of",
+            "json",
+            str(fixture_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    payload = json.loads(probe.stdout)
+    streams = payload.get("streams")
+    frames = payload.get("frames")
+    if (
+        not isinstance(streams, list)
+        or len(streams) != 1
+        or not isinstance(streams[0], dict)
+        or not isinstance(frames, list)
+        or not frames
+    ):
+        raise ValueError("fixture_probe_output_invalid")
+    stream = streams[0]
+    try:
+        probed_fps = Fraction(str(stream["r_frame_rate"]))
+    except (KeyError, ValueError, ZeroDivisionError) as error:
+        raise ValueError("fixture_probe_output_invalid") from error
+    if probed_fps != profile.fixture.fps or stream.get("codec_name") != profile.fixture.codec:
+        raise ValueError("fixture_probe_output_invalid")
+    keyframes = tuple(
+        index
+        for index, frame in enumerate(frames)
+        if isinstance(frame, dict) and frame.get("key_frame") == 1
+    )
+    frame_count = len(frames)
+    duration_seconds = frame_count / profile.fixture.fps
+    manifest = FixtureManifest(
+        schema_version=1,
+        fixture_sha256=profile.fixture.sha256,
+        fixture_size_bytes=fixture_path.stat().st_size,
+        codec=profile.fixture.codec,
+        fps=profile.fixture.fps,
+        frame_count=frame_count,
+        duration_seconds=duration_seconds,
+        measured_bitrate_bps=round(fixture_path.stat().st_size * 8 / duration_seconds),
+        keyframe_indices=keyframes,
+        keyframe_intervals=tuple(current - previous for previous, current in pairwise(keyframes)),
+        loop_keyframe_interval_frames=frame_count - keyframes[-1] if keyframes else 0,
+        audio=profile.fixture.audio,
+        ffmpeg_version=profile.artifacts.ffmpeg_version,
+        ffmpeg_sha256=profile.artifacts.ffmpeg_sha256,
+        ffprobe_version=ffprobe_version_output[0],
+        ffprobe_sha256=profile.artifacts.ffprobe_sha256,
+    )
+    validate_fixture_manifest(profile, manifest)
+    _write_json_exclusive(
+        destination or _fixture_manifest_path(profile), manifest.model_dump(mode="json")
+    )
+    return manifest
 
 
 def sha256_file(path: Path) -> str:
@@ -61,7 +243,8 @@ def _canonical_json_bytes(payload: object) -> bytes:
 
 def _reader_plan_bytes(plan: ReaderPlan) -> bytes:
     return "".join(
-        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}\n"
+        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}\t"
+        f"{target.warm_anchor_count}\t{target.measured_schedule_start}\n"
         for target in plan.targets
     ).encode("ascii")
 
@@ -90,6 +273,12 @@ def _reader_arguments(
     generator_host: str,
     reader_plan_sha256: str,
     coordinated_start_unix_ms: int,
+    coordinated_anchor_start_unix_ms: int,
+    coordinated_ramp_end_unix_ms: int,
+    coordinated_lifecycle_start_unix_ms: int,
+    coordinated_measurement_start_unix_ms: int,
+    coordinated_measurement_end_unix_ms: int,
+    coordinated_workload_end_unix_ms: int,
 ) -> list[str]:
     lifecycle = profile.reader_lifecycle
     arguments = [
@@ -130,9 +319,25 @@ def _reader_arguments(
         reader_plan_sha256,
         "--start-unix-ms",
         str(coordinated_start_unix_ms),
+        "--anchor-start-unix-ms",
+        str(coordinated_anchor_start_unix_ms),
+        "--ramp-end-unix-ms",
+        str(coordinated_ramp_end_unix_ms),
+        "--lifecycle-start-unix-ms",
+        str(coordinated_lifecycle_start_unix_ms),
+        "--measurement-start-unix-ms",
+        str(coordinated_measurement_start_unix_ms),
+        "--measurement-end-unix-ms",
+        str(coordinated_measurement_end_unix_ms),
+        "--workload-end-unix-ms",
+        str(coordinated_workload_end_unix_ms),
+        "--evidence-grace-seconds",
+        str(evidence_grace_seconds(profile)),
     ]
     if profile.workload.endpoint_mode == "proxy" and profile.reader_credentials_file:
         arguments.extend(["--credentials-file", profile.reader_credentials_file])
+    if profile.fixture.audio == "opus":
+        arguments.append("--audio")
     return arguments
 
 
@@ -156,17 +361,34 @@ def prepare_run_directory(
         profile.artifacts.load_reader_sha256,
         executable=True,
     )
-    _require_pinned_file(Path(profile.fixture.path), profile.fixture.sha256, executable=False)
+    fixture_path = Path(profile.fixture.path)
+    _require_pinned_file(fixture_path, profile.fixture.sha256, executable=False)
+    fixture_manifest = _load_fixture_manifest(_fixture_manifest_path(profile))
+    validate_fixture_manifest(profile, fixture_manifest)
+    if fixture_manifest.fixture_size_bytes != fixture_path.stat().st_size:
+        raise ValueError("fixture_manifest_size_mismatch")
     if coordinated_start_unix_ms is None:
         coordinated_start_unix_ms = time.time_ns() // 1_000_000 + 120_000
     if coordinated_start_unix_ms <= time.time_ns() // 1_000_000:
         raise ValueError("coordinated_start_must_be_in_future")
 
     initialize_run_directory(profile, destination)
+    coordinated_lifecycle_start = lifecycle_start_unix_ms(profile, coordinated_start_unix_ms)
+    coordinated_anchor_start = warm_anchor_start_unix_ms(profile, coordinated_start_unix_ms)
+    if coordinated_anchor_start <= time.time_ns() // 1_000_000:
+        raise ValueError("coordinated_anchor_start_must_be_in_future")
+    coordinated_ramp_end = ramp_end_unix_ms(profile, coordinated_start_unix_ms)
+    coordinated_measurement_start = measurement_start_unix_ms(profile, coordinated_start_unix_ms)
+    coordinated_measurement_end = measurement_end_unix_ms(profile, coordinated_start_unix_ms)
+    coordinated_workload_end = workload_end_unix_ms(profile, coordinated_start_unix_ms)
     raw_directory = destination / "raw"
     summary_directory = destination / "summary"
     raw_directory.mkdir(mode=0o750)
     summary_directory.mkdir(mode=0o750)
+    fixture_manifest_sha256 = _write_json_exclusive(
+        destination / "fixture-manifest.json",
+        fixture_manifest.model_dump(mode="json"),
+    )
     catalog_path = destination / "path-catalog.json"
     write_load_catalog(profile, catalog_path)
 
@@ -184,10 +406,14 @@ def prepare_run_directory(
             str(host.source_count),
             "--fixture",
             profile.fixture.path,
+            "--fixture-sha256",
+            profile.fixture.sha256,
             "--codec",
             profile.fixture.codec,
             "--fps",
             str(profile.fixture.fps),
+            "--rtp-mtu",
+            str(profile.fixture.rtp_mtu_bytes),
         ]
         if profile.fixture.audio == "opus":
             arguments.append("--audio")
@@ -223,6 +449,12 @@ def prepare_run_directory(
                         generator_host=host.name,
                         reader_plan_sha256=plan_sha256,
                         coordinated_start_unix_ms=coordinated_start_unix_ms,
+                        coordinated_anchor_start_unix_ms=coordinated_anchor_start,
+                        coordinated_ramp_end_unix_ms=coordinated_ramp_end,
+                        coordinated_lifecycle_start_unix_ms=coordinated_lifecycle_start,
+                        coordinated_measurement_start_unix_ms=coordinated_measurement_start,
+                        coordinated_measurement_end_unix_ms=coordinated_measurement_end,
+                        coordinated_workload_end_unix_ms=coordinated_workload_end,
                     ),
                 }
             )
@@ -246,6 +478,12 @@ def prepare_run_directory(
                         generator_host=host.name,
                         reader_plan_sha256=plan_sha256,
                         coordinated_start_unix_ms=coordinated_start_unix_ms,
+                        coordinated_anchor_start_unix_ms=coordinated_anchor_start,
+                        coordinated_ramp_end_unix_ms=coordinated_ramp_end,
+                        coordinated_lifecycle_start_unix_ms=coordinated_lifecycle_start,
+                        coordinated_measurement_start_unix_ms=coordinated_measurement_start,
+                        coordinated_measurement_end_unix_ms=coordinated_measurement_end,
+                        coordinated_workload_end_unix_ms=coordinated_workload_end,
                     ),
                 }
             )
@@ -267,8 +505,15 @@ def prepare_run_directory(
         "schema_version": 1,
         "profile_sha256": canonical_profile_bytes(profile)[1],
         "coordinated_start_unix_ms": coordinated_start_unix_ms,
+        "coordinated_anchor_start_unix_ms": coordinated_anchor_start,
+        "coordinated_ramp_end_unix_ms": coordinated_ramp_end,
+        "coordinated_lifecycle_start_unix_ms": coordinated_lifecycle_start,
+        "coordinated_measurement_start_unix_ms": coordinated_measurement_start,
+        "coordinated_measurement_end_unix_ms": coordinated_measurement_end,
+        "coordinated_workload_end_unix_ms": coordinated_workload_end,
         "verified_artifacts": {
             "fixture_sha256": profile.fixture.sha256,
+            "fixture_manifest_sha256": fixture_manifest_sha256,
             "pull_server_sha256": profile.artifacts.pull_server_sha256,
             "load_reader_sha256": profile.artifacts.load_reader_sha256,
         },
@@ -285,13 +530,17 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
     expected_catalog = _canonical_json_bytes(build_load_catalog(profile).model_dump(mode="json"))
     if catalog_path.read_bytes() != expected_catalog:
         raise ValueError("prepared_catalog_mismatch")
-    launch = cast(
-        dict[str, Any], json.loads(launch_path.read_text(encoding="utf-8"))
-    )
+    launch = cast(dict[str, Any], json.loads(launch_path.read_text(encoding="utf-8")))
     if set(launch) != {
         "schema_version",
         "profile_sha256",
         "coordinated_start_unix_ms",
+        "coordinated_anchor_start_unix_ms",
+        "coordinated_ramp_end_unix_ms",
+        "coordinated_lifecycle_start_unix_ms",
+        "coordinated_measurement_start_unix_ms",
+        "coordinated_measurement_end_unix_ms",
+        "coordinated_workload_end_unix_ms",
         "verified_artifacts",
         "source_servers",
         "readers",
@@ -300,8 +549,27 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
     coordinated_start = launch["coordinated_start_unix_ms"]
     if not isinstance(coordinated_start, int) or coordinated_start <= 0:
         raise ValueError("prepared_launch_start_invalid")
+    coordinated_anchor_start = launch["coordinated_anchor_start_unix_ms"]
+    if coordinated_anchor_start != warm_anchor_start_unix_ms(profile, coordinated_start):
+        raise ValueError("prepared_anchor_start_invalid")
+    coordinated_lifecycle_start = launch["coordinated_lifecycle_start_unix_ms"]
+    if coordinated_lifecycle_start != lifecycle_start_unix_ms(profile, coordinated_start):
+        raise ValueError("prepared_lifecycle_start_invalid")
+    coordinated_ramp_end = launch["coordinated_ramp_end_unix_ms"]
+    if coordinated_ramp_end != ramp_end_unix_ms(profile, coordinated_start):
+        raise ValueError("prepared_ramp_end_invalid")
+    coordinated_measurement_start = launch["coordinated_measurement_start_unix_ms"]
+    if coordinated_measurement_start != measurement_start_unix_ms(profile, coordinated_start):
+        raise ValueError("prepared_measurement_start_invalid")
+    coordinated_measurement_end = launch["coordinated_measurement_end_unix_ms"]
+    if coordinated_measurement_end != measurement_end_unix_ms(profile, coordinated_start):
+        raise ValueError("prepared_measurement_end_invalid")
+    coordinated_workload_end = launch["coordinated_workload_end_unix_ms"]
+    if coordinated_workload_end != workload_end_unix_ms(profile, coordinated_start):
+        raise ValueError("prepared_workload_end_invalid")
     expected_artifacts = {
         "fixture_sha256": profile.fixture.sha256,
+        "fixture_manifest_sha256": sha256_file(run_directory / "fixture-manifest.json"),
         "pull_server_sha256": profile.artifacts.pull_server_sha256,
         "load_reader_sha256": profile.artifacts.load_reader_sha256,
     }
@@ -320,7 +588,12 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
         raise ValueError("prepared_source_launch_invalid")
     pull_server_binary = Path(first_source_argv[0])
     _require_pinned_file(pull_server_binary, profile.artifacts.pull_server_sha256, executable=True)
-    _require_pinned_file(Path(profile.fixture.path), profile.fixture.sha256, executable=False)
+    fixture_path = Path(profile.fixture.path)
+    _require_pinned_file(fixture_path, profile.fixture.sha256, executable=False)
+    fixture_manifest = _load_fixture_manifest(run_directory / "fixture-manifest.json")
+    validate_fixture_manifest(profile, fixture_manifest)
+    if fixture_manifest.fixture_size_bytes != fixture_path.stat().st_size:
+        raise ValueError("fixture_manifest_size_mismatch")
 
     expected_sources: list[dict[str, object]] = []
     for host in profile.generator_hosts:
@@ -336,10 +609,14 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
             str(host.source_count),
             "--fixture",
             profile.fixture.path,
+            "--fixture-sha256",
+            profile.fixture.sha256,
             "--codec",
             profile.fixture.codec,
             "--fps",
             str(profile.fixture.fps),
+            "--rtp-mtu",
+            str(profile.fixture.rtp_mtu_bytes),
         ]
         if profile.fixture.audio == "opus":
             arguments.append("--audio")
@@ -411,6 +688,12 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
             generator_host=host_name,
             reader_plan_sha256=hashlib.sha256(_reader_plan_bytes(plan)).hexdigest(),
             coordinated_start_unix_ms=coordinated_start,
+            coordinated_anchor_start_unix_ms=coordinated_anchor_start,
+            coordinated_ramp_end_unix_ms=coordinated_ramp_end,
+            coordinated_lifecycle_start_unix_ms=coordinated_lifecycle_start,
+            coordinated_measurement_start_unix_ms=coordinated_measurement_start,
+            coordinated_measurement_end_unix_ms=coordinated_measurement_end,
+            coordinated_workload_end_unix_ms=coordinated_workload_end,
         )
         arguments.extend(
             [

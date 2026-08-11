@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from rtsp_proxy.load_evidence import REQUIRED_SUT_METRIC_FAMILIES, read_mediamtx_metrics
+
 MEDIA_MTX_BINARY = os.environ.get("MEDIAMTX_BINARY")
 pytestmark = [
     pytest.mark.contract,
@@ -88,6 +90,12 @@ def test_phase_0_baseline_exposes_only_ordinary_tcp_rtsp_and_local_management(
             "moq": False,
         }
         assert {key: actual[key] for key in expected} == expected
+        empty_metrics = read_mediamtx_metrics(f"http://127.0.0.1:{metrics_port}/metrics")
+        assert empty_metrics.observed_families == REQUIRED_SUT_METRIC_FAMILIES
+        assert empty_metrics.total_rtsp_sessions == 0
+        assert empty_metrics.ready_runtime_paths == 0
+        assert empty_metrics.active_sessions == ()
+        assert empty_metrics.active_paths == ()
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGINT)

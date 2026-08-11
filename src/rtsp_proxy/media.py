@@ -10,6 +10,7 @@ from urllib.parse import quote
 from rtsp_proxy.identifiers import InvalidPublicId, PublicId
 
 NO_ORACLE_PATH_MATCHER = "~^[a-z0-9]{25}$"
+SOURCE_ON_DEMAND_CLOSE_AFTER = "10s"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class MediaMtxClient:
             payload={
                 "source": path.source_url,
                 "sourceOnDemand": True,
+                "sourceOnDemandCloseAfter": SOURCE_ON_DEMAND_CLOSE_AFTER,
                 "rtspTransport": "tcp",
             },
         )
@@ -73,11 +75,13 @@ class MediaMtxClient:
 
         source = response.get("source")
         source_on_demand = response.get("sourceOnDemand")
+        source_on_demand_close_after = response.get("sourceOnDemandCloseAfter")
         response_name = response.get("name")
         if (
             not isinstance(response_name, str)
             or not isinstance(source, str)
             or not isinstance(source_on_demand, bool)
+            or source_on_demand_close_after != SOURCE_ON_DEMAND_CLOSE_AFTER
         ):
             raise MediaNodeProtocolError("mediamtx_invalid_path_response")
         if not source_on_demand:
@@ -135,6 +139,79 @@ class MediaMtxClient:
                     camera_ids=tuple(sorted(camera_ids, key=str)),
                     no_oracle_matcher_present=no_oracle_matcher_present,
                 )
+
+    def path_runtime_ready(self, name: PublicId) -> bool:
+        status = self.path_runtime_status(name)
+        return status is not None and status[0]
+
+    def runtime_path_statuses(
+        self, names: tuple[PublicId, ...]
+    ) -> dict[PublicId, tuple[bool, int] | None]:
+        targets = set(names)
+        observed: dict[PublicId, tuple[bool, int]] = {}
+        page = 0
+        while True:
+            response = self._request(
+                "GET",
+                f"/v3/paths/list?itemsPerPage=1000&page={page}",
+            )
+            if not isinstance(response, dict):
+                raise MediaNodeProtocolError("mediamtx_invalid_runtime_path_list")
+            page_count = response.get("pageCount")
+            items = response.get("items")
+            if (
+                not isinstance(page_count, int)
+                or isinstance(page_count, bool)
+                or page_count < 0
+                or not isinstance(items, list)
+            ):
+                raise MediaNodeProtocolError("mediamtx_invalid_runtime_path_list")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise MediaNodeProtocolError("mediamtx_invalid_runtime_path_list")
+                raw_name = item.get("name")
+                ready = item.get("ready")
+                readers = item.get("readers")
+                if (
+                    not isinstance(raw_name, str)
+                    or not isinstance(ready, bool)
+                    or not isinstance(readers, list)
+                    or any(not isinstance(reader, dict) for reader in readers)
+                ):
+                    raise MediaNodeProtocolError("mediamtx_invalid_runtime_path_list")
+                try:
+                    name = PublicId.parse(raw_name)
+                except InvalidPublicId:
+                    continue
+                if name in targets:
+                    if name in observed:
+                        raise MediaNodeProtocolError("mediamtx_duplicate_runtime_path")
+                    observed[name] = (ready, len(readers))
+            page += 1
+            if page >= page_count:
+                return {name: observed.get(name) for name in names}
+
+    def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
+        response = self._request(
+            "GET",
+            f"/v3/paths/get/{_path_segment(name)}",
+            not_found_is_none=True,
+        )
+        if response is None:
+            return None
+        if not isinstance(response, dict):
+            raise MediaNodeProtocolError("mediamtx_invalid_runtime_path_response")
+        response_name = response.get("name")
+        ready = response.get("ready")
+        readers = response.get("readers")
+        if (
+            response_name != str(name)
+            or not isinstance(ready, bool)
+            or not isinstance(readers, list)
+            or any(not isinstance(reader, dict) for reader in readers)
+        ):
+            raise MediaNodeProtocolError("mediamtx_invalid_runtime_path_response")
+        return ready, len(readers)
 
     def delete_path(self, name: PublicId) -> None:
         path_segment = _path_segment(name)

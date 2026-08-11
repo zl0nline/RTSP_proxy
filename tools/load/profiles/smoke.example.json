@@ -20,7 +20,8 @@
   "evidence_sampling": {
     "interval_seconds": 1,
     "maximum_clock_error_ms": 10,
-    "maximum_gap_factor": 1.5
+    "maximum_gap_factor": 1.5,
+    "maximum_start_lateness_ms": 250
   },
   "fixture": {
     "audio": "none",
@@ -28,6 +29,7 @@
     "codec": "h264",
     "fps": 25,
     "gop_frames": 50,
+    "rtp_mtu_bytes": 1200,
     "path": "/srv/rtsp-load/fixtures/h264-2mbit-gop50.h264",
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "source_mode": "rtsp-pull"
@@ -74,6 +76,6 @@
     "probe_rate_per_second": 0,
     "registered_paths": 100,
     "session_temperature": "warm",
-    "total_readers": 100
+    "total_readers": 200
   }
 }

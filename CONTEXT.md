@@ -53,10 +53,34 @@ ffprobe runner until ADR 0004's process/egress boundary is accepted.
 Phase 0B is in progress. `tools/load` contains native GStreamer pull-source and
 multi-reader binaries plus a digest-bound per-host run orchestrator. Latency is
 split into RTSP handshake and first-decodable measurements; cold results require
-a finalized direct-control pair. Generator evidence is host/process/cgroup
-bound and final bundles are hash-complete/read-only. Repeat exit review is in
-progress; native CI is functional evidence only and is not a measured
-single-node capacity envelope.
+a finalized direct-control pair and subtract only handshake latency, not
+unsynchronized GOP waits. A warm proxy run reserves one reader per active path
+inside `total_readers` as an anchor, starts those anchors 60 seconds before the
+measured ramp and proves them through the ramp boundary with typed API polling.
+Shards share future UTC anchor/ramp/measurement/soak epochs and remain observable
+through a derived post-workload sampling grace. Completion binds exact per-host
+counts and lifecycle slots to
+host/profile/reader-plan/clock evidence, including an end-of-workload clock
+proof and bounded early/late schedule deviation. Generator evidence binds the exact
+cgroup PID set to executable digests/start times and captures NIC packets/MTU
+plus effective ephemeral TCP capacity after reserved ports. Measurement and
+soak headroom/session-health gates are recomputed separately;
+finalization regenerates plans and summaries from raw data before sealing the
+bundle. Capacity bundles additionally require typed MediaMTX PID/cgroup/NIC,
+maximum rolling 6h RSS slope, FD/all-session/runtime-path drain, per-sample SUT
+clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
+reconciliation. A fixture
+manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
+Previous native amd64/arm64 CI `31417242196` is green; the current
+hardened slice is awaiting native CI and repeat exit review. WAN/netem and
+non-zero probe/CRUD axes deliberately fail closed
+until typed drivers exist; native CI is functional evidence only and is not a
+measured single-node capacity envelope.
+
+The remaining Phase 0B exit evidence explicitly includes a per-host hardware,
+architecture and dynamically linked GStreamer package/build manifest. Current
+executable hashes and profile labels do not by themselves prove that runtime
+environment, so no finalized functional bundle is a production capacity claim.
 
 Role processes do not yet run catalog, grant, reconciler, scheduler or
 observability loops. PostgreSQL durability, artifact provenance, capacity and

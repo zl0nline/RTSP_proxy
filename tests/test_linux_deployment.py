@@ -23,12 +23,8 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
 
     web = read_unit("rtsp-proxy-web.service")
     media = read_unit("mediamtx.service")
-    assert web["Service"]["EnvironmentFile"] == (
-        "/etc/rtsp-proxy/control-plane/rtsp-proxy.env"
-    )
-    assert media["Service"]["ExecStart"].endswith(
-        " /etc/rtsp-proxy/mediamtx/mediamtx.yml"
-    )
+    assert web["Service"]["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy.env")
+    assert media["Service"]["ExecStart"].endswith(" /etc/rtsp-proxy/mediamtx/mediamtx.yml")
 
 
 def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
@@ -51,9 +47,7 @@ def test_background_roles_use_a_separate_systemd_template() -> None:
     assert service["ExecStart"] == (
         "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i"
     )
-    assert service["EnvironmentFile"] == (
-        "/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env"
-    )
+    assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env")
 
 
 def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> None:

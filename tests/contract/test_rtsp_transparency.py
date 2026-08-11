@@ -20,6 +20,7 @@ from typing import ClassVar
 import pytest
 
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.load_evidence import REQUIRED_SUT_METRIC_FAMILIES, read_mediamtx_metrics
 from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
 
 MEDIA_MTX_BINARY = os.environ.get("MEDIAMTX_BINARY")
@@ -211,9 +212,7 @@ def wait_for_reader(metrics_url: str, *, path_name: str) -> None:
     pytest.fail("RTSP reader did not become observable within 10 seconds")
 
 
-def wait_for_cold_race(
-    *, origin_api_url: str, proxy_metrics_url: str, path_name: str
-) -> None:
+def wait_for_cold_race(*, origin_api_url: str, proxy_metrics_url: str, path_name: str) -> None:
     deadline = time.monotonic() + 10
     expected_proxy_readers = (
         f'paths_readers{{name="{path_name}",readerType="rtspSession",state="ready"}} 4'
@@ -222,9 +221,8 @@ def wait_for_cold_race(
         try:
             with urllib.request.urlopen(origin_api_url, timeout=1) as response:
                 origin_path = json.load(response)
-            if (
-                len(origin_path["readers"]) == 1
-                and expected_proxy_readers in metrics_lines(proxy_metrics_url)
+            if len(origin_path["readers"]) == 1 and expected_proxy_readers in metrics_lines(
+                proxy_metrics_url
             ):
                 return
         except (OSError, urllib.error.URLError):
@@ -350,9 +348,7 @@ def test_external_rtsp_tcp_is_transparent_and_unrelated_hot_update_isolated(
         auth_port,
         timeout_api_port,
         timeout_rtsp_port,
-    ) = (
-        unused_tcp_ports(8)
-    )
+    ) = unused_tcp_ports(8)
     public_id = "f" * 25
     other_public_id = "g" * 25
     race_public_id = "h" * 25
@@ -494,9 +490,7 @@ paths: {{}}
             f"http://127.0.0.1:{timeout_api_port}/v3/config/global/get",
             timeout_proxy,
         )
-        assert_partial_rtsp_header_outlives_media_read_timeout(
-            "127.0.0.1", timeout_rtsp_port
-        )
+        assert_partial_rtsp_header_outlives_media_read_timeout("127.0.0.1", timeout_rtsp_port)
         stop_process(timeout_proxy)
         timeout_proxy = None
         publisher = start_process(
@@ -548,8 +542,7 @@ paths: {{}}
             MediaPathConfig(
                 name=PublicId.parse(public_id),
                 source_url=(
-                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
-                    "/fixture"
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/fixture"
                 ),
             )
         )
@@ -557,8 +550,7 @@ paths: {{}}
             MediaPathConfig(
                 name=PublicId.parse(other_public_id),
                 source_url=(
-                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
-                    "/fixture"
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/fixture"
                 ),
             )
         )
@@ -566,8 +558,7 @@ paths: {{}}
             MediaPathConfig(
                 name=PublicId.parse(race_public_id),
                 source_url=(
-                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
-                    "/fixture"
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/fixture"
                 ),
             )
         )
@@ -575,8 +566,7 @@ paths: {{}}
             MediaPathConfig(
                 name=PublicId.parse(failing_source_public_id),
                 source_url=(
-                    f"rtsp://origin-reader:wrong-source-secret@127.0.0.1:"
-                    f"{origin_rtsp_port}/fixture"
+                    f"rtsp://origin-reader:wrong-source-secret@127.0.0.1:{origin_rtsp_port}/fixture"
                 ),
             )
         )
@@ -606,9 +596,7 @@ paths: {{}}
         with ThreadPoolExecutor(max_workers=4) as executor:
             cold_readers = [executor.submit(consume_cold_path) for _ in range(4)]
             wait_for_cold_race(
-                origin_api_url=(
-                    f"http://127.0.0.1:{origin_api_port}/v3/paths/get/fixture"
-                ),
+                origin_api_url=(f"http://127.0.0.1:{origin_api_port}/v3/paths/get/fixture"),
                 proxy_metrics_url=metrics_url,
                 path_name=race_public_id,
             )
@@ -673,9 +661,7 @@ paths: {{}}
         assert inventory.no_oracle_matcher_present is (auth_method == "http")
         observed_metrics = metrics_lines(metrics_url)
         schema_contract = json.loads(
-            Path("docs/evidence/mediamtx-v1.20.0-metrics-schema.json").read_text(
-                encoding="utf-8"
-            )
+            Path("docs/evidence/mediamtx-v1.20.0-metrics-schema.json").read_text(encoding="utf-8")
         )
         assert metric_schema(observed_metrics) == schema_contract["families"]
         assert not any(line.startswith(("# HELP ", "# TYPE ")) for line in observed_metrics)
@@ -690,6 +676,12 @@ paths: {{}}
             and 'state="read"' in line
             for line in observed_metrics
         )
+        typed_metrics = read_mediamtx_metrics(metrics_url)
+        assert typed_metrics.observed_families == REQUIRED_SUT_METRIC_FAMILIES
+        assert typed_metrics.total_rtsp_sessions >= 1
+        assert typed_metrics.ready_runtime_paths >= 1
+        assert typed_metrics.active_sessions
+        assert typed_metrics.active_paths
         assert not any(line.startswith("rtsps_") for line in observed_metrics)
 
         if auth_server is not None:
@@ -744,14 +736,21 @@ paths: {{}}
             AuthCallbackHandler.response_delay_seconds = 2
             AuthCallbackHandler.peak_active_requests = 0
             with ThreadPoolExecutor(max_workers=4) as executor:
-                overload_results = list(executor.map(lambda _: run_lab_ffprobe(
-                    binary=FFPROBE_BINARY,
-                    host="127.0.0.1",
-                    port=proxy_rtsp_port,
-                    path=public_id,
-                    username="external",
-                    password="lab-secret",
-                ).returncode, range(4)))
+                overload_results = list(
+                    executor.map(
+                        lambda _: (
+                            run_lab_ffprobe(
+                                binary=FFPROBE_BINARY,
+                                host="127.0.0.1",
+                                port=proxy_rtsp_port,
+                                path=public_id,
+                                username="external",
+                                password="lab-secret",
+                            ).returncode
+                        ),
+                        range(4),
+                    )
+                )
             assert all(returncode != 0 for returncode in overload_results)
             assert AuthCallbackHandler.peak_active_requests >= 1
             drain_deadline = time.monotonic() + 15
@@ -784,8 +783,7 @@ paths: {{}}
             MediaPathConfig(
                 name=PublicId.parse(public_id),
                 source_url=(
-                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}"
-                    "/different"
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/different"
                 ),
             )
         )

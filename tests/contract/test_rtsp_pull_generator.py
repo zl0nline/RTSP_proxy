@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -178,6 +179,8 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
             "2",
             "--fixture",
             str(fixture),
+            "--fixture-sha256",
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
             "--codec",
             codec,
             "--fps",
@@ -211,7 +214,10 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         assert rejected_udp.returncode != 0
 
         reader_plan = tmp_path / "reader-plan.tsv"
-        reader_plan.write_text("source-00000\t2\t0\nsource-00001\t2\t2\n", encoding="utf-8")
+        reader_plan.write_text(
+            "source-00000\t2\t0\t0\t0\nsource-00001\t2\t2\t0\t2\n",
+            encoding="utf-8",
+        )
         events_file = tmp_path / "reader-events.jsonl"
         load_reader = subprocess.Popen(
             [
@@ -228,6 +234,8 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
                 "10",
                 "--hold-seconds",
                 "2",
+                "--evidence-grace-seconds",
+                "2",
                 "--events-file",
                 str(events_file),
                 "--lifecycle",
@@ -243,6 +251,8 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         time.sleep(1)
         assert load_reader.poll() is None
         assert process_owned_udp_sockets(load_reader) == frozenset()
+        time.sleep(2)
+        assert load_reader.poll() is None, "reader PID exited before evidence grace elapsed"
         reader_output, _ = load_reader.communicate(timeout=10)
         assert load_reader.returncode == 0, reader_output
         assert "SUMMARY started=4 decodable=4 failed=0 transport=tcp" in reader_output
@@ -250,11 +260,13 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         reader_events = [
             json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()
         ]
-        assert len(reader_events) == 13
+        assert len(reader_events) == 21
         assert {event["event"] for event in reader_events} == {
             "reader_started",
             "play_sent",
             "first_decodable_frame",
+            "reader_rtp_segment",
+            "reader_rtp_phase",
             "run_completed",
         }
         assert {
@@ -262,6 +274,34 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
             for event in reader_events
             if event["event"] == "first_decodable_frame"
         } == {0, 1, 2, 3}
+        assert all(
+            event["access_unit"] is True
+            for event in reader_events
+            if event["event"] == "first_decodable_frame"
+        )
+        assert all(
+            event["measurement_video_rtp_packets"] > 0
+            and event["measurement_video_rtp_sequence_gaps"] == 0
+            and event["audio_expected"] is False
+            and event["quiesced"] is True
+            and event["video_parse_failures"] == 0
+            and event["audio_parse_failures"] == 0
+            for event in reader_events
+            if event["event"] == "reader_rtp_phase"
+        )
+        assert all(
+            event["track"] == "video"
+            and event["phase"] == "measurement"
+            and event["received_packets"] == event["sequence_expected_packets"]
+            and event["sequence_gaps"] == 0
+            for event in reader_events
+            if event["event"] == "reader_rtp_segment"
+        )
+        completion = reader_events[-1]
+        assert completion["measurement_rtp_sequence_gaps"] == 0
+        assert completion["soak_rtp_sequence_gaps"] == 0
+        assert completion["process_end_unix_ms"] - completion["workload_end_unix_ms"] >= 1900
+        assert completion["scheduled_workload_end_unix_ms"] <= completion["workload_end_unix_ms"]
         starts = sorted(
             event["at_monotonic_ms"]
             for event in reader_events
@@ -270,10 +310,114 @@ def test_prepared_fixture_is_served_by_independent_pull_endpoints_over_tcp(
         assert starts[-1] - starts[0] >= 250
     finally:
         if server.poll() is None:
-            server.send_signal(signal.SIGINT)
+            os.kill(server.pid, signal.SIGINT)
+            with suppress(ProcessLookupError):
+                os.kill(server.pid, signal.SIGTERM)
         output, _ = server.communicate(timeout=10)
     assert server.returncode == 0, output
     assert "transport=tcp" in output
+
+
+def test_opus_track_is_consumed_and_sequence_checked_with_video(tmp_path: Path) -> None:
+    assert RTSP_PULL_SERVER_BINARY is not None
+    assert RTSP_LOAD_READER_BINARY is not None
+    assert FFMPEG_BINARY is not None
+    assert FFPROBE_BINARY is not None
+    fixture = tmp_path / "fixture.h264"
+    create_fixture(FFMPEG_BINARY, fixture, "h264")
+    port = unused_tcp_port()
+    server = subprocess.Popen(
+        [
+            RTSP_PULL_SERVER_BINARY,
+            "--address",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--mount-prefix",
+            "/source-",
+            "--source-count",
+            "1",
+            "--fixture",
+            str(fixture),
+            "--fixture-sha256",
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            "--codec",
+            "h264",
+            "--fps",
+            "25",
+            "--audio",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        wait_for_listener(server, port)
+        probe = probe_source(FFPROBE_BINARY, port, "source-00000", "tcp")
+        assert probe.returncode == 0, probe.stderr
+        assert {
+            (stream["codec_type"], stream["codec_name"])
+            for stream in json.loads(probe.stdout)["streams"]
+        } == {("video", "h264"), ("audio", "opus")}
+
+        reader_plan = tmp_path / "reader-plan.tsv"
+        reader_plan.write_text("source-00000\t1\t0\t0\t0\n", encoding="utf-8")
+        events_file = tmp_path / "reader-events.jsonl"
+        reader = subprocess.run(
+            [
+                RTSP_LOAD_READER_BINARY,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--reader-plan",
+                str(reader_plan),
+                "--codec",
+                "h264",
+                "--connect-rate",
+                "1",
+                "--hold-seconds",
+                "3",
+                "--events-file",
+                str(events_file),
+                "--lifecycle",
+                "single",
+                "--global-reader-count",
+                "1",
+                "--audio",
+                *reader_evidence_arguments(reader_plan),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert reader.returncode == 0, reader.stdout + reader.stderr
+        events = [
+            json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()
+        ]
+        phase = next(event for event in events if event["event"] == "reader_rtp_phase")
+        assert phase["audio_expected"] is True
+        assert phase["quiesced"] is True
+        assert phase["measurement_video_rtp_packets"] > 0
+        assert phase["measurement_audio_rtp_packets"] > 0
+        assert phase["video_parse_failures"] == 0
+        assert phase["audio_parse_failures"] == 0
+        segments = [event for event in events if event["event"] == "reader_rtp_segment"]
+        assert {event["track"] for event in segments} == {"video", "audio"}
+        assert all(
+            event["received_packets"] == event["sequence_expected_packets"]
+            and event["sequence_gaps"] == 0
+            for event in segments
+        )
+        assert process_owned_udp_sockets(server) == frozenset()
+    finally:
+        if server.poll() is None:
+            os.kill(server.pid, signal.SIGINT)
+            with suppress(ProcessLookupError):
+                os.kill(server.pid, signal.SIGTERM)
+        output, _ = server.communicate(timeout=10)
+    assert server.returncode == 0, output
 
 
 def test_pull_server_rejects_relative_fixture_paths(tmp_path: Path) -> None:
@@ -299,12 +443,37 @@ def test_pull_server_rejects_relative_fixture_paths(tmp_path: Path) -> None:
     assert "fixture_must_be_an_absolute_regular_file" in result.stderr
 
 
+def test_pull_server_rejects_fixture_digest_drift(tmp_path: Path) -> None:
+    assert RTSP_PULL_SERVER_BINARY is not None
+    fixture = tmp_path / "fixture.h264"
+    fixture.write_bytes(b"fixture")
+
+    result = subprocess.run(
+        [
+            RTSP_PULL_SERVER_BINARY,
+            "--fixture",
+            str(fixture),
+            "--fixture-sha256",
+            "0" * 64,
+            "--codec",
+            "h264",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert "fixture_digest_mismatch" in result.stderr
+
+
 def test_load_reader_interruption_never_reports_a_partial_run_as_success(
     tmp_path: Path,
 ) -> None:
     assert RTSP_LOAD_READER_BINARY is not None
     plan = tmp_path / "plan.tsv"
-    plan.write_text("source-00000\t4\t0\n", encoding="utf-8")
+    plan.write_text("source-00000\t4\t0\t0\t0\n", encoding="utf-8")
     events = tmp_path / "events.jsonl"
     process = subprocess.Popen(
         [
@@ -346,10 +515,65 @@ def test_load_reader_interruption_never_reports_a_partial_run_as_success(
     assert completion["interrupted"] is True
 
 
+def test_zero_rate_reader_waits_for_common_future_epoch(tmp_path: Path) -> None:
+    assert RTSP_LOAD_READER_BINARY is not None
+    plan = tmp_path / "plan.tsv"
+    plan.write_text("source-00000\t1\t0\t0\t0\n", encoding="utf-8")
+    events = tmp_path / "events.jsonl"
+    scheduled_start = time.time_ns() // 1_000_000 + 5000
+    process = subprocess.Popen(
+        [
+            RTSP_LOAD_READER_BINARY,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9",
+            "--reader-plan",
+            str(plan),
+            "--codec",
+            "h264",
+            "--connect-rate",
+            "0",
+            "--hold-seconds",
+            "2",
+            "--events-file",
+            str(events),
+            "--lifecycle",
+            "single",
+            "--global-reader-count",
+            "1",
+            "--start-unix-ms",
+            str(scheduled_start),
+            "--workload-end-unix-ms",
+            str(scheduled_start + 2000),
+            "--allow-failures",
+            *reader_evidence_arguments(plan),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.monotonic() + 2
+    while not events.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert process.poll() is None
+    assert events.exists()
+    assert events.read_text(encoding="utf-8") == ""
+    process.send_signal(signal.SIGTERM)
+    output, _ = process.communicate(timeout=10)
+
+    assert process.returncode == 6, output
+    payloads = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    assert [payload["event"] for payload in payloads] == [
+        "reader_rtp_phase",
+        "run_completed",
+    ]
+
+
 def test_load_reader_rejects_a_group_readable_credentials_file(tmp_path: Path) -> None:
     assert RTSP_LOAD_READER_BINARY is not None
     plan = tmp_path / "plan.tsv"
-    plan.write_text("source-00000\t1\t0\n", encoding="utf-8")
+    plan.write_text("source-00000\t1\t0\t0\t0\n", encoding="utf-8")
     credentials = tmp_path / "credentials.txt"
     credentials.write_text("user\npassword\n", encoding="utf-8")
     credentials.chmod(0o640)

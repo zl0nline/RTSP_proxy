@@ -15,9 +15,16 @@ TCP endpoint.
 >   ordinary-RTSP contract прошли Standards/Spec exit review и native
 >   amd64/arm64 CI; Proposed auth/security gates всё ещё блокируют production.
 > - Phase 0B load harness: **IN PROGRESS** — native GStreamer pull sources,
->   scalable TCP readers и tamper-evident run bundles реализованы; повторное
->   exit review и native amd64/arm64 CI выполняются после hardening. Выделенный
->   production-equivalent Spike #0 и 24h soak ещё не выполнены.
+>   scalable TCP readers и reproducible tamper-evident run bundles реализованы;
+>   hardening закрывает повторное вычисление summaries, warm anchors внутри
+>   заявленной reader-когорты, общие UTC ramp/measurement/soak epochs,
+>   post-workload sampling barrier,
+>   typed fixture semantics, process/cgroup/binary binding, phase RTP и
+>   обязательные SUT resource/leak/loss gates для capacity. Предыдущий native
+>   amd64/arm64 CI `31417242196` прошёл; текущий hardened срез отправляется на
+>   повторные native CI и exit review. Выделенный
+>   production-equivalent Spike #0 и 24h soak ещё не выполнены; WAN/netem и
+>   probe/CRUD drivers пока fail closed.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -226,11 +233,33 @@ Production ffprobe runner намеренно не поставляется: пе
 Catalog продукта, PostgreSQL, grant verifier, reconciler/task loops и dashboard
 ещё не реализованы. Phase 0B load harness теперь связывает profile, fixture и
 SHA load binaries с точным per-host launch plan; reader измеряет отдельно
-`DESCRIBE→PLAY` и первый декодируемый access unit, поддерживает steady/ramp/
-burst/outage и парный direct-control. Generator headroom проверяется по host,
-process/RLIMIT и finite cgroup limits, а final manifest хэширует весь raw/
-summary bundle. Эти механизмы не публикуют capacity envelope без выделенных
-стендов, LAN/WAN matrix и 24h soak. FFmpeg/ffprobe
+`DESCRIBE→PLAY` и первый parser-aligned non-header decodable access unit,
+поддерживает steady/ramp/
+burst/outage и парный direct-control. Все shards используют единые будущие UTC
+anchor/ramp/measurement/soak epochs; completion связан с profile/plan/host,
+точными lifecycle slots и clock-sync evidence, проверяемым до завершения
+workload. Для warm proxy один reader из `total_readers` на каждый active path
+работает как anchor за 60 секунд до измеряемого ramp, а typed API polling
+проверяет anchors до и на границе ramp. Cold proxy перед стартом parallel
+reset/recreate целевые on-demand paths, требует один reader на active path и
+`single` lifecycle; до отдельного масштабного доказательного прогона preflight
+имеет implementation safety cap: 512 paths и 32 API workers. Generator
+headroom проверяет точный `cgroup.procs`,
+executable digest/start time, host/process/RLIMIT, NIC packets/MTU, effective
+ephemeral TCP capacity с учётом reserved ports и finite cgroup limits; measurement
+и soak проверяются раздельно, а post-workload
+barrier оставляет PID доступным до завершающей resource sample. Finalizer заново
+строит планы и summaries из raw evidence до хэширования bundle. Capacity bundle
+дополнительно требует MediaMTX PID/cgroup/NIC series, kernel clock proof,
+rolling 6h RSS, включая границу measurement/soak,
+FD/all-session/runtime-path drain, identity-recomputed RTP/RTCP/path error
+deltas и per-cycle/per-reader/per-track sent-sequence/received phase RTP
+reconciliation с проверкой темпа и границ connected interval. Один stalled
+video/Opus reader не маскируется зелёным aggregate. Fixture manifest связывает pinned
+FFmpeg/ffprobe с измеренными codec/FPS/bitrate/GOP. Эти механизмы
+не публикуют capacity envelope без выделенных стендов, typed WAN/netem и
+probe/CRUD drivers, per-host architecture/GStreamer runtime manifest, полной
+matrix и 24h soak. FFmpeg/ffprobe
 зафиксированы как Phase 0 candidate,
 но upstream artifact не имеет GitHub attestation и ещё не прошёл security
 provenance gate. Наличие Phase 0-кода не означает доказанную production

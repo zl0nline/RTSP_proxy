@@ -37,13 +37,9 @@ def test_catalog_maps_every_registered_path_to_its_generator_range() -> None:
     assert catalog.schema_version == 1
     assert catalog.source_mode == "rtsp-pull"
     assert len(catalog.paths) == 4
-    assert catalog.paths[0].source_url == (
-        "rtsp://generator-a.load.internal:8554/source-00000"
-    )
+    assert catalog.paths[0].source_url == ("rtsp://generator-a.load.internal:8554/source-00000")
     assert catalog.paths[1].source_url.endswith("/source-00001")
-    assert catalog.paths[2].source_url == (
-        "rtsp://generator-b.load.internal:8554/source-00002"
-    )
+    assert catalog.paths[2].source_url == ("rtsp://generator-b.load.internal:8554/source-00002")
     assert len({path.public_id for path in catalog.paths}) == 4
 
 
@@ -77,7 +73,8 @@ def test_proxy_reader_plan_is_bound_to_the_catalog_without_urls(tmp_path: Path) 
 
     assert len(paths_sha256) == 64
     assert destination.read_text(encoding="utf-8").splitlines() == [
-        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}"
+        f"{target.path}\t{target.reader_count}\t{target.reader_id_start}\t"
+        f"{target.warm_anchor_count}\t{target.measured_schedule_start}"
         for target in plan.targets
     ]
     assert "rtsp://" not in destination.read_text(encoding="utf-8")
@@ -110,12 +107,12 @@ def test_direct_control_paths_are_rendered_per_generator_host(tmp_path: Path) ->
     write_direct_reader_paths(profile, "generator-b", second)
 
     assert first.read_text(encoding="utf-8").splitlines() == [
-        "source-00000\t2\t0",
-        "source-00001\t2\t4",
+        "source-00000\t2\t0\t1\t0",
+        "source-00001\t2\t4\t1\t2",
     ]
     assert second.read_text(encoding="utf-8").splitlines() == [
-        "source-00002\t2\t2",
-        "source-00003\t2\t6",
+        "source-00002\t2\t2\t1\t1",
+        "source-00003\t2\t6\t1\t3",
     ]
 
     with pytest.raises(ValueError, match="unknown_generator_host"):
