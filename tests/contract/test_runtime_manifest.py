@@ -51,8 +51,19 @@ def _wait_for_main_pid(unit: str) -> int:
         raw = _command_stdout(["sudo", "systemctl", "show", "--property=MainPID", "--value", unit])
         if raw.isdigit() and int(raw) > 0:
             pid = int(raw)
-            maps = Path(f"/proc/{pid}/maps")
-            if maps.is_file() and "libgstreamer-1.0.so" in maps.read_text(encoding="utf-8"):
+            process_root = Path(f"/proc/{pid}")
+            try:
+                maps = (process_root / "maps").read_text(encoding="utf-8")
+                status = (process_root / "status").read_text(encoding="utf-8")
+                limits = (process_root / "limits").read_text(encoding="utf-8")
+            except FileNotFoundError:
+                time.sleep(0.1)
+                continue
+            if (
+                "libgstreamer-1.0.so" in maps
+                and re.search(r"^VmRSS:\s+\d+\s+kB$", status, re.MULTILINE)
+                and re.search(r"^Max open files\s+\d+\s+\d+\s+\S+$", limits, re.MULTILINE)
+            ):
                 return pid
         time.sleep(0.1)
     raise AssertionError("native runtime contract service did not become ready")
@@ -166,6 +177,7 @@ def test_native_runtime_capture_binds_real_proc_cgroup_dpkg_and_maps() -> None:
                 f"--unit={unit}",
                 f"--uid={os.getuid()}",
                 "--property=CPUQuota=200%",
+                "--property=LimitNOFILE=65536",
                 "--property=MemoryMax=1G",
                 "--property=TasksMax=128",
                 "--collect",
