@@ -777,12 +777,34 @@ def _validate_links(
     if (
         not isinstance(linkinfo, dict)
         or linkinfo.get("info_kind") != "ifb"
-        or ifb.get("addr_info") not in (None, [])
+        or not _ifb_address_inventory_is_dedicated(ifb.get("addr_info"))
     ):
         raise ValueError("netem_ifb_not_dedicated")
     _positive_int(ingress.get("ifindex"), "netem_ingress_ifindex_invalid")
     _positive_int(ifb.get("ifindex"), "netem_ifb_ifindex_invalid")
     return ingress, ifb
+
+
+def _ifb_address_inventory_is_dedicated(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, list):
+        return False
+    for entry in value:
+        if not isinstance(entry, dict):
+            return False
+        local = entry.get("local")
+        if entry.get("family") != "inet6" or entry.get("scope") != "link":
+            return False
+        if not isinstance(local, str):
+            return False
+        try:
+            address = ipaddress.IPv6Address(local)
+        except ipaddress.AddressValueError:
+            return False
+        if not address.is_link_local:
+            return False
+    return True
 
 
 def _validate_kernel_state(

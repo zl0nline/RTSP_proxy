@@ -81,6 +81,7 @@ class FakeNetemKernel(NetemKernel):
         self.filters: list[dict[str, object]] = []
         self.egress: list[dict[str, object]] = []
         self.commands: list[tuple[str, ...]] = []
+        self.ifb_addr_info: list[dict[str, object]] = []
 
     @property
     def tc_identity(self) -> NetemToolIdentity:
@@ -105,7 +106,7 @@ class FakeNetemKernel(NetemKernel):
                 "ifname": "rtspifb0",
                 "flags": ["BROADCAST", "UP"],
                 "mtu": 1500,
-                "addr_info": [],
+                "addr_info": self.ifb_addr_info,
                 "linkinfo": {"info_kind": "ifb"},
             }
         raise ValueError("unknown fake interface")
@@ -921,6 +922,33 @@ def test_install_and_remove_own_only_clean_scoped_netem_state() -> None:
     remove_netem(kernel, plan)
     assert kernel.filters == []
     assert str(kernel.ifb_qdiscs[0]["kind"]) == "noqueue"
+
+
+def test_ifb_accepts_only_automatic_ipv6_link_local_address() -> None:
+    plan = required_netem_site_plans(wan_profile())[0]
+    kernel = FakeNetemKernel()
+    kernel.ifb_addr_info = [
+        {
+            "family": "inet6",
+            "local": "fe80::5054:ff:fe12:3456",
+            "prefixlen": 64,
+            "scope": "link",
+        }
+    ]
+
+    install_netem(kernel, plan)
+    remove_netem(kernel, plan)
+
+    kernel.ifb_addr_info = [
+        {
+            "family": "inet",
+            "local": "198.51.100.10",
+            "prefixlen": 24,
+            "scope": "global",
+        }
+    ]
+    with pytest.raises(ValueError, match="netem_ifb_not_dedicated"):
+        install_netem(kernel, plan)
 
 
 def test_observation_and_summary_reject_state_drift_and_queue_overlimit(tmp_path: Path) -> None:
