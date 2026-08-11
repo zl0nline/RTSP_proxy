@@ -21,8 +21,9 @@ TCP endpoint.
 >   post-workload sampling barrier,
 >   typed fixture semantics, process/cgroup/binary binding, phase RTP и
 >   обязательные SUT resource/leak/loss gates для capacity. Предыдущий native
->   amd64/arm64 CI `31417242196` прошёл; текущий hardened срез отправляется на
->   повторные native CI и exit review. Выделенный
+>   amd64/arm64 CI заменён подтверждённым hardened run `31499414349`: полный
+>   workflow и его повторный прогон прошли, Standards/Spec review — PASS.
+>   Выделенный
 >   production-equivalent Spike #0 и 24h soak ещё не выполнены; WAN/netem и
 >   probe/CRUD drivers пока fail closed.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.

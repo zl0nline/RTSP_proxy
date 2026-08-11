@@ -14,6 +14,17 @@ publisher into MediaMTX nor a different external protocol is part of the test
 path: the remote consumer sees the same ordinary RTSP server contract as a
 direct camera.
 
+The source process reparses video to one H.264/H.265 access unit per buffer.
+Each constructed RTSP media instance passes its first access unit immediately
+for preroll, then paces video against rational absolute monotonic deadlines at
+the profile FPS. When a buffer arrives more than one frame interval after its
+deadline, the scheduler rebases and waits one interval instead of producing a
+catch-up burst; otherwise it preserves the absolute deadline schedule.
+Configured Opus uses 960 samples at 48 kHz and the same absolute scheduler at 50
+raw buffers/s before encoding and RTP payloading. Pacing therefore neither
+waits for the RTSP media pipeline clock during prepare nor accumulates
+per-buffer processing delay over a soak.
+
 `rtsp-load-reader` consumes a strict TSV plan (`path`, reader count, first
 global reader ID, warm-anchor count, first measured schedule index), timestamps
 outgoing DESCRIBE and PLAY requests, and records
@@ -335,11 +346,11 @@ This is locally tamper-evident and read-only, not magical WORM: production
 evidence must then be transferred to root-owned immutable storage or the
 approved WORM target.
 
-Previous native amd64/arm64 CI run `31417242196` proves compilation,
-H.264/H.265 decodability, independent paths, fan-out, timing events,
-interruption failure and TCP-only sockets on Linux amd64/arm64. A fresh run is
-required for the current lifecycle/barrier hardening. It does not prove
-production capacity. Spike #0
+Hardened native amd64/arm64 CI run `31499414349` and its full rerun prove
+compilation, H.264/H.265/Opus decodability, independent paths, fan-out, timing
+events, interruption failure and TCP-only sockets on Linux amd64/arm64. The
+same slice passed repeat Standards/Spec review. This does not prove production
+capacity. Spike #0
 still requires dedicated hardware, LAN and camera-side WAN/netem, typical and
 worst GOP, untuned 100/500/1000 baselines, the full lifecycle/fault matrix and
 a 24-hour production-equivalent soak. Until a typed netem verifier and probe/

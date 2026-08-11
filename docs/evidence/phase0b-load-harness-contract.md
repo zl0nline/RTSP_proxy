@@ -1,7 +1,7 @@
 # Phase 0B load harness evidence
 
-- Date: 2026-08-10
-- Status: functional harness in progress; no capacity decision
+- Last reviewed: 2026-08-11
+- Status: functional harness reviewed; no capacity decision
 - Deployment: direct Linux, no Docker/container runtime
 - Architectures: native `amd64` and `arm64`
 
@@ -12,6 +12,13 @@
   keyframe-to-loop-restart interval before GStreamer serves them;
 - every remote source process verifies the pinned fixture SHA-256 before
   announcing readiness;
+- each RTSP media instance reparses video to complete H.264/H.265 access units,
+  passes the first unit immediately for preroll and schedules subsequent units
+  at profile FPS using rational absolute monotonic deadlines; when a buffer
+  arrives more than one frame interval after its deadline, the schedule rebases
+  and waits one interval instead of producing a catch-up burst, otherwise it
+  preserves the absolute deadlines. Opus uses 960-sample/20ms raw buffers on an
+  independent 50 Hz schedule before encoding and RTP payloading;
 - MediaMTX is expected to pull those endpoints on demand; push publication into
   MediaMTX is not a supported primary load path;
 - source and reader processes force RTSP-over-TCP and the native contract scans
@@ -91,9 +98,9 @@
 
 ## Functional CI boundary
 
-Previous native amd64/arm64 run `31417242196` is green for application,
-release/media and pull-load-generator jobs. The current hardened slice requires
-a fresh native run before its repeat exit review can pass.
+Hardened native amd64/arm64 run `31499414349` and its full rerun are green for
+application, release/media and pull-load-generator jobs. Repeat Standards/Spec
+review passed.
 
 The native jobs compile both C binaries with distro GStreamer development
 libraries, print exact package versions and binary SHA-256 values, prepare

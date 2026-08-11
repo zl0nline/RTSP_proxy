@@ -114,7 +114,7 @@ URL или handshake.
 | Planning consensus | COMPLETE | Issues согласованы, corrections внесены |
 | Phase 0 | IN PROGRESS | Owner authorization получено 2026-08-10 |
 | Phase 0A compatibility | COMPLETE | Standards/Spec PASS; native amd64/arm64 contract CI |
-| Phase 0B harness / Spike #0 | IN PROGRESS | Harness hardening in repeat review; dedicated hardware evidence absent |
+| Phase 0B harness / Spike #0 | IN PROGRESS | Functional harness review/CI passed; dedicated hardware evidence absent |
 | Scale-out topology | EVIDENCE BLOCKED | Провален single-node gate и пройден topology spike #10 |
 | Foundation implementation | REVIEWED | Health/release/package/Linux artifacts прошли exit review |
 | Product behavior | EVIDENCE GATED | Зелёные обязательные Phase 0 fork decisions |
@@ -794,6 +794,15 @@ publication into MediaMTX cannot substitute this path.
 GStreamer fixtures control codec, audio, bitrate, packet rate and GOP. Load hosts
 are outside SUT and maintain ≥30% headroom; otherwise run invalid. At least two
 generator hosts confirm the generator knee is not mistaken for SUT capacity.
+The native source reparses video to complete access units, passes the first unit
+without clock wait for RTSP preroll and then uses per-media rational absolute
+monotonic deadlines. A buffer arriving more than one frame interval after its
+deadline rebases the schedule and waits one interval instead of producing a
+catch-up burst; otherwise absolute deadlines are preserved. Opus uses a
+separate 960-sample/20ms raw-buffer schedule before encoding and RTP payloading.
+Relative per-buffer sleeps and pipeline-clock pacing are not accepted because
+they respectively drift over a soak or can deadlock while gst-rtsp-server
+prepares blocked payloader pads.
 
 Every run saves commit and release-artifact SHA-256 values, versions, hardware,
 kernel/sysctl/ulimit/systemd resource limits, network, topology, workload axes,
@@ -1063,8 +1072,8 @@ loss/error delta.
 Missing SUT or fixture evidence
 fails finalization rather than downgrading the claim.
 
-Previous native amd64/arm64 CI run `31417242196` is green; the current hardened
-harness awaits a fresh native run and repeat Standards/Spec exit review.
+Hardened native amd64/arm64 CI run `31499414349` and its full rerun are green;
+repeat Standards/Spec review passed.
 Per-host hardware/architecture and dynamically linked GStreamer package/build
 evidence remains an explicit Phase 0B exit artifact; profile labels and
 executable hashes alone do not prove it. WAN/netem and non-zero probe/CRUD

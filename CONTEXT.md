@@ -71,9 +71,9 @@ maximum rolling 6h RSS slope, FD/all-session/runtime-path drain, per-sample SUT
 clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
 reconciliation. A fixture
 manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
-Previous native amd64/arm64 CI `31417242196` is green; the current
-hardened slice is awaiting native CI and repeat exit review. WAN/netem and
-non-zero probe/CRUD axes deliberately fail closed
+Hardened native amd64/arm64 CI `31499414349` and its full rerun are green;
+repeat Standards/Spec review passed. WAN/netem and non-zero probe/CRUD axes
+deliberately fail closed
 until typed drivers exist; native CI is functional evidence only and is not a
 measured single-node capacity envelope.
 
