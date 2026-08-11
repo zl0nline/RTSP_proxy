@@ -1094,10 +1094,11 @@ invalidates the A/B pair. Missing, stale, cross-machine or architecture-mismatch
 evidence fails finalization. This collector targets the documented Ubuntu 24.04
 native host shape equally on amd64 and arm64.
 
-Hardened native amd64/arm64 CI run `31499414349` and its full rerun cover the
-pre-runtime-manifest harness. The collector now has a privileged public
-capture/binding contract on both native runners; a new published CI result and
-repeat review remain required before this slice exits.
+Hardened native amd64/arm64 CI run `31511231574` covers the complete functional
+harness. On both native runners it executes the runtime collector against real
+procfs, non-root cgroup v2 constraints, dpkg and mapped GStreamer libraries,
+then executes the H.264/H.265 RTSP/TCP contract. Repeat Standards/Spec review
+passed.
 Per-host hardware/architecture and dynamically linked GStreamer package/build
 evidence is now mandatory in the finalizer, but no production-equivalent host
 manifest or capacity result has been published. WAN/netem and non-zero probe/CRUD

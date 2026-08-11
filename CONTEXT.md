@@ -76,10 +76,10 @@ maximum rolling 6h RSS slope, FD/all-session/runtime-path drain, per-sample SUT
 clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
 reconciliation. A fixture
 manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
-Hardened native amd64/arm64 CI `31499414349` and its full rerun cover the
-pre-runtime-manifest harness. The runtime collector now has a privileged public
-capture/binding contract on both native runners but requires a newly published CI
-result and repeat review. WAN/netem and non-zero probe/CRUD axes
+Hardened native amd64/arm64 CI `31511231574` covers the complete functional
+harness, including the runtime collector against real procfs, cgroup v2, dpkg and
+mapped GStreamer libraries followed by the H.264/H.265 RTSP/TCP contract on both
+native runners. Repeat Standards/Spec review passed. WAN/netem and non-zero probe/CRUD axes
 deliberately fail closed
 until typed drivers exist; native CI is functional evidence only and is not a
 measured single-node capacity envelope.

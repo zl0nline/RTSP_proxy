@@ -404,10 +404,11 @@ This is locally tamper-evident and read-only, not magical WORM: production
 evidence must then be transferred to root-owned immutable storage or the
 approved WORM target.
 
-Hardened native amd64/arm64 CI run `31499414349` and its full rerun prove
-compilation, H.264/H.265/Opus decodability, independent paths, fan-out, timing
-events, interruption failure and TCP-only sockets on Linux amd64/arm64. The
-same slice passed repeat Standards/Spec review. This does not prove production
+Hardened native amd64/arm64 CI run `31511231574` proves compilation,
+runtime-manifest capture against real procfs/cgroup v2/dpkg/mapped libraries,
+H.264/H.265/Opus decodability, independent paths, fan-out, timing events,
+interruption failure and TCP-only sockets on Linux amd64/arm64. The same slice
+passed repeat Standards/Spec review. This does not prove production
 capacity. Spike #0
 still requires dedicated hardware, LAN and camera-side WAN/netem, typical and
 worst GOP, untuned 100/500/1000 baselines, the full lifecycle/fault matrix and

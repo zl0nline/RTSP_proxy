@@ -22,10 +22,11 @@ TCP endpoint.
 >   typed fixture semantics, process/cgroup/binary binding, phase RTP и
 >   обязательный независимый SUT resource/session/loss ряд для каждого proxy и
 >   расширенные leak/soak gates для capacity, а также per-host
->   architecture/hardware/GStreamer runtime manifests. Предыдущий native
->   amd64/arm64 CI run `31499414349` подтверждает предшествующий native harness;
->   runtime-manifest slice добавляет отдельный privileged capture/binding contract
->   на обоих native runners и требует нового опубликованного CI результата.
+>   architecture/hardware/GStreamer runtime manifests. Native amd64/arm64 CI run
+>   `31511231574` подтверждает весь functional slice, включая real `/proc`,
+>   cgroup v2, dpkg и mapped-library runtime capture, а также последующий
+>   H.264/H.265 RTSP/TCP contract на обоих native runners; повторный
+>   Standards/Spec review пройден.
 >   Выделенный
 >   production-equivalent Spike #0 и 24h soak ещё не выполнены; WAN/netem и
 >   probe/CRUD drivers пока fail closed.

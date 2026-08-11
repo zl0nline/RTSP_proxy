@@ -109,9 +109,8 @@
 
 ## Functional CI boundary
 
-Hardened native amd64/arm64 run `31499414349` and its full rerun are green for
-application, release/media and pull-load-generator jobs. Repeat Standards/Spec
-review passed.
+Hardened native amd64/arm64 run `31511231574` is green for all six application,
+release/media and pull-load-generator jobs. Repeat Standards/Spec review passed.
 
 The native jobs compile both C binaries with distro GStreamer development
 libraries, print exact package versions and binary SHA-256 values, prepare
@@ -119,14 +118,12 @@ pinned-FFmpeg fixtures, then prove two H.264 and two H.265 pull endpoints with
 fan-out readers and rejected UDP transport. The updated workflow also starts a
 finite systemd service and runs the public runtime capture/binding contract against
 real `/proc`, cgroup v2, dpkg and mapped GStreamer libraries on both amd64 and
-arm64. The previously published run `31499414349` predates this added contract;
-a new green run is required.
+arm64 before the H.264/H.265 RTSP/TCP checks.
 
 This proves functional compatibility only. It does not satisfy the Spike #0
-exit: the runtime-manifest implementation has no published
-production-equivalent hardware capture, two-host generator
-convergence, LAN/WAN baseline, 100/500/1000 ladder, knee, churn/fault matrix or
-24-hour soak has been published yet.
+exit. None of the following evidence has been published: production-equivalent
+hardware capture, two-host generator convergence, LAN/WAN baseline,
+100/500/1000 ladder, knee, churn/fault matrix or 24-hour soak.
 
 WAN/netem and non-zero probe/CRUD axes currently fail profile validation until
 their typed drivers and verification evidence are implemented. This is an
