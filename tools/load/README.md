@@ -214,20 +214,37 @@ RUN_DIR=/srv/rtsp-load/runs/2026-08-11T180000Z-amd64
 SITE=sut
 TC_BIN=$(readlink -f "$(command -v tc)")
 IP_BIN=$(readlink -f "$(command -v ip)")
+LOAD_CLI=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-load
+NETEM_INSTALLED=0
 
-sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load install-netem "$RUN_DIR" \
+cleanup_netem() {
+  if [ "$NETEM_INSTALLED" = 1 ]; then
+    sudo "$LOAD_CLI" remove-netem "$RUN_DIR" \
+      --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN" || {
+        echo "FATAL: owned netem cleanup failed; quarantine this host" >&2
+        return 1
+      }
+  fi
+}
+trap 'status=$?; cleanup_netem || status=1; trap - EXIT; exit "$status"' EXIT
+trap 'exit 130' HUP INT TERM
+
+sudo "$LOAD_CLI" install-netem "$RUN_DIR" \
   --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN"
+NETEM_INSTALLED=1
 
-sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load sample-netem \
+"$LOAD_CLI" sample-netem \
   "$RUN_DIR" "$RUN_DIR/raw/netem-$SITE.jsonl" \
   --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN"
 
-sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load summarize-netem \
+"$LOAD_CLI" summarize-netem \
   "$RUN_DIR" "$RUN_DIR/raw/netem-$SITE.jsonl" \
   "$RUN_DIR/summary/netem-$SITE.json" --site "$SITE"
 
-sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load remove-netem "$RUN_DIR" \
+sudo "$LOAD_CLI" remove-netem "$RUN_DIR" \
   --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN"
+NETEM_INSTALLED=0
+trap - EXIT HUP INT TERM
 ```
 
 Install before source/anchor traffic and start the blocking sampler no later
@@ -238,7 +255,8 @@ pinned on-demand close and SUT drain window. Do not remove netem before the
 sampler exits and the summary is written.
 
 The driver creates one owned `clsact`, one chain-0 flower per exact source
-IPv4/TCP listen endpoint, and one root netem qdisc on the IFB. It records the
+IPv4/TCP listen endpoint, a bounded root delay/jitter netem qdisc and its
+maximum-capacity random-loss child on the IFB. It records the
 resolved regular `tc`/`ip` paths, hashes and versions; ordinary distro symlinks
 are resolved before execution. The workload `seed` controls scenario/lifecycle
 selection only. Ubuntu 24.04 iproute2 6.1 has no supported deterministic netem
@@ -247,16 +265,24 @@ of claiming an identical dropped-packet sequence.
 
 Summary recomputation requires every scoped flow to carry traffic, zero flower
 action drops/overlimits, monotonic counters, queue occupancy below the configured
-limit, drops within the random-loss envelope, exact flower-input versus
-netem-dequeue/drop packet accounting, empty boundary queues and two final
-quiescent samples. A neighboring control flow is not redirected. For cold WAN
-A/B, `compare-cold` copies the direct raw/summary/launch/runtime evidence into
-the proxy bundle; finalization recomputes it and checks compatible iproute2
-versions instead of trusting stored `valid` flags.
+limit, random drops inside a two-sided statistical envelope, exact flower-input
+versus qdisc packet accounting, empty boundary queues and two final quiescent
+samples. Parent drops include child random drops, so a non-zero parent-minus-child
+drop delta is cumulative proof of queue overflow and fails the run even when a
+short saturation event falls between samples. The child queue cannot overflow:
+its limit is `2^32-1`, the observed attempt count must remain below that limit,
+and its boundary backlog must be zero. A neighboring control flow is not
+redirected. For cold WAN A/B, `compare-cold` copies the direct
+raw/summary/launch/runtime evidence into the proxy bundle; finalization
+recomputes it, checks compatible iproute2 versions and seals the aggregate
+proxy-minus-direct random-loss delta in `cold-comparison.json` instead of
+trusting stored `valid` flags.
 
 Install and remove are ownership-safe and fail closed on foreign ingress,
 egress, non-zero-chain, duplicate or IFB qdisc state. A timeout after a possible
-kernel mutation triggers exact read-back cleanup. If cleanup reports
+kernel mutation triggers exact read-back cleanup. Keep the shown cleanup trap
+for every manual session, or encode the same call as a systemd `ExecStop=`;
+sampler/workload interruption must not leave impairment active. If cleanup reports
 `netem_install_failed_cleanup_incomplete`, stop the run and inspect
 `tc -s -j qdisc` plus both ingress and egress `tc -s -j filter` inventories;
 do not blindly delete `clsact` or the IFB. Rerun `remove-netem` only after the

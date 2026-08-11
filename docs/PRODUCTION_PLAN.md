@@ -1016,8 +1016,9 @@ reader plans; active paths and reader counts remain independent. Reader events
 separate outgoing `DESCRIBE→PLAY` from the first parser-aligned
 IDR/IRAP random-access unit; header-only, delta, decode-only, corrupted and gap
 buffers are rejected. Cold pass/fail is accepted only from a compatible
-finalized direct-control pair; only handshake deltas are compared, while both GOP waits are published
-separately. Seeded steady/ramp/burst/outage primitives, interruption
+finalized direct-control pair; handshake deltas are compared while both GOP
+waits are published separately, and impaired pairs additionally publish the
+aggregate random-loss delta. Seeded steady/ramp/burst/outage primitives, interruption
 fail-closed and owner-only credentials are implemented. Warm proxy profiles
 reserve one reader from `total_readers` per active path as an anchor, start the
 anchors 60 seconds before measured ramp and require typed MediaMTX runtime
@@ -1101,7 +1102,8 @@ ingress. For proxy runs the receiver site is the SUT and exact upstream source
 server IPv4/TCP endpoints are selected; for direct-control, the receiver sites
 are generator hosts carrying reader shards and the same remote source leg is
 selected. Traffic is redirected by owned chain-0 `clsact/flower` rules into a
-dedicated MTU-matched IFB with one pinned root netem qdisc. Other host traffic
+dedicated MTU-matched IFB with a pinned bounded delay/jitter root and a
+maximum-capacity random-loss child netem qdisc. Other host traffic
 and adjacent source ports are not impaired.
 
 Install/remove is a privileged operator boundary, separate from application
@@ -1116,14 +1118,17 @@ Every impaired run requires per-site raw observations from before the anchor
 through the role-specific quiescent drain and a summary recomputed by the
 finalizer. The contract binds interface indexes/MTU, canonical plan, clock,
 machine/boot and tool identity; exact flower action counters are reconciled with
-netem dequeued+dropped packet counters. Positive action drops/overlimits,
-counter reset/drift, missing scoped traffic, queue saturation, random loss above
+both qdisc levels. Parent-minus-child drop delta is the cumulative queue-overflow
+signal and must remain zero; child drops must remain inside a two-sided
+statistical random-loss envelope and its attempt count remains below its
+`2^32-1` queue limit. Positive action drops/overlimits,
+counter reset/drift, missing scoped traffic, queue saturation, loss outside
 the statistical envelope, accounting mismatch, boundary backlog or continuing
 traffic at the final two samples fails. The profile scenario seed does not claim
 a deterministic dropped-packet sequence because Ubuntu 24.04 iproute2 6.1 does
 not expose a supported netem seed. Cold A/B copies and hashes direct raw netem,
-summary, launch and runtime evidence into the proxy bundle, then recomputes and
-compares it.
+summary, launch and runtime evidence into the proxy bundle, then recomputes it
+and seals the aggregate proxy-minus-direct random-loss delta.
 
 Hardened native amd64/arm64 CI run `31527148623` covers the complete functional
 harness. On both native runners it executes the runtime collector against real

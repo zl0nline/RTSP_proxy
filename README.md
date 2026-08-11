@@ -275,10 +275,12 @@ cgroup/RLIMIT и PID/start/executable identity; на generator hosts он так
 отвергает drift machine/boot/kernel/sysctl/cgroup/RLIMIT/GStreamer среды. Typed
 WAN/netem driver на camera-side ingress перенаправляет только точные IPv4/TCP
 source endpoints через `clsact/flower` в выделенный IFB с pinned
-delay/jitter/random-loss/queue. Finalizer заново проверяет per-flow action
-counters, qdisc accounting, statistical loss envelope, quiescent drain и exact
-`tc`/`ip` identity; direct-control WAN evidence копируется внутрь cold proxy
-bundle и повторно вычисляется. Эти механизмы не публикуют capacity envelope без
+delay/jitter/random-loss/queue. Root delay и child random-loss qdisc дают
+раздельный cumulative queue-overflow signal; finalizer проверяет per-flow action
+counters, two-sided statistical loss envelope, quiescent drain и exact
+`tc`/`ip` identity. Direct-control WAN evidence копируется внутрь cold proxy
+bundle, повторно вычисляется и публикует sealed proxy-minus-direct loss delta.
+Эти механизмы не публикуют capacity envelope без
 фактических выделенных LAN/WAN стендов, non-zero probe/CRUD drivers, полной
 matrix и 24h soak. FFmpeg/ffprobe
 зафиксированы как Phase 0 candidate,

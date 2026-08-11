@@ -53,8 +53,9 @@ ffprobe runner until ADR 0004's process/egress boundary is accepted.
 Phase 0B is in progress. `tools/load` contains native GStreamer pull-source and
 multi-reader binaries plus a digest-bound per-host run orchestrator. Latency is
 split into RTSP handshake and first-decodable measurements; cold results require
-a finalized direct-control pair and subtract only handshake latency, not
-unsynchronized GOP waits. A warm proxy run reserves one reader per active path
+a finalized direct-control pair, subtract handshake latency without conflating
+unsynchronized GOP waits, and publish the aggregate WAN random-loss delta. A
+warm proxy run reserves one reader per active path
 inside `total_readers` as an anchor, starts those anchors 60 seconds before the
 measured ramp and proves them through the ramp boundary with typed API polling.
 Shards share future UTC anchor/ramp/measurement/soak epochs and remain observable
@@ -77,8 +78,9 @@ clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
 reconciliation. A fixture
 manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
 The typed WAN driver applies only exact camera-source IPv4/TCP flows at receiver
-ingress through `clsact/flower` into a dedicated IFB and pinned netem qdisc. Raw
-evidence binds per-flow action counters, qdisc accounting, loss envelope, drain,
+ingress through `clsact/flower` into a dedicated IFB and a pinned root-delay plus
+child-random-loss netem hierarchy. Raw evidence binds per-flow action counters,
+separate cumulative queue/random drops, a two-sided loss envelope, drain,
 tool identity and direct-control comparison. Hardened native amd64/arm64 CI
 `31527148623` covers the complete functional harness, including real
 procfs/cgroup v2/dpkg/mapped-library runtime capture, scoped netem traffic/control

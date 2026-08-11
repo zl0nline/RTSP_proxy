@@ -5,7 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -26,6 +26,9 @@ from rtsp_proxy.load_profile import (
     warm_anchor_start_unix_ms,
     workload_end_unix_ms,
 )
+
+if TYPE_CHECKING:
+    from rtsp_proxy.load_netem import NetemSummary
 
 LatencyGate = Literal[
     "warm_proxy_p99",
@@ -243,6 +246,27 @@ class ReaderRunSummary(BaseModel):
     invalid_reasons: tuple[str, ...]
 
 
+class WanLossComparisonSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    schema_version: Literal[1]
+    proxy_plan_sha256s: tuple[Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")], ...]
+    direct_plan_sha256s: tuple[Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")], ...]
+    proxy_observations_sha256s: tuple[
+        Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")], ...
+    ]
+    direct_observations_sha256s: tuple[
+        Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")], ...
+    ]
+    proxy_attempted_packets: Annotated[int, Field(gt=0)]
+    proxy_random_loss_drops: Annotated[int, Field(gt=0)]
+    direct_attempted_packets: Annotated[int, Field(gt=0)]
+    direct_random_loss_drops: Annotated[int, Field(gt=0)]
+    proxy_random_loss_percent: Annotated[float, Field(gt=0, lt=100)]
+    direct_random_loss_percent: Annotated[float, Field(gt=0, lt=100)]
+    proxy_minus_direct_loss_percentage_points: float
+
+
 class ColdComparisonSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -258,6 +282,7 @@ class ColdComparisonSummary(BaseModel):
     proxy_wait_for_decodable_p99_ms: float
     proxy_overhead_slo_ms: float
     proxy_overhead_slo_pass: bool
+    wan_loss: WanLossComparisonSummary | None
     valid: bool
     invalid_reasons: tuple[str, ...]
 
@@ -1142,6 +1167,7 @@ def summarize_cold_comparison(
     direct_events: Path,
     *,
     direct_final_manifest_sha256: str,
+    wan_loss: WanLossComparisonSummary | None = None,
 ) -> ColdComparisonSummary:
     validate_comparison_pair(proxy_profile, direct_profile)
     if proxy_profile.workload.session_temperature != "cold":
@@ -1175,6 +1201,10 @@ def summarize_cold_comparison(
         reasons.append("direct_reader_run_invalid")
     if not slo_pass:
         reasons.append("cold_proxy_overhead_p99_above_1000ms")
+    if proxy_profile.network.profile != "lan" and wan_loss is None:
+        reasons.append("wan_loss_comparison_missing")
+    if proxy_profile.network.profile == "lan" and wan_loss is not None:
+        reasons.append("lan_has_unexpected_wan_loss_comparison")
     return ColdComparisonSummary(
         comparison_id=proxy_profile.comparison_id,
         proxy_events_sha256=_sha256_file(proxy_events),
@@ -1188,6 +1218,44 @@ def summarize_cold_comparison(
         proxy_wait_for_decodable_p99_ms=proxy_wait_p99,
         proxy_overhead_slo_ms=1000,
         proxy_overhead_slo_pass=slo_pass,
+        wan_loss=wan_loss,
         valid=not reasons,
         invalid_reasons=tuple(reasons),
+    )
+
+
+def summarize_wan_loss_comparison(
+    proxy_summaries: tuple[NetemSummary, ...],
+    direct_summaries: tuple[NetemSummary, ...],
+) -> WanLossComparisonSummary:
+    if not proxy_summaries or not direct_summaries:
+        raise ValueError("wan_loss_comparison_evidence_missing")
+    if any(not item.valid for item in (*proxy_summaries, *direct_summaries)):
+        raise ValueError("wan_loss_comparison_evidence_invalid")
+
+    proxy_attempted = sum(item.scoped_input_packets_delta for item in proxy_summaries)
+    direct_attempted = sum(item.scoped_input_packets_delta for item in direct_summaries)
+    proxy_drops = sum(item.random_loss_drops_delta for item in proxy_summaries)
+    direct_drops = sum(item.random_loss_drops_delta for item in direct_summaries)
+    if min(proxy_attempted, direct_attempted, proxy_drops, direct_drops) <= 0:
+        raise ValueError("wan_loss_comparison_sample_invalid")
+    proxy_percent = proxy_drops / proxy_attempted * 100
+    direct_percent = direct_drops / direct_attempted * 100
+    return WanLossComparisonSummary(
+        schema_version=1,
+        proxy_plan_sha256s=tuple(item.plan_sha256 for item in proxy_summaries),
+        direct_plan_sha256s=tuple(item.plan_sha256 for item in direct_summaries),
+        proxy_observations_sha256s=tuple(
+            item.observations_sha256 for item in proxy_summaries
+        ),
+        direct_observations_sha256s=tuple(
+            item.observations_sha256 for item in direct_summaries
+        ),
+        proxy_attempted_packets=proxy_attempted,
+        proxy_random_loss_drops=proxy_drops,
+        direct_attempted_packets=direct_attempted,
+        direct_random_loss_drops=direct_drops,
+        proxy_random_loss_percent=proxy_percent,
+        direct_random_loss_percent=direct_percent,
+        proxy_minus_direct_loss_percentage_points=proxy_percent - direct_percent,
     )

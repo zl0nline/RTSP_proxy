@@ -546,9 +546,8 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
     from rtsp_proxy.load_netem import (
         NetemObservation,
         NetemSummary,
-        load_netem_observations,
+        recompute_stored_netem_summary,
         required_netem_site_plans,
-        summarize_netem,
         validate_netem_comparison_tool_versions,
     )
     from rtsp_proxy.load_results import (
@@ -558,6 +557,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         load_reader_events,
         summarize_cold_comparison,
         summarize_reader_events,
+        summarize_wan_loss_comparison,
     )
     from rtsp_proxy.load_run import validate_prepared_run_directory
     from rtsp_proxy.load_runtime import (
@@ -832,25 +832,21 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             raise ValueError("sut_observation_window_does_not_cover_load")
 
     netem_observation_sets: dict[str, tuple[NetemObservation, ...]] = {}
+    netem_summaries: dict[str, NetemSummary] = {}
     for plan in netem_plans:
         raw_name = f"raw/netem-{plan.site}.jsonl"
         summary_name = f"summary/netem-{plan.site}.json"
         if raw_name not in files:
             raise ValueError("netem_raw_evidence_missing")
-        netem_observations = load_netem_observations(files[raw_name])
-        expected_netem_summary = summarize_netem(
+        netem_observations, stored_netem_summary = recompute_stored_netem_summary(
             profile,
             plan,
-            netem_observations,
-            observations_sha256=_hash_file(files[raw_name])[0],
+            files[raw_name],
+            files[summary_name],
             coordinated_start_unix_ms=prepared_launch["coordinated_start_unix_ms"],
         )
-        stored_netem_summary = NetemSummary.model_validate_json(
-            files[summary_name].read_text(encoding="utf-8")
-        )
-        if stored_netem_summary != expected_netem_summary or not stored_netem_summary.valid:
-            raise ValueError("netem_summary_not_reproducible_or_invalid")
         netem_observation_sets[plan.site] = netem_observations
+        netem_summaries[plan.site] = stored_netem_summary
         if plan.role == "sut":
             if stored_sut_summary is None:
                 raise ValueError("netem_sut_resource_binding_missing")
@@ -921,6 +917,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             )
             validate_runtime_comparison_pair(proxy_runtime, direct_runtime)
         direct_netem_observation_sets: list[tuple[NetemObservation, ...]] = []
+        direct_netem_summaries: list[NetemSummary] = []
         for direct_plan in required_netem_site_plans(direct_profile):
             direct_netem_raw_path = (
                 destination / "reference" / f"direct-netem-{direct_plan.site}.jsonl"
@@ -943,19 +940,13 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
                 != summary_size
             ):
                 raise ValueError("direct_netem_reference_manifest_binding_invalid")
-            direct_observations = load_netem_observations(direct_netem_raw_path)
-            expected_direct_summary = summarize_netem(
+            direct_observations, stored_direct_summary = recompute_stored_netem_summary(
                 direct_profile,
                 direct_plan,
-                direct_observations,
-                observations_sha256=raw_digest,
+                direct_netem_raw_path,
+                direct_netem_summary_path,
                 coordinated_start_unix_ms=direct_start_unix_ms,
             )
-            stored_direct_summary = NetemSummary.model_validate_json(
-                direct_netem_summary_path.read_text(encoding="utf-8")
-            )
-            if stored_direct_summary != expected_direct_summary or not stored_direct_summary.valid:
-                raise ValueError("direct_netem_summary_not_reproducible_or_invalid")
             receiver_runtime = direct_runtimes.get(direct_plan.receiver_host)
             if (
                 receiver_runtime is None
@@ -964,6 +955,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             ):
                 raise ValueError("direct_netem_receiver_runtime_binding_invalid")
             direct_netem_observation_sets.append(direct_observations)
+            direct_netem_summaries.append(stored_direct_summary)
         if direct_netem_observation_sets:
             proxy_netem_observations = [
                 observations
@@ -979,6 +971,14 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             direct_profile,
             reference_events_path,
             direct_final_manifest_sha256=_hash_file(reference_manifest_path)[0],
+            wan_loss=(
+                summarize_wan_loss_comparison(
+                    tuple(netem_summaries[plan.site] for plan in netem_plans),
+                    tuple(direct_netem_summaries),
+                )
+                if netem_plans
+                else None
+            ),
         )
         stored_cold = ColdComparisonSummary.model_validate_json(
             files["summary/cold-comparison.json"].read_text(encoding="utf-8")

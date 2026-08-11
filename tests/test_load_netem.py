@@ -126,7 +126,6 @@ class FakeNetemKernel(NetemKernel):
         self.commands.append(arguments)
         if arguments[:6] == ("qdisc", "add", "dev", "rtspifb0", "root", "handle"):
             delay_index = arguments.index("delay")
-            loss_index = arguments.index("loss")
             limit_index = arguments.index("limit")
             self.ifb_qdiscs = [
                 {
@@ -140,6 +139,28 @@ class FakeNetemKernel(NetemKernel):
                             "jitter": float(arguments[delay_index + 2].removesuffix("ms")) / 1000,
                             "correlation": 0.0,
                         },
+                        "ecn": False,
+                        "gap": 0,
+                    },
+                    "bytes": 0,
+                    "packets": 0,
+                    "drops": 0,
+                    "overlimits": 0,
+                    "backlog": 0,
+                    "qlen": 0,
+                }
+            ]
+            return
+        if arguments[:6] == ("qdisc", "add", "dev", "rtspifb0", "parent", "7a10:1"):
+            loss_index = arguments.index("loss")
+            limit_index = arguments.index("limit")
+            self.ifb_qdiscs.append(
+                {
+                    "kind": "netem",
+                    "handle": "7a20:",
+                    "parent": "7a10:1",
+                    "options": {
+                        "limit": int(arguments[limit_index + 1]),
                         "loss-random": {
                             "loss": float(arguments[loss_index + 2].removesuffix("%")) / 100,
                             "correlation": 0.0,
@@ -154,7 +175,7 @@ class FakeNetemKernel(NetemKernel):
                     "backlog": 0,
                     "qlen": 0,
                 }
-            ]
+            )
             return
         if arguments == ("qdisc", "add", "dev", "camera0", "clsact"):
             self.ingress_qdiscs.append({"kind": "clsact", "handle": "ffff:"})
@@ -294,6 +315,34 @@ def sample_times(start_ms: int, end_ms: int) -> tuple[int, ...]:
     if values[-1] != end_ms:
         values.append(end_ms)
     return tuple(values)
+
+
+def traffic_observation(
+    base: NetemObservation,
+    plan: NetemSitePlan,
+    *,
+    observed_at_ms: int,
+    attempted_packets: int,
+) -> NetemObservation:
+    random_drops = (
+        max(1, round(attempted_packets * plan.loss_percent / 100))
+        if attempted_packets
+        else 0
+    )
+    delivered = attempted_packets - random_drops
+    return base.model_copy(
+        update={
+            "timestamp": datetime.fromtimestamp(observed_at_ms / 1000, UTC),
+            "clock_proof": clock(observed_at_ms),
+            "packets": delivered,
+            "bytes": delivered * 100,
+            "drops": random_drops,
+            "random_loss_packets": delivered,
+            "random_loss_bytes": delivered * 100,
+            "random_loss_drops": random_drops,
+            "flow_counters": flow_counters_at(plan, attempted_packets),
+        }
+    )
 
 
 def resource_observation(
@@ -676,21 +725,18 @@ def write_netem_evidence(
             root=identity_roots[plan.receiver_host],
             clock_proof=fixed_clock(anchor_ms),
         )
-        observations = tuple(
-            base.model_copy(
-                update={
-                    "timestamp": datetime.fromtimestamp(observed_at_ms / 1000, UTC),
-                    "clock_proof": clock(observed_at_ms),
-                    "packets": max(0, min(observed_at_ms, workload_end_ms) - anchor_ms),
-                    "bytes": max(0, min(observed_at_ms, workload_end_ms) - anchor_ms) * 100,
-                    "flow_counters": flow_counters_at(
-                        plan,
-                        max(0, min(observed_at_ms, workload_end_ms) - anchor_ms),
-                    ),
-                }
+        observations_list: list[NetemObservation] = []
+        for observed_at_ms in sample_times(anchor_ms, sampling_end_ms):
+            attempted = max(0, min(observed_at_ms, workload_end_ms) - anchor_ms)
+            observations_list.append(
+                traffic_observation(
+                    base,
+                    plan,
+                    observed_at_ms=observed_at_ms,
+                    attempted_packets=attempted,
+                )
             )
-            for observed_at_ms in sample_times(anchor_ms, sampling_end_ms)
-        )
+        observations = tuple(observations_list)
         raw_path = run_directory / f"raw/netem-{plan.site}.jsonl"
         raw_path.write_text(
             "".join(item.model_dump_json() + "\n" for item in observations),
@@ -884,6 +930,17 @@ def test_public_wan_cold_pair_copies_recomputes_finalizes_and_verifies(
         )
         == 0
     )
+    comparison_payload = json.loads(
+        (proxy_run / "summary/cold-comparison.json").read_text(encoding="utf-8")
+    )
+    assert comparison_payload["wan_loss"]["proxy_attempted_packets"] > 0
+    assert comparison_payload["wan_loss"]["direct_attempted_packets"] > 0
+    assert comparison_payload["wan_loss"]["proxy_random_loss_drops"] > 0
+    assert comparison_payload["wan_loss"]["direct_random_loss_drops"] > 0
+    assert isinstance(
+        comparison_payload["wan_loss"]["proxy_minus_direct_loss_percentage_points"],
+        float,
+    )
     assert {
         "direct-netem-generator-a.jsonl",
         "direct-netem-generator-b.jsonl",
@@ -898,6 +955,15 @@ def test_public_wan_cold_pair_copies_recomputes_finalizes_and_verifies(
     with pytest.raises(ValueError, match="direct_netem_reference_manifest_binding_invalid"):
         finalize_run_directory(proxy_run)
     copied_summary.write_bytes(original_summary)
+
+    comparison_path = proxy_run / "summary/cold-comparison.json"
+    original_comparison = comparison_path.read_bytes()
+    tampered_comparison = json.loads(original_comparison)
+    tampered_comparison["wan_loss"]["proxy_minus_direct_loss_percentage_points"] += 1
+    comparison_path.write_text(json.dumps(tampered_comparison) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="cold_comparison_not_reproducible_or_invalid"):
+        finalize_run_directory(proxy_run)
+    comparison_path.write_bytes(original_comparison)
 
     assert load_cli_main(["finalize", str(proxy_run)]) == 0
     assert load_cli_main(["verify", str(proxy_run)]) == 0
@@ -973,6 +1039,25 @@ def test_ifb_accepts_only_automatic_ipv6_link_local_address() -> None:
     with pytest.raises(ValueError, match="netem_ifb_not_dedicated"):
         install_netem(kernel, plan)
 
+    class IncompleteIfbKernel(FakeNetemKernel):
+        def __init__(self, *, master: bool) -> None:
+            super().__init__()
+            self.master = master
+
+        def link(self, interface: str) -> dict[str, object]:
+            result = super().link(interface)
+            if interface == "rtspifb0":
+                if self.master:
+                    result["master"] = "bond0"
+                else:
+                    result.pop("addr_info")
+            return result
+
+    with pytest.raises(ValueError, match="netem_ifb_not_dedicated"):
+        install_netem(IncompleteIfbKernel(master=False), plan)
+    with pytest.raises(ValueError, match="netem_ifb_not_dedicated"):
+        install_netem(IncompleteIfbKernel(master=True), plan)
+
 
 def test_observation_and_summary_reject_state_drift_and_queue_overlimit(tmp_path: Path) -> None:
     profile = wan_profile(measurement_seconds=20)
@@ -995,28 +1080,21 @@ def test_observation_and_summary_reject_state_drift_and_queue_overlimit(tmp_path
     while current_ms <= end_ms:
         offset = min(current_ms, workload_end_ms) - anchor_ms
         observations.append(
-            base.model_copy(
-                update={
-                    "timestamp": datetime.fromtimestamp(current_ms / 1000, tz=UTC),
-                    "clock_proof": clock(current_ms),
-                    "packets": offset * 10,
-                    "bytes": offset * 1000,
-                    "drops": 0,
-                    "flow_counters": flow_counters_at(plan, offset * 10 + 1),
-                }
+            traffic_observation(
+                base,
+                plan,
+                observed_at_ms=current_ms,
+                attempted_packets=offset * 10 + 1,
             )
         )
         current_ms += 1000
     if round(observations[-1].timestamp.timestamp() * 1000) < end_ms:
         observations.append(
-            observations[-1].model_copy(
-                update={
-                    "timestamp": datetime.fromtimestamp(end_ms / 1000, tz=UTC),
-                    "clock_proof": clock(end_ms),
-                    "packets": (workload_end_ms - anchor_ms) * 10,
-                    "bytes": (workload_end_ms - anchor_ms) * 1000,
-                    "flow_counters": flow_counters_at(plan, (workload_end_ms - anchor_ms) * 10 + 1),
-                }
+            traffic_observation(
+                base,
+                plan,
+                observed_at_ms=end_ms,
+                attempted_packets=(workload_end_ms - anchor_ms) * 10 + 1,
             )
         )
     if round(observations[-1].timestamp.timestamp() * 1000) < end_ms:
@@ -1096,7 +1174,38 @@ def test_observation_and_summary_reject_state_drift_and_queue_overlimit(tmp_path
         coordinated_start_unix_ms=start_ms,
     )
     assert not saturated.valid
-    assert "netem_drop_rate_above_random_loss_envelope" in saturated.invalid_reasons
+    assert "netem_queue_overflow_drop" in saturated.invalid_reasons
+
+    excessive_random_loss = list(observations)
+    excessive_random_loss[-1] = excessive_random_loss[-1].model_copy(
+        update={
+            "drops": excessive_random_loss[-1].packets,
+            "random_loss_drops": excessive_random_loss[-1].packets,
+        }
+    )
+    excessive_random = summarize_netem(
+        profile,
+        plan,
+        tuple(excessive_random_loss),
+        observations_sha256="8" * 64,
+        coordinated_start_unix_ms=start_ms,
+    )
+    assert not excessive_random.valid
+    assert "netem_drop_rate_above_random_loss_envelope" in excessive_random.invalid_reasons
+
+    missing_random_loss = [
+        item.model_copy(update={"drops": 0, "random_loss_drops": 0})
+        for item in observations
+    ]
+    missing_random = summarize_netem(
+        profile,
+        plan,
+        tuple(missing_random_loss),
+        observations_sha256="7" * 64,
+        coordinated_start_unix_ms=start_ms,
+    )
+    assert not missing_random.valid
+    assert "netem_drop_rate_below_random_loss_envelope" in missing_random.invalid_reasons
 
     kernel.ifb_qdiscs[0]["options"]["delay"]["delay"] = 0.15  # type: ignore[index]
     with pytest.raises(ValueError, match="netem_qdisc_options_invalid"):
@@ -1288,12 +1397,17 @@ def test_models_and_clean_install_guards_reject_ambiguous_ownership() -> None:
         maximum_gap_seconds=0,
         packets_delta=1,
         bytes_delta=1,
-        drops_delta=0,
+        drops_delta=1,
+        random_loss_drops_delta=1,
+        queue_overflow_drops_delta=0,
+        drop_envelope_minimum=1,
         drop_envelope_maximum=3,
-        observed_drop_percent=0,
+        observed_drop_percent=50,
         overlimits_delta=0,
+        random_loss_overlimits_delta=0,
         maximum_queued_packets=0,
-        scoped_input_packets_delta=1,
+        maximum_random_loss_queued_packets=0,
+        scoped_input_packets_delta=2,
         scoped_input_bytes_delta=1,
         flow_deltas=(),
     )
@@ -1489,27 +1603,21 @@ def test_public_cli_summarizes_typed_netem_evidence(tmp_path: Path) -> None:
     while current_ms <= end_ms:
         offset = min(current_ms, workload_end_ms) - anchor_ms
         observations.append(
-            base.model_copy(
-                update={
-                    "timestamp": datetime.fromtimestamp(current_ms / 1000, tz=UTC),
-                    "clock_proof": clock(current_ms),
-                    "packets": offset + 1,
-                    "bytes": (offset + 1) * 100,
-                    "flow_counters": flow_counters_at(plan, offset + 1),
-                }
+            traffic_observation(
+                base,
+                plan,
+                observed_at_ms=current_ms,
+                attempted_packets=offset + 1,
             )
         )
         current_ms += 1000
     if round(observations[-1].timestamp.timestamp() * 1000) < end_ms:
         observations.append(
-            observations[-1].model_copy(
-                update={
-                    "timestamp": datetime.fromtimestamp(end_ms / 1000, tz=UTC),
-                    "clock_proof": clock(end_ms),
-                    "packets": workload_end_ms - anchor_ms + 1,
-                    "bytes": (workload_end_ms - anchor_ms + 1) * 100,
-                    "flow_counters": flow_counters_at(plan, workload_end_ms - anchor_ms + 1),
-                }
+            traffic_observation(
+                base,
+                plan,
+                observed_at_ms=end_ms,
+                attempted_packets=workload_end_ms - anchor_ms + 1,
             )
         )
     observations_path = raw_directory / "netem-sut.jsonl"
@@ -1557,7 +1665,7 @@ def test_public_cli_installs_and_removes_through_external_iproute2_adapter(
     initialize_run_directory(profile, run_directory)
     state_path = tmp_path / "tc-state.json"
     state_path.write_text(
-        json.dumps({"ifb": False, "clsact": False, "filters": []}),
+        json.dumps({"ifb": False, "loss": False, "clsact": False, "filters": []}),
         encoding="utf-8",
     )
     monkeypatch.setenv("FAKE_TC_STATE", str(state_path))
@@ -1581,13 +1689,16 @@ elif 'address' in args:
 elif '-j' in args and 'qdisc' in args:
     name = args[-1]
     if name == 'rtspifb0':
-        result = ([{'kind': 'netem', 'handle': '7a10:', 'root': True,
-                    'options': {'limit': 1000,
-                                'delay': {'delay': 0.05, 'jitter': 0.01,
-                                          'correlation': 0.0},
-                                'loss-random': {'loss': 0.005, 'correlation': 0.0},
-                                'ecn': False, 'gap': 0}}]
-                  if state['ifb'] else [{'kind': 'noqueue', 'handle': '0:', 'root': True}])
+        result = (([{'kind': 'netem', 'handle': '7a10:', 'root': True,
+                        'options': {'limit': 1000,
+                                    'delay': {'delay': 0.05, 'jitter': 0.01,
+                                              'correlation': 0.0},
+                                    'ecn': False, 'gap': 0}}] +
+                       ([{'kind': 'netem', 'handle': '7a20:', 'parent': '7a10:1',
+                        'options': {'limit': 4294967295,
+                                    'loss-random': {'loss': 0.005, 'correlation': 0.0},
+                                    'ecn': False, 'gap': 0}}] if state['loss'] else []))
+                      if state['ifb'] else [{'kind': 'noqueue', 'handle': '0:', 'root': True}])
     else:
         result = [{'kind': 'fq_codel', 'root': True}]
         if state['clsact']:
@@ -1597,6 +1708,8 @@ elif '-j' in args and 'filter' in args:
     print(json.dumps(state['filters'] if args[-1] == 'ingress' else []))
 elif args[:5] == ['qdisc', 'add', 'dev', 'rtspifb0', 'root']:
     state['ifb'] = True
+elif args[:6] == ['qdisc', 'add', 'dev', 'rtspifb0', 'parent', '7a10:1']:
+    state['loss'] = True
 elif args == ['qdisc', 'add', 'dev', 'camera0', 'clsact']:
     state['clsact'] = True
 elif args[:4] == ['filter', 'add', 'dev', 'camera0']:
@@ -1618,6 +1731,7 @@ elif args == ['qdisc', 'del', 'dev', 'camera0', 'clsact']:
     state['filters'] = []
 elif args == ['qdisc', 'del', 'dev', 'rtspifb0', 'root']:
     state['ifb'] = False
+    state['loss'] = False
 else:
     print('unsupported', args, file=sys.stderr)
     raise SystemExit(2)

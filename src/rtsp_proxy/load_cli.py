@@ -25,9 +25,11 @@ from rtsp_proxy.load_evidence import (
 )
 from rtsp_proxy.load_netem import (
     NetemSitePlan,
+    NetemSummary,
     SubprocessNetemKernel,
     install_netem,
     load_netem_observations,
+    recompute_stored_netem_summary,
     remove_netem,
     required_netem_site_plans,
     sample_linux_netem,
@@ -48,6 +50,7 @@ from rtsp_proxy.load_results import (
     merge_reader_event_files,
     summarize_cold_comparison,
     summarize_reader_events,
+    summarize_wan_loss_comparison,
 )
 from rtsp_proxy.load_run import (
     inspect_fixture,
@@ -187,6 +190,26 @@ def _require_run_path(run_directory: Path, path: Path) -> None:
     parent = path.parent.resolve(strict=True)
     if parent != run_root and run_root not in parent.parents:
         raise ValueError("evidence_path_outside_run_directory")
+
+
+def _recompute_run_netem_summaries(
+    run_directory: Path, profile: LoadProfile
+) -> tuple[NetemSummary, ...]:
+    launch = json.loads((run_directory / "launch-plan.json").read_text(encoding="utf-8"))
+    coordinated_start = launch.get("coordinated_start_unix_ms")
+    if not isinstance(coordinated_start, int) or isinstance(coordinated_start, bool):
+        raise ValueError("launch_plan_start_invalid")
+    summaries: list[NetemSummary] = []
+    for plan in required_netem_site_plans(profile):
+        _, summary = recompute_stored_netem_summary(
+            profile,
+            plan,
+            run_directory / "raw" / f"netem-{plan.site}.jsonl",
+            run_directory / "summary" / f"netem-{plan.site}.json",
+            coordinated_start_unix_ms=coordinated_start,
+        )
+        summaries.append(summary)
+    return tuple(summaries)
 
 
 def _loopback_api_url(value: str) -> str:
@@ -597,6 +620,10 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "compare-cold":
             direct_profile = load_stored_profile(arguments.direct_run_directory)
             verify_run_directory(arguments.direct_run_directory)
+            proxy_netem_summaries = _recompute_run_netem_summaries(run_directory, profile)
+            direct_netem_summaries = _recompute_run_netem_summaries(
+                arguments.direct_run_directory, direct_profile
+            )
             _require_run_path(run_directory, arguments.proxy_events)
             _require_run_path(arguments.direct_run_directory, arguments.direct_events)
             _require_run_path(run_directory, arguments.output)
@@ -638,6 +665,14 @@ def main(argv: list[str] | None = None) -> int:
                 direct_profile,
                 reference_events,
                 direct_final_manifest_sha256=sha256_file(reference_manifest),
+                wan_loss=(
+                    summarize_wan_loss_comparison(
+                        proxy_netem_summaries,
+                        direct_netem_summaries,
+                    )
+                    if proxy_netem_summaries
+                    else None
+                ),
             )
             write_summary(arguments.output, comparison)
             print(f"SUMMARIZED_COLD_COMPARISON output={arguments.output}")

@@ -179,6 +179,8 @@ def test_linux_netem_installs_exact_scoped_ifb_and_detects_drift() -> None:
         assert matching.configuration.flows == plan.flows
         assert matching.configuration.delay_ms == 50
         assert matching.configuration.loss_percent == 0.5
+        assert matching.configuration.delay_qdisc_handle == "7a10:"
+        assert matching.configuration.loss_qdisc_handle == "7a20:"
         assert matching.packets > before.packets
         assert matching.flow_counters[0].packets > before.flow_counters[0].packets
         scoped_packets = matching.flow_counters[0].packets - before.flow_counters[0].packets
@@ -206,9 +208,6 @@ def test_linux_netem_installs_exact_scoped_ifb_and_detects_drift() -> None:
                 "delay",
                 "51ms",
                 "10ms",
-                "loss",
-                "random",
-                "0.5%",
             )
         )
         with pytest.raises(ValueError, match="netem_qdisc_options_invalid"):
@@ -228,9 +227,6 @@ def test_linux_netem_installs_exact_scoped_ifb_and_detects_drift() -> None:
                 "delay",
                 "50ms",
                 "10ms",
-                "loss",
-                "random",
-                "0.5%",
             )
         )
         remove_netem(kernel, plan)

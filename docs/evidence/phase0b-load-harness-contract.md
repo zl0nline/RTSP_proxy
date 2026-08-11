@@ -105,17 +105,21 @@
 - named WAN profiles are exact (`50 ms` added RTT at camera-side ingress,
   `10 ms` jitter, `0.5%` random loss); exact camera-source IPv4/TCP flows are
   redirected by `clsact/flower` to a dedicated, MTU-matched IFB with no
-  routable address and one pinned root netem qdisc. Installation refuses
+  routable address, a pinned bounded delay/jitter root and a maximum-capacity
+  random-loss child netem qdisc. Installation refuses
   dirty/ambiguous ingress, egress, chain or IFB state and rollback removes only
   exact owned state;
 - every impaired run requires typed raw observations and a recomputed summary
   for every receiver site. Evidence binds canonical plans, interface
   indexes/MTU, `tc`/`ip` canonical path/SHA/version, exact per-flow action
-  counters, qdisc counters, queue boundaries and synchronized time. Positive
-  action drops/overlimits, counter drift/reset, missing scoped traffic, queue
-  saturation, loss above the random-loss envelope, packet-accounting mismatch
-  or non-quiescent drain fails closed. Cold proxy A/B copies and revalidates the
-  direct netem raw/summary/runtime/launch evidence;
+  counters, both qdisc levels, queue boundaries and synchronized time. The
+  cumulative parent-minus-child drop delta proves queue overflow independently
+  from child random loss, which must fit a two-sided envelope. Positive action
+  drops/overlimits, counter drift/reset, missing scoped traffic, any queue
+  overflow, loss outside the envelope, packet-accounting mismatch or
+  non-quiescent drain fails closed. Cold proxy A/B copies and revalidates the
+  direct netem raw/summary/runtime/launch evidence and seals the aggregate
+  proxy-minus-direct loss delta;
 - the final manifest is the sealing completion marker; verification checks
   exact `0440`/`0550` modes and an interrupted final chmod is recoverable only
   by rerunning the full semantic finalizer. The marker is published with an

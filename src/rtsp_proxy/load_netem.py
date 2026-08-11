@@ -34,6 +34,9 @@ SafeName = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,128}$")]
 SafeHost = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,253}$")]
 InterfaceName = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_.:-]{1,15}$")]
 NETEM_QDISC_HANDLE = "7a10:"
+NETEM_LOSS_QDISC_HANDLE = "7a20:"
+NETEM_LOSS_QDISC_PARENT = "7a10:1"
+NETEM_LOSS_QUEUE_LIMIT_PACKETS = 4294967295
 NETEM_FILTER_PREF_START = 49000
 
 
@@ -104,7 +107,9 @@ class NetemKernelConfiguration(StrictModel):
     ifb_ifindex: Annotated[int, Field(gt=0)]
     ingress_mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
     ifb_mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
-    qdisc_handle: Literal["7a10:"]
+    delay_qdisc_handle: Literal["7a10:"]
+    loss_qdisc_handle: Literal["7a20:"]
+    loss_qdisc_parent: Literal["7a10:1"]
     delay_ms: Annotated[float, Field(gt=0)]
     jitter_ms: Annotated[float, Field(ge=0)]
     loss_percent: Annotated[float, Field(gt=0, lt=100)]
@@ -160,6 +165,12 @@ class NetemObservation(StrictModel):
     overlimits: Annotated[int, Field(ge=0)]
     backlog_bytes: Annotated[int, Field(ge=0)]
     queued_packets: Annotated[int, Field(ge=0)]
+    random_loss_packets: Annotated[int, Field(ge=0)]
+    random_loss_bytes: Annotated[int, Field(ge=0)]
+    random_loss_drops: Annotated[int, Field(ge=0)]
+    random_loss_overlimits: Annotated[int, Field(ge=0)]
+    random_loss_backlog_bytes: Annotated[int, Field(ge=0)]
+    random_loss_queued_packets: Annotated[int, Field(ge=0)]
     flow_counters: tuple[NetemFlowCounters, ...]
 
     @model_validator(mode="after")
@@ -188,10 +199,15 @@ class NetemSummary(StrictModel):
     packets_delta: Annotated[int, Field(ge=0)]
     bytes_delta: Annotated[int, Field(ge=0)]
     drops_delta: Annotated[int, Field(ge=0)]
+    random_loss_drops_delta: Annotated[int, Field(ge=0)]
+    queue_overflow_drops_delta: Annotated[int, Field(ge=0)]
+    drop_envelope_minimum: Annotated[int, Field(ge=0)]
     drop_envelope_maximum: Annotated[int, Field(ge=0)]
     observed_drop_percent: Annotated[float, Field(ge=0, le=100)]
     overlimits_delta: Annotated[int, Field(ge=0)]
+    random_loss_overlimits_delta: Annotated[int, Field(ge=0)]
     maximum_queued_packets: Annotated[int, Field(ge=0)]
+    maximum_random_loss_queued_packets: Annotated[int, Field(ge=0)]
     scoped_input_packets_delta: Annotated[int, Field(ge=0)]
     scoped_input_bytes_delta: Annotated[int, Field(ge=0)]
     flow_deltas: tuple[NetemFlowDelta, ...]
@@ -378,6 +394,19 @@ def install_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
         "delay",
         f"{_decimal(plan.delay_ms)}ms",
         f"{_decimal(plan.jitter_ms)}ms",
+    )
+    loss_add_arguments = (
+        "qdisc",
+        "add",
+        "dev",
+        plan.ifb_interface,
+        "parent",
+        NETEM_LOSS_QDISC_PARENT,
+        "handle",
+        NETEM_LOSS_QDISC_HANDLE,
+        "netem",
+        "limit",
+        str(NETEM_LOSS_QUEUE_LIMIT_PACKETS),
         "loss",
         "random",
         f"{_decimal(plan.loss_percent)}%",
@@ -397,6 +426,7 @@ def install_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
             mutation_may_have_applied = True
             raise
         mutation_may_have_applied = True
+        kernel.mutate_tc(loss_add_arguments)
         kernel.mutate_tc(("qdisc", "add", "dev", plan.ingress_interface, "clsact"))
         for flow in plan.flows:
             kernel.mutate_tc(_filter_add_arguments(plan, flow))
@@ -424,7 +454,7 @@ def capture_netem_observation(
     clock_proof: Callable[[float], KernelClockProof] = prove_linux_clock,
 ) -> NetemObservation:
     ingress, ifb = _validate_links(kernel, plan)
-    qdisc, flow_counters = _validate_kernel_state(kernel, plan)
+    delay_qdisc, loss_qdisc, flow_counters = _validate_kernel_state(kernel, plan)
     proof = clock_proof(1000)
     timestamp = datetime.fromtimestamp(proof.observed_at_unix_ms / 1000, tz=UTC)
     machine_id = _bounded_text(root / "etc/machine-id", 128)
@@ -448,19 +478,43 @@ def capture_netem_observation(
             ifb_ifindex=_positive_int(ifb.get("ifindex"), "netem_ifb_ifindex_invalid"),
             ingress_mtu_bytes=_positive_int(ingress.get("mtu"), "netem_ingress_mtu_invalid"),
             ifb_mtu_bytes=_positive_int(ifb.get("mtu"), "netem_ifb_mtu_invalid"),
-            qdisc_handle="7a10:",
+            delay_qdisc_handle="7a10:",
+            loss_qdisc_handle="7a20:",
+            loss_qdisc_parent="7a10:1",
             delay_ms=plan.delay_ms,
             jitter_ms=plan.jitter_ms,
             loss_percent=plan.loss_percent,
             queue_limit_packets=plan.queue_limit_packets,
             flows=plan.flows,
         ),
-        packets=_nonnegative_int(qdisc.get("packets"), "netem_qdisc_stats_invalid"),
-        bytes=_nonnegative_int(qdisc.get("bytes"), "netem_qdisc_stats_invalid"),
-        drops=_nonnegative_int(qdisc.get("drops"), "netem_qdisc_stats_invalid"),
-        overlimits=_nonnegative_int(qdisc.get("overlimits"), "netem_qdisc_stats_invalid"),
-        backlog_bytes=_nonnegative_int(qdisc.get("backlog"), "netem_qdisc_stats_invalid"),
-        queued_packets=_nonnegative_int(qdisc.get("qlen"), "netem_qdisc_stats_invalid"),
+        packets=_nonnegative_int(delay_qdisc.get("packets"), "netem_qdisc_stats_invalid"),
+        bytes=_nonnegative_int(delay_qdisc.get("bytes"), "netem_qdisc_stats_invalid"),
+        drops=_nonnegative_int(delay_qdisc.get("drops"), "netem_qdisc_stats_invalid"),
+        overlimits=_nonnegative_int(delay_qdisc.get("overlimits"), "netem_qdisc_stats_invalid"),
+        backlog_bytes=_nonnegative_int(
+            delay_qdisc.get("backlog"), "netem_qdisc_stats_invalid"
+        ),
+        queued_packets=_nonnegative_int(
+            delay_qdisc.get("qlen"), "netem_qdisc_stats_invalid"
+        ),
+        random_loss_packets=_nonnegative_int(
+            loss_qdisc.get("packets"), "netem_loss_qdisc_stats_invalid"
+        ),
+        random_loss_bytes=_nonnegative_int(
+            loss_qdisc.get("bytes"), "netem_loss_qdisc_stats_invalid"
+        ),
+        random_loss_drops=_nonnegative_int(
+            loss_qdisc.get("drops"), "netem_loss_qdisc_stats_invalid"
+        ),
+        random_loss_overlimits=_nonnegative_int(
+            loss_qdisc.get("overlimits"), "netem_loss_qdisc_stats_invalid"
+        ),
+        random_loss_backlog_bytes=_nonnegative_int(
+            loss_qdisc.get("backlog"), "netem_loss_qdisc_stats_invalid"
+        ),
+        random_loss_queued_packets=_nonnegative_int(
+            loss_qdisc.get("qlen"), "netem_loss_qdisc_stats_invalid"
+        ),
         flow_counters=flow_counters,
     )
 
@@ -582,6 +636,13 @@ def summarize_netem(
                     (observation.bytes, previous.bytes),
                     (observation.drops, previous.drops),
                     (observation.overlimits, previous.overlimits),
+                    (observation.random_loss_packets, previous.random_loss_packets),
+                    (observation.random_loss_bytes, previous.random_loss_bytes),
+                    (observation.random_loss_drops, previous.random_loss_drops),
+                    (
+                        observation.random_loss_overlimits,
+                        previous.random_loss_overlimits,
+                    ),
                 )
             ):
                 reasons.add("netem_counter_reset")
@@ -614,12 +675,39 @@ def summarize_netem(
     bytes_delta = observations[-1].bytes - first.bytes
     drops_delta = observations[-1].drops - first.drops
     overlimits_delta = observations[-1].overlimits - first.overlimits
+    random_loss_packets_delta = observations[-1].random_loss_packets - first.random_loss_packets
+    random_loss_bytes_delta = observations[-1].random_loss_bytes - first.random_loss_bytes
+    random_loss_drops_delta = observations[-1].random_loss_drops - first.random_loss_drops
+    random_loss_overlimits_delta = (
+        observations[-1].random_loss_overlimits - first.random_loss_overlimits
+    )
     if packets_delta <= 0 or bytes_delta <= 0:
         reasons.add("netem_no_scoped_traffic_observed")
     attempted_packets = max(0, packets_delta) + max(0, drops_delta)
-    drop_envelope_maximum = _random_loss_drop_upper_bound(attempted_packets, plan.loss_percent)
-    if drops_delta > drop_envelope_maximum:
+    random_loss_attempted_packets = max(0, random_loss_packets_delta) + max(
+        0, random_loss_drops_delta
+    )
+    drop_envelope_minimum, drop_envelope_maximum = _random_loss_drop_bounds(
+        random_loss_attempted_packets, plan.loss_percent
+    )
+    if random_loss_drops_delta < drop_envelope_minimum:
+        reasons.add("netem_drop_rate_below_random_loss_envelope")
+    if random_loss_drops_delta > drop_envelope_maximum:
         reasons.add("netem_drop_rate_above_random_loss_envelope")
+    queue_overflow_drops_delta = drops_delta - random_loss_drops_delta
+    if queue_overflow_drops_delta < 0:
+        reasons.add("netem_qdisc_drop_accounting_invalid")
+    elif queue_overflow_drops_delta > 0:
+        reasons.add("netem_queue_overflow_drop")
+    if (
+        random_loss_packets_delta != packets_delta
+        or random_loss_bytes_delta != bytes_delta
+        or random_loss_attempted_packets + max(0, queue_overflow_drops_delta)
+        != attempted_packets
+    ):
+        reasons.add("netem_qdisc_hierarchy_accounting_mismatch")
+    if random_loss_attempted_packets >= NETEM_LOSS_QUEUE_LIMIT_PACKETS:
+        reasons.add("netem_loss_qdisc_capacity_exhausted")
     first_flows = {item.key: item for item in first.flow_counters}
     last_flows = {item.key: item for item in observations[-1].flow_counters}
     flow_deltas: list[NetemFlowDelta] = []
@@ -660,6 +748,10 @@ def summarize_netem(
             observations[-1].queued_packets,
             first.backlog_bytes,
             observations[-1].backlog_bytes,
+            first.random_loss_queued_packets,
+            observations[-1].random_loss_queued_packets,
+            first.random_loss_backlog_bytes,
+            observations[-1].random_loss_backlog_bytes,
         )
     ):
         reasons.add("netem_queue_not_drained_at_boundary")
@@ -671,11 +763,22 @@ def summarize_netem(
             getattr(observations[-1], field) != getattr(observations[-2], field)
             for field in ("packets", "bytes", "drops", "overlimits")
         )
+        or any(
+            getattr(observations[-1], field) != getattr(observations[-2], field)
+            for field in (
+                "random_loss_packets",
+                "random_loss_bytes",
+                "random_loss_drops",
+                "random_loss_overlimits",
+            )
+        )
         or observations[-1].flow_counters != observations[-2].flow_counters
     ):
         reasons.add("netem_traffic_not_quiescent_at_end")
     if overlimits_delta != 0:
         reasons.add("netem_queue_overlimit")
+    if random_loss_overlimits_delta != 0:
+        reasons.add("netem_loss_queue_overlimit")
     ordered_reasons = tuple(sorted(reasons))
     return NetemSummary(
         schema_version=1,
@@ -695,16 +798,47 @@ def summarize_netem(
         packets_delta=max(0, packets_delta),
         bytes_delta=max(0, bytes_delta),
         drops_delta=max(0, drops_delta),
+        random_loss_drops_delta=max(0, random_loss_drops_delta),
+        queue_overflow_drops_delta=max(0, queue_overflow_drops_delta),
+        drop_envelope_minimum=drop_envelope_minimum,
         drop_envelope_maximum=drop_envelope_maximum,
         observed_drop_percent=(
-            max(0, drops_delta) / attempted_packets * 100 if attempted_packets else 0
+            max(0, random_loss_drops_delta) / random_loss_attempted_packets * 100
+            if random_loss_attempted_packets
+            else 0
         ),
         overlimits_delta=max(0, overlimits_delta),
+        random_loss_overlimits_delta=max(0, random_loss_overlimits_delta),
         maximum_queued_packets=max(item.queued_packets for item in observations),
+        maximum_random_loss_queued_packets=max(
+            item.random_loss_queued_packets for item in observations
+        ),
         scoped_input_packets_delta=scoped_input_packets_delta,
         scoped_input_bytes_delta=scoped_input_bytes_delta,
         flow_deltas=tuple(flow_deltas),
     )
+
+
+def recompute_stored_netem_summary(
+    profile: LoadProfile,
+    plan: NetemSitePlan,
+    observations_path: Path,
+    summary_path: Path,
+    *,
+    coordinated_start_unix_ms: int,
+) -> tuple[tuple[NetemObservation, ...], NetemSummary]:
+    observations = load_netem_observations(observations_path)
+    expected = summarize_netem(
+        profile,
+        plan,
+        observations,
+        observations_sha256=_sha256_file(observations_path),
+        coordinated_start_unix_ms=coordinated_start_unix_ms,
+    )
+    stored = NetemSummary.model_validate_json(summary_path.read_text(encoding="utf-8"))
+    if stored != expected or not stored.valid:
+        raise ValueError("netem_summary_not_reproducible_or_invalid")
+    return observations, stored
 
 
 def validate_netem_comparison_tool_versions(
@@ -777,6 +911,7 @@ def _validate_links(
     if (
         not isinstance(linkinfo, dict)
         or linkinfo.get("info_kind") != "ifb"
+        or "master" in ifb
         or not _ifb_address_inventory_is_dedicated(ifb.get("addr_info"))
     ):
         raise ValueError("netem_ifb_not_dedicated")
@@ -786,8 +921,6 @@ def _validate_links(
 
 
 def _ifb_address_inventory_is_dedicated(value: object) -> bool:
-    if value is None:
-        return True
     if not isinstance(value, list):
         return False
     for entry in value:
@@ -809,18 +942,26 @@ def _ifb_address_inventory_is_dedicated(value: object) -> bool:
 
 def _validate_kernel_state(
     kernel: NetemKernel, plan: NetemSitePlan
-) -> tuple[dict[str, object], tuple[NetemFlowCounters, ...]]:
+) -> tuple[dict[str, object], dict[str, object], tuple[NetemFlowCounters, ...]]:
     ifb_qdiscs = kernel.qdiscs(plan.ifb_interface)
-    netem = [
+    delay_qdiscs = [
         item
         for item in ifb_qdiscs
         if item.get("kind") == "netem"
         and item.get("handle") == NETEM_QDISC_HANDLE
         and item.get("root") is True
     ]
-    if len(netem) != 1 or len(ifb_qdiscs) != 1:
+    loss_qdiscs = [
+        item
+        for item in ifb_qdiscs
+        if item.get("kind") == "netem"
+        and item.get("handle") == NETEM_LOSS_QDISC_HANDLE
+        and item.get("parent") == NETEM_LOSS_QDISC_PARENT
+    ]
+    if len(delay_qdiscs) != 1 or len(loss_qdiscs) != 1 or len(ifb_qdiscs) != 2:
         raise ValueError("netem_qdisc_set_invalid")
-    _validate_netem_options(netem[0].get("options"), plan)
+    _validate_delay_netem_options(delay_qdiscs[0].get("options"), plan)
+    _validate_loss_netem_options(loss_qdiscs[0].get("options"), plan)
     ingress_special = [
         item
         for item in kernel.qdiscs(plan.ingress_interface)
@@ -851,7 +992,7 @@ def _validate_kernel_state(
     )
     if observed != expected:
         raise ValueError("netem_filter_set_invalid")
-    return netem[0], observed_counters
+    return delay_qdiscs[0], loss_qdiscs[0], observed_counters
 
 
 def _normalize_filter_inventory(
@@ -875,27 +1016,42 @@ def _normalize_filter_inventory(
     return details
 
 
-def _validate_netem_options(options: object, plan: NetemSitePlan) -> None:
+def _validate_delay_netem_options(options: object, plan: NetemSitePlan) -> None:
     if not isinstance(options, dict):
         raise ValueError("netem_qdisc_options_invalid")
-    allowed = {"limit", "delay", "loss-random", "ecn", "gap"}
+    allowed = {"limit", "delay", "ecn", "gap"}
     if set(options) - allowed:
         raise ValueError("netem_qdisc_options_invalid")
     delay = options.get("delay")
-    loss = options.get("loss-random")
-    if not isinstance(delay, dict) or not isinstance(loss, dict):
+    if not isinstance(delay, dict):
         raise ValueError("netem_qdisc_options_invalid")
     if (
         options.get("limit") != plan.queue_limit_packets
         or not _near(delay.get("delay"), plan.delay_ms / 1000)
         or not _near(delay.get("jitter"), plan.jitter_ms / 1000)
         or not _near(delay.get("correlation", 0), 0)
+        or options.get("ecn") not in (None, False)
+        or options.get("gap") not in (None, 0)
+    ):
+        raise ValueError("netem_qdisc_options_invalid")
+
+
+def _validate_loss_netem_options(options: object, plan: NetemSitePlan) -> None:
+    if not isinstance(options, dict):
+        raise ValueError("netem_loss_qdisc_options_invalid")
+    allowed = {"limit", "loss-random", "ecn", "gap"}
+    if set(options) - allowed:
+        raise ValueError("netem_loss_qdisc_options_invalid")
+    loss = options.get("loss-random")
+    if (
+        not isinstance(loss, dict)
+        or options.get("limit") != NETEM_LOSS_QUEUE_LIMIT_PACKETS
         or not _near(loss.get("loss"), plan.loss_percent / 100)
         or not _near(loss.get("correlation", 0), 0)
         or options.get("ecn") not in (None, False)
         or options.get("gap") not in (None, 0)
     ):
-        raise ValueError("netem_qdisc_options_invalid")
+        raise ValueError("netem_loss_qdisc_options_invalid")
 
 
 def _parse_filter(item: dict[str, object], ifb_interface: str) -> NetemFlowCounters:
@@ -1017,25 +1173,35 @@ def _cleanup_owned_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
         raise ValueError("netem_cleanup_foreign_ingress_state")
 
     ifb_qdiscs = kernel.qdiscs(plan.ifb_interface)
-    owned_ifb_qdiscs = [
+    owned_delay_qdiscs = [
         item
         for item in ifb_qdiscs
         if item.get("kind") == "netem"
         and item.get("handle") == NETEM_QDISC_HANDLE
         and item.get("root") is True
     ]
-    if len(owned_ifb_qdiscs) > 1:
+    owned_loss_qdiscs = [
+        item
+        for item in ifb_qdiscs
+        if item.get("kind") == "netem"
+        and item.get("handle") == NETEM_LOSS_QDISC_HANDLE
+        and item.get("parent") == NETEM_LOSS_QDISC_PARENT
+    ]
+    if len(owned_delay_qdiscs) > 1 or len(owned_loss_qdiscs) > 1:
         raise ValueError("netem_cleanup_foreign_ifb_state")
-    if owned_ifb_qdiscs:
-        if len(ifb_qdiscs) != 1:
+    if owned_delay_qdiscs:
+        expected_owned_count = 1 + bool(owned_loss_qdiscs)
+        if len(ifb_qdiscs) != expected_owned_count:
             raise ValueError("netem_cleanup_foreign_ifb_state")
         try:
-            _validate_netem_options(owned_ifb_qdiscs[0].get("options"), plan)
+            _validate_delay_netem_options(owned_delay_qdiscs[0].get("options"), plan)
+            if owned_loss_qdiscs:
+                _validate_loss_netem_options(owned_loss_qdiscs[0].get("options"), plan)
         except ValueError as error:
             raise ValueError("netem_cleanup_foreign_ifb_state") from error
-    elif not _is_kernel_default_qdisc_inventory(ifb_qdiscs):
+    elif owned_loss_qdiscs or not _is_kernel_default_qdisc_inventory(ifb_qdiscs):
         raise ValueError("netem_cleanup_foreign_ifb_state")
-    if ingress_special and not observed_flow_keys and not owned_ifb_qdiscs:
+    if ingress_special and not observed_flow_keys and not owned_delay_qdiscs:
         raise ValueError("netem_cleanup_foreign_ingress_state")
 
     ingress_error: BaseException | None = None
@@ -1056,7 +1222,7 @@ def _cleanup_owned_netem(kernel: NetemKernel, plan: NetemSitePlan) -> None:
             raise ValueError("netem_cleanup_ingress_qdisc_remains") from ingress_error
 
     ifb_error: BaseException | None = None
-    if owned_ifb_qdiscs:
+    if owned_delay_qdiscs:
         try:
             kernel.mutate_tc(("qdisc", "del", "dev", plan.ifb_interface, "root"))
         except BaseException as error:
@@ -1085,6 +1251,9 @@ def _configuration_without_ifindices(plan: NetemSitePlan) -> tuple[object, ...]:
         plan.ifb_interface,
         plan.ingress_mtu_bytes,
         plan.ingress_mtu_bytes,
+        NETEM_QDISC_HANDLE,
+        NETEM_LOSS_QDISC_HANDLE,
+        NETEM_LOSS_QDISC_PARENT,
         plan.delay_ms,
         plan.jitter_ms,
         plan.loss_percent,
@@ -1102,6 +1271,9 @@ def _configuration_without_ifindices_from_observation(
         config.ifb_interface,
         config.ingress_mtu_bytes,
         config.ifb_mtu_bytes,
+        config.delay_qdisc_handle,
+        config.loss_qdisc_handle,
+        config.loss_qdisc_parent,
         config.delay_ms,
         config.jitter_ms,
         config.loss_percent,
@@ -1178,17 +1350,22 @@ def _near(value: object, expected: float) -> bool:
     )
 
 
-def _random_loss_drop_upper_bound(attempted_packets: int, loss_percent: float) -> int:
+def _random_loss_drop_bounds(attempted_packets: int, loss_percent: float) -> tuple[int, int]:
     if attempted_packets <= 0:
-        return 0
+        return 0, 0
     probability = loss_percent / 100
     expected = attempted_packets * probability
     standard_deviation = math.sqrt(attempted_packets * probability * (1 - probability))
     measurement_tolerance = max(3, math.ceil(attempted_packets * 0.001))
-    return min(
+    minimum = max(
+        1,
+        math.floor(expected - 6 * standard_deviation) - measurement_tolerance,
+    )
+    maximum = min(
         attempted_packets,
         math.ceil(expected + 6 * standard_deviation) + measurement_tolerance,
     )
+    return min(minimum, maximum), maximum
 
 
 def _positive_int(value: object, reason: str) -> int:
