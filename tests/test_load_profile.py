@@ -26,7 +26,6 @@ from rtsp_proxy.load_evidence import (
     RuntimeProcessLimit,
     SutObservation,
     summarize_generator_headroom,
-    summarize_sut_capacity,
 )
 from rtsp_proxy.load_profile import (
     LoadProfile,
@@ -62,6 +61,7 @@ from rtsp_proxy.load_runtime import (
     RuntimeSetting,
     capture_generator_runtime,
     validate_runtime_comparison_pair,
+    validate_runtime_manifest,
 )
 
 
@@ -623,8 +623,33 @@ def test_unimplemented_workload_drivers_fail_closed() -> None:
         LoadProfile.model_validate(raw)
 
 
+@pytest.mark.parametrize(
+    ("machine", "architecture", "cpuinfo", "expected_cpu_model"),
+    [
+        (
+            "x86_64",
+            "amd64",
+            "processor : 0\nmodel name : Test CPU\nprocessor : 1\n",
+            "Test CPU",
+        ),
+        (
+            "aarch64",
+            "arm64",
+            (
+                "processor : 0\nCPU implementer : 0x41\nCPU architecture : 8\n"
+                "CPU variant : 0x3\nCPU part : 0xd0c\nprocessor : 1\n"
+            ),
+            "CPU implementer=0x41 CPU architecture=8 CPU variant=0x3 CPU part=0xd0c",
+        ),
+    ],
+)
 def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    machine: str,
+    architecture: Literal["amd64", "arm64"],
+    cpuinfo: str,
+    expected_cpu_model: str,
 ) -> None:
     raw = valid_profile()
     hosts = raw["generator_hosts"]
@@ -632,7 +657,7 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
     assert isinstance(hosts, list)
     assert isinstance(hosts[0], dict)
     assert isinstance(artifacts, dict)
-    hosts[0]["architecture"] = "amd64"
+    hosts[0]["architecture"] = architecture
     artifacts["gstreamer_build_id"] = "1.24.2-1ubuntu0.1"
     source_binary = tmp_path / "opt/rtsp-pull-server"
     reader_binary = tmp_path / "opt/rtsp-load-reader"
@@ -657,7 +682,7 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
         for index, pid in enumerate(pids)
     )
     monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(platform, "machine", lambda: machine)
     observed_at = 4_102_444_799_000
 
     class FakeAdjtimex:
@@ -691,7 +716,7 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
         "etc/machine-id": "machine-a\n",
         "proc/sys/kernel/osrelease": "6.8.0-test\n",
         "proc/sys/kernel/random/boot_id": "11111111-1111-1111-1111-111111111111\n",
-        "proc/cpuinfo": "processor : 0\nmodel name : Test CPU\nprocessor : 1\n",
+        "proc/cpuinfo": cpuinfo,
         "proc/stat": "cpu  100 20 30 400 50 6 7 8 0 0\n",
         "proc/meminfo": "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\n",
         "proc/net/tcp": "  sl  local_address rem_address st\n",
@@ -699,11 +724,11 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
         "var/lib/dpkg/status": (
             "Package: libgstreamer1.0-0\n"
             "Status: install ok installed\n"
-            "Architecture: amd64\n"
+            f"Architecture: {architecture}\n"
             "Version: 1.24.2-1ubuntu0.1\n\n"
             "Package: gstreamer1.0-plugins-good\n"
             "Status: install ok installed\n"
-            "Architecture: amd64\n"
+            f"Architecture: {architecture}\n"
             "Version: 1.24.2-1ubuntu0.1\n"
         ),
     }.items():
@@ -795,14 +820,67 @@ def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
         root=tmp_path,
     )
 
-    assert manifest.architecture == "amd64"
-    assert manifest.cpu_model == "Test CPU"
+    assert manifest.architecture == architecture
+    assert manifest.cpu_model == expected_cpu_model
     assert manifest.logical_cpu_count == 2
     assert manifest.gstreamer is not None
     assert manifest.gstreamer.package_build_id == "1.24.2-1ubuntu0.1"
     assert manifest.gstreamer.loaded_libraries[0].process_ids == pids
     assert manifest.capture_started_clock.observed_at_unix_ms == observed_at
     assert manifest.capture_completed_clock.observed_at_unix_ms == observed_at + 1
+
+    monkeypatch.setattr(time, "time_ns", lambda: observed_at * 1_000_000)
+    with pytest.raises(ValueError, match="runtime_path_must_be_absolute"):
+        capture_generator_runtime(
+            profile,
+            host="generator-a",
+            pids=pids,
+            cgroup="rtsp-load.slice",
+            expected_executables={item.pid: item.executable_sha256 for item in bindings},
+            gst_launch_binary=Path("usr/bin/gst-launch-1.0"),
+            root=tmp_path,
+        )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="gst-launch-1.0 version 1.23.0\nGStreamer 1.23.0\n"
+        ),
+    )
+    with pytest.raises(ValueError, match="gstreamer_version_mismatch"):
+        capture_generator_runtime(
+            profile,
+            host="generator-a",
+            pids=pids,
+            cgroup="rtsp-load.slice",
+            expected_executables={item.pid: item.executable_sha256 for item in bindings},
+            gst_launch_binary=Path("/usr/bin/gst-launch-1.0"),
+            root=tmp_path,
+        )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="gst-launch-1.0 version 1.24.2\nGStreamer 1.24.2\n"
+        ),
+    )
+    (tmp_path / "var/lib/dpkg/status").write_text(
+        "Package: libgstreamer1.0-0\n"
+        "Status: install ok installed\n"
+        f"Architecture: {architecture}\n"
+        "Version: unexpected-build\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="gstreamer_package_build_mismatch"):
+        capture_generator_runtime(
+            profile,
+            host="generator-a",
+            pids=pids,
+            cgroup="rtsp-load.slice",
+            expected_executables={item.pid: item.executable_sha256 for item in bindings},
+            gst_launch_binary=Path("/usr/bin/gst-launch-1.0"),
+            root=tmp_path,
+        )
 
 
 def test_cold_runtime_pair_rejects_environment_drift_but_not_process_identity() -> None:
@@ -897,11 +975,115 @@ def test_cold_runtime_pair_rejects_environment_drift_but_not_process_identity() 
         ("net.ipv4.ip_local_port_range", "60999 32768"),
         ("net.ipv4.ip_local_reserved_ports", "9000,8000"),
         ("net.core.somaxconn", "not-a-number"),
+        ("net.core.unknown", "1"),
+        ("net.core.somaxconn", "0"),
+        ("net.ipv4.tcp_tw_reuse", "3"),
     ],
 )
 def test_runtime_setting_rejects_untyped_or_noncanonical_sysctls(name: str, value: str) -> None:
     with pytest.raises(ValidationError):
         RuntimeSetting(name=name, value=value)
+
+
+def test_runtime_models_reject_noncanonical_limits_libraries_and_inventory() -> None:
+    process = RuntimeProcess(
+        pid=1,
+        executable_sha256="a" * 64,
+        start_time_ticks=1,
+        max_open_files_soft=100,
+        max_open_files_hard=200,
+        max_processes_soft=100,
+        max_processes_hard=200,
+    )
+    for update in (
+        {"max_open_files_soft": 201},
+        {"max_processes_soft": 201},
+        {"max_processes_soft": "unlimited", "max_processes_hard": 200},
+    ):
+        with pytest.raises(ValidationError, match="runtime_process_soft_limit_exceeds_hard"):
+            RuntimeProcess.model_validate({**process.model_dump(mode="json"), **update})
+
+    library = RuntimeLibrary(
+        path="/usr/lib/libgstreamer-1.0.so.0",
+        sha256="b" * 64,
+        size_bytes=1,
+        device_major=8,
+        device_minor=1,
+        inode=1,
+        process_ids=(1,),
+    )
+    with pytest.raises(ValidationError, match="runtime_library_process_ids_not_canonical"):
+        RuntimeLibrary.model_validate({**library.model_dump(mode="json"), "process_ids": [1, 1]})
+
+    package = RuntimePackage(name="libgstreamer1.0-0", version="1", architecture="amd64")
+    with pytest.raises(ValidationError, match="gstreamer_runtime_inventory_not_canonical"):
+        GStreamerRuntime(
+            version="1.24.2",
+            package_build_id="1",
+            gst_launch_path="/usr/bin/gst-launch-1.0",
+            gst_launch_sha256="c" * 64,
+            packages=(package,),
+            packages_sha256="d" * 64,
+            loaded_libraries=(library,),
+        )
+
+    profile = LoadProfile.model_validate(valid_profile())
+    manifest = runtime_manifest(
+        profile,
+        role="generator",
+        host="generator-a",
+        architecture="amd64",
+        processes=runtime_process_bindings(),
+        machine_id_sha256="a" * 64,
+        boot_id="11111111-1111-1111-1111-111111111111",
+        observed_at_unix_ms=4_102_444_799_000,
+    )
+    manifest_payload = manifest.model_dump(mode="json")
+    completed_clock = manifest.capture_completed_clock.model_copy(
+        update={"observed_at_unix_ms": manifest.capture_started_clock.observed_at_unix_ms - 1}
+    )
+    with pytest.raises(ValidationError, match="linux_runtime_manifest_not_canonical"):
+        LinuxRuntimeManifest.model_validate(
+            {**manifest_payload, "capture_completed_clock": completed_clock.model_dump(mode="json")}
+        )
+    runtime = manifest.gstreamer
+    assert runtime is not None
+    incomplete_library = runtime.loaded_libraries[0].model_copy(update={"process_ids": (100,)})
+    with pytest.raises(ValidationError, match="gstreamer_runtime_process_coverage_incomplete"):
+        LinuxRuntimeManifest.model_validate(
+            {
+                **manifest_payload,
+                "gstreamer": runtime.model_copy(
+                    update={"loaded_libraries": (incomplete_library,)}
+                ).model_dump(mode="json"),
+            }
+        )
+
+
+def test_runtime_capture_rejects_unknown_host_and_linux_platform_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = LoadProfile.model_validate(valid_profile())
+    arguments: dict[str, Any] = {
+        "pids": (1,),
+        "cgroup": "load.slice",
+        "expected_executables": {1: "a" * 64},
+        "gst_launch_binary": Path("/usr/bin/gst-launch-1.0"),
+        "root": tmp_path,
+    }
+    with pytest.raises(ValueError, match="unknown_generator_host"):
+        capture_generator_runtime(profile, host="unknown", **arguments)
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    with pytest.raises(ValueError, match="runtime_manifest_requires_linux"):
+        capture_generator_runtime(profile, host="generator-a", **arguments)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "mips64")
+    with pytest.raises(ValueError, match="runtime_manifest_architecture_unsupported"):
+        capture_generator_runtime(profile, host="generator-a", **arguments)
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    with pytest.raises(ValueError, match="runtime_manifest_architecture_mismatch"):
+        capture_generator_runtime(profile, host="generator-a", **arguments)
 
 
 @pytest.mark.parametrize(
@@ -1367,20 +1549,16 @@ def test_functional_proxy_finalization_recomputes_real_sut_evidence_seam(
         "".join(item.model_dump_json() + "\n" for item in sut_observations),
         encoding="utf-8",
     )
-    write_summary(
-        run_directory / "summary/sut.json",
-        summarize_sut_capacity(
-            sut_observations,
-            expected_sut_host=profile.sut_rtsp_host,
-            expected_interval_seconds=1,
-            maximum_gap_factor=1.5,
-            observations_sha256=sha256_file(sut_raw),
-            measurement_start_unix_ms=scheduled_start_ms,
-            measurement_end_unix_ms=scheduled_start_ms + 1000,
-            soak_end_unix_ms=scheduled_start_ms + 1000,
-            maximum_clock_error_ms=10,
-            capacity_gate=False,
-        ),
+    assert (
+        load_cli_main(
+            [
+                "summarize-sut",
+                str(run_directory),
+                str(sut_raw),
+                str(run_directory / "summary/sut.json"),
+            ]
+        )
+        == 0
     )
     write_summary(
         run_directory / "raw/runtime-sut.json",
@@ -1398,6 +1576,249 @@ def test_functional_proxy_finalization_recomputes_real_sut_evidence_seam(
 
     finalize_run_directory(run_directory)
     verify_run_directory(run_directory)
+
+
+def test_load_cli_rejects_inapplicable_or_incomplete_runtime_commands_via_public_seam(
+    tmp_path: Path,
+) -> None:
+    raw = valid_profile()
+    workload = raw["workload"]
+    assert isinstance(workload, dict)
+    workload["endpoint_mode"] = "direct-control"
+    profile = LoadProfile.model_validate(raw)
+    run_directory = tmp_path / "direct-run"
+    initialize_run_directory(profile, run_directory)
+    (run_directory / "raw").mkdir()
+    (run_directory / "summary").mkdir()
+    (run_directory / "launch-plan.json").write_text(
+        json.dumps(
+            {
+                "coordinated_start_unix_ms": 4_102_444_800_000,
+                "source_servers": [{"generator_host": "generator-a"}],
+                "readers": [{"generator_host": "generator-a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    commands = (
+        [
+            "capture-generator-runtime",
+            str(run_directory),
+            "--generator-host",
+            "generator-a",
+            "--source-pid",
+            "101",
+            "--cgroup",
+            "rtsp-load.slice",
+            "--gst-launch-binary",
+            "/usr/bin/gst-launch-1.0",
+        ],
+        [
+            "capture-sut-runtime",
+            str(run_directory),
+            "--mediamtx-pid",
+            "201",
+            "--cgroup",
+            "mediamtx.service",
+        ],
+        [
+            "capture-generator-runtime",
+            str(run_directory),
+            "--generator-host",
+            "generator-a",
+            "--source-pid",
+            "101",
+            "--reader-pid",
+            "102",
+            "--cgroup",
+            "rtsp-load.slice",
+            "--gst-launch-binary",
+            "/usr/bin/gst-launch-1.0",
+        ],
+        [
+            "sample-sut",
+            str(run_directory),
+            str(run_directory / "raw/sut.jsonl"),
+            "--mediamtx-pid",
+            "201",
+            "--cgroup",
+            "mediamtx.service",
+            "--metrics-url",
+            "http://127.0.0.1:9998/metrics",
+        ],
+        [
+            "summarize-sut",
+            str(run_directory),
+            str(run_directory / "raw/sut.jsonl"),
+            str(run_directory / "summary/sut.json"),
+        ],
+        [
+            "sample-generator",
+            str(run_directory),
+            str(run_directory / "raw/unknown.jsonl"),
+            "--generator-host",
+            "unknown",
+            "--source-pid",
+            "101",
+            "--cgroup",
+            "rtsp-load.slice",
+        ],
+    )
+    assert [load_cli_main(command) for command in commands] == [2, 2, 2, 2, 2, 2]
+
+    generator_output = run_directory / "raw/generator.jsonl"
+    generator_output.write_text("", encoding="utf-8")
+    assert (
+        load_cli_main(
+            [
+                "sample-generator",
+                str(run_directory),
+                str(tmp_path / "outside.jsonl"),
+                "--generator-host",
+                "generator-a",
+                "--source-pid",
+                "101",
+                "--reader-pid",
+                "102",
+                "--cgroup",
+                "rtsp-load.slice",
+            ]
+        )
+        == 2
+    )
+    assert (
+        load_cli_main(
+            [
+                "sample-generator",
+                str(run_directory),
+                str(generator_output),
+                "--generator-host",
+                "generator-a",
+                "--source-pid",
+                "101",
+                "--cgroup",
+                "rtsp-load.slice",
+            ]
+        )
+        == 2
+    )
+    (run_directory / "launch-plan.json").write_text(
+        json.dumps(
+            {
+                "coordinated_start_unix_ms": None,
+                "source_servers": [{"generator_host": "generator-a"}],
+                "readers": [{"generator_host": "generator-a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    exact_generator_arguments = [
+        "--generator-host",
+        "generator-a",
+        "--source-pid",
+        "101",
+        "--reader-pid",
+        "102",
+        "--cgroup",
+        "rtsp-load.slice",
+    ]
+    assert (
+        load_cli_main(
+            [
+                "sample-generator",
+                str(run_directory),
+                str(generator_output),
+                *exact_generator_arguments,
+            ]
+        )
+        == 2
+    )
+    assert (
+        load_cli_main(
+            [
+                "summarize-generator",
+                str(run_directory),
+                str(generator_output),
+                str(run_directory / "summary/generator.json"),
+                "--generator-host",
+                "generator-a",
+            ]
+        )
+        == 2
+    )
+    assert (
+        load_cli_main(
+            [
+                "apply-paths",
+                str(run_directory),
+                "--api-url",
+                "http://192.0.2.1:9997",
+            ]
+        )
+        == 2
+    )
+    assert (
+        load_cli_main(
+            [
+                "preflight-cold",
+                str(run_directory),
+                "--api-url",
+                "http://127.0.0.1:9997",
+            ]
+        )
+        == 2
+    )
+
+    proxy_run = tmp_path / "proxy-run"
+    initialize_run_directory(LoadProfile.model_validate(valid_profile()), proxy_run)
+    (proxy_run / "raw").mkdir()
+    (proxy_run / "summary").mkdir()
+    (proxy_run / "launch-plan.json").write_text(
+        json.dumps({"coordinated_start_unix_ms": None}), encoding="utf-8"
+    )
+    sut_observations = proxy_run / "raw/sut.jsonl"
+    sut_observations.write_text("", encoding="utf-8")
+    assert (
+        load_cli_main(
+            [
+                "capture-sut-runtime",
+                str(proxy_run),
+                "--mediamtx-pid",
+                "201",
+                "--cgroup",
+                "mediamtx.service",
+            ]
+        )
+        == 2
+    )
+    assert (
+        load_cli_main(
+            [
+                "sample-sut",
+                str(proxy_run),
+                str(sut_observations),
+                "--mediamtx-pid",
+                "201",
+                "--cgroup",
+                "mediamtx.service",
+                "--metrics-url",
+                "http://127.0.0.1:9998/metrics",
+            ]
+        )
+        == 2
+    )
+    assert (
+        load_cli_main(
+            [
+                "summarize-sut",
+                str(proxy_run),
+                str(sut_observations),
+                str(proxy_run / "summary/sut.json"),
+            ]
+        )
+        == 2
+    )
 
 
 def test_cold_finalization_requires_typed_inactive_path_preflight(tmp_path: Path) -> None:
@@ -1761,6 +2182,45 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     stored_runtime = LinuxRuntimeManifest.model_validate_json(
         runtime_path.read_text(encoding="utf-8")
     )
+    validation_arguments: dict[str, Any] = {
+        "role": "generator",
+        "host": "generator-a",
+        "expected_architecture": profile.generator_hosts[0].architecture,
+        "coordinated_anchor_start_unix_ms": warm_anchor_start_unix_ms(profile, scheduled_start_ms),
+        "coordinated_measurement_start_unix_ms": measurement_start_unix_ms(
+            profile, scheduled_start_ms
+        ),
+        "resource_summary": restored_summary,
+    }
+    validate_runtime_manifest(profile, stored_runtime, **validation_arguments)
+    with pytest.raises(ValueError, match="runtime_manifest_binding_invalid"):
+        validate_runtime_manifest(
+            profile,
+            stored_runtime.model_copy(update={"host": "wrong-host"}),
+            **validation_arguments,
+        )
+    with pytest.raises(ValueError, match="runtime_manifest_requires_resource_summary"):
+        validate_runtime_manifest(
+            profile,
+            stored_runtime,
+            **{**validation_arguments, "resource_summary": None},
+        )
+    runtime = stored_runtime.gstreamer
+    assert runtime is not None
+    with pytest.raises(ValueError, match="runtime_manifest_gstreamer_binding_invalid"):
+        validate_runtime_manifest(
+            profile,
+            stored_runtime.model_copy(
+                update={"gstreamer": runtime.model_copy(update={"version": "1.23.0"})}
+            ),
+            **validation_arguments,
+        )
+    with pytest.raises(ValueError, match="runtime_manifest_sut_has_gstreamer_inventory"):
+        validate_runtime_manifest(
+            profile,
+            stored_runtime.model_copy(update={"role": "sut"}),
+            **{**validation_arguments, "role": "sut"},
+        )
     runtime_path.write_text(
         stored_runtime.model_copy(update={"machine_id_sha256": "5" * 64}).model_dump_json() + "\n",
         encoding="utf-8",

@@ -158,27 +158,31 @@ def test_native_runtime_capture_binds_real_proc_cgroup_dpkg_and_maps() -> None:
     interface = route[0]["dev"]
     mtu = int(Path(f"/sys/class/net/{interface}/mtu").read_text(encoding="utf-8"))
     unit = f"rtsp-runtime-contract-{os.getpid()}.service"
-    subprocess.run(
-        [
-            "sudo",
-            "systemd-run",
-            f"--unit={unit}",
-            "--property=CPUQuota=200%",
-            "--property=MemoryMax=1G",
-            "--property=TasksMax=128",
-            "--collect",
-            "/usr/bin/gst-launch-1.0",
-            "videotestsrc",
-            "is-live=true",
-            "!",
-            "fakesink",
-            "sync=false",
-        ],
-        check=True,
-        timeout=15,
-    )
     try:
+        subprocess.run(
+            [
+                "sudo",
+                "systemd-run",
+                f"--unit={unit}",
+                f"--uid={os.getuid()}",
+                "--property=CPUQuota=200%",
+                "--property=MemoryMax=1G",
+                "--property=TasksMax=128",
+                "--collect",
+                "/usr/bin/gst-launch-1.0",
+                "videotestsrc",
+                "is-live=true",
+                "!",
+                "fakesink",
+                "sync=false",
+            ],
+            check=True,
+            timeout=15,
+        )
         pid = _wait_for_main_pid(unit)
+        process_status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        uid_match = re.search(r"^Uid:\s+(\d+)\s+", process_status, re.MULTILINE)
+        assert uid_match is not None and int(uid_match.group(1)) == os.getuid()
         executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
         executable_sha256 = _sha256(executable)
         membership = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").strip()
