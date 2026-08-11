@@ -832,7 +832,8 @@ def _validate_kernel_state(
     if kernel.egress_filters(plan.ingress_interface):
         raise ValueError("netem_egress_filter_set_invalid")
     if len(filters) != len(plan.flows):
-        raise ValueError("netem_filter_set_invalid")
+        inventory = json.dumps(filters, sort_keys=True, separators=(",", ":"))[:4096]
+        raise ValueError(f"netem_filter_set_invalid:{inventory}")
     observed_counters = tuple(
         sorted(
             (_parse_filter(item, plan.ifb_interface) for item in filters),
