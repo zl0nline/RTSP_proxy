@@ -350,11 +350,20 @@ def test_opus_track_is_consumed_and_sequence_checked_with_video(tmp_path: Path) 
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env={
+            **os.environ,
+            "GST_DEBUG": "rtspmedia:7,rtspclient:6,rtspserver:6",
+        },
     )
     try:
         wait_for_listener(server, port)
         probe = probe_source(FFPROBE_BINARY, port, "source-00000", "tcp")
-        assert probe.returncode == 0, probe.stderr
+        if probe.returncode != 0:
+            os.kill(server.pid, signal.SIGINT)
+            server_output, _ = server.communicate(timeout=10)
+            pytest.fail(
+                f"{probe.stderr}\n[DEBUG-a4f2] pull server trace:\n{server_output}"
+            )
         assert {
             (stream["codec_type"], stream["codec_name"])
             for stream in json.loads(probe.stdout)["streams"]
@@ -392,7 +401,13 @@ def test_opus_track_is_consumed_and_sequence_checked_with_video(tmp_path: Path) 
             text=True,
             timeout=15,
         )
-        assert reader.returncode == 0, reader.stdout + reader.stderr
+        if reader.returncode != 0:
+            os.kill(server.pid, signal.SIGINT)
+            server_output, _ = server.communicate(timeout=10)
+            pytest.fail(
+                f"{reader.stdout}{reader.stderr}"
+                f"\n[DEBUG-a4f2] pull server trace:\n{server_output}"
+            )
         events = [
             json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()
         ]
