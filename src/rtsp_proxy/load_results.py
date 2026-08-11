@@ -285,19 +285,11 @@ def injected_reconnect_backoff_ms(
     if profile.reader_lifecycle.mode != "outage":
         return profile.reader_lifecycle.backoff_base_ms
     mask = (1 << 32) - 1
-    value = (
-        profile.seed
-        ^ (reader_id * 2654435761 & mask)
-        ^ (cycle * 2246822519 & mask)
-    ) & mask
+    value = (profile.seed ^ (reader_id * 2654435761 & mask) ^ (cycle * 2246822519 & mask)) & mask
     value ^= value >> 16
     value = value * 2246822519 & mask
     value ^= value >> 13
-    span = (
-        profile.reader_lifecycle.backoff_max_ms
-        - profile.reader_lifecycle.backoff_base_ms
-        + 1
-    )
+    span = profile.reader_lifecycle.backoff_max_ms - profile.reader_lifecycle.backoff_base_ms + 1
     return profile.reader_lifecycle.backoff_base_ms + value % span
 
 
@@ -521,8 +513,7 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
     if set(starts) != set(plays) or set(plays) != set(frames):
         reasons.append("reader_handshake_chain_incomplete")
     if any(
-        event.event != "reader_started"
-        and (event.reader_id, event.cycle) not in starts
+        event.event != "reader_started" and (event.reader_id, event.cycle) not in starts
         for event in events
     ):
         reasons.append("reader_event_cycle_without_start")
@@ -655,9 +646,7 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
     injected_events = [
         event for event in events if event.event == "reader_disconnected" and event.injected is True
     ]
-    event_index = {
-        (event.reader_id, event.cycle, event.event): event for event in events
-    }
+    event_index = {(event.reader_id, event.cycle, event.event): event for event in events}
     reconnect_chain_valid = True
     scheduled_events = [event for event in events if event.event == "reconnect_scheduled"]
     for reader_id, cycle in starts:
@@ -703,10 +692,7 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
                 )
                 if candidate is not None
             ]
-            if (
-                len(predecessors) != 1
-                or (scheduled.reader_id, scheduled.cycle + 1) not in starts
-            ):
+            if len(predecessors) != 1 or (scheduled.reader_id, scheduled.cycle + 1) not in starts:
                 reconnect_chain_valid = False
                 break
     if reconnect_chain_valid:
@@ -899,9 +885,7 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
             )
     expected_segment_windows: dict[RtpSegmentKey, tuple[float, float]] = {}
     workload_end_relative = workload_end_unix_ms(profile, schedule_epoch) - schedule_epoch
-    expected_tracks: tuple[RtpTrack, ...] = (
-        ("video", "audio") if expected_audio else ("video",)
-    )
+    expected_tracks: tuple[RtpTrack, ...] = ("video", "audio") if expected_audio else ("video",)
     for key, frame in frame_events.items():
         connected_end = termination_times.get(key, workload_end_relative)
         if connected_end < frame.at_monotonic_ms:
@@ -939,10 +923,8 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
         and all(
             item.path == expected_paths.get(item.reader_id)
             and (item.track == "video" or expected_audio)
-            and expected_segment_windows[segment_key][0]
-            <= item.first_at_monotonic_ms
-            and item.last_at_monotonic_ms
-            <= expected_segment_windows[segment_key][1]
+            and expected_segment_windows[segment_key][0] <= item.first_at_monotonic_ms
+            and item.last_at_monotonic_ms <= expected_segment_windows[segment_key][1]
             for segment_key, item in segment_by_key.items()
         )
     )
@@ -997,11 +979,7 @@ def summarize_reader_events(profile: LoadProfile, path: Path) -> ReaderRunSummar
         segment = segment_by_key.get(segment_key)
         track = segment_key[2]
         connected_seconds = (connected_end - connected_start) / 1000
-        minimum_rate = (
-            40
-            if track == "audio"
-            else max(per_reader_rate, profile.fixture.fps * 0.8)
-        )
+        minimum_rate = 40 if track == "audio" else max(per_reader_rate, profile.fixture.fps * 0.8)
         freshness_ms = 1000
         segment_rate_valid[segment_key] = (
             segment is not None

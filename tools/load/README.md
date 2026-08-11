@@ -48,9 +48,11 @@ sudo apt-get install --yes --no-install-recommends \
 make -C tools/load
 ```
 
-Record `gst-launch-1.0 --version`, exact package build IDs and SHA-256 of both
-binaries in the profile. CI proves compatibility only; distro/package drift
-invalidates comparisons.
+Record `gst-launch-1.0 --version`, the exact dpkg `Version` of
+`libgstreamer1.0-0` as `gstreamer_build_id`, and SHA-256 of both binaries in the
+profile. The evidence collector currently targets the documented Ubuntu 24.04
+native host shape on both architectures. CI proves compatibility only;
+distro/package drift invalidates comparisons.
 
 ## Prepared fixture
 
@@ -177,6 +179,45 @@ The optional external Basic Auth file is not included in argv contents. It
 must be an owner-owned regular file, mode `0600`/`0400`, no symlink, and contain
 exactly username and password on separate non-empty lines.
 
+## Runtime and hardware manifest
+
+After the prepared source/reader processes are running, capture each generator
+host's immutable runtime inventory. Capture after its GStreamer processes have
+loaded the media path, no earlier than five minutes before the anchor epoch and
+no later than measurement start:
+
+```sh
+rtsp-proxy-load capture-generator-runtime RUN_DIR \
+  --generator-host generator-a \
+  --source-pid 1234 --reader-pid 1235 \
+  --cgroup rtsp-load.slice \
+  --gst-launch-binary /usr/bin/gst-launch-1.0
+```
+
+Run the equivalent command on the SUT for every proxy run and every capacity
+run. A direct-control functional run has no SUT process in its data path and
+does not require this file:
+
+```sh
+rtsp-proxy-load capture-sut-runtime RUN_DIR \
+  --mediamtx-pid 4321 --cgroup mediamtx.service
+```
+
+The commands write exclusive `raw/runtime-generator-<host>.json` and
+`raw/runtime-sut.json` files. Each manifest binds the canonical profile and
+brackets the complete capture with synchronized Linux clock proofs. It binds native
+`amd64`/`arm64`, machine/boot identity, CPU model
+and count, RAM, NIC link speed/MTU, kernel, OS release digest, a fixed sysctl
+set, the full cgroup v2 constraint-chain digest, effective CPU/memory/pids limits and per-process
+RLIMIT/PID/start-time/executable SHA. Generator manifests additionally bind the
+exact installed GStreamer dpkg inventory and core package build to SHA-256,
+device and inode identities of the libraries actually mapped by every workload
+process. Capture rechecks process identity and every hard denominator before its
+completion proof. Missing, stale, cross-host or profile-label-only manifests fail
+finalization. A cold proxy/direct pair copies the finalized direct generator
+manifests into the proxy bundle and compares stable machine, boot, kernel, sysctl,
+cgroup/RLIMIT and GStreamer inventory fields; environment drift invalidates A/B.
+
 ## Churn and outage primitives
 
 One immutable profile selects one lifecycle:
@@ -244,7 +285,12 @@ The PID set must equal `cgroup.procs`; every PID must report that cgroup in
 procfs and retain its pinned executable digest and process start time. Validation
 uses host CPU/RAM/NIC byte and packet rates, actual interface MTU, maximum
 per-process single-core CPU/RLIMIT_NOFILE consumption and finite cgroup
-CPU/memory/pids limits. Machine/boot identity, sample cadence and coverage of
+CPU/memory/pids limits. The sampler walks the cgroup v2 chain through the mount
+root and gates CPU, memory and PID usage at every ancestor that shares a relevant
+constraint, so sibling usage in a limiting systemd slice cannot create false
+headroom. NIC speed, total RAM, effective limits, constraint chain and every
+process RLIMIT remain immutable across samples and must equal the runtime
+manifest. Machine/boot identity, sample cadence and coverage of
 the complete scheduled workload window are checked. Capacity runs require
 different machine IDs for their generator hosts. Crossing the tier-specific
 ceiling (CPU `>65%`, NIC bytes/packets `>60%`, or any other hard resource
@@ -253,11 +299,16 @@ finalization.
 The finalizer also compares the executable-digest multiset with the exact
 prepared source/reader roles; a self-consistent raw series from different
 binaries is rejected.
+The fixed sysctl inventory is typed and canonical. In particular,
+`ip_local_port_range` plus `ip_local_reserved_ports` must recompute the exact
+range, usable socket capacity and reservation digest observed in every resource
+sample; arbitrary strings or label-only manifests fail finalization.
 
-## Capacity SUT evidence
+## Proxy and capacity SUT evidence
 
-Every `capacity` run additionally requires a dedicated MediaMTX systemd cgroup,
-the exact MediaMTX PID and loopback metrics listener:
+Every proxy run and every capacity run requires a dedicated MediaMTX systemd
+cgroup, the exact MediaMTX PID and loopback metrics listener. A functional
+direct-control run has no SUT in its path and does not require this series:
 
 ```sh
 rtsp-proxy-load sample-sut RUN_DIR RUN_DIR/raw/sut.jsonl \
@@ -287,6 +338,10 @@ RSS growth above `1%/h` in any 6h+ window, including windows crossing the
 measurement/soak boundary, FD leak above `0.1%` or 10, non-zero
 post-workload RTSP sessions or ready runtime paths, and any positive
 measurement/soak RTP loss/error delta.
+Functional proxy finalization uses the same independently recomputed SUT identity,
+session/path reconciliation, drain and zero-loss evidence with its `<70%` safety
+headroom policy; the 6h/24h leak conclusions remain capacity-only because a short
+functional run cannot establish them.
 
 ## Reader and cold A/B summaries
 
@@ -332,8 +387,9 @@ rtsp-proxy-load verify RUN_DIR
 
 Finalization does not trust stored `valid` flags. It regenerates the catalog,
 reader plans and launch arguments from the canonical profile, re-parses raw
-reader/generator/SUT evidence into exact typed summaries, checks the shard/process/
-machine/time-window sets, checks cold inactivity or warm anchor evidence, and
+reader/generator/SUT evidence into exact typed summaries, validates the exact
+per-host runtime/hardware manifests, checks the shard/process/machine/time-window
+sets, checks cold inactivity or warm anchor evidence, and
 reproduces cold A/B from a copied finalized direct reference. Only then does it
 hash every input/raw/summary file, seal files/directories to `0440`/`0550`, and
 write the final manifest as the completion marker. Verification checks both

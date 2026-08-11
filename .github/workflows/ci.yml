@@ -226,6 +226,11 @@ jobs:
           make -C tools/load
           sha256sum tools/load/rtsp-pull-server tools/load/rtsp-load-reader
 
+      - name: Capture and bind native Linux runtime manifest (${{ matrix.arch }})
+        env:
+          RTSP_RUNTIME_NATIVE: "1"
+        run: uv run pytest tests/contract/test_runtime_manifest.py -q
+
       - name: Verify H264/H265 independent pull endpoints over RTSP/TCP
         env:
           RTSP_PULL_SERVER_BINARY: tools/load/rtsp-pull-server

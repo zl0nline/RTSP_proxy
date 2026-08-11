@@ -46,6 +46,7 @@ from rtsp_proxy.load_run import (
     sha256_file,
     write_summary,
 )
+from rtsp_proxy.load_runtime import capture_generator_runtime, capture_sut_runtime
 from rtsp_proxy.media import MediaMtxClient
 
 
@@ -82,6 +83,19 @@ def _parser() -> argparse.ArgumentParser:
     warm_preflight.add_argument("run_directory", type=Path)
     warm_preflight.add_argument("--api-url", required=True)
     warm_preflight.add_argument("--timeout", type=float, default=2)
+
+    runtime_generator = commands.add_parser("capture-generator-runtime")
+    runtime_generator.add_argument("run_directory", type=Path)
+    runtime_generator.add_argument("--generator-host", required=True)
+    runtime_generator.add_argument("--source-pid", required=True, action="append", type=int)
+    runtime_generator.add_argument("--reader-pid", action="append", type=int, default=[])
+    runtime_generator.add_argument("--cgroup", required=True)
+    runtime_generator.add_argument("--gst-launch-binary", required=True, type=Path)
+
+    runtime_sut = commands.add_parser("capture-sut-runtime")
+    runtime_sut.add_argument("run_directory", type=Path)
+    runtime_sut.add_argument("--mediamtx-pid", required=True, type=int)
+    runtime_sut.add_argument("--cgroup", required=True)
 
     sample = commands.add_parser("sample-generator")
     sample.add_argument("run_directory", type=Path)
@@ -296,6 +310,53 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"{label}={len(paths)} output={output}")
             return 0
+        if arguments.command == "capture-generator-runtime":
+            source_pids = tuple(arguments.source_pid)
+            reader_pids = tuple(arguments.reader_pid)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            expected_source_count = sum(
+                launch.get("generator_host") == arguments.generator_host
+                for launch in launch_plan.get("source_servers", [])
+            )
+            expected_reader_count = sum(
+                launch.get("generator_host") == arguments.generator_host
+                for launch in launch_plan.get("readers", [])
+            )
+            if (
+                len(source_pids) != expected_source_count
+                or len(reader_pids) != expected_reader_count
+            ):
+                raise ValueError("generator_workload_pid_set_incomplete")
+            expected_executables = {
+                **{pid: profile.artifacts.pull_server_sha256 for pid in source_pids},
+                **{pid: profile.artifacts.load_reader_sha256 for pid in reader_pids},
+            }
+            runtime_manifest = capture_generator_runtime(
+                profile,
+                host=arguments.generator_host,
+                pids=source_pids + reader_pids,
+                cgroup=arguments.cgroup,
+                expected_executables=expected_executables,
+                gst_launch_binary=arguments.gst_launch_binary,
+            )
+            output = run_directory / "raw" / f"runtime-generator-{arguments.generator_host}.json"
+            write_summary(output, runtime_manifest)
+            print(f"CAPTURED_GENERATOR_RUNTIME host={arguments.generator_host} output={output}")
+            return 0
+        if arguments.command == "capture-sut-runtime":
+            if profile.workload.endpoint_mode != "proxy" and profile.tier != "capacity":
+                raise ValueError("sut_runtime_not_required_for_direct_functional_profile")
+            runtime_manifest = capture_sut_runtime(
+                profile,
+                pid=arguments.mediamtx_pid,
+                cgroup=arguments.cgroup,
+            )
+            output = run_directory / "raw" / "runtime-sut.json"
+            write_summary(output, runtime_manifest)
+            print(f"CAPTURED_SUT_RUNTIME output={output}")
+            return 0
         if arguments.command == "sample-generator":
             if arguments.generator_host not in {host.name for host in profile.generator_hosts}:
                 raise ValueError("unknown_generator_host")
@@ -344,8 +405,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SAMPLED observations={count} output={arguments.output}")
             return 0
         if arguments.command == "sample-sut":
-            if profile.tier != "capacity":
-                raise ValueError("sut_sampler_requires_capacity_profile")
+            if profile.workload.endpoint_mode != "proxy" and profile.tier != "capacity":
+                raise ValueError("sut_sampler_not_required_for_direct_functional_profile")
             _require_run_path(run_directory, arguments.output)
             launch_plan = json.loads(
                 (run_directory / "launch-plan.json").read_text(encoding="utf-8")
@@ -399,8 +460,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SUMMARIZED_GENERATOR output={arguments.output}")
             return 0 if generator_summary.valid else 3
         if arguments.command == "summarize-sut":
-            if profile.tier != "capacity":
-                raise ValueError("sut_summary_requires_capacity_profile")
+            if profile.workload.endpoint_mode != "proxy" and profile.tier != "capacity":
+                raise ValueError("sut_summary_not_required_for_direct_functional_profile")
             _require_run_path(run_directory, arguments.observations)
             _require_run_path(run_directory, arguments.output)
             sut_observations = load_sut_observations(arguments.observations)
@@ -420,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
                 measurement_end_unix_ms=measurement_end_unix_ms(profile, coordinated_start_ms),
                 soak_end_unix_ms=workload_end_unix_ms(profile, coordinated_start_ms),
                 maximum_clock_error_ms=profile.evidence_sampling.maximum_clock_error_ms,
+                capacity_gate=profile.tier == "capacity",
             )
             write_summary(arguments.output, sut_summary)
             print(f"SUMMARIZED_SUT output={arguments.output}")
@@ -457,6 +519,11 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.direct_run_directory / "final-manifest.json",
                 reference_manifest,
             )
+            for host in direct_profile.generator_hosts:
+                _copy_reference_exclusive(
+                    arguments.direct_run_directory / "raw" / f"runtime-generator-{host.name}.json",
+                    reference_directory / f"direct-runtime-generator-{host.name}.json",
+                )
             comparison = summarize_cold_comparison(
                 profile,
                 arguments.proxy_events,

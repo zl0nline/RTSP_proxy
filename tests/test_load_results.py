@@ -781,14 +781,11 @@ def test_outage_summary_binds_exact_cohort_to_common_epoch(tmp_path: Path) -> No
                     measurement_end_unix_ms(profile, 2_000_000) - 2_000_001
                 )
             elif segment["event"] == "reader_rtp_phase":
-                segment["at_monotonic_ms"] = (
-                    workload_end_unix_ms(profile, 2_000_000) - 2_000_000
-                )
+                segment["at_monotonic_ms"] = workload_end_unix_ms(profile, 2_000_000) - 2_000_000
         replacement_segment = next(
             event
             for event in events
-            if event["event"] == "reader_rtp_segment"
-            and event["reader_id"] == expected_reader_id
+            if event["event"] == "reader_rtp_segment" and event["reader_id"] == expected_reader_id
         )
         replacement_segment.update(
             cycle=1,
@@ -854,9 +851,7 @@ def test_outage_summary_binds_exact_cohort_to_common_epoch(tmp_path: Path) -> No
     )
 
     wrong_backoff = outage_events(lateness_ms=0)
-    reconnect = next(
-        event for event in wrong_backoff if event["event"] == "reconnect_scheduled"
-    )
+    reconnect = next(event for event in wrong_backoff if event["event"] == "reconnect_scheduled")
     reported_backoff = reconnect["backoff_ms"]
     assert isinstance(reported_backoff, int)
     reconnect["backoff_ms"] = reported_backoff + 1
@@ -870,9 +865,7 @@ def test_outage_summary_binds_exact_cohort_to_common_epoch(tmp_path: Path) -> No
     missing_play = outage_events(lateness_ms=0)
     missing_play.remove(
         next(
-            event
-            for event in missing_play
-            if event["event"] == "play_sent" and event["cycle"] == 1
+            event for event in missing_play if event["event"] == "play_sent" and event["cycle"] == 1
         )
     )
     missing_play_path = tmp_path / "outage-missing-play.jsonl"
@@ -892,9 +885,7 @@ def test_outage_summary_binds_exact_cohort_to_common_epoch(tmp_path: Path) -> No
     )
 
     wrong_cohort = outage_events(lateness_ms=0)
-    disconnect = next(
-        event for event in wrong_cohort if event["event"] == "reader_disconnected"
-    )
+    disconnect = next(event for event in wrong_cohort if event["event"] == "reader_disconnected")
     original_reader_id = disconnect["reader_id"]
     assert isinstance(original_reader_id, int)
     disconnect["reader_id"] = (original_reader_id + 1) % 4

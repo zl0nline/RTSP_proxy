@@ -1046,7 +1046,7 @@ Fixture bytes alone are insufficient evidence: `prepare` requires a typed
 manifest produced with the pinned FFmpeg/ffprobe binaries and matching probed
 codec, FPS, bitrate, every internal GOP interval and the cyclic loop boundary.
 The Phase 0B harness is IPv4-only and rejects IPv6 literals until its native
-source/evidence path is fully dual-stack. Every capacity bundle also requires
+source/evidence path is fully dual-stack. Every proxy and capacity bundle requires
 a typed SUT series bound to the single MediaMTX PID/systemd cgroup and relevant
 NIC. Each SUT sample and loopback preflight carries Linux kernel clock proof;
 session/path counters remain cumulative across churn and use a pre-measurement
@@ -1068,15 +1068,39 @@ Recomputed gates enforce SUT headroom, maximum rolling RSS slope `<=1%/h` for
 every covered 6h window, including cross-phase windows,
 bounded FD delta, zero RTSP sessions and ready runtime paths after the pinned
 on-demand close/drain interval, and zero inbound/outbound RTP, RTCP and path
-loss/error delta.
-Missing SUT or fixture evidence
+loss/error delta. Every proxy bundle requires the same independent SUT
+identity/resource/session/loss series with the functional `<70%` headroom policy;
+capacity adds the 6h/24h leak/soak conclusions. Missing SUT or fixture evidence
 fails finalization rather than downgrading the claim.
 
-Hardened native amd64/arm64 CI run `31499414349` and its full rerun are green;
-repeat Standards/Spec review passed.
+Every finalized run requires a typed manifest from each generator host; proxy
+and capacity runs also require the SUT manifest. It binds the canonical profile
+and brackets the complete capture with synchronized start/completion clock proofs.
+Native architecture, machine/boot, CPU/RAM/NIC, kernel/OS, the fixed sysctl set,
+full cgroup v2 constraint-chain digest, effective cgroup/RLIMIT values and the exact
+PID/start/executable identities already present in the resource series.
+Generator manifests additionally require the profile-pinned GStreamer version,
+the exact `libgstreamer1.0-0` dpkg build, a canonical installed-package ledger,
+and SHA-256/device/inode proof for GStreamer libraries mapped by every workload
+process. Capture rechecks process/cgroup/denominator identity before the completion
+proof and is bounded to the five minutes before the anchor through measurement
+start. Resource sampling gates usage of every limiting cgroup ancestor, including
+shared systemd slices, and binds unchanged RAM/NIC/cgroup/RLIMIT denominators back
+to this manifest. The typed `ip_local_port_range` and canonical reserved-port set
+must recompute the exact socket denominator and digest in the resource series.
+Cold proxy/direct bundles copy, hash and compare stable generator
+runtime environments; machine/boot/kernel/sysctl/cgroup/RLIMIT or GStreamer drift
+invalidates the A/B pair. Missing, stale, cross-machine or architecture-mismatched
+evidence fails finalization. This collector targets the documented Ubuntu 24.04
+native host shape equally on amd64 and arm64.
+
+Hardened native amd64/arm64 CI run `31499414349` and its full rerun cover the
+pre-runtime-manifest harness. The collector now has a privileged public
+capture/binding contract on both native runners; a new published CI result and
+repeat review remain required before this slice exits.
 Per-host hardware/architecture and dynamically linked GStreamer package/build
-evidence remains an explicit Phase 0B exit artifact; profile labels and
-executable hashes alone do not prove it. WAN/netem and non-zero probe/CRUD
+evidence is now mandatory in the finalizer, but no production-equivalent host
+manifest or capacity result has been published. WAN/netem and non-zero probe/CRUD
 profiles currently fail closed until typed drivers and their evidence verifiers
 are implemented. CI is not capacity evidence; dedicated LAN/WAN hardware,
 untuned baselines, saturation knee, complete fault matrix and 24h soak remain

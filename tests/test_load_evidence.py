@@ -6,6 +6,7 @@ import json
 import sys
 import time
 import urllib.request
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import rtsp_proxy.load_evidence as load_evidence_module
 from rtsp_proxy.load_evidence import (
     REQUIRED_SUT_METRIC_FAMILIES,
     SESSION_COUNTER_FIELDS,
+    CgroupConstraintCounters,
     CgroupCounters,
     GeneratorCounters,
     HostCounters,
@@ -26,6 +28,7 @@ from rtsp_proxy.load_evidence import (
     ProcessCounters,
     ResourceObservation,
     RuntimeProcessBinding,
+    RuntimeProcessLimit,
     SessionMetricSnapshot,
     SutObservation,
     load_observations,
@@ -128,10 +131,17 @@ def observation(
         network_packets_per_second=1000,
         packet_rate_percent=10,
         interface_mtu_bytes=1500,
+        memory_total_bytes=1_000,
+        nic_link_speed_bits_per_second=8_000,
+        cgroup_cpu_capacity_cores=1,
+        cgroup_memory_limit_bytes=1_000,
+        cgroup_pids_limit=100,
         process_count=1,
         workload_processes=TEST_PROCESS_BINDINGS,
         workload_processes_sha256=TEST_PROCESS_BINDINGS_SHA256,
+        workload_process_limits=(RuntimeProcessLimit(pid=123, max_open_files=1_000),),
         cgroup_path_sha256="e" * 64,
+        cgroup_constraint_chain_sha256="c" * 64,
     )
 
 
@@ -179,6 +189,18 @@ def generator_counters(
             memory_limit_bytes=1_000,
             pids_current=20,
             pids_limit=100,
+            constraint_chain_sha256="c" * 64,
+            constraints=(
+                CgroupConstraintCounters(
+                    path_sha256="b" * 64,
+                    cpu_usage_usec=process_ticks * 10_000,
+                    cpu_capacity_cores=1,
+                    memory_current_bytes=300,
+                    memory_limit_bytes=1_000,
+                    pids_current=20,
+                    pids_limit=100,
+                ),
+            ),
         ),
         machine_id_sha256="a" * 64,
         boot_id="11111111-1111-1111-1111-111111111111",
@@ -221,6 +243,71 @@ def test_generator_counter_delta_uses_process_cgroup_and_nic_hard_limits() -> No
     assert measured.network_percent == 60
     assert measured.network_packets_per_second == 0
     assert measured.interface_mtu_bytes == 1500
+
+
+def test_generator_counter_delta_gates_shared_ancestor_cgroup_usage() -> None:
+    before = generator_counters(
+        cpu_total=1_000,
+        cpu_idle=600,
+        process_ticks=100,
+        network_rx=1_000,
+        network_tx=2_000,
+    )
+    after = generator_counters(
+        cpu_total=1_200,
+        cpu_idle=700,
+        process_ticks=110,
+        network_rx=1_100,
+        network_tx=2_100,
+    )
+    parent_path = "9" * 64
+    before = replace(
+        before,
+        cgroup=replace(
+            before.cgroup,
+            constraints=(
+                CgroupConstraintCounters(
+                    path_sha256=parent_path,
+                    cpu_usage_usec=1_000_000,
+                    cpu_capacity_cores=1,
+                    memory_current_bytes=800,
+                    memory_limit_bytes=1_000,
+                    pids_current=80,
+                    pids_limit=100,
+                ),
+                *before.cgroup.constraints,
+            ),
+        ),
+    )
+    after = replace(
+        after,
+        cgroup=replace(
+            after.cgroup,
+            constraints=(
+                CgroupConstraintCounters(
+                    path_sha256=parent_path,
+                    cpu_usage_usec=1_900_000,
+                    cpu_capacity_cores=1,
+                    memory_current_bytes=900,
+                    memory_limit_bytes=1_000,
+                    pids_current=90,
+                    pids_limit=100,
+                ),
+                *after.cgroup.constraints,
+            ),
+        ),
+    )
+
+    measured = after.observation_since(
+        before,
+        generator_host="generator-a",
+        elapsed_seconds=1,
+        timestamp="2026-08-10T12:00:01Z",
+    )
+
+    assert measured.cgroup_cpu_percent == 90
+    assert measured.cgroup_ram_percent == 90
+    assert measured.cgroup_pids_percent == 90
 
 
 def test_generator_headroom_requires_every_resource_to_stay_below_70_percent() -> None:
@@ -410,7 +497,9 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
         "11111111-1111-1111-1111-111111111111\n", encoding="utf-8"
     )
     (tmp_path / "proc/sys/net/ipv4").mkdir(parents=True)
-    (tmp_path / "proc/sys/net/ipv4/ip_local_port_range").write_text("8000 8009\n", encoding="utf-8")
+    (tmp_path / "proc/sys/net/ipv4/ip_local_port_range").write_text(
+        "8000\t8009\n", encoding="utf-8"
+    )
     (tmp_path / "proc/sys/net/ipv4/ip_local_reserved_ports").write_text("8009\n", encoding="utf-8")
     (tmp_path / "proc/net").mkdir()
     tcp_header = "  sl  local_address rem_address st\n"
@@ -435,11 +524,20 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
     cgroup = tmp_path / "sys/fs/cgroup/load.slice"
     (cgroup / "cpu.stat").write_text("usage_usec 1234\n", encoding="utf-8")
     (cgroup / "cpu.max").write_text("100000 100000\n", encoding="utf-8")
+    (cgroup / "cpuset.cpus.effective").write_text("0-3\n", encoding="utf-8")
     (cgroup / "memory.current").write_text("100000\n", encoding="utf-8")
     (cgroup / "memory.max").write_text("1000000\n", encoding="utf-8")
     (cgroup / "pids.current").write_text("10\n", encoding="utf-8")
     (cgroup / "pids.max").write_text("100\n", encoding="utf-8")
     (cgroup / "cgroup.procs").write_text("123\n", encoding="utf-8")
+    cgroup_mount = tmp_path / "sys/fs/cgroup"
+    (cgroup_mount / "cpu.max").write_text("max 100000\n", encoding="utf-8")
+    (cgroup_mount / "memory.max").write_text("max\n", encoding="utf-8")
+    (cgroup_mount / "pids.max").write_text("max\n", encoding="utf-8")
+    (cgroup_mount / "cpuset.cpus.effective").write_text("0-7\n", encoding="utf-8")
+    (cgroup_mount / "cpu.stat").write_text("usage_usec 2234\n", encoding="utf-8")
+    (cgroup_mount / "memory.current").write_text("200000\n", encoding="utf-8")
+    (cgroup_mount / "pids.current").write_text("20\n", encoding="utf-8")
 
     counters = read_linux_generator_counters(
         tmp_path,
@@ -457,6 +555,7 @@ def test_linux_counter_reader_uses_procfs_cgroup_process_limits_and_nic(
     assert counters.processes[0].rss_bytes == 204_800
     assert counters.processes[0].open_file_descriptors == 2
     assert counters.cgroup.memory_limit_bytes == 1_000_000
+    assert len(counters.cgroup.constraints) == 2
     assert counters.host.nic_bits_per_second == 1_000_000_000
     assert counters.host.ephemeral_port_start == 8000
     assert counters.host.ephemeral_port_end == 8009
@@ -1001,14 +1100,9 @@ def test_mediamtx_session_identity_survives_idle_read_path_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def metrics_body(*, session_path: str, state: str, outbound_packets: int) -> bytes:
-        labels = (
-            f'id="1",path="{session_path}",'
-            f'remoteAddr="127.0.0.1:5000",state="{state}"'
-        )
+        labels = f'id="1",path="{session_path}",remoteAddr="127.0.0.1:5000",state="{state}"'
         session_families = tuple(
-            family
-            for family in REQUIRED_SUT_METRIC_FAMILIES
-            if family.startswith("rtsp_sessions_")
+            family for family in REQUIRED_SUT_METRIC_FAMILIES if family.startswith("rtsp_sessions_")
         )
         outbound_family = "rtsp_sessions_outbound_rtp_packets"
         return (
@@ -1059,8 +1153,7 @@ def test_mediamtx_session_identity_survives_idle_read_path_transition(
     history = load_evidence_module._MetricHistory()
     assert history.update(idle.active_sessions, idle.active_paths)["outbound_rtp_packets"] == 5
     assert (
-        history.update(reading.active_sessions, reading.active_paths)["outbound_rtp_packets"]
-        == 10
+        history.update(reading.active_sessions, reading.active_paths)["outbound_rtp_packets"] == 10
     )
 
 
@@ -1120,16 +1213,19 @@ def test_sut_metric_history_fails_continuous_resets_and_accumulates_reappearance
         )
 
     reappeared = load_evidence_module._MetricHistory()
-    assert reappeared.update(
-        (session(10),),
-        (
-            PathMetricSnapshot(
-                identity_sha256="2" * 64,
-                state="ready",
-                inbound_frames_in_error=10,
+    assert (
+        reappeared.update(
+            (session(10),),
+            (
+                PathMetricSnapshot(
+                    identity_sha256="2" * 64,
+                    state="ready",
+                    inbound_frames_in_error=10,
+                ),
             ),
-        ),
-    )["outbound_rtp_packets"] == 10
+        )["outbound_rtp_packets"]
+        == 10
+    )
     reappeared.update((), ())
     totals = reappeared.update(
         (session(2),),
@@ -1176,6 +1272,7 @@ def test_sut_metric_history_fails_continuous_resets_and_accumulates_reappearance
         ),
     )
     assert transitioned_totals["path_inbound_frames_in_error"] == 12
+
 
 def test_linux_sut_sampler_binds_mediamtx_process_and_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

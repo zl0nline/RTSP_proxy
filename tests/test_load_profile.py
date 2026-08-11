@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
+import os
+import platform
 import subprocess
+import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal
 
 import pytest
 from pydantic import ValidationError
 
-import rtsp_proxy.load_cli as load_cli_module
+import rtsp_proxy.load_evidence as load_evidence_module
 from rtsp_proxy.load_catalog import build_direct_reader_plan
 from rtsp_proxy.load_cli import main as load_cli_main
 from rtsp_proxy.load_evidence import (
+    REQUIRED_SUT_METRIC_FAMILIES,
+    KernelClockProof,
     ResourceObservation,
     RuntimeProcessBinding,
+    RuntimeProcessLimit,
+    SutObservation,
     summarize_generator_headroom,
+    summarize_sut_capacity,
 )
 from rtsp_proxy.load_profile import (
     LoadProfile,
@@ -26,6 +37,7 @@ from rtsp_proxy.load_profile import (
     measurement_end_unix_ms,
     measurement_start_unix_ms,
     ramp_end_unix_ms,
+    sut_sampling_end_unix_ms,
     validate_comparison_pair,
     verify_run_directory,
     warm_anchor_start_unix_ms,
@@ -40,6 +52,16 @@ from rtsp_proxy.load_run import (
     sha256_file,
     validate_fixture_manifest,
     write_summary,
+)
+from rtsp_proxy.load_runtime import (
+    GStreamerRuntime,
+    LinuxRuntimeManifest,
+    RuntimeLibrary,
+    RuntimePackage,
+    RuntimeProcess,
+    RuntimeSetting,
+    capture_generator_runtime,
+    validate_runtime_comparison_pair,
 )
 
 
@@ -62,6 +84,128 @@ def runtime_process_bindings_sha256(bindings: tuple[RuntimeProcessBinding, ...])
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
+
+
+def runtime_manifest(
+    profile: LoadProfile,
+    *,
+    role: Literal["generator", "sut"],
+    host: str,
+    architecture: Literal["amd64", "arm64"],
+    processes: tuple[RuntimeProcessBinding, ...],
+    machine_id_sha256: str,
+    boot_id: str,
+    observed_at_unix_ms: int,
+) -> LinuxRuntimeManifest:
+    typed_processes = tuple(
+        RuntimeProcess(
+            pid=item.pid,
+            executable_sha256=item.executable_sha256,
+            start_time_ticks=item.start_time_ticks,
+            max_open_files_soft=65536,
+            max_open_files_hard=65536,
+            max_processes_soft="unlimited",
+            max_processes_hard="unlimited",
+        )
+        for item in processes
+    )
+    package = RuntimePackage(
+        name="libgstreamer1.0-0",
+        version=profile.artifacts.gstreamer_build_id,
+        architecture="amd64" if architecture == "amd64" else "arm64",
+    )
+    package_digest = hashlib.sha256(
+        json.dumps(
+            [package.model_dump(mode="json")],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    gstreamer = (
+        GStreamerRuntime(
+            version=profile.artifacts.gstreamer_version,
+            package_build_id=profile.artifacts.gstreamer_build_id,
+            gst_launch_path="/usr/bin/gst-launch-1.0",
+            gst_launch_sha256="9" * 64,
+            packages=(package,),
+            packages_sha256=package_digest,
+            loaded_libraries=(
+                RuntimeLibrary(
+                    path="/usr/lib/libgstreamer-1.0.so.0",
+                    sha256="8" * 64,
+                    size_bytes=1024,
+                    device_major=8,
+                    device_minor=1,
+                    inode=42,
+                    process_ids=tuple(item.pid for item in processes),
+                ),
+            ),
+        )
+        if role == "generator"
+        else None
+    )
+    return LinuxRuntimeManifest(
+        schema_version=1,
+        profile_sha256=canonical_profile_bytes(profile)[1],
+        role=role,
+        host=host,
+        architecture=architecture,
+        capture_started_clock=KernelClockProof(
+            observed_at_unix_ms=observed_at_unix_ms,
+            synchronized=True,
+            state=0,
+            status=0,
+            max_error_ms=1,
+        ),
+        capture_completed_clock=KernelClockProof(
+            observed_at_unix_ms=observed_at_unix_ms + 1,
+            synchronized=True,
+            state=0,
+            status=0,
+            max_error_ms=1,
+        ),
+        machine_id_sha256=machine_id_sha256,
+        boot_id=boot_id,
+        kernel_release="6.8.0-test",
+        os_release_sha256="7" * 64,
+        cpu_model="test cpu",
+        logical_cpu_count=8,
+        memory_total_bytes=16 * 1024**3,
+        network_interface=profile.network.interface,
+        interface_mtu_bytes=profile.network.mtu_bytes,
+        nic_link_speed_bits_per_second=10_000_000_000,
+        sysctls=tuple(
+            RuntimeSetting(
+                name=name,
+                value=(
+                    "32768 60999"
+                    if name == "net.ipv4.ip_local_port_range"
+                    else ""
+                    if name == "net.ipv4.ip_local_reserved_ports"
+                    else "1"
+                ),
+            )
+            for name in (
+                "fs.file-max",
+                "net.core.rmem_max",
+                "net.core.somaxconn",
+                "net.core.wmem_max",
+                "net.ipv4.ip_local_port_range",
+                "net.ipv4.ip_local_reserved_ports",
+                "net.ipv4.tcp_fin_timeout",
+                "net.ipv4.tcp_keepalive_time",
+                "net.ipv4.tcp_max_syn_backlog",
+                "net.ipv4.tcp_tw_reuse",
+            )
+        ),
+        cgroup_path_sha256="c" * 64,
+        cgroup_cpu_capacity_cores=4,
+        cgroup_memory_limit_bytes=8 * 1024**3,
+        cgroup_pids_limit=100000,
+        cgroup_constraint_chain_sha256="5" * 64,
+        processes=typed_processes,
+        gstreamer=gstreamer,
+    )
 
 
 def write_fixture_manifest(profile: LoadProfile) -> None:
@@ -134,7 +278,7 @@ def valid_profile(*, tier: str = "smoke") -> dict[str, object]:
             "ffmpeg_sha256": "c" * 64,
             "ffprobe_sha256": "d" * 64,
             "gstreamer_version": "1.24.2",
-            "gstreamer_build_id": "ubuntu-1.24.2-1ubuntu0.1",
+            "gstreamer_build_id": "1.24.2-1ubuntu0.1",
             "pull_server_sha256": "f" * 64,
             "load_reader_sha256": "1" * 64,
         },
@@ -479,6 +623,287 @@ def test_unimplemented_workload_drivers_fail_closed() -> None:
         LoadProfile.model_validate(raw)
 
 
+def test_runtime_manifest_captures_and_binds_actual_linux_gstreamer_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = valid_profile()
+    hosts = raw["generator_hosts"]
+    artifacts = raw["artifacts"]
+    assert isinstance(hosts, list)
+    assert isinstance(hosts[0], dict)
+    assert isinstance(artifacts, dict)
+    hosts[0]["architecture"] = "amd64"
+    artifacts["gstreamer_build_id"] = "1.24.2-1ubuntu0.1"
+    source_binary = tmp_path / "opt/rtsp-pull-server"
+    reader_binary = tmp_path / "opt/rtsp-load-reader"
+    source_binary.parent.mkdir(parents=True)
+    source_binary.write_bytes(b"pull-server")
+    reader_binary.write_bytes(b"load-reader")
+    artifacts["pull_server_sha256"] = hashlib.sha256(b"pull-server").hexdigest()
+    artifacts["load_reader_sha256"] = hashlib.sha256(b"load-reader").hexdigest()
+    profile = LoadProfile.model_validate(raw)
+    pids = (101, 202)
+    executables = (source_binary, reader_binary)
+    bindings = tuple(
+        RuntimeProcessBinding(
+            pid=pid,
+            executable_sha256=(
+                profile.artifacts.pull_server_sha256
+                if pid == 101
+                else profile.artifacts.load_reader_sha256
+            ),
+            start_time_ticks=1000 + index,
+        )
+        for index, pid in enumerate(pids)
+    )
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    observed_at = 4_102_444_799_000
+
+    class FakeAdjtimex:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, pointer: Any) -> int:
+            value = ctypes.cast(pointer, ctypes.POINTER(load_evidence_module._Timex)).contents
+            value.status = 0
+            value.maxerror = 1_000
+            value.esterror = 0
+            return 0
+
+    class FakeLibc:
+        adjtimex = FakeAdjtimex()
+
+    clock_values = iter((observed_at * 1_000_000, (observed_at + 1) * 1_000_000))
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: FakeLibc())
+    monkeypatch.setattr(time, "time_ns", lambda: next(clock_values))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="gst-launch-1.0 version 1.24.2\nGStreamer 1.24.2\n"
+        ),
+    )
+
+    for relative_path, body in {
+        "etc/os-release": "ID=ubuntu\nVERSION_ID=24.04\n",
+        "etc/machine-id": "machine-a\n",
+        "proc/sys/kernel/osrelease": "6.8.0-test\n",
+        "proc/sys/kernel/random/boot_id": "11111111-1111-1111-1111-111111111111\n",
+        "proc/cpuinfo": "processor : 0\nmodel name : Test CPU\nprocessor : 1\n",
+        "proc/stat": "cpu  100 20 30 400 50 6 7 8 0 0\n",
+        "proc/meminfo": "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\n",
+        "proc/net/tcp": "  sl  local_address rem_address st\n",
+        "proc/net/tcp6": "  sl  local_address rem_address st\n",
+        "var/lib/dpkg/status": (
+            "Package: libgstreamer1.0-0\n"
+            "Status: install ok installed\n"
+            "Architecture: amd64\n"
+            "Version: 1.24.2-1ubuntu0.1\n\n"
+            "Package: gstreamer1.0-plugins-good\n"
+            "Status: install ok installed\n"
+            "Architecture: amd64\n"
+            "Version: 1.24.2-1ubuntu0.1\n"
+        ),
+    }.items():
+        destination = tmp_path / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(body, encoding="utf-8")
+    for relative in (
+        "fs/file-max",
+        "net/core/rmem_max",
+        "net/core/somaxconn",
+        "net/core/wmem_max",
+        "net/ipv4/ip_local_port_range",
+        "net/ipv4/ip_local_reserved_ports",
+        "net/ipv4/tcp_fin_timeout",
+        "net/ipv4/tcp_keepalive_time",
+        "net/ipv4/tcp_max_syn_backlog",
+        "net/ipv4/tcp_tw_reuse",
+    ):
+        sysctl_path = tmp_path / "proc/sys" / relative
+        sysctl_path.parent.mkdir(parents=True, exist_ok=True)
+        sysctl_path.write_text("32768 60999\n" if relative.endswith("port_range") else "1\n")
+    interface = tmp_path / "sys/class/net/camera0"
+    (interface / "statistics").mkdir(parents=True)
+    for name in ("rx_bytes", "tx_bytes", "rx_packets", "tx_packets"):
+        (interface / "statistics" / name).write_text("1\n", encoding="utf-8")
+    (interface / "speed").write_text("10000\n", encoding="utf-8")
+    (interface / "mtu").write_text("1500\n", encoding="utf-8")
+    cgroup_mount = tmp_path / "sys/fs/cgroup"
+    cgroup = cgroup_mount / "rtsp-load.slice"
+    cgroup.mkdir(parents=True)
+    for target, values in (
+        (cgroup_mount, ("max 100000", "max", "max", "0-7")),
+        (cgroup, ("400000 100000", str(8 * 1024**3), "100000", "0-7")),
+    ):
+        for name, value in zip(
+            ("cpu.max", "memory.max", "pids.max", "cpuset.cpus.effective"),
+            values,
+            strict=True,
+        ):
+            (target / name).write_text(value + "\n", encoding="utf-8")
+    (cgroup_mount / "cpu.stat").write_text("usage_usec 2\n", encoding="utf-8")
+    (cgroup_mount / "memory.current").write_text("2048\n", encoding="utf-8")
+    (cgroup_mount / "pids.current").write_text("3\n", encoding="utf-8")
+    (cgroup / "cpu.stat").write_text("usage_usec 1\n", encoding="utf-8")
+    (cgroup / "memory.current").write_text("1024\n", encoding="utf-8")
+    (cgroup / "pids.current").write_text("2\n", encoding="utf-8")
+    (cgroup / "cgroup.procs").write_text("101\n202\n", encoding="utf-8")
+    gst_launch = tmp_path / "usr/bin/gst-launch-1.0"
+    gst_launch.parent.mkdir(parents=True)
+    gst_launch.write_bytes(b"gst-launch")
+    gst_launch.chmod(0o755)
+    library = tmp_path / "usr/lib/libgstreamer-1.0.so.0"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"gstreamer-core")
+    library_stat = library.stat()
+    device = f"{os.major(library_stat.st_dev):02x}:{os.minor(library_stat.st_dev):02x}"
+    for index, (pid, executable) in enumerate(zip(pids, executables, strict=True)):
+        process_root = tmp_path / "proc" / str(pid)
+        (process_root / "fd").mkdir(parents=True)
+        (process_root / "fd/0").touch()
+        fields = ["S", *("0" for _ in range(21))]
+        fields[11] = "1"
+        fields[12] = "1"
+        fields[19] = str(1000 + index)
+        (process_root / "stat").write_text(
+            f"{pid} (load process) {' '.join(fields)}\n", encoding="utf-8"
+        )
+        (process_root / "status").write_text("VmRSS: 1 kB\n", encoding="utf-8")
+        (process_root / "cgroup").write_text("0::/rtsp-load.slice\n", encoding="utf-8")
+        (process_root / "exe").symlink_to(executable)
+        (process_root / "limits").write_text(
+            "Max open files            65536                65536                files\n"
+            "Max processes             unlimited             unlimited             processes\n",
+            encoding="utf-8",
+        )
+        (process_root / "maps").write_text(
+            f"00001000-00002000 r-xp 00000000 {device} {library_stat.st_ino} "
+            "/usr/lib/libgstreamer-1.0.so.0\n",
+            encoding="utf-8",
+        )
+
+    manifest = capture_generator_runtime(
+        profile,
+        host="generator-a",
+        pids=pids,
+        cgroup="rtsp-load.slice",
+        expected_executables={item.pid: item.executable_sha256 for item in bindings},
+        gst_launch_binary=Path("/usr/bin/gst-launch-1.0"),
+        root=tmp_path,
+    )
+
+    assert manifest.architecture == "amd64"
+    assert manifest.cpu_model == "Test CPU"
+    assert manifest.logical_cpu_count == 2
+    assert manifest.gstreamer is not None
+    assert manifest.gstreamer.package_build_id == "1.24.2-1ubuntu0.1"
+    assert manifest.gstreamer.loaded_libraries[0].process_ids == pids
+    assert manifest.capture_started_clock.observed_at_unix_ms == observed_at
+    assert manifest.capture_completed_clock.observed_at_unix_ms == observed_at + 1
+
+
+def test_cold_runtime_pair_rejects_environment_drift_but_not_process_identity() -> None:
+    proxy_profile = LoadProfile.model_validate(valid_profile())
+    direct_raw = valid_profile()
+    direct_workload = direct_raw["workload"]
+    assert isinstance(direct_workload, dict)
+    direct_workload["endpoint_mode"] = "direct-control"
+    direct_profile = LoadProfile.model_validate(direct_raw)
+    proxy = runtime_manifest(
+        proxy_profile,
+        role="generator",
+        host="generator-a",
+        architecture="amd64",
+        processes=runtime_process_bindings(),
+        machine_id_sha256="a" * 64,
+        boot_id="11111111-1111-1111-1111-111111111111",
+        observed_at_unix_ms=4_102_444_799_000,
+    )
+    direct = runtime_manifest(
+        direct_profile,
+        role="generator",
+        host="generator-a",
+        architecture="amd64",
+        processes=tuple(
+            item.model_copy(update={"pid": item.pid + 1000, "start_time_ticks": 9999})
+            for item in runtime_process_bindings()
+        ),
+        machine_id_sha256="a" * 64,
+        boot_id="11111111-1111-1111-1111-111111111111",
+        observed_at_unix_ms=4_102_444_800_000,
+    )
+
+    validate_runtime_comparison_pair(proxy, direct)
+
+    changed = direct.model_copy(
+        update={
+            "sysctls": tuple(
+                item.model_copy(update={"value": "2"}) if index == 0 else item
+                for index, item in enumerate(direct.sysctls)
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="runtime_comparison_environment_differs"):
+        validate_runtime_comparison_pair(proxy, changed)
+
+    source_pid, reader_pid = (item.pid for item in direct.processes)
+    plugin = RuntimeLibrary(
+        path="/usr/lib/gstreamer-1.0/libgsttest.so",
+        sha256="6" * 64,
+        size_bytes=2048,
+        device_major=8,
+        device_minor=1,
+        inode=43,
+        process_ids=(source_pid,),
+    )
+    proxy_runtime = proxy.gstreamer
+    direct_runtime = direct.gstreamer
+    assert proxy_runtime is not None and direct_runtime is not None
+    proxy_with_plugin = proxy.model_copy(
+        update={
+            "gstreamer": proxy_runtime.model_copy(
+                update={
+                    "loaded_libraries": (
+                        *proxy_runtime.loaded_libraries,
+                        plugin.model_copy(update={"process_ids": (proxy.processes[0].pid,)}),
+                    )
+                }
+            )
+        }
+    )
+    direct_with_swapped_plugin = direct.model_copy(
+        update={
+            "gstreamer": direct_runtime.model_copy(
+                update={
+                    "loaded_libraries": (
+                        *direct_runtime.loaded_libraries,
+                        plugin.model_copy(update={"process_ids": (reader_pid,)}),
+                    )
+                }
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="runtime_comparison_environment_differs"):
+        validate_runtime_comparison_pair(proxy_with_plugin, direct_with_swapped_plugin)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("net.ipv4.ip_local_port_range", "garbage"),
+        ("net.ipv4.ip_local_port_range", "60999 32768"),
+        ("net.ipv4.ip_local_reserved_ports", "9000,8000"),
+        ("net.core.somaxconn", "not-a-number"),
+    ],
+)
+def test_runtime_setting_rejects_untyped_or_noncanonical_sysctls(name: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        RuntimeSetting(name=name, value=value)
+
+
 @pytest.mark.parametrize(
     ("location", "field", "value", "reason"),
     [
@@ -743,137 +1168,236 @@ def test_fixture_inspector_binds_probe_semantics_and_pinned_tools(
     assert cli_destination.is_file()
 
 
-def test_load_cli_samples_and_summarizes_required_capacity_sut_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_functional_proxy_finalization_recomputes_real_sut_evidence_seam(
+    tmp_path: Path,
 ) -> None:
-    profile = LoadProfile.model_validate(valid_profile(tier="capacity"))
-    run_directory = tmp_path / "capacity-run"
-    initialize_run_directory(profile, run_directory)
-    raw_directory = run_directory / "raw"
-    summary_directory = run_directory / "summary"
-    raw_directory.mkdir()
-    summary_directory.mkdir()
-    scheduled_start = 4_102_444_800_000
-    (run_directory / "launch-plan.json").write_text(
-        json.dumps({"coordinated_start_unix_ms": scheduled_start}),
+    pull_server = tmp_path / "rtsp-pull-server"
+    load_reader = tmp_path / "rtsp-load-reader"
+    fixture = tmp_path / "fixture.h264"
+    pull_server.write_bytes(b"pull-server")
+    load_reader.write_bytes(b"load-reader")
+    fixture.write_bytes(b"fixture")
+    pull_server.chmod(0o750)
+    load_reader.chmod(0o750)
+    raw = valid_profile()
+    artifacts = raw["artifacts"]
+    fixture_profile = raw["fixture"]
+    workload = raw["workload"]
+    assert isinstance(artifacts, dict)
+    assert isinstance(fixture_profile, dict)
+    assert isinstance(workload, dict)
+    artifacts["pull_server_sha256"] = hashlib.sha256(b"pull-server").hexdigest()
+    artifacts["load_reader_sha256"] = hashlib.sha256(b"load-reader").hexdigest()
+    fixture_profile.update(path=str(fixture), sha256=hashlib.sha256(b"fixture").hexdigest())
+    workload.update(
+        active_sources=0,
+        total_readers=0,
+        connect_rate_per_second=0,
+        minimum_rtp_packets_per_second=0,
+        endpoint_mode="proxy",
+        session_temperature="warm",
+    )
+    raw["duration"] = {
+        "warmup_seconds": 0,
+        "measurement_seconds": 1,
+        "soak_seconds": 0,
+    }
+    profile = LoadProfile.model_validate(raw)
+    write_fixture_manifest(profile)
+    scheduled_start_ms = 4_102_444_800_000
+    run_directory = tmp_path / "proxy-functional"
+    prepare_run_directory(
+        profile,
+        run_directory,
+        pull_server_binary=pull_server,
+        load_reader_binary=load_reader,
+        coordinated_start_unix_ms=scheduled_start_ms,
+    )
+
+    def timestamp(unix_ms: int) -> str:
+        return (
+            datetime.fromtimestamp(unix_ms / 1000, UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def resource(
+        *,
+        host: str,
+        machine: str,
+        observed_at_ms: int,
+        processes: tuple[RuntimeProcessBinding, ...],
+    ) -> ResourceObservation:
+        return ResourceObservation(
+            generator_host=host,
+            machine_id_sha256=machine,
+            boot_id="11111111-1111-1111-1111-111111111111",
+            timestamp=timestamp(observed_at_ms),
+            interval_seconds=1,
+            host_cpu_percent=10,
+            host_ram_percent=10,
+            max_process_cpu_percent=10,
+            cgroup_cpu_percent=10,
+            cgroup_ram_percent=10,
+            max_process_fd_percent=10,
+            socket_percent=10,
+            ephemeral_port_start=32768,
+            ephemeral_port_end=60999,
+            ephemeral_port_capacity=28232,
+            reserved_ports_sha256=hashlib.sha256(b"").hexdigest(),
+            cgroup_pids_percent=10,
+            network_percent=10,
+            network_packets_per_second=1000,
+            packet_rate_percent=10,
+            interface_mtu_bytes=1500,
+            memory_total_bytes=16 * 1024**3,
+            nic_link_speed_bits_per_second=10_000_000_000,
+            cgroup_cpu_capacity_cores=4,
+            cgroup_memory_limit_bytes=8 * 1024**3,
+            cgroup_pids_limit=100000,
+            process_count=len(processes),
+            workload_processes=processes,
+            workload_processes_sha256=runtime_process_bindings_sha256(processes),
+            workload_process_limits=tuple(
+                RuntimeProcessLimit(pid=item.pid, max_open_files=65536) for item in processes
+            ),
+            cgroup_path_sha256="c" * 64,
+            cgroup_constraint_chain_sha256="5" * 64,
+        )
+
+    generator_processes = tuple(
+        RuntimeProcessBinding(
+            pid=100 + index,
+            executable_sha256=profile.artifacts.pull_server_sha256,
+            start_time_ticks=1000 + index,
+        )
+        for index in range(1)
+    )
+    generator_observations = tuple(
+        resource(
+            host="generator-a",
+            machine="a" * 64,
+            observed_at_ms=scheduled_start_ms + offset,
+            processes=generator_processes,
+        )
+        for offset in (0, 500, 1000)
+    )
+    generator_raw = run_directory / "raw/generator-generator-a.jsonl"
+    generator_raw.write_text(
+        "".join(item.model_dump_json() + "\n" for item in generator_observations),
         encoding="utf-8",
     )
-    sampled: dict[str, object] = {}
+    write_summary(
+        run_directory / "summary/generator-generator-a.json",
+        summarize_generator_headroom(
+            generator_observations,
+            expected_generator_host="generator-a",
+            minimum_duration_seconds=1,
+            expected_interval_seconds=1,
+            maximum_gap_factor=1.5,
+            observations_sha256=sha256_file(generator_raw),
+            measurement_start_unix_ms=scheduled_start_ms,
+            measurement_end_unix_ms=scheduled_start_ms + 1000,
+            soak_end_unix_ms=scheduled_start_ms + 1000,
+        ),
+    )
+    write_summary(
+        run_directory / "raw/runtime-generator-generator-a.json",
+        runtime_manifest(
+            profile,
+            role="generator",
+            host="generator-a",
+            architecture=profile.generator_hosts[0].architecture,
+            processes=generator_processes,
+            machine_id_sha256="a" * 64,
+            boot_id="11111111-1111-1111-1111-111111111111",
+            observed_at_unix_ms=scheduled_start_ms - 1000,
+        ),
+    )
 
-    def fake_sample(**kwargs: object) -> int:
-        sampled.update(kwargs)
-        return 7
-
-    class FakeSummary:
-        valid = True
-
-        def model_dump(self, *, mode: str) -> dict[str, object]:
-            assert mode == "json"
-            return {"valid": True}
-
-    monkeypatch.setattr(load_cli_module, "sample_linux_sut_resources", fake_sample)
-    output = raw_directory / "sut.jsonl"
-    assert (
-        load_cli_main(
-            [
-                "sample-sut",
-                str(run_directory),
-                str(output),
-                "--mediamtx-pid",
-                "321",
-                "--cgroup",
-                "mediamtx.service",
-                "--metrics-url",
-                "http://127.0.0.1:9998/metrics",
-            ]
+    sut_processes = (
+        RuntimeProcessBinding(
+            pid=200,
+            executable_sha256=profile.artifacts.mediamtx_sha256,
+            start_time_ticks=2000,
+        ),
+    )
+    sampling_end_ms = sut_sampling_end_unix_ms(profile, scheduled_start_ms)
+    sut_offsets = (0, 500, *range(1000, sampling_end_ms - scheduled_start_ms + 1, 1000))
+    sut_observations = tuple(
+        SutObservation(
+            sut_host=profile.sut_rtsp_host,
+            timestamp=timestamp(scheduled_start_ms + offset),
+            clock_proof=KernelClockProof(
+                observed_at_unix_ms=scheduled_start_ms + offset,
+                synchronized=True,
+                state=0,
+                status=0,
+                max_error_ms=1,
+            ),
+            resource=resource(
+                host=profile.sut_rtsp_host,
+                machine="b" * 64,
+                observed_at_ms=scheduled_start_ms + offset,
+                processes=sut_processes,
+            ),
+            mediamtx_rss_bytes=1024,
+            mediamtx_open_file_descriptors=10,
+            metrics_families=REQUIRED_SUT_METRIC_FAMILIES,
+            total_rtsp_sessions=0,
+            ready_runtime_paths=0,
+            active_session_counters=(),
+            active_path_counters=(),
+            cumulative_inbound_rtp_packets=0,
+            cumulative_outbound_rtp_packets=0,
+            inbound_rtp_packets_lost=0,
+            inbound_rtp_packets_in_error=0,
+            inbound_rtcp_packets_in_error=0,
+            outbound_rtp_packets_discarded=0,
+            outbound_rtp_packets_reported_lost=0,
+            rtcp_packets_in_error=0,
+            rtp_packets_in_error=0,
+            rtp_packets_lost=0,
+            path_inbound_frames_in_error=0,
         )
-        == 0
+        for offset in sut_offsets
     )
-    assert sampled["mediamtx_pid"] == 321
-    assert sampled["expected_mediamtx_sha256"] == profile.artifacts.mediamtx_sha256
-    capsys.readouterr()
-
-    output.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(load_cli_module, "load_sut_observations", lambda path: ())
-    monkeypatch.setattr(
-        load_cli_module, "summarize_sut_capacity", lambda *args, **kwargs: FakeSummary()
+    sut_raw = run_directory / "raw/sut.jsonl"
+    sut_raw.write_text(
+        "".join(item.model_dump_json() + "\n" for item in sut_observations),
+        encoding="utf-8",
     )
-    summary = summary_directory / "sut.json"
-    assert (
-        load_cli_main(
-            [
-                "summarize-sut",
-                str(run_directory),
-                str(output),
-                str(summary),
-            ]
-        )
-        == 0
+    write_summary(
+        run_directory / "summary/sut.json",
+        summarize_sut_capacity(
+            sut_observations,
+            expected_sut_host=profile.sut_rtsp_host,
+            expected_interval_seconds=1,
+            maximum_gap_factor=1.5,
+            observations_sha256=sha256_file(sut_raw),
+            measurement_start_unix_ms=scheduled_start_ms,
+            measurement_end_unix_ms=scheduled_start_ms + 1000,
+            soak_end_unix_ms=scheduled_start_ms + 1000,
+            maximum_clock_error_ms=10,
+            capacity_gate=False,
+        ),
     )
-    assert json.loads(summary.read_text(encoding="utf-8")) == {"valid": True}
-
-
-def test_load_cli_copies_and_binds_cold_direct_reference(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    proxy_raw = valid_profile()
-    proxy_workload = proxy_raw["workload"]
-    assert isinstance(proxy_workload, dict)
-    proxy_workload.update(
-        active_sources=4,
-        total_readers=4,
-        session_temperature="cold",
-        endpoint_mode="proxy",
+    write_summary(
+        run_directory / "raw/runtime-sut.json",
+        runtime_manifest(
+            profile,
+            role="sut",
+            host=profile.sut_rtsp_host,
+            architecture=profile.sut_architecture,
+            processes=sut_processes,
+            machine_id_sha256="b" * 64,
+            boot_id="11111111-1111-1111-1111-111111111111",
+            observed_at_unix_ms=scheduled_start_ms - 1000,
+        ),
     )
-    direct_raw = json.loads(json.dumps(proxy_raw))
-    direct_workload = direct_raw["workload"]
-    assert isinstance(direct_workload, dict)
-    direct_workload["endpoint_mode"] = "direct-control"
-    proxy = LoadProfile.model_validate(proxy_raw)
-    direct = LoadProfile.model_validate(direct_raw)
-    proxy_run = tmp_path / "proxy"
-    direct_run = tmp_path / "direct"
-    initialize_run_directory(proxy, proxy_run)
-    initialize_run_directory(direct, direct_run)
-    (proxy_run / "raw").mkdir()
-    (proxy_run / "summary").mkdir()
-    (direct_run / "raw").mkdir()
-    proxy_events = proxy_run / "raw" / "readers.jsonl"
-    direct_events = direct_run / "raw" / "readers.jsonl"
-    proxy_events.write_text("{}\n", encoding="utf-8")
-    direct_events.write_text("{}\n", encoding="utf-8")
-    (direct_run / "final-manifest.json").write_text("{}\n", encoding="utf-8")
 
-    class FakeComparison:
-        valid = True
-
-        def model_dump(self, *, mode: str) -> dict[str, object]:
-            assert mode == "json"
-            return {"valid": True}
-
-    monkeypatch.setattr(load_cli_module, "verify_run_directory", lambda path: {})
-    monkeypatch.setattr(
-        load_cli_module,
-        "summarize_cold_comparison",
-        lambda *args, **kwargs: FakeComparison(),
-    )
-    output = proxy_run / "summary" / "cold-comparison.json"
-
-    assert (
-        load_cli_main(
-            [
-                "compare-cold",
-                str(proxy_run),
-                str(proxy_events),
-                str(direct_run),
-                str(direct_events),
-                str(output),
-            ]
-        )
-        == 0
-    )
-    assert json.loads(output.read_text(encoding="utf-8")) == {"valid": True}
-    assert (proxy_run / "reference" / "direct-final-manifest.json").is_file()
+    finalize_run_directory(run_directory)
+    verify_run_directory(run_directory)
 
 
 def test_cold_finalization_requires_typed_inactive_path_preflight(tmp_path: Path) -> None:
@@ -1012,14 +1536,13 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
                 "event": "reader_rtp_segment",
                 "reader_id": reader_id,
                 "cycle": 0,
-                    "path": path,
-                    "track": "video",
-                    "phase": "measurement",
-                    "first_at_monotonic_ms": max(
-                        measurement_start_unix_ms(profile, scheduled_start_ms)
-                        - scheduled_start_ms,
-                        reader_id * 100 + handshake + 100,
-                    ),
+                "path": path,
+                "track": "video",
+                "phase": "measurement",
+                "first_at_monotonic_ms": max(
+                    measurement_start_unix_ms(profile, scheduled_start_ms) - scheduled_start_ms,
+                    reader_id * 100 + handshake + 100,
+                ),
                 "last_at_monotonic_ms": measurement_end_unix_ms(profile, scheduled_start_ms)
                 - scheduled_start_ms
                 - 1,
@@ -1125,16 +1648,26 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
             ephemeral_port_start=32768,
             ephemeral_port_end=60999,
             ephemeral_port_capacity=28232,
-            reserved_ports_sha256="d" * 64,
+            reserved_ports_sha256=hashlib.sha256(b"").hexdigest(),
             cgroup_pids_percent=10,
             network_percent=10,
             network_packets_per_second=1000,
             packet_rate_percent=10,
             interface_mtu_bytes=1500,
+            memory_total_bytes=16 * 1024**3,
+            nic_link_speed_bits_per_second=10_000_000_000,
+            cgroup_cpu_capacity_cores=4,
+            cgroup_memory_limit_bytes=8 * 1024**3,
+            cgroup_pids_limit=100000,
             process_count=2,
             workload_processes=process_bindings,
             workload_processes_sha256=runtime_process_bindings_sha256(process_bindings),
+            workload_process_limits=(
+                RuntimeProcessLimit(pid=100, max_open_files=65536),
+                RuntimeProcessLimit(pid=101, max_open_files=65536),
+            ),
             cgroup_path_sha256="c" * 64,
+            cgroup_constraint_chain_sha256="5" * 64,
         )
         for offset in (0, 1, 2)
     ]
@@ -1155,6 +1688,19 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
             measurement_start_unix_ms=measurement_start_unix_ms(profile, scheduled_start_ms),
             measurement_end_unix_ms=measurement_end_unix_ms(profile, scheduled_start_ms),
             soak_end_unix_ms=workload_end_unix_ms(profile, scheduled_start_ms),
+        ),
+    )
+    write_summary(
+        run_directory / "raw" / "runtime-generator-generator-a.json",
+        runtime_manifest(
+            profile,
+            role="generator",
+            host="generator-a",
+            architecture=profile.generator_hosts[0].architecture,
+            processes=process_bindings,
+            machine_id_sha256="a" * 64,
+            boot_id="11111111-1111-1111-1111-111111111111",
+            observed_at_unix_ms=scheduled_start_ms,
         ),
     )
 
@@ -1211,6 +1757,32 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
         restored_summary.model_dump_json() + "\n", encoding="utf-8"
     )
 
+    runtime_path = run_directory / "raw" / "runtime-generator-generator-a.json"
+    stored_runtime = LinuxRuntimeManifest.model_validate_json(
+        runtime_path.read_text(encoding="utf-8")
+    )
+    runtime_path.write_text(
+        stored_runtime.model_copy(update={"machine_id_sha256": "5" * 64}).model_dump_json() + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="runtime_manifest_resource_series_binding_invalid"):
+        finalize_run_directory(run_directory)
+    runtime_path.write_text(stored_runtime.model_dump_json() + "\n", encoding="utf-8")
+
+    changed_sysctls = tuple(
+        item.model_copy(update={"value": "32769 60999"})
+        if item.name == "net.ipv4.ip_local_port_range"
+        else item
+        for item in stored_runtime.sysctls
+    )
+    runtime_path.write_text(
+        stored_runtime.model_copy(update={"sysctls": changed_sysctls}).model_dump_json() + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="runtime_manifest_resource_series_binding_invalid"):
+        finalize_run_directory(run_directory)
+    runtime_path.write_text(stored_runtime.model_dump_json() + "\n", encoding="utf-8")
+
     (run_directory / "final-manifest.json").write_text('{"schema_version":', encoding="utf-8")
     assert load_cli_main(["finalize", str(run_directory)]) == 0
     finalized_output = capsys.readouterr()
@@ -1221,6 +1793,7 @@ def test_run_directory_finalization_hashes_and_seals_every_evidence_file(
     assert {
         "reader-plan-generator-a.tsv",
         "raw/generator-generator-a.jsonl",
+        "raw/runtime-generator-generator-a.json",
         "raw/readers.jsonl",
         "summary/generator-generator-a.json",
         "summary/readers.json",
@@ -1493,10 +2066,19 @@ def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid
                         "network_packets_per_second": 1000,
                         "packet_rate_percent": 10,
                         "interface_mtu_bytes": 1500,
+                        "memory_total_bytes": 16 * 1024**3,
+                        "nic_link_speed_bits_per_second": 10_000_000_000,
+                        "cgroup_cpu_capacity_cores": 4,
+                        "cgroup_memory_limit_bytes": 8 * 1024**3,
+                        "cgroup_pids_limit": 100000,
                         "process_count": 2,
                         "workload_processes": process_binding_payload,
                         "workload_processes_sha256": process_binding_sha256,
+                        "workload_process_limits": [
+                            {"pid": item.pid, "max_open_files": 65536} for item in process_bindings
+                        ],
                         "cgroup_path_sha256": "c" * 64,
+                        "cgroup_constraint_chain_sha256": "5" * 64,
                     }
                 )
                 + "\n"
@@ -1546,63 +2128,6 @@ def test_load_cli_summarizes_generator_headroom_and_returns_nonzero_when_invalid
     capsys.readouterr()
     invalid_output = json.loads(invalid_summary_path.read_text(encoding="utf-8"))
     assert invalid_output["invalid_reasons"] == ["generator_network_headroom_below_30_percent"]
-
-
-def test_load_cli_binds_generator_sampler_to_launch_processes_and_mtu(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    profile = LoadProfile.model_validate(valid_profile())
-    run_directory = tmp_path / "run"
-    initialize_run_directory(profile, run_directory)
-    (run_directory / "raw").mkdir()
-    future_start = 4_102_444_800_000
-    (run_directory / "launch-plan.json").write_text(
-        json.dumps(
-            {
-                "coordinated_start_unix_ms": future_start,
-                "source_servers": [{"generator_host": "generator-a"}],
-                "readers": [{"generator_host": "generator-a"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    captured: dict[str, object] = {}
-
-    def sample(**kwargs: object) -> int:
-        captured.update(kwargs)
-        return 7
-
-    monkeypatch.setattr(load_cli_module, "sample_linux_generator_resources", sample)
-    output = run_directory / "raw" / "generator-generator-a.jsonl"
-
-    assert (
-        load_cli_main(
-            [
-                "sample-generator",
-                str(run_directory),
-                str(output),
-                "--generator-host",
-                "generator-a",
-                "--source-pid",
-                "101",
-                "--reader-pid",
-                "202",
-                "--cgroup",
-                "rtsp-load.slice",
-            ]
-        )
-        == 0
-    )
-    assert capsys.readouterr().out == f"SAMPLED observations=7 output={output}\n"
-    assert captured["pids"] == (101, 202)
-    assert captured["expected_executables"] == {
-        101: profile.artifacts.pull_server_sha256,
-        202: profile.artifacts.load_reader_sha256,
-    }
-    assert captured["expected_mtu_bytes"] == 1500
-    captured_duration = captured["duration_seconds"]
-    assert isinstance(captured_duration, int)
-    assert captured_duration > profile.duration.total_seconds
 
 
 def test_versioned_smoke_profile_example_fails_until_placeholders_are_replaced() -> None:

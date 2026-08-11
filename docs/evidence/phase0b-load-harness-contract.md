@@ -59,7 +59,18 @@
   samples plus effective ephemeral-port capacity after reserved ports and
   in-use TCP sockets cover the
   complete workload window; capacity CPU is `<=65%`, NIC bytes/packets `<=60%`,
-  and RAM/FD/socket/cgroup-pids remain `<70%`;
+  and RAM/FD/socket/cgroup-pids remain `<70%`. Cgroup v2 accounting walks every
+  limiting ancestor and includes shared-slice usage; hard denominators and the
+  canonical constraint chain must remain unchanged across samples;
+- every finalized run requires typed runtime/hardware evidence from every
+  generator host; proxy and capacity runs also require the SUT manifest. The
+  capture is bracketed by synchronized Linux clock proofs and binds profile to native architecture,
+  machine/boot, CPU/RAM/NIC/kernel/OS, fixed sysctls, effective cgroup/RLIMIT and
+  exact PID/start/executable identity. Generator evidence also binds the exact
+  `libgstreamer1.0-0` dpkg build, installed package ledger and
+  SHA-256/device/inode identities of mapped GStreamer libraries for every
+  workload process. Cold A/B copies finalized direct runtime manifests and rejects
+  stable environment drift;
 - reader summary retains failed attempts, enforces `>=99.9%` establishment and
   warm proxy ramp p99 `<=500ms`; one anchor inside `total_readers` keeps every
   active path warm across ramp start, typed API polling proves the anchors, and
@@ -76,7 +87,7 @@
 - ramp, warm-up, measurement and soak are bound as distinct epochs; session
   health, RTP rates and resource ceilings are recomputed separately for measurement and
   soak, and steady/outage injection starts only after the readiness warm-up.
-- capacity finalization additionally requires a SUT series bound to the exact
+- every proxy and every capacity finalization requires an independent SUT series bound to the exact
   MediaMTX PID/cgroup/NIC and pinned metrics families. Each sample and each
   loopback cold/warm preflight carries fail-closed kernel clock proof;
   per-session/per-path counters remain cumulative across churn and are gated
@@ -90,7 +101,7 @@
   headroom, maximum rolling 6h RSS slope including
   cross-phase windows, FD drain, all RTSP sessions plus ready runtime paths
   after the pinned on-demand close/drain interval, and zero RTP/RTCP/path error
-  delta.
+  delta. Capacity additionally applies the long-window leak/soak conclusions;
 - the final manifest is the sealing completion marker; verification checks
   exact `0440`/`0550` modes and an interrupted final chmod is recoverable only
   by rerunning the full semantic finalizer. The marker is published with an
@@ -105,10 +116,15 @@ review passed.
 The native jobs compile both C binaries with distro GStreamer development
 libraries, print exact package versions and binary SHA-256 values, prepare
 pinned-FFmpeg fixtures, then prove two H.264 and two H.265 pull endpoints with
-fan-out readers and rejected UDP transport.
+fan-out readers and rejected UDP transport. The updated workflow also starts a
+finite systemd service and runs the public runtime capture/binding contract against
+real `/proc`, cgroup v2, dpkg and mapped GStreamer libraries on both amd64 and
+arm64. The previously published run `31499414349` predates this added contract;
+a new green run is required.
 
 This proves functional compatibility only. It does not satisfy the Spike #0
-exit: no production-equivalent hardware manifest, two-host generator
+exit: the runtime-manifest implementation has no published
+production-equivalent hardware capture, two-host generator
 convergence, LAN/WAN baseline, 100/500/1000 ladder, knee, churn/fault matrix or
 24-hour soak has been published yet.
 

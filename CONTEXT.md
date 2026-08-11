@@ -63,24 +63,30 @@ counts and lifecycle slots to
 host/profile/reader-plan/clock evidence, including an end-of-workload clock
 proof and bounded early/late schedule deviation. Generator evidence binds the exact
 cgroup PID set to executable digests/start times and captures NIC packets/MTU
-plus effective ephemeral TCP capacity after reserved ports. Measurement and
+plus effective ephemeral TCP capacity after reserved ports. An obligatory
+per-host runtime manifest brackets the full capture with synchronized clock proofs and binds profile, architecture,
+machine/boot, CPU/RAM/NIC/kernel/sysctl, effective cgroup/RLIMIT values and exact
+process identity; generator manifests also bind the dpkg GStreamer build and
+the SHA/device/inode of libraries mapped by every workload process. Measurement and
 soak headroom/session-health gates are recomputed separately;
 finalization regenerates plans and summaries from raw data before sealing the
-bundle. Capacity bundles additionally require typed MediaMTX PID/cgroup/NIC,
+bundle. Every proxy bundle, and every capacity bundle, also requires an independent
+typed MediaMTX PID/cgroup/NIC series; capacity gates additionally include
 maximum rolling 6h RSS slope, FD/all-session/runtime-path drain, per-sample SUT
 clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
 reconciliation. A fixture
 manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
-Hardened native amd64/arm64 CI `31499414349` and its full rerun are green;
-repeat Standards/Spec review passed. WAN/netem and non-zero probe/CRUD axes
+Hardened native amd64/arm64 CI `31499414349` and its full rerun cover the
+pre-runtime-manifest harness. The runtime collector now has a privileged public
+capture/binding contract on both native runners but requires a newly published CI
+result and repeat review. WAN/netem and non-zero probe/CRUD axes
 deliberately fail closed
 until typed drivers exist; native CI is functional evidence only and is not a
 measured single-node capacity envelope.
 
-The remaining Phase 0B exit evidence explicitly includes a per-host hardware,
-architecture and dynamically linked GStreamer package/build manifest. Current
-executable hashes and profile labels do not by themselves prove that runtime
-environment, so no finalized functional bundle is a production capacity claim.
+The runtime/hardware manifest code is implemented, but no production-equivalent
+hardware manifest or capacity run has been published. A finalized functional
+bundle remains compatibility evidence, not a production capacity claim.
 
 Role processes do not yet run catalog, grant, reconciler, scheduler or
 observability loops. PostgreSQL durability, artifact provenance, capacity and

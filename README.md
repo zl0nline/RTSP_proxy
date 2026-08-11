@@ -20,9 +20,12 @@ TCP endpoint.
 >   заявленной reader-когорты, общие UTC ramp/measurement/soak epochs,
 >   post-workload sampling barrier,
 >   typed fixture semantics, process/cgroup/binary binding, phase RTP и
->   обязательные SUT resource/leak/loss gates для capacity. Предыдущий native
->   amd64/arm64 CI заменён подтверждённым hardened run `31499414349`: полный
->   workflow и его повторный прогон прошли, Standards/Spec review — PASS.
+>   обязательный независимый SUT resource/session/loss ряд для каждого proxy и
+>   расширенные leak/soak gates для capacity, а также per-host
+>   architecture/hardware/GStreamer runtime manifests. Предыдущий native
+>   amd64/arm64 CI run `31499414349` подтверждает предшествующий native harness;
+>   runtime-manifest slice добавляет отдельный privileged capture/binding contract
+>   на обоих native runners и требует нового опубликованного CI результата.
 >   Выделенный
 >   production-equivalent Spike #0 и 24h soak ещё не выполнены; WAN/netem и
 >   probe/CRUD drivers пока fail closed.
@@ -247,20 +250,29 @@ reset/recreate целевые on-demand paths, требует один reader н
 имеет implementation safety cap: 512 paths и 32 API workers. Generator
 headroom проверяет точный `cgroup.procs`,
 executable digest/start time, host/process/RLIMIT, NIC packets/MTU, effective
-ephemeral TCP capacity с учётом reserved ports и finite cgroup limits; measurement
+ephemeral TCP capacity с учётом reserved ports и usage каждого ограничивающего
+cgroup v2 ancestor, а не только leaf scope; measurement
 и soak проверяются раздельно, а post-workload
-barrier оставляет PID доступным до завершающей resource sample. Finalizer заново
+barrier оставляет PID доступным до завершающей resource sample. Каждый proxy
+run также требует независимый MediaMTX PID/cgroup/NIC series; capacity добавляет
+24h leak/soak gates. Finalizer заново
 строит планы и summaries из raw evidence до хэширования bundle. Capacity bundle
-дополнительно требует MediaMTX PID/cgroup/NIC series, kernel clock proof,
+дополнительно требует kernel clock proof,
 rolling 6h RSS, включая границу measurement/soak,
 FD/all-session/runtime-path drain, identity-recomputed RTP/RTCP/path error
 deltas и per-cycle/per-reader/per-track sent-sequence/received phase RTP
 reconciliation с проверкой темпа и границ connected interval. Один stalled
 video/Opus reader не маскируется зелёным aggregate. Fixture manifest связывает pinned
-FFmpeg/ffprobe с измеренными codec/FPS/bitrate/GOP. Эти механизмы
-не публикуют capacity envelope без выделенных стендов, typed WAN/netem и
-probe/CRUD drivers, per-host architecture/GStreamer runtime manifest, полной
-matrix и 24h soak. FFmpeg/ffprobe
+FFmpeg/ffprobe с измеренными codec/FPS/bitrate/GOP. Обязательный per-host runtime
+manifest двумя clock proofs ограничивает весь capture и связывает native architecture,
+CPU/RAM/NIC/kernel/sysctl, effective
+cgroup/RLIMIT и PID/start/executable identity; на generator hosts он также
+фиксирует exact dpkg build и SHA/device/inode реально mmap'нутых GStreamer
+библиотек. Cold A/B дополнительно копирует и хэширует direct runtime manifests и
+отвергает drift machine/boot/kernel/sysctl/cgroup/RLIMIT/GStreamer среды. Эти
+механизмы не публикуют capacity envelope без фактических
+выделенных стендов, typed WAN/netem и probe/CRUD drivers, полной matrix и 24h
+soak. FFmpeg/ffprobe
 зафиксированы как Phase 0 candidate,
 но upstream artifact не имеет GitHub attestation и ещё не прошёл security
 provenance gate. Наличие Phase 0-кода не означает доказанную production

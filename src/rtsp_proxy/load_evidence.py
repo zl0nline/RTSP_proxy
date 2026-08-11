@@ -195,6 +195,13 @@ class RuntimeProcessBinding(BaseModel):
     start_time_ticks: Annotated[int, Field(gt=0)]
 
 
+class RuntimeProcessLimit(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pid: Annotated[int, Field(gt=0)]
+    max_open_files: Annotated[int, Field(gt=0)]
+
+
 class ResourceObservation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -219,10 +226,17 @@ class ResourceObservation(BaseModel):
     network_packets_per_second: Annotated[float, Field(ge=0)]
     packet_rate_percent: Percent
     interface_mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
+    memory_total_bytes: Annotated[int, Field(gt=0)]
+    nic_link_speed_bits_per_second: Annotated[int, Field(gt=0)]
+    cgroup_cpu_capacity_cores: Annotated[float, Field(gt=0)]
+    cgroup_memory_limit_bytes: Annotated[int, Field(gt=0)]
+    cgroup_pids_limit: Annotated[int, Field(gt=0)]
     process_count: Annotated[int, Field(gt=0)]
     workload_processes: tuple[RuntimeProcessBinding, ...]
     workload_processes_sha256: Sha256
+    workload_process_limits: tuple[RuntimeProcessLimit, ...]
     cgroup_path_sha256: Sha256
+    cgroup_constraint_chain_sha256: Sha256
 
     @model_validator(mode="after")
     def validate_ephemeral_range(self) -> Self:
@@ -238,6 +252,8 @@ class ResourceObservation(BaseModel):
             != self.workload_processes
             or len({item.pid for item in self.workload_processes}) != self.process_count
             or _process_bindings_sha256(self.workload_processes) != self.workload_processes_sha256
+            or tuple(item.pid for item in self.workload_process_limits)
+            != tuple(item.pid for item in self.workload_processes)
         ):
             raise ValueError("workload_process_binding_invalid")
         return self
@@ -276,10 +292,17 @@ class GeneratorHeadroomSummary(BaseModel):
     max_network_packets_per_second: Annotated[float, Field(ge=0)]
     max_packet_rate_percent: Percent
     interface_mtu_bytes: Annotated[int, Field(ge=576, le=9216)]
+    memory_total_bytes: Annotated[int, Field(gt=0)]
+    nic_link_speed_bits_per_second: Annotated[int, Field(gt=0)]
+    cgroup_cpu_capacity_cores: Annotated[float, Field(gt=0)]
+    cgroup_memory_limit_bytes: Annotated[int, Field(gt=0)]
+    cgroup_pids_limit: Annotated[int, Field(gt=0)]
     process_count: Annotated[int, Field(gt=0)]
     workload_processes: tuple[RuntimeProcessBinding, ...]
     workload_processes_sha256: Sha256
+    workload_process_limits: tuple[RuntimeProcessLimit, ...]
     cgroup_path_sha256: Sha256
+    cgroup_constraint_chain_sha256: Sha256
     valid: bool
     invalid_reasons: tuple[str, ...]
 
@@ -308,6 +331,8 @@ class GeneratorHeadroomSummary(BaseModel):
         if (
             len(self.workload_processes) != self.process_count
             or _process_bindings_sha256(self.workload_processes) != self.workload_processes_sha256
+            or tuple(item.pid for item in self.workload_process_limits)
+            != tuple(item.pid for item in self.workload_processes)
         ):
             raise ValueError("workload_process_binding_invalid")
         return self
@@ -439,6 +464,17 @@ class ProcessCounters:
 
 
 @dataclass(frozen=True, slots=True)
+class CgroupConstraintCounters:
+    path_sha256: str
+    cpu_usage_usec: int
+    cpu_capacity_cores: float
+    memory_current_bytes: int
+    memory_limit_bytes: int | None
+    pids_current: int
+    pids_limit: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class CgroupCounters:
     cpu_usage_usec: int
     cpu_capacity_cores: float
@@ -446,6 +482,8 @@ class CgroupCounters:
     memory_limit_bytes: int
     pids_current: int
     pids_limit: int
+    constraint_chain_sha256: str
+    constraints: tuple[CgroupConstraintCounters, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,8 +521,10 @@ class GeneratorCounters:
             or rx_packets_delta < 0
             or tx_packets_delta < 0
             or self.host.memory_total_bytes <= 0
+            or self.host.memory_total_bytes != previous.host.memory_total_bytes
             or not 0 <= self.host.memory_available_bytes <= self.host.memory_total_bytes
             or self.host.nic_bits_per_second <= 0
+            or self.host.nic_bits_per_second != previous.host.nic_bits_per_second
             or not 576 <= self.host.interface_mtu_bytes <= 9216
             or self.host.interface_mtu_bytes != previous.host.interface_mtu_bytes
             or self.host.ephemeral_port_start != previous.host.ephemeral_port_start
@@ -500,10 +540,14 @@ class GeneratorCounters:
             or self.boot_id != previous.boot_id
             or self.clock_ticks_per_second <= 0
             or self.cgroup_path_sha256 != previous.cgroup_path_sha256
+            or self.cgroup.constraint_chain_sha256 != previous.cgroup.constraint_chain_sha256
             or {item.pid for item in self.processes} != set(previous_processes)
             or self.cgroup.cpu_capacity_cores <= 0
+            or self.cgroup.cpu_capacity_cores != previous.cgroup.cpu_capacity_cores
             or self.cgroup.memory_limit_bytes <= 0
+            or self.cgroup.memory_limit_bytes != previous.cgroup.memory_limit_bytes
             or self.cgroup.pids_limit <= 0
+            or self.cgroup.pids_limit != previous.cgroup.pids_limit
         ):
             raise ValueError("invalid_or_non_monotonic_generator_counters")
 
@@ -516,6 +560,7 @@ class GeneratorCounters:
                 tick_delta < 0
                 or process.rss_bytes < 0
                 or process.max_file_descriptors <= 0
+                or process.max_file_descriptors != prior.max_file_descriptors
                 or process.executable_sha256 != prior.executable_sha256
                 or process.start_time_ticks != prior.start_time_ticks
                 or not 0 <= process.open_file_descriptors <= process.max_file_descriptors
@@ -524,12 +569,47 @@ class GeneratorCounters:
             process_cpu.append(tick_delta / self.clock_ticks_per_second / elapsed_seconds * 100)
             fd_percent.append(process.open_file_descriptors / process.max_file_descriptors * 100)
 
-        cgroup_cpu_delta = self.cgroup.cpu_usage_usec - previous.cgroup.cpu_usage_usec
-        if (
-            cgroup_cpu_delta < 0
-            or not 0 <= self.cgroup.memory_current_bytes <= self.cgroup.memory_limit_bytes
-            or not 0 <= self.cgroup.pids_current <= self.cgroup.pids_limit
-        ):
+        previous_constraints = {item.path_sha256: item for item in previous.cgroup.constraints}
+        if not self.cgroup.constraints or {
+            item.path_sha256 for item in self.cgroup.constraints
+        } != set(previous_constraints):
+            raise ValueError("invalid_or_non_monotonic_generator_counters")
+        cgroup_cpu_percentages: list[float] = []
+        cgroup_ram_percentages: list[float] = []
+        cgroup_pids_percentages: list[float] = []
+        for constraint in self.cgroup.constraints:
+            prior_constraint = previous_constraints[constraint.path_sha256]
+            cpu_delta = constraint.cpu_usage_usec - prior_constraint.cpu_usage_usec
+            if (
+                cpu_delta < 0
+                or constraint.cpu_capacity_cores <= 0
+                or constraint.cpu_capacity_cores != prior_constraint.cpu_capacity_cores
+                or constraint.memory_limit_bytes != prior_constraint.memory_limit_bytes
+                or constraint.pids_limit != prior_constraint.pids_limit
+                or constraint.memory_current_bytes < 0
+                or constraint.pids_current < 0
+                or (
+                    constraint.memory_limit_bytes is not None
+                    and constraint.memory_current_bytes > constraint.memory_limit_bytes
+                )
+                or (
+                    constraint.pids_limit is not None
+                    and constraint.pids_current > constraint.pids_limit
+                )
+            ):
+                raise ValueError("invalid_or_non_monotonic_generator_counters")
+            cgroup_cpu_percentages.append(
+                cpu_delta / 1_000_000 / elapsed_seconds / constraint.cpu_capacity_cores * 100
+            )
+            if constraint.memory_limit_bytes is not None:
+                cgroup_ram_percentages.append(
+                    constraint.memory_current_bytes / constraint.memory_limit_bytes * 100
+                )
+            if constraint.pids_limit is not None:
+                cgroup_pids_percentages.append(
+                    constraint.pids_current / constraint.pids_limit * 100
+                )
+        if not cgroup_ram_percentages or not cgroup_pids_percentages:
             raise ValueError("invalid_or_non_monotonic_generator_counters")
         host_cpu = (total_delta - idle_delta) / total_delta * 100
         host_ram = (
@@ -537,9 +617,7 @@ class GeneratorCounters:
             / self.host.memory_total_bytes
             * 100
         )
-        cgroup_cpu = (
-            cgroup_cpu_delta / 1_000_000 / elapsed_seconds / self.cgroup.cpu_capacity_cores * 100
-        )
+        cgroup_cpu = max(cgroup_cpu_percentages)
         network = (
             max(rx_delta, tx_delta) * 8 / elapsed_seconds / self.host.nic_bits_per_second * 100
         )
@@ -556,6 +634,10 @@ class GeneratorCounters:
             for item in sorted(self.processes, key=lambda item: item.pid)
         )
         processes_sha256 = _process_bindings_sha256(process_bindings)
+        process_limits = tuple(
+            RuntimeProcessLimit(pid=item.pid, max_open_files=item.max_file_descriptors)
+            for item in sorted(self.processes, key=lambda item: item.pid)
+        )
         return ResourceObservation(
             generator_host=generator_host,
             machine_id_sha256=self.machine_id_sha256,
@@ -566,9 +648,7 @@ class GeneratorCounters:
             host_ram_percent=min(host_ram, 100),
             max_process_cpu_percent=min(max(process_cpu, default=0), 100),
             cgroup_cpu_percent=min(cgroup_cpu, 100),
-            cgroup_ram_percent=(
-                self.cgroup.memory_current_bytes / self.cgroup.memory_limit_bytes * 100
-            ),
+            cgroup_ram_percent=min(max(cgroup_ram_percentages), 100),
             max_process_fd_percent=max(fd_percent, default=0),
             socket_percent=min(
                 self.host.tcp_ephemeral_ports_in_use / self.host.ephemeral_port_capacity * 100,
@@ -578,7 +658,7 @@ class GeneratorCounters:
             ephemeral_port_end=self.host.ephemeral_port_end,
             ephemeral_port_capacity=self.host.ephemeral_port_capacity,
             reserved_ports_sha256=self.host.reserved_ports_sha256,
-            cgroup_pids_percent=self.cgroup.pids_current / self.cgroup.pids_limit * 100,
+            cgroup_pids_percent=min(max(cgroup_pids_percentages), 100),
             network_percent=min(network, 100),
             network_packets_per_second=network_packets_per_second,
             packet_rate_percent=min(
@@ -586,10 +666,17 @@ class GeneratorCounters:
                 100,
             ),
             interface_mtu_bytes=self.host.interface_mtu_bytes,
+            memory_total_bytes=self.host.memory_total_bytes,
+            nic_link_speed_bits_per_second=self.host.nic_bits_per_second,
+            cgroup_cpu_capacity_cores=self.cgroup.cpu_capacity_cores,
+            cgroup_memory_limit_bytes=self.cgroup.memory_limit_bytes,
+            cgroup_pids_limit=self.cgroup.pids_limit,
             process_count=len(self.processes),
             workload_processes=process_bindings,
             workload_processes_sha256=processes_sha256,
+            workload_process_limits=process_limits,
             cgroup_path_sha256=self.cgroup_path_sha256,
+            cgroup_constraint_chain_sha256=self.cgroup.constraint_chain_sha256,
         )
 
 
@@ -798,9 +885,7 @@ def read_mediamtx_metrics(metrics_url: str, *, timeout_seconds: float = 2) -> Me
                 or integer_value != 1
             ):
                 raise ValueError("sut_metrics_invalid")
-            identity = hashlib.sha256(
-                f"{session_id}\0{remote_address}".encode()
-            ).hexdigest()
+            identity = hashlib.sha256(f"{session_id}\0{remote_address}".encode()).hexdigest()
             session = sessions.setdefault(
                 identity,
                 {
@@ -833,9 +918,7 @@ def read_mediamtx_metrics(metrics_url: str, *, timeout_seconds: float = 2) -> Me
                     or state not in {"idle", "publish", "read"}
                 ):
                     raise ValueError("sut_metrics_invalid")
-                identity = hashlib.sha256(
-                    f"{session_id}\0{remote_address}".encode()
-                ).hexdigest()
+                identity = hashlib.sha256(f"{session_id}\0{remote_address}".encode()).hexdigest()
                 session = sessions.setdefault(
                     identity,
                     {
@@ -972,6 +1055,18 @@ def summarize_generator_headroom(
     }
     process_counts = {item.process_count for item in observations}
     cgroups = {item.cgroup_path_sha256 for item in observations}
+    cgroup_chains = {item.cgroup_constraint_chain_sha256 for item in observations}
+    resource_limits = {
+        (
+            item.memory_total_bytes,
+            item.nic_link_speed_bits_per_second,
+            item.cgroup_cpu_capacity_cores,
+            item.cgroup_memory_limit_bytes,
+            item.cgroup_pids_limit,
+            item.workload_process_limits,
+        )
+        for item in observations
+    }
     if (
         len(hosts) != 1
         or len(machines) != 1
@@ -982,6 +1077,8 @@ def summarize_generator_headroom(
         or len(port_ranges) != 1
         or len(process_counts) != 1
         or len(cgroups) != 1
+        or len(cgroup_chains) != 1
+        or len(resource_limits) != 1
     ):
         raise ValueError("generator_observation_identity_changed")
     generator_host = next(iter(hosts))
@@ -1109,10 +1206,17 @@ def summarize_generator_headroom(
         max_network_packets_per_second=max(item.network_packets_per_second for item in measured),
         max_packet_rate_percent=maxima["packet_rate"],
         interface_mtu_bytes=next(iter(mtus)),
+        memory_total_bytes=next(iter(resource_limits))[0],
+        nic_link_speed_bits_per_second=next(iter(resource_limits))[1],
+        cgroup_cpu_capacity_cores=next(iter(resource_limits))[2],
+        cgroup_memory_limit_bytes=next(iter(resource_limits))[3],
+        cgroup_pids_limit=next(iter(resource_limits))[4],
         process_count=next(iter(process_counts)),
         workload_processes=next(iter(process_bindings)),
         workload_processes_sha256=next(iter(bindings)),
+        workload_process_limits=next(iter(resource_limits))[5],
         cgroup_path_sha256=next(iter(cgroups)),
+        cgroup_constraint_chain_sha256=next(iter(cgroup_chains)),
         valid=not reasons,
         invalid_reasons=tuple(reasons),
     )
@@ -1180,6 +1284,7 @@ def summarize_sut_capacity(
     measurement_end_unix_ms: int,
     soak_end_unix_ms: int,
     maximum_clock_error_ms: float,
+    capacity_gate: bool = True,
 ) -> SutCapacitySummary:
     if not observations:
         raise ValueError("sut_observations_empty")
@@ -1194,7 +1299,7 @@ def summarize_sut_capacity(
         expected_interval_seconds=expected_interval_seconds,
         maximum_gap_factor=maximum_gap_factor,
         observations_sha256=observations_sha256,
-        capacity_gate=True,
+        capacity_gate=capacity_gate,
         measurement_start_unix_ms=measurement_start_unix_ms,
         measurement_end_unix_ms=measurement_end_unix_ms,
         soak_end_unix_ms=soak_end_unix_ms,
@@ -1352,18 +1457,18 @@ def _read_integer(path: Path) -> int:
     return int(path.read_text(encoding="utf-8").strip())
 
 
-def _read_ephemeral_socket_counters(root: Path) -> tuple[int, int, int, str, int]:
-    range_fields = (
-        (root / "proc/sys/net/ipv4/ip_local_port_range").read_text(encoding="utf-8").split()
-    )
+def normalize_linux_ephemeral_port_range(port_range: str) -> str:
+    range_fields = port_range.split()
     if len(range_fields) != 2:
         raise ValueError("invalid_ephemeral_port_range")
     start, end = (int(value) for value in range_fields)
     if not 1 <= start <= end <= 65535:
         raise ValueError("invalid_ephemeral_port_range")
-    reserved_body = (
-        (root / "proc/sys/net/ipv4/ip_local_reserved_ports").read_text(encoding="utf-8").strip()
-    )
+    return f"{start} {end}"
+
+
+def normalize_linux_reserved_ports(reserved_ports: str) -> str:
+    reserved_body = reserved_ports.strip()
     reserved: set[int] = set()
     if reserved_body:
         for token in reserved_body.split(","):
@@ -1375,10 +1480,39 @@ def _read_ephemeral_socket_counters(root: Path) -> tuple[int, int, int, str, int
             if not 1 <= reserved_start <= reserved_end <= 65535:
                 raise ValueError("invalid_reserved_port_range")
             reserved.update(range(reserved_start, reserved_end + 1))
+    canonical_tokens: list[str] = []
+    for _, group in itertools.groupby(enumerate(sorted(reserved)), lambda item: item[1] - item[0]):
+        ports = [item[1] for item in group]
+        canonical_tokens.append(
+            str(ports[0]) if ports[0] == ports[-1] else f"{ports[0]}-{ports[-1]}"
+        )
+    return ",".join(canonical_tokens)
+
+
+def parse_linux_ephemeral_port_settings(
+    port_range: str, reserved_ports: str
+) -> tuple[int, int, int, str]:
+    canonical_range = normalize_linux_ephemeral_port_range(port_range)
+    start, end = (int(value) for value in canonical_range.split())
+    reserved_body = normalize_linux_reserved_ports(reserved_ports)
+    reserved: set[int] = set()
+    if reserved_body:
+        for token in reserved_body.split(","):
+            bounds = [int(value) for value in token.split("-", 1)]
+            reserved.update(range(bounds[0], bounds[-1] + 1))
     capacity = end - start + 1 - sum(start <= port <= end for port in reserved)
     if capacity <= 0:
         raise ValueError("ephemeral_port_capacity_exhausted_by_reservations")
     reserved_sha256 = hashlib.sha256(reserved_body.encode()).hexdigest()
+    return start, end, capacity, reserved_sha256
+
+
+def _read_ephemeral_socket_counters(root: Path) -> tuple[int, int, int, str, int]:
+    range_body = (root / "proc/sys/net/ipv4/ip_local_port_range").read_text(encoding="utf-8")
+    reserved_body = (root / "proc/sys/net/ipv4/ip_local_reserved_ports").read_text(encoding="utf-8")
+    start, end, capacity, reserved_sha256 = parse_linux_ephemeral_port_settings(
+        range_body, reserved_body
+    )
     in_use = 0
     for table_name in ("tcp", "tcp6"):
         for line in (root / "proc/net" / table_name).read_text(encoding="utf-8").splitlines()[1:]:
@@ -1489,26 +1623,115 @@ def _safe_cgroup_root(root: Path, cgroup: str) -> Path:
 
 def _read_cgroup_counters(root: Path, cgroup: str) -> CgroupCounters:
     cgroup_root = _safe_cgroup_root(root, cgroup)
-    cpu_stat = {
-        fields[0]: int(fields[1])
-        for line in (cgroup_root / "cpu.stat").read_text(encoding="utf-8").splitlines()
-        if len(fields := line.split()) == 2
-    }
-    cpu_max = (cgroup_root / "cpu.max").read_text(encoding="utf-8").split()
-    if "usage_usec" not in cpu_stat or len(cpu_max) != 2 or cpu_max[0] == "max":
-        raise ValueError("finite_cgroup_cpu_limit_required")
-    memory_max = (cgroup_root / "memory.max").read_text(encoding="utf-8").strip()
-    pids_max = (cgroup_root / "pids.max").read_text(encoding="utf-8").strip()
-    if memory_max == "max" or pids_max == "max":
-        raise ValueError("finite_cgroup_memory_and_pids_limits_required")
+    mount_root = root / "sys/fs/cgroup"
+    chain: list[dict[str, str]] = []
+    current = cgroup_root
+    while True:
+        try:
+            relative = current.relative_to(mount_root).as_posix() or "/"
+        except ValueError as error:
+            raise ValueError("invalid_cgroup_path") from error
+        chain.append(
+            {
+                "path": "/" if relative == "." else f"/{relative}",
+                "cpu.max": (current / "cpu.max").read_text(encoding="utf-8").strip(),
+                "memory.max": (current / "memory.max").read_text(encoding="utf-8").strip(),
+                "pids.max": (current / "pids.max").read_text(encoding="utf-8").strip(),
+                "cpuset.cpus.effective": (current / "cpuset.cpus.effective")
+                .read_text(encoding="utf-8")
+                .strip(),
+            }
+        )
+        if current == mount_root:
+            break
+        current = current.parent
+    chain.reverse()
+    constraints: list[CgroupConstraintCounters] = []
+    cpu_capacities: list[float] = []
+    memory_limits: list[int] = []
+    pids_limits: list[int] = []
+    for item in chain:
+        cpu_fields = item["cpu.max"].split()
+        if (
+            len(cpu_fields) != 2
+            or not cpu_fields[1].isdigit()
+            or int(cpu_fields[1]) <= 0
+            or (cpu_fields[0] != "max" and not cpu_fields[0].isdigit())
+        ):
+            raise ValueError("invalid_cgroup_cpu_limit")
+        quota_capacity = None if cpu_fields[0] == "max" else int(cpu_fields[0]) / int(cpu_fields[1])
+        if quota_capacity is not None and quota_capacity <= 0:
+            raise ValueError("invalid_cgroup_cpu_limit")
+        cpuset_capacity = _count_linux_cpu_list(item["cpuset.cpus.effective"])
+        cpu_capacity = min(
+            float(cpuset_capacity),
+            quota_capacity if quota_capacity is not None else float(cpuset_capacity),
+        )
+        cpu_capacities.append(cpu_capacity)
+        finite_values: dict[str, int | None] = {}
+        for field, destination in (
+            ("memory.max", memory_limits),
+            ("pids.max", pids_limits),
+        ):
+            value = item[field]
+            parsed: int | None = None
+            if value != "max":
+                if not value.isdigit() or int(value) <= 0:
+                    raise ValueError("invalid_cgroup_limit")
+                parsed = int(value)
+                destination.append(parsed)
+            finite_values[field] = parsed
+        constraint_root = mount_root / item["path"].lstrip("/")
+        cpu_stat = {
+            fields[0]: int(fields[1])
+            for line in (constraint_root / "cpu.stat").read_text(encoding="utf-8").splitlines()
+            if len(fields := line.split()) == 2
+        }
+        if "usage_usec" not in cpu_stat:
+            raise ValueError("invalid_cgroup_cpu_stat")
+        constraints.append(
+            CgroupConstraintCounters(
+                path_sha256=hashlib.sha256(item["path"].encode()).hexdigest(),
+                cpu_usage_usec=cpu_stat["usage_usec"],
+                cpu_capacity_cores=cpu_capacity,
+                memory_current_bytes=_read_integer(constraint_root / "memory.current"),
+                memory_limit_bytes=finite_values["memory.max"],
+                pids_current=_read_integer(constraint_root / "pids.current"),
+                pids_limit=finite_values["pids.max"],
+            )
+        )
+    if not memory_limits or not pids_limits:
+        raise ValueError("finite_effective_cgroup_limits_required")
+    constraint_chain_sha256 = hashlib.sha256(
+        json.dumps(chain, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return CgroupCounters(
-        cpu_usage_usec=cpu_stat["usage_usec"],
-        cpu_capacity_cores=int(cpu_max[0]) / int(cpu_max[1]),
+        cpu_usage_usec=constraints[-1].cpu_usage_usec,
+        cpu_capacity_cores=min(cpu_capacities),
         memory_current_bytes=_read_integer(cgroup_root / "memory.current"),
-        memory_limit_bytes=int(memory_max),
+        memory_limit_bytes=min(memory_limits),
         pids_current=_read_integer(cgroup_root / "pids.current"),
-        pids_limit=int(pids_max),
+        pids_limit=min(pids_limits),
+        constraint_chain_sha256=constraint_chain_sha256,
+        constraints=tuple(constraints),
     )
+
+
+def _count_linux_cpu_list(value: str) -> int:
+    cpus: set[int] = set()
+    if not value:
+        raise ValueError("effective_cgroup_cpuset_empty")
+    for token in value.split(","):
+        if re.fullmatch(r"\d+(?:-\d+)?", token) is None:
+            raise ValueError("effective_cgroup_cpuset_invalid")
+        bounds = tuple(int(item) for item in token.split("-", 1))
+        start, end = bounds[0], bounds[-1]
+        if start > end:
+            raise ValueError("effective_cgroup_cpuset_invalid")
+        cpus.update(range(start, end + 1))
+    if not cpus:
+        raise ValueError("effective_cgroup_cpuset_empty")
+    return len(cpus)
 
 
 def read_linux_generator_counters(

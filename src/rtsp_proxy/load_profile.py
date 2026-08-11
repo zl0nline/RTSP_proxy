@@ -505,6 +505,11 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         summarize_reader_events,
     )
     from rtsp_proxy.load_run import validate_prepared_run_directory
+    from rtsp_proxy.load_runtime import (
+        LinuxRuntimeManifest,
+        validate_runtime_comparison_pair,
+        validate_runtime_manifest,
+    )
 
     final_manifest_path = destination / "final-manifest.json"
     files = _evidence_files(destination)
@@ -539,11 +544,12 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
     if initial != expected_initial:
         raise ValueError("evidence_initial_manifest_binding_invalid")
     prepared_launch = validate_prepared_run_directory(destination, profile)
+    sut_runtime_required = profile.workload.endpoint_mode == "proxy" or profile.tier == "capacity"
 
     expected_summary_names = {
         f"summary/generator-{host.name}.json" for host in profile.generator_hosts
     }
-    if profile.tier == "capacity":
+    if sut_runtime_required:
         expected_summary_names.add("summary/sut.json")
     reader_events_path = destination / "raw" / "readers.jsonl"
     if profile.workload.total_readers > 0:
@@ -583,6 +589,13 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             warm_preflight,
             scheduled_start_unix_ms=prepared_launch["coordinated_start_unix_ms"],
         )
+    runtime_required = {
+        f"raw/runtime-generator-{host.name}.json" for host in profile.generator_hosts
+    }
+    if sut_runtime_required:
+        runtime_required.add("raw/runtime-sut.json")
+    if not runtime_required.issubset(files):
+        raise ValueError("runtime_manifest_evidence_missing")
     observed_summary_names = {name for name in files if name.startswith("summary/")}
     if observed_summary_names != expected_summary_names:
         raise ValueError("evidence_summary_set_invalid")
@@ -659,6 +672,21 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             or observed_process_digests != expected_process_digests
         ):
             raise ValueError("generator_workload_process_count_mismatch")
+        runtime_manifest = LinuxRuntimeManifest.model_validate_json(
+            files[f"raw/runtime-generator-{host.name}.json"].read_text(encoding="utf-8")
+        )
+        validate_runtime_manifest(
+            profile,
+            runtime_manifest,
+            role="generator",
+            host=host.name,
+            expected_architecture=host.architecture,
+            coordinated_anchor_start_unix_ms=prepared_launch["coordinated_anchor_start_unix_ms"],
+            coordinated_measurement_start_unix_ms=prepared_launch[
+                "coordinated_measurement_start_unix_ms"
+            ],
+            resource_summary=stored_generator_summary,
+        )
         generator_machine_ids.add(stored_generator_summary.machine_id_sha256)
         first_sample_ms = int(datetime.fromisoformat(observations[0].timestamp).timestamp() * 1000)
         last_sample_ms = int(datetime.fromisoformat(observations[-1].timestamp).timestamp() * 1000)
@@ -670,7 +698,19 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
     if profile.tier == "capacity" and len(generator_machine_ids) != len(profile.generator_hosts):
         raise ValueError("capacity_generator_machine_id_not_unique")
 
-    if profile.tier == "capacity":
+    sut_runtime: LinuxRuntimeManifest | None = None
+    if sut_runtime_required:
+        sut_runtime = LinuxRuntimeManifest.model_validate_json(
+            files["raw/runtime-sut.json"].read_text(encoding="utf-8")
+        )
+        sut_processes = tuple(item.binding for item in sut_runtime.processes)
+        if (
+            len(sut_processes) != 1
+            or sut_processes[0].executable_sha256 != profile.artifacts.mediamtx_sha256
+            or sut_runtime.machine_id_sha256 in generator_machine_ids
+        ):
+            raise ValueError("sut_runtime_manifest_process_or_machine_invalid")
+    if sut_runtime_required:
         sut_raw_name = "raw/sut.jsonl"
         sut_summary_name = "summary/sut.json"
         if sut_raw_name not in files:
@@ -686,6 +726,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             measurement_end_unix_ms=prepared_launch["coordinated_measurement_end_unix_ms"],
             soak_end_unix_ms=prepared_launch["coordinated_workload_end_unix_ms"],
             maximum_clock_error_ms=profile.evidence_sampling.maximum_clock_error_ms,
+            capacity_gate=profile.tier == "capacity",
         )
         stored_sut_summary = SutCapacitySummary.model_validate_json(
             files[sut_summary_name].read_text(encoding="utf-8")
@@ -703,6 +744,20 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             or stored_sut_summary.resource_summary.machine_id_sha256 in generator_machine_ids
         ):
             raise ValueError("sut_summary_not_reproducible_or_invalid")
+        if sut_runtime is None:
+            raise ValueError("sut_runtime_manifest_missing")
+        validate_runtime_manifest(
+            profile,
+            sut_runtime,
+            role="sut",
+            host=profile.sut_rtsp_host,
+            expected_architecture=profile.sut_architecture,
+            coordinated_anchor_start_unix_ms=prepared_launch["coordinated_anchor_start_unix_ms"],
+            coordinated_measurement_start_unix_ms=prepared_launch[
+                "coordinated_measurement_start_unix_ms"
+            ],
+            resource_summary=stored_sut_summary.resource_summary,
+        )
         first_sut_sample_ms = int(
             datetime.fromisoformat(sut_observations[0].timestamp).timestamp() * 1000
         )
@@ -737,6 +792,28 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         direct_profile = LoadProfile.model_validate_json(
             reference_profile_path.read_text(encoding="utf-8")
         )
+        for host in profile.generator_hosts:
+            direct_runtime_path = (
+                destination / "reference" / f"direct-runtime-generator-{host.name}.json"
+            )
+            direct_runtime_sha256, direct_runtime_size = _hash_file(direct_runtime_path)
+            direct_runtime_entry = reference_files.get(
+                f"raw/runtime-generator-{host.name}.json", {}
+            )
+            if (
+                direct_runtime_entry.get("sha256") != direct_runtime_sha256
+                or direct_runtime_entry.get("size_bytes") != direct_runtime_size
+            ):
+                raise ValueError("direct_runtime_manifest_binding_invalid")
+            direct_runtime = LinuxRuntimeManifest.model_validate_json(
+                direct_runtime_path.read_text(encoding="utf-8")
+            )
+            if direct_runtime.profile_sha256 != canonical_profile_bytes(direct_profile)[1]:
+                raise ValueError("direct_runtime_manifest_profile_binding_invalid")
+            proxy_runtime = LinuxRuntimeManifest.model_validate_json(
+                files[f"raw/runtime-generator-{host.name}.json"].read_text(encoding="utf-8")
+            )
+            validate_runtime_comparison_pair(proxy_runtime, direct_runtime)
         expected_cold = summarize_cold_comparison(
             profile,
             reader_events_path,
