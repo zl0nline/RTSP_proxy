@@ -180,9 +180,10 @@ review, fixes и native amd64/arm64 CI.
 - tamper-evident resource/runtime/fixture evidence;
 - scoped IFB/netem WAN evidence and direct-control comparison.
 
-Phase B прошла independent Standards/Spec review; для phase exit остался
-green native amd64/arm64 CI. Credentialed/query-token source URLs сейчас fail
-closed: они не будут приниматься до encrypted secret-reference flow. Ещё не реализованы
+Phase B **complete**: independent Standards/Spec review и все шесть jobs
+[native amd64/arm64 CI](https://github.com/zl0nline/RTSP_proxy/actions/runs/31547513916)
+прошли. Credentialed/query-token source URLs сейчас fail closed: они не будут
+приниматься до encrypted secret-reference flow. Ещё не реализованы
 per-node systemd runtime и automatic missing-target provisioner; поэтому при
 отсутствии eligible RUNNING node camera create завершается fail closed без
 ghost placement. Также ещё не реализованы reconciler/move/drain, dashboard,

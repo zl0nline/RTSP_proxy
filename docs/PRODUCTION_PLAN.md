@@ -678,11 +678,13 @@ Exit: one non-contradictory normative model.
 Exit: API tests prove max_nodes, port exhaustion/collisions, deterministic
 least-loaded placement and no 101st camera.
 
-Status: **implementation and independent Standards/Spec reviews passed;
-native amd64/arm64 CI pending**. Source credentials remain fail-closed until
-the encrypted secret-reference slice; this Phase B code never persists URL
-userinfo/query tokens. The binary and release manifest are bound to packaged
-Alembic head `0004_management_freshness`; startup rejects any other live database revision.
+Status: **COMPLETE**. Implementation and independent Standards/Spec reviews
+passed; all six native amd64/arm64 jobs are green in
+[CI run 31547513916](https://github.com/zl0nline/RTSP_proxy/actions/runs/31547513916).
+Source credentials remain fail-closed until the encrypted secret-reference
+slice; this Phase B code never persists URL userinfo/query tokens. The binary
+and release manifest are bound to packaged Alembic head
+`0004_management_freshness`; startup rejects any other live database revision.
 Until Phase C supplies the typed process/config provisioner, absence of an
 eligible RUNNING node fails closed and no camera or ghost placement is
 committed.
