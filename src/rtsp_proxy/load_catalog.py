@@ -14,7 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.load_evidence import KernelClockProof, prove_linux_clock
-from rtsp_proxy.load_profile import MAX_COLD_PREFLIGHT_PATHS, LoadProfile, canonical_profile_bytes
+from rtsp_proxy.load_profile import (
+    MAX_COLD_PREFLIGHT_PATHS,
+    GeneratorHost,
+    LoadProfile,
+    canonical_profile_bytes,
+)
 from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
 
 _BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -211,13 +216,14 @@ def build_proxy_reader_plan(profile: LoadProfile, generator_host: str | None = N
 
 
 def build_direct_reader_plan(profile: LoadProfile, generator_host: str) -> ReaderPlan:
-    host = next(
+    reader_host = next(
         (item for item in profile.generator_hosts if item.name == generator_host),
         None,
     )
-    if host is None:
+    if reader_host is None:
         raise ValueError("unknown_generator_host")
-    end = host.source_start + host.source_count
+    source_host = direct_source_host(profile, generator_host)
+    end = source_host.source_start + source_host.source_count
     targets = tuple(
         ReaderTarget(
             path=f"source-{index:05d}",
@@ -227,14 +233,33 @@ def build_direct_reader_plan(profile: LoadProfile, generator_host: str) -> Reade
             measured_schedule_start=measured_start,
         )
         for index, count, start, measured_start in _target_specs(profile)
-        if host.source_start <= index < end
+        if source_host.source_start <= index < end
     )
     return ReaderPlan(
         schema_version=1,
         endpoint_mode="direct-control",
-        generator_host=host.name,
+        generator_host=reader_host.name,
         targets=targets,
     )
+
+
+def direct_source_host(profile: LoadProfile, reader_host: str) -> GeneratorHost:
+    """Select the source host for a direct-control reader shard.
+
+    LAN smoke preserves the one-host local control. Impaired profiles rotate
+    shards so the camera stream crosses a receiver ingress and cannot bypass
+    the netem contract used by the proxy run.
+    """
+    hosts = tuple(profile.generator_hosts)
+    reader_index = next(
+        (index for index, item in enumerate(hosts) if item.name == reader_host),
+        None,
+    )
+    if reader_index is None:
+        raise ValueError("unknown_generator_host")
+    if profile.network.profile == "lan":
+        return hosts[reader_index]
+    return hosts[(reader_index - 1) % len(hosts)]
 
 
 def _cold_proxy_paths(profile: LoadProfile) -> tuple[str, ...]:

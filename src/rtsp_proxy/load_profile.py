@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -97,17 +98,31 @@ class NetworkProfile(StrictModel):
     rtt_ms: Annotated[float, Field(ge=0)]
     jitter_ms: Annotated[float, Field(ge=0)]
     loss_percent: Annotated[float, Field(ge=0, lt=100)]
+    ifb_interface: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_.:-]{1,15}$")] | None = (
+        None
+    )
+    netem_queue_limit_packets: Annotated[int, Field(ge=1000, le=4294967295)] | None = None
 
     @model_validator(mode="after")
     def validate_named_network_profile(self) -> Self:
-        if self.profile == "lan" and any((self.rtt_ms, self.jitter_ms, self.loss_percent)):
+        if self.profile == "lan" and (
+            any((self.rtt_ms, self.jitter_ms, self.loss_percent))
+            or self.ifb_interface is not None
+            or self.netem_queue_limit_packets is not None
+        ):
             raise ValueError("lan_profile_must_not_inject_impairment")
         if self.profile == "wan" and (
-            self.rtt_ms < 50 or self.jitter_ms < 10 or self.loss_percent < 0.5
+            self.rtt_ms != 50 or self.jitter_ms != 10 or self.loss_percent != 0.5
         ):
-            raise ValueError("wan_profile_below_consensus_impairment")
-        if self.profile != "lan":
-            raise ValueError("network_impairment_driver_not_implemented")
+            raise ValueError("wan_profile_must_match_consensus_impairment")
+        if self.profile == "chaos" and (self.rtt_ms != 150 or self.loss_percent != 2):
+            raise ValueError("chaos_profile_must_match_consensus_impairment")
+        if self.profile != "lan" and (
+            self.ifb_interface is None
+            or self.netem_queue_limit_packets is None
+            or self.ifb_interface == self.interface
+        ):
+            raise ValueError("network_impairment_interfaces_or_limit_invalid")
         return self
 
 
@@ -242,6 +257,21 @@ class LoadProfile(StrictModel):
             raise ValueError("generator_host_names_not_unique")
         if self.tier == "capacity" and len(self.generator_hosts) < 2:
             raise ValueError("capacity_requires_two_generator_hosts")
+        if self.network.profile != "lan":
+            if len(self.generator_hosts) < 2:
+                raise ValueError("impaired_network_requires_two_generator_hosts")
+            if self.workload.active_sources == 0:
+                raise ValueError("impaired_network_requires_active_sources")
+            if any(len(host.name) > 128 for host in self.generator_hosts):
+                raise ValueError("impaired_network_generator_name_too_long")
+            try:
+                generator_addresses = tuple(
+                    str(ipaddress.IPv4Address(host.rtsp_host)) for host in self.generator_hosts
+                )
+            except ipaddress.AddressValueError as error:
+                raise ValueError("impaired_network_requires_literal_generator_ipv4") from error
+            if len(set(generator_addresses)) != len(generator_addresses):
+                raise ValueError("impaired_network_generator_ipv4_not_unique")
 
         cursor = 0
         for host in sorted(self.generator_hosts, key=lambda item: item.source_start):
@@ -301,6 +331,23 @@ class LoadProfile(StrictModel):
             self.duration.warmup_seconds * 1000 < math.ceil(self.fixture.gop_seconds * 1000) + 5000
         ):
             raise ValueError("lifecycle_warmup_does_not_cover_decodable_ready_budget")
+
+        if self.network.profile != "lan":
+            packets_per_source_per_second = math.ceil(
+                self.fixture.bitrate_bps / (self.fixture.rtp_mtu_bytes * 8)
+            ) + (50 if self.fixture.audio == "opus" else 0)
+            buffered_seconds = (self.network.rtt_ms + 3 * self.network.jitter_ms) / 1000
+            required_queue_packets = max(
+                1000,
+                math.ceil(
+                    packets_per_source_per_second
+                    * self.workload.active_sources
+                    * buffered_seconds
+                    * 2
+                ),
+            )
+            if cast(int, self.network.netem_queue_limit_packets) < required_queue_packets:
+                raise ValueError("network_impairment_queue_limit_below_workload_budget")
 
         if self.tier == "capacity":
             if self.workload.total_readers == 0:
@@ -496,6 +543,14 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         summarize_generator_headroom,
         summarize_sut_capacity,
     )
+    from rtsp_proxy.load_netem import (
+        NetemObservation,
+        NetemSummary,
+        load_netem_observations,
+        required_netem_site_plans,
+        summarize_netem,
+        validate_netem_comparison_tool_versions,
+    )
     from rtsp_proxy.load_results import (
         ColdComparisonSummary,
         ReaderRunCompletedEvent,
@@ -551,6 +606,8 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
     }
     if sut_runtime_required:
         expected_summary_names.add("summary/sut.json")
+    netem_plans = required_netem_site_plans(profile)
+    expected_summary_names.update(f"summary/netem-{plan.site}.json" for plan in netem_plans)
     reader_events_path = destination / "raw" / "readers.jsonl"
     if profile.workload.total_readers > 0:
         expected_summary_names.add("summary/readers.json")
@@ -620,6 +677,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             raise ValueError("reader_completion_start_not_bound_to_launch")
 
     generator_machine_ids: set[str] = set()
+    generator_summaries: dict[str, GeneratorHeadroomSummary] = {}
     for host in profile.generator_hosts:
         raw_name = f"raw/generator-{host.name}.jsonl"
         summary_name = f"summary/generator-{host.name}.json"
@@ -641,6 +699,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         stored_generator_summary = GeneratorHeadroomSummary.model_validate_json(
             files[summary_name].read_text(encoding="utf-8")
         )
+        generator_summaries[host.name] = stored_generator_summary
         if (
             stored_generator_summary != expected_generator_summary
             or not stored_generator_summary.valid
@@ -699,6 +758,7 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         raise ValueError("capacity_generator_machine_id_not_unique")
 
     sut_runtime: LinuxRuntimeManifest | None = None
+    stored_sut_summary: SutCapacitySummary | None = None
     if sut_runtime_required:
         sut_runtime = LinuxRuntimeManifest.model_validate_json(
             files["raw/runtime-sut.json"].read_text(encoding="utf-8")
@@ -771,14 +831,51 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         ):
             raise ValueError("sut_observation_window_does_not_cover_load")
 
+    netem_observation_sets: dict[str, tuple[NetemObservation, ...]] = {}
+    for plan in netem_plans:
+        raw_name = f"raw/netem-{plan.site}.jsonl"
+        summary_name = f"summary/netem-{plan.site}.json"
+        if raw_name not in files:
+            raise ValueError("netem_raw_evidence_missing")
+        netem_observations = load_netem_observations(files[raw_name])
+        expected_netem_summary = summarize_netem(
+            profile,
+            plan,
+            netem_observations,
+            observations_sha256=_hash_file(files[raw_name])[0],
+            coordinated_start_unix_ms=prepared_launch["coordinated_start_unix_ms"],
+        )
+        stored_netem_summary = NetemSummary.model_validate_json(
+            files[summary_name].read_text(encoding="utf-8")
+        )
+        if stored_netem_summary != expected_netem_summary or not stored_netem_summary.valid:
+            raise ValueError("netem_summary_not_reproducible_or_invalid")
+        netem_observation_sets[plan.site] = netem_observations
+        if plan.role == "sut":
+            if stored_sut_summary is None:
+                raise ValueError("netem_sut_resource_binding_missing")
+            receiver_resource: GeneratorHeadroomSummary = stored_sut_summary.resource_summary
+        else:
+            generator_receiver_resource = generator_summaries.get(plan.receiver_host)
+            if generator_receiver_resource is None:
+                raise ValueError("netem_generator_resource_binding_missing")
+            receiver_resource = generator_receiver_resource
+        if (
+            stored_netem_summary.machine_id_sha256 != receiver_resource.machine_id_sha256
+            or stored_netem_summary.boot_id != receiver_resource.boot_id
+        ):
+            raise ValueError("netem_receiver_runtime_binding_invalid")
+
     if cold_required:
         reference_profile_path = destination / "reference" / "direct-profile.json"
         reference_events_path = destination / "reference" / "direct-readers.jsonl"
         reference_manifest_path = destination / "reference" / "direct-final-manifest.json"
+        reference_launch_path = destination / "reference" / "direct-launch-plan.json"
         reference_manifest = json.loads(reference_manifest_path.read_text(encoding="utf-8"))
         reference_files = reference_manifest.get("files")
         reference_profile_sha256, reference_profile_size = _hash_file(reference_profile_path)
         reference_events_sha256, reference_events_size = _hash_file(reference_events_path)
+        reference_launch_sha256, reference_launch_size = _hash_file(reference_launch_path)
         if (
             reference_manifest.get("status") != "finalized"
             or not isinstance(reference_files, dict)
@@ -787,11 +884,19 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             or reference_files.get("raw/readers.jsonl", {}).get("sha256") != reference_events_sha256
             or reference_files.get("raw/readers.jsonl", {}).get("size_bytes")
             != reference_events_size
+            or reference_files.get("launch-plan.json", {}).get("sha256") != reference_launch_sha256
+            or reference_files.get("launch-plan.json", {}).get("size_bytes")
+            != reference_launch_size
         ):
             raise ValueError("direct_reference_manifest_binding_invalid")
         direct_profile = LoadProfile.model_validate_json(
             reference_profile_path.read_text(encoding="utf-8")
         )
+        direct_launch = json.loads(reference_launch_path.read_text(encoding="utf-8"))
+        direct_start_unix_ms = direct_launch.get("coordinated_start_unix_ms")
+        if not isinstance(direct_start_unix_ms, int) or isinstance(direct_start_unix_ms, bool):
+            raise ValueError("direct_reference_launch_plan_invalid")
+        direct_runtimes: dict[str, LinuxRuntimeManifest] = {}
         for host in profile.generator_hosts:
             direct_runtime_path = (
                 destination / "reference" / f"direct-runtime-generator-{host.name}.json"
@@ -808,12 +913,66 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             direct_runtime = LinuxRuntimeManifest.model_validate_json(
                 direct_runtime_path.read_text(encoding="utf-8")
             )
+            direct_runtimes[host.name] = direct_runtime
             if direct_runtime.profile_sha256 != canonical_profile_bytes(direct_profile)[1]:
                 raise ValueError("direct_runtime_manifest_profile_binding_invalid")
             proxy_runtime = LinuxRuntimeManifest.model_validate_json(
                 files[f"raw/runtime-generator-{host.name}.json"].read_text(encoding="utf-8")
             )
             validate_runtime_comparison_pair(proxy_runtime, direct_runtime)
+        direct_netem_observation_sets: list[tuple[NetemObservation, ...]] = []
+        for direct_plan in required_netem_site_plans(direct_profile):
+            direct_netem_raw_path = (
+                destination / "reference" / f"direct-netem-{direct_plan.site}.jsonl"
+            )
+            direct_netem_summary_path = (
+                destination / "reference" / f"direct-netem-summary-{direct_plan.site}.json"
+            )
+            raw_digest, raw_size = _hash_file(direct_netem_raw_path)
+            summary_digest, summary_size = _hash_file(direct_netem_summary_path)
+            if (
+                reference_files.get(f"raw/netem-{direct_plan.site}.jsonl", {}).get("sha256")
+                != raw_digest
+                or reference_files.get(f"raw/netem-{direct_plan.site}.jsonl", {}).get("size_bytes")
+                != raw_size
+                or reference_files.get(f"summary/netem-{direct_plan.site}.json", {}).get("sha256")
+                != summary_digest
+                or reference_files.get(f"summary/netem-{direct_plan.site}.json", {}).get(
+                    "size_bytes"
+                )
+                != summary_size
+            ):
+                raise ValueError("direct_netem_reference_manifest_binding_invalid")
+            direct_observations = load_netem_observations(direct_netem_raw_path)
+            expected_direct_summary = summarize_netem(
+                direct_profile,
+                direct_plan,
+                direct_observations,
+                observations_sha256=raw_digest,
+                coordinated_start_unix_ms=direct_start_unix_ms,
+            )
+            stored_direct_summary = NetemSummary.model_validate_json(
+                direct_netem_summary_path.read_text(encoding="utf-8")
+            )
+            if stored_direct_summary != expected_direct_summary or not stored_direct_summary.valid:
+                raise ValueError("direct_netem_summary_not_reproducible_or_invalid")
+            receiver_runtime = direct_runtimes.get(direct_plan.receiver_host)
+            if (
+                receiver_runtime is None
+                or stored_direct_summary.machine_id_sha256 != receiver_runtime.machine_id_sha256
+                or stored_direct_summary.boot_id != receiver_runtime.boot_id
+            ):
+                raise ValueError("direct_netem_receiver_runtime_binding_invalid")
+            direct_netem_observation_sets.append(direct_observations)
+        if direct_netem_observation_sets:
+            proxy_netem_observations = [
+                observations
+                for plan in netem_plans
+                for observations in (netem_observation_sets[plan.site],)
+            ]
+            validate_netem_comparison_tool_versions(
+                (*proxy_netem_observations, *direct_netem_observation_sets)
+            )
         expected_cold = summarize_cold_comparison(
             profile,
             reader_events_path,

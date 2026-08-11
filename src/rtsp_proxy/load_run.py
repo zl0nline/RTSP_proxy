@@ -18,6 +18,7 @@ from rtsp_proxy.load_catalog import (
     build_direct_reader_plan,
     build_load_catalog,
     build_proxy_reader_plan,
+    direct_source_host,
     write_load_catalog,
     write_reader_paths,
 )
@@ -463,6 +464,7 @@ def prepare_run_directory(
             plan = build_direct_reader_plan(profile, host.name)
             if not plan.targets:
                 continue
+            source_host = direct_source_host(profile, host.name)
             plan_path = destination / f"reader-plan-{host.name}.tsv"
             plan_sha256 = write_reader_paths(plan, plan_path)
             reader_launches.append(
@@ -471,8 +473,8 @@ def prepare_run_directory(
                     "argv": _reader_arguments(
                         profile,
                         load_reader_binary=load_reader_binary,
-                        host=host.rtsp_host,
-                        port=host.rtsp_port,
+                        host=source_host.rtsp_host,
+                        port=source_host.rtsp_port,
                         plan_path=plan_path,
                         events_path=raw_directory / f"readers-{host.name}.jsonl",
                         generator_host=host.name,
@@ -547,7 +549,11 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
     }:
         raise ValueError("prepared_launch_plan_shape_invalid")
     coordinated_start = launch["coordinated_start_unix_ms"]
-    if not isinstance(coordinated_start, int) or coordinated_start <= 0:
+    if (
+        not isinstance(coordinated_start, int)
+        or isinstance(coordinated_start, bool)
+        or coordinated_start <= 0
+    ):
         raise ValueError("prepared_launch_start_invalid")
     coordinated_anchor_start = launch["coordinated_anchor_start_unix_ms"]
     if coordinated_anchor_start != warm_anchor_start_unix_ms(profile, coordinated_start):
@@ -669,19 +675,19 @@ def validate_prepared_run_directory(run_directory: Path, profile: LoadProfile) -
     expected_readers: list[dict[str, object]] = []
     for shard_index, (host_name, plan, plan_path, events_path) in enumerate(plans):
         assert load_reader_binary is not None
-        host = next(item for item in profile.generator_hosts if item.name == host_name)
+        source_host = direct_source_host(profile, host_name)
         arguments = _reader_arguments(
             profile,
             load_reader_binary=load_reader_binary,
             host=(
                 profile.sut_rtsp_host
                 if profile.workload.endpoint_mode == "proxy"
-                else host.rtsp_host
+                else source_host.rtsp_host
             ),
             port=(
                 profile.sut_rtsp_port
                 if profile.workload.endpoint_mode == "proxy"
-                else host.rtsp_port
+                else source_host.rtsp_port
             ),
             plan_path=plan_path,
             events_path=events_path,

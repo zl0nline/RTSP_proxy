@@ -50,6 +50,7 @@ from rtsp_proxy.load_run import (
     prepare_run_directory,
     sha256_file,
     validate_fixture_manifest,
+    validate_prepared_run_directory,
     write_summary,
 )
 from rtsp_proxy.load_runtime import (
@@ -594,8 +595,13 @@ def test_generator_source_ranges_must_cover_active_sources_without_overlap() -> 
         LoadProfile.model_validate(raw)
 
 
-def test_wan_profile_fails_closed_until_netem_driver_is_implemented() -> None:
-    raw = valid_profile()
+def test_impaired_network_profile_requires_remote_ipv4_hosts_and_sized_ifb() -> None:
+    raw = valid_profile(tier="capacity")
+    hosts = raw["generator_hosts"]
+    assert isinstance(hosts, list) and all(isinstance(item, dict) for item in hosts)
+    for index, host in enumerate(hosts):
+        assert isinstance(host, dict)
+        host["rtsp_host"] = f"192.0.2.{10 + index}"
     raw["network"] = {
         "profile": "wan",
         "interface": "camera0",
@@ -603,14 +609,57 @@ def test_wan_profile_fails_closed_until_netem_driver_is_implemented() -> None:
         "rtt_ms": 50,
         "jitter_ms": 10,
         "loss_percent": 0.5,
+        "ifb_interface": "rtspifb0",
+        "netem_queue_limit_packets": 1000,
     }
-    with pytest.raises(ValidationError, match="network_impairment_driver_not_implemented"):
-        LoadProfile.model_validate(raw)
+    assert LoadProfile.model_validate(raw).network.ifb_interface == "rtspifb0"
 
     network = raw["network"]
     assert isinstance(network, dict)
     network["rtt_ms"] = 0
-    with pytest.raises(ValidationError, match="wan_profile_below_consensus_impairment"):
+    with pytest.raises(ValidationError, match="wan_profile_must_match_consensus_impairment"):
+        LoadProfile.model_validate(raw)
+
+    network["rtt_ms"] = 51
+    with pytest.raises(ValidationError, match="wan_profile_must_match_consensus_impairment"):
+        LoadProfile.model_validate(raw)
+
+    network["rtt_ms"] = 50
+    network["ifb_interface"] = None
+    with pytest.raises(ValidationError, match="network_impairment_interfaces_or_limit_invalid"):
+        LoadProfile.model_validate(raw)
+
+    network["ifb_interface"] = "rtspifb0"
+    first = hosts[0]
+    assert isinstance(first, dict)
+    first["rtsp_host"] = "generator-a.load.internal"
+    with pytest.raises(ValidationError, match="impaired_network_requires_literal_generator_ipv4"):
+        LoadProfile.model_validate(raw)
+
+    first["rtsp_host"] = "192.0.2.10"
+    workload = raw["workload"]
+    assert isinstance(workload, dict)
+    workload.update(active_sources=0, total_readers=0, minimum_rtp_packets_per_second=0)
+    with pytest.raises(ValidationError, match="impaired_network_requires_active_sources"):
+        LoadProfile.model_validate(raw)
+
+
+def test_impaired_network_requires_two_generator_hosts() -> None:
+    raw = valid_profile()
+    hosts = raw["generator_hosts"]
+    assert isinstance(hosts, list) and isinstance(hosts[0], dict)
+    hosts[0]["rtsp_host"] = "192.0.2.10"
+    raw["network"] = {
+        "profile": "wan",
+        "interface": "camera0",
+        "mtu_bytes": 1500,
+        "rtt_ms": 50,
+        "jitter_ms": 10,
+        "loss_percent": 0.5,
+        "ifb_interface": "rtspifb0",
+        "netem_queue_limit_packets": 1000,
+    }
+    with pytest.raises(ValidationError, match="impaired_network_requires_two_generator_hosts"):
         LoadProfile.model_validate(raw)
 
 
@@ -2381,6 +2430,11 @@ def test_load_cli_validates_and_prepares_a_digest_bound_run_without_overwrite(
     failure_output = capsys.readouterr()
     assert failure_output.out == ""
     assert failure_output.err == "load_profile_error: destination_exists\n"
+
+    launch_plan["coordinated_start_unix_ms"] = True
+    (run_directory / "launch-plan.json").write_text(json.dumps(launch_plan), encoding="utf-8")
+    with pytest.raises(ValueError, match="prepared_launch_start_invalid"):
+        validate_prepared_run_directory(run_directory, LoadProfile.model_validate(raw))
 
 
 def test_direct_control_prepare_writes_one_coordinated_reader_shard_per_host(

@@ -7,6 +7,7 @@ import pytest
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.load_catalog import (
+    build_direct_reader_plan,
     build_load_catalog,
     build_proxy_reader_plan,
     load_public_id,
@@ -117,6 +118,33 @@ def test_direct_control_paths_are_rendered_per_generator_host(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="unknown_generator_host"):
         write_direct_reader_paths(profile, "missing", tmp_path / "missing.txt")
+
+
+def test_wan_direct_control_rotates_readers_to_remote_source_hosts() -> None:
+    raw = valid_profile(tier="capacity")
+    workload = raw["workload"]
+    network = raw["network"]
+    hosts = raw["generator_hosts"]
+    assert isinstance(workload, dict) and isinstance(network, dict) and isinstance(hosts, list)
+    workload["endpoint_mode"] = "direct-control"
+    network.update(
+        profile="wan",
+        rtt_ms=50,
+        jitter_ms=10,
+        loss_percent=0.5,
+        ifb_interface="rtspifb0",
+        netem_queue_limit_packets=1000,
+    )
+    for index, host in enumerate(hosts):
+        assert isinstance(host, dict)
+        host["rtsp_host"] = f"192.0.2.{10 + index}"
+    profile = LoadProfile.model_validate(raw)
+
+    first = build_direct_reader_plan(profile, "generator-a")
+    second = build_direct_reader_plan(profile, "generator-b")
+
+    assert [target.path for target in first.targets] == ["source-00002", "source-00003"]
+    assert [target.path for target in second.targets] == ["source-00000", "source-00001"]
 
 
 def test_reader_plan_preserves_independent_active_and_reader_axes() -> None:

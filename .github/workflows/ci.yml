@@ -195,6 +195,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
+            iproute2 \
             libgstrtspserver-1.0-dev \
             gstreamer1.0-tools \
             gstreamer1.0-plugins-base \
@@ -230,6 +231,14 @@ jobs:
         env:
           RTSP_RUNTIME_NATIVE: "1"
         run: uv run pytest tests/contract/test_runtime_manifest.py -q
+
+      - name: Verify scoped Linux ingress netem contract (${{ matrix.arch }})
+        run: |
+          sudo env \
+            RTSP_NETEM_NATIVE=1 \
+            PATH="$PATH" \
+            PYTHONPATH="$PWD/src:$PWD" \
+            "$PWD/.venv/bin/python" -m pytest tests/contract/test_netem.py -q
 
       - name: Verify H264/H265 independent pull endpoints over RTSP/TCP
         env:

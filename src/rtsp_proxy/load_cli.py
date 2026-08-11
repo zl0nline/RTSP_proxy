@@ -23,6 +23,16 @@ from rtsp_proxy.load_evidence import (
     summarize_generator_headroom,
     summarize_sut_capacity,
 )
+from rtsp_proxy.load_netem import (
+    NetemSitePlan,
+    SubprocessNetemKernel,
+    install_netem,
+    load_netem_observations,
+    remove_netem,
+    required_netem_site_plans,
+    sample_linux_netem,
+    summarize_netem,
+)
 from rtsp_proxy.load_profile import (
     LoadProfile,
     canonical_profile_bytes,
@@ -123,6 +133,26 @@ def _parser() -> argparse.ArgumentParser:
     summarize_sut.add_argument("observations", type=Path)
     summarize_sut.add_argument("output", type=Path)
 
+    for command_name in ("install-netem", "remove-netem"):
+        netem_command = commands.add_parser(command_name)
+        netem_command.add_argument("run_directory", type=Path)
+        netem_command.add_argument("--site", required=True)
+        netem_command.add_argument("--tc-binary", required=True, type=Path)
+        netem_command.add_argument("--ip-binary", required=True, type=Path)
+
+    sample_netem = commands.add_parser("sample-netem")
+    sample_netem.add_argument("run_directory", type=Path)
+    sample_netem.add_argument("output", type=Path)
+    sample_netem.add_argument("--site", required=True)
+    sample_netem.add_argument("--tc-binary", required=True, type=Path)
+    sample_netem.add_argument("--ip-binary", required=True, type=Path)
+
+    summarize_netem_command = commands.add_parser("summarize-netem")
+    summarize_netem_command.add_argument("run_directory", type=Path)
+    summarize_netem_command.add_argument("observations", type=Path)
+    summarize_netem_command.add_argument("output", type=Path)
+    summarize_netem_command.add_argument("--site", required=True)
+
     summarize_readers = commands.add_parser("summarize-readers")
     summarize_readers.add_argument("run_directory", type=Path)
     summarize_readers.add_argument("events", type=Path)
@@ -202,6 +232,13 @@ def _copy_reference_exclusive(source: Path, destination: Path) -> None:
     destination.chmod(0o640)
 
 
+def _netem_plan(profile: LoadProfile, site: str) -> NetemSitePlan:
+    matches = tuple(plan for plan in required_netem_site_plans(profile) if plan.site == site)
+    if len(matches) != 1:
+        raise ValueError("netem_site_not_required_by_profile")
+    return matches[0]
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
@@ -254,6 +291,63 @@ def main(argv: list[str] | None = None) -> int:
             else arguments.run_directory
         )
         profile = load_stored_profile(run_directory)
+        if arguments.command in {"install-netem", "remove-netem", "sample-netem"}:
+            plan = _netem_plan(profile, arguments.site)
+            kernel = SubprocessNetemKernel(
+                tc_binary=arguments.tc_binary,
+                ip_binary=arguments.ip_binary,
+            )
+            if arguments.command == "install-netem":
+                install_netem(kernel, plan)
+                print(f"INSTALLED_NETEM site={plan.site} plan_sha256={plan.sha256}")
+                return 0
+            if arguments.command == "remove-netem":
+                remove_netem(kernel, plan)
+                print(f"REMOVED_NETEM site={plan.site}")
+                return 0
+            _require_run_path(run_directory, arguments.output)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            coordinated_start = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start, int) or isinstance(coordinated_start, bool):
+                raise ValueError("launch_plan_start_invalid")
+            sampled_netem_observations = sample_linux_netem(
+                profile,
+                plan,
+                arguments.output,
+                kernel=kernel,
+                coordinated_start_unix_ms=coordinated_start,
+            )
+            print(
+                f"SAMPLED_NETEM site={plan.site} samples={len(sampled_netem_observations)} "
+                f"output={arguments.output}"
+            )
+            return 0
+        if arguments.command == "summarize-netem":
+            _require_run_path(run_directory, arguments.observations)
+            _require_run_path(run_directory, arguments.output)
+            plan = _netem_plan(profile, arguments.site)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            coordinated_start = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start, int) or isinstance(coordinated_start, bool):
+                raise ValueError("launch_plan_start_invalid")
+            netem_observations = load_netem_observations(arguments.observations)
+            summary = summarize_netem(
+                profile,
+                plan,
+                netem_observations,
+                observations_sha256=sha256_file(arguments.observations),
+                coordinated_start_unix_ms=coordinated_start,
+            )
+            write_summary(arguments.output, summary)
+            print(
+                f"SUMMARIZED_NETEM site={plan.site} valid={str(summary.valid).lower()} "
+                f"output={arguments.output}"
+            )
+            return 0 if summary.valid else 3
         if arguments.command == "apply-paths":
             result = apply_load_catalog(
                 build_load_catalog(profile),
@@ -384,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
                 **{pid: profile.artifacts.load_reader_sha256 for pid in reader_pids},
             }
             coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
-            if not isinstance(coordinated_start_ms, int):
+            if not isinstance(coordinated_start_ms, int) or isinstance(coordinated_start_ms, bool):
                 raise ValueError("launch_plan_start_invalid")
             sample_until_ms = generator_sampling_end_unix_ms(profile, coordinated_start_ms)
             duration_seconds = math.ceil((sample_until_ms - time.time_ns() // 1_000_000) / 1000)
@@ -412,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                 (run_directory / "launch-plan.json").read_text(encoding="utf-8")
             )
             coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
-            if not isinstance(coordinated_start_ms, int):
+            if not isinstance(coordinated_start_ms, int) or isinstance(coordinated_start_ms, bool):
                 raise ValueError("launch_plan_start_invalid")
             sample_until_ms = sut_sampling_end_unix_ms(profile, coordinated_start_ms)
             duration_seconds = math.ceil((sample_until_ms - time.time_ns() // 1_000_000) / 1000)
@@ -442,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
                 (run_directory / "launch-plan.json").read_text(encoding="utf-8")
             )
             coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
-            if not isinstance(coordinated_start_ms, int):
+            if not isinstance(coordinated_start_ms, int) or isinstance(coordinated_start_ms, bool):
                 raise ValueError("launch_plan_start_invalid")
             generator_summary = summarize_generator_headroom(
                 observations,
@@ -469,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
                 (run_directory / "launch-plan.json").read_text(encoding="utf-8")
             )
             coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
-            if not isinstance(coordinated_start_ms, int):
+            if not isinstance(coordinated_start_ms, int) or isinstance(coordinated_start_ms, bool):
                 raise ValueError("launch_plan_start_invalid")
             sut_summary = summarize_sut_capacity(
                 sut_observations,
@@ -511,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
             reference_profile = reference_directory / "direct-profile.json"
             reference_events = reference_directory / "direct-readers.jsonl"
             reference_manifest = reference_directory / "direct-final-manifest.json"
+            reference_launch = reference_directory / "direct-launch-plan.json"
             _copy_reference_exclusive(
                 arguments.direct_run_directory / "profile.json", reference_profile
             )
@@ -519,10 +614,23 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.direct_run_directory / "final-manifest.json",
                 reference_manifest,
             )
+            _copy_reference_exclusive(
+                arguments.direct_run_directory / "launch-plan.json",
+                reference_launch,
+            )
             for host in direct_profile.generator_hosts:
                 _copy_reference_exclusive(
                     arguments.direct_run_directory / "raw" / f"runtime-generator-{host.name}.json",
                     reference_directory / f"direct-runtime-generator-{host.name}.json",
+                )
+            for plan in required_netem_site_plans(direct_profile):
+                _copy_reference_exclusive(
+                    arguments.direct_run_directory / "raw" / f"netem-{plan.site}.jsonl",
+                    reference_directory / f"direct-netem-{plan.site}.jsonl",
+                )
+                _copy_reference_exclusive(
+                    arguments.direct_run_directory / "summary" / f"netem-{plan.site}.json",
+                    reference_directory / f"direct-netem-summary-{plan.site}.json",
                 )
             comparison = summarize_cold_comparison(
                 profile,
