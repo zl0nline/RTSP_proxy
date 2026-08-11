@@ -52,6 +52,8 @@ def _postgres_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[s
             "127.0.0.1",
             "-p",
             str(port),
+            "-k",
+            "",
         ],
         stdout=subprocess.DEVNULL,
         stderr=log_stream,
@@ -59,7 +61,14 @@ def _postgres_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[s
     )
     database_url = f"postgresql+psycopg://postgres@127.0.0.1:{port}/postgres"
     try:
-        _wait_for_postgres(database_url)
+        try:
+            _wait_for_postgres(database_url)
+        except RuntimeError as error:
+            log_stream.flush()
+            diagnostic = server_log.read_text(encoding="utf-8", errors="replace")
+            raise RuntimeError(
+                f"postgres_test_server_start_timeout:\n{diagnostic[-4000:]}"
+            ) from error
         yield database_url
     finally:
         process.terminate()
