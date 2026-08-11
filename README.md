@@ -22,14 +22,16 @@ TCP endpoint.
 >   typed fixture semantics, process/cgroup/binary binding, phase RTP и
 >   обязательный независимый SUT resource/session/loss ряд для каждого proxy и
 >   расширенные leak/soak gates для capacity, а также per-host
->   architecture/hardware/GStreamer runtime manifests. Native amd64/arm64 CI run
->   `31511231574` подтверждает весь functional slice, включая real `/proc`,
+>   architecture/hardware/GStreamer runtime manifests и scoped camera-ingress
+>   WAN/netem evidence с direct-control binding. Native amd64/arm64 CI run
+>   `31527148623` подтверждает весь functional slice, включая real `/proc`,
 >   cgroup v2, dpkg и mapped-library runtime capture, а также последующий
->   H.264/H.265 RTSP/TCP contract на обоих native runners; повторный
+>   scoped `tc/flower→IFB→netem` и H.264/H.265 RTSP/TCP contracts на обоих
+>   native runners; повторный
 >   Standards/Spec review пройден.
 >   Выделенный
->   production-equivalent Spike #0 и 24h soak ещё не выполнены; WAN/netem и
->   probe/CRUD drivers пока fail closed.
+>   production-equivalent Spike #0, фактический LAN/WAN A/B и 24h soak ещё не
+>   выполнены; non-zero probe/CRUD drivers пока fail closed.
 > - Product behavior: **EVIDENCE GATED** обязательными Phase 0 fork decisions.
 > - Production: **NO-GO**.
 > - Scale-out: **EVIDENCE BLOCKED** до single-node Spike #0.
@@ -270,10 +272,15 @@ CPU/RAM/NIC/kernel/sysctl, effective
 cgroup/RLIMIT и PID/start/executable identity; на generator hosts он также
 фиксирует exact dpkg build и SHA/device/inode реально mmap'нутых GStreamer
 библиотек. Cold A/B дополнительно копирует и хэширует direct runtime manifests и
-отвергает drift machine/boot/kernel/sysctl/cgroup/RLIMIT/GStreamer среды. Эти
-механизмы не публикуют capacity envelope без фактических
-выделенных стендов, typed WAN/netem и probe/CRUD drivers, полной matrix и 24h
-soak. FFmpeg/ffprobe
+отвергает drift machine/boot/kernel/sysctl/cgroup/RLIMIT/GStreamer среды. Typed
+WAN/netem driver на camera-side ingress перенаправляет только точные IPv4/TCP
+source endpoints через `clsact/flower` в выделенный IFB с pinned
+delay/jitter/random-loss/queue. Finalizer заново проверяет per-flow action
+counters, qdisc accounting, statistical loss envelope, quiescent drain и exact
+`tc`/`ip` identity; direct-control WAN evidence копируется внутрь cold proxy
+bundle и повторно вычисляется. Эти механизмы не публикуют capacity envelope без
+фактических выделенных LAN/WAN стендов, non-zero probe/CRUD drivers, полной
+matrix и 24h soak. FFmpeg/ffprobe
 зафиксированы как Phase 0 candidate,
 но upstream artifact не имеет GitHub attestation и ещё не прошёл security
 provenance gate. Наличие Phase 0-кода не означает доказанную production

@@ -102,6 +102,20 @@
   cross-phase windows, FD drain, all RTSP sessions plus ready runtime paths
   after the pinned on-demand close/drain interval, and zero RTP/RTCP/path error
   delta. Capacity additionally applies the long-window leak/soak conclusions;
+- named WAN profiles are exact (`50 ms` added RTT at camera-side ingress,
+  `10 ms` jitter, `0.5%` random loss); exact camera-source IPv4/TCP flows are
+  redirected by `clsact/flower` to a dedicated, MTU-matched IFB with no
+  routable address and one pinned root netem qdisc. Installation refuses
+  dirty/ambiguous ingress, egress, chain or IFB state and rollback removes only
+  exact owned state;
+- every impaired run requires typed raw observations and a recomputed summary
+  for every receiver site. Evidence binds canonical plans, interface
+  indexes/MTU, `tc`/`ip` canonical path/SHA/version, exact per-flow action
+  counters, qdisc counters, queue boundaries and synchronized time. Positive
+  action drops/overlimits, counter drift/reset, missing scoped traffic, queue
+  saturation, loss above the random-loss envelope, packet-accounting mismatch
+  or non-quiescent drain fails closed. Cold proxy A/B copies and revalidates the
+  direct netem raw/summary/runtime/launch evidence;
 - the final manifest is the sealing completion marker; verification checks
   exact `0440`/`0550` modes and an interrupted final chmod is recoverable only
   by rerunning the full semantic finalizer. The marker is published with an
@@ -109,22 +123,26 @@
 
 ## Functional CI boundary
 
-Hardened native amd64/arm64 run `31511231574` is green for all six application,
+Hardened native amd64/arm64 run `31527148623` is green for all six application,
 release/media and pull-load-generator jobs. Repeat Standards/Spec review passed.
 
 The native jobs compile both C binaries with distro GStreamer development
 libraries, print exact package versions and binary SHA-256 values, prepare
 pinned-FFmpeg fixtures, then prove two H.264 and two H.265 pull endpoints with
 fan-out readers and rejected UDP transport. The updated workflow also starts a
-finite systemd service and runs the public runtime capture/binding contract against
-real `/proc`, cgroup v2, dpkg and mapped GStreamer libraries on both amd64 and
-arm64 before the H.264/H.265 RTSP/TCP checks.
+finite systemd service and runs the public runtime capture/binding contract
+against real `/proc`, cgroup v2, dpkg and mapped GStreamer libraries. Isolated
+Linux network namespaces also prove that matching camera-source traffic is
+impaired, an adjacent control flow is not, counters reconcile, drift is rejected
+and exact state is removed. All contracts run on both amd64 and arm64 before the
+H.264/H.265 RTSP/TCP checks.
 
 This proves functional compatibility only. It does not satisfy the Spike #0
 exit. None of the following evidence has been published: production-equivalent
-hardware capture, two-host generator convergence, LAN/WAN baseline,
+hardware capture, two-host generator convergence, production-equivalent LAN/WAN baseline,
 100/500/1000 ladder, knee, churn/fault matrix or 24-hour soak.
 
-WAN/netem and non-zero probe/CRUD axes currently fail profile validation until
-their typed drivers and verification evidence are implemented. This is an
-explicit Phase 0B code gap, not a silently ignored workload axis.
+Non-zero probe/CRUD axes currently fail profile validation until their typed
+drivers and verification evidence are implemented. This is an explicit Phase
+0B code gap, not a silently ignored workload axis. The green namespace netem
+contract is functional compatibility evidence, not a real WAN capacity result.

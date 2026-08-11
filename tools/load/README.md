@@ -42,7 +42,7 @@ On Ubuntu 24.04 install the architecture-native packages:
 ```sh
 sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
-  build-essential pkg-config libgstrtspserver-1.0-dev \
+  build-essential iproute2 pkg-config libgstrtspserver-1.0-dev \
   gstreamer1.0-tools gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
 make -C tools/load
@@ -178,6 +178,89 @@ fail closed. Anchors are not extra hidden load: they are part of
 The optional external Basic Auth file is not included in argv contents. It
 must be an owner-owned regular file, mode `0600`/`0400`, no symlink, and contain
 exactly username and password on separate non-empty lines.
+
+## Scoped WAN/netem evidence
+
+The named WAN profile is exact: `50 ms` added RTT, `10 ms` jitter and `0.5%`
+random loss at camera-side receiver ingress. Because only the incoming
+camera-to-receiver leg is delayed, the configured netem delay is the specified
+added RTT. `chaos` uses the separate exact `150 ms`/`2%` profile; arbitrary
+values must not be mislabeled as either named gate.
+
+The profile names the real receiver-side camera interface in
+`network.interface`, an otherwise unused IFB in `network.ifb_interface`, the
+common MTU and the explicit queue limit. Create and raise the IFB on every
+receiver before the run; the harness never creates or deletes links:
+
+```sh
+sudo ip link add rtspifb0 type ifb
+sudo ip link set dev rtspifb0 mtu 1500 up
+```
+
+The IFB must have no routable address, must retain exactly its kernel-default
+root qdisc before install, and must not be shared with other traffic-control
+owners. An automatic IPv6 link-local address is accepted. The ingress interface
+must already be `UP` with the exact profile MTU. Use a root-controlled operator
+session or transient service with `CAP_NET_ADMIN`; the application services do
+not receive that capability.
+
+For a proxy profile, run the following on the SUT with site `sut`. For a
+direct-control profile, run it on every receiving generator host that has a
+reader shard, using that host's profile name as `SITE` (for example
+`generator-a`):
+
+```sh
+RUN_DIR=/srv/rtsp-load/runs/2026-08-11T180000Z-amd64
+SITE=sut
+TC_BIN=$(readlink -f "$(command -v tc)")
+IP_BIN=$(readlink -f "$(command -v ip)")
+
+sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load install-netem "$RUN_DIR" \
+  --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN"
+
+sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load sample-netem \
+  "$RUN_DIR" "$RUN_DIR/raw/netem-$SITE.jsonl" \
+  --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN"
+
+sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load summarize-netem \
+  "$RUN_DIR" "$RUN_DIR/raw/netem-$SITE.jsonl" \
+  "$RUN_DIR/summary/netem-$SITE.json" --site "$SITE"
+
+sudo /opt/rtsp-proxy/current/bin/rtsp-proxy-load remove-netem "$RUN_DIR" \
+  --site "$SITE" --tc-binary "$TC_BIN" --ip-binary "$IP_BIN"
+```
+
+Install before source/anchor traffic and start the blocking sampler no later
+than the warm-anchor epoch. Run the media workload concurrently. The sampler
+uses the immutable launch epochs and stops only after the role-specific drain:
+the direct receiver follows generator completion, while the SUT includes the
+pinned on-demand close and SUT drain window. Do not remove netem before the
+sampler exits and the summary is written.
+
+The driver creates one owned `clsact`, one chain-0 flower per exact source
+IPv4/TCP listen endpoint, and one root netem qdisc on the IFB. It records the
+resolved regular `tc`/`ip` paths, hashes and versions; ordinary distro symlinks
+are resolved before execution. The workload `seed` controls scenario/lifecycle
+selection only. Ubuntu 24.04 iproute2 6.1 has no supported deterministic netem
+packet-loss seed, so the evidence gates the observed loss statistically instead
+of claiming an identical dropped-packet sequence.
+
+Summary recomputation requires every scoped flow to carry traffic, zero flower
+action drops/overlimits, monotonic counters, queue occupancy below the configured
+limit, drops within the random-loss envelope, exact flower-input versus
+netem-dequeue/drop packet accounting, empty boundary queues and two final
+quiescent samples. A neighboring control flow is not redirected. For cold WAN
+A/B, `compare-cold` copies the direct raw/summary/launch/runtime evidence into
+the proxy bundle; finalization recomputes it and checks compatible iproute2
+versions instead of trusting stored `valid` flags.
+
+Install and remove are ownership-safe and fail closed on foreign ingress,
+egress, non-zero-chain, duplicate or IFB qdisc state. A timeout after a possible
+kernel mutation triggers exact read-back cleanup. If cleanup reports
+`netem_install_failed_cleanup_incomplete`, stop the run and inspect
+`tc -s -j qdisc` plus both ingress and egress `tc -s -j filter` inventories;
+do not blindly delete `clsact` or the IFB. Rerun `remove-netem` only after the
+observed partial state is proven to belong to the same immutable site plan.
 
 ## Runtime and hardware manifest
 
@@ -404,17 +487,17 @@ This is locally tamper-evident and read-only, not magical WORM: production
 evidence must then be transferred to root-owned immutable storage or the
 approved WORM target.
 
-Hardened native amd64/arm64 CI run `31511231574` proves compilation,
+Hardened native amd64/arm64 CI run `31527148623` proves compilation,
 runtime-manifest capture against real procfs/cgroup v2/dpkg/mapped libraries,
-H.264/H.265/Opus decodability, independent paths, fan-out, timing events,
-interruption failure and TCP-only sockets on Linux amd64/arm64. The same slice
-passed repeat Standards/Spec review. This does not prove production
-capacity. Spike #0
-still requires dedicated hardware, LAN and camera-side WAN/netem, typical and
+scoped Linux camera-ingress `clsact/flower→IFB→netem`, H.264/H.265/Opus
+decodability, independent paths, fan-out, timing events, interruption failure
+and TCP-only sockets on Linux amd64/arm64. The same slice passed repeat
+Standards/Spec review. This does not prove production capacity. Spike #0 still
+requires dedicated hardware, production-equivalent LAN and camera-side WAN A/B, typical and
 worst GOP, untuned 100/500/1000 baselines, the full lifecycle/fault matrix and
-a 24-hour production-equivalent soak. Until a typed netem verifier and probe/
-CRUD drivers land, profiles containing those axes fail closed instead of
-silently producing partial evidence.
+a 24-hour production-equivalent soak. Until typed non-zero probe/CRUD drivers
+land, profiles containing those axes fail closed instead of silently producing
+partial evidence.
 
 Run durations are not one undifferentiated hold: `ramp_end`,
 `measurement_start`, `measurement_end` and `soak_end` are deterministic launch

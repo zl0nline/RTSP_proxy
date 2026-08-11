@@ -76,13 +76,16 @@ maximum rolling 6h RSS slope, FD/all-session/runtime-path drain, per-sample SUT
 clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
 reconciliation. A fixture
 manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
-Hardened native amd64/arm64 CI `31511231574` covers the complete functional
-harness, including the runtime collector against real procfs, cgroup v2, dpkg and
-mapped GStreamer libraries followed by the H.264/H.265 RTSP/TCP contract on both
-native runners. Repeat Standards/Spec review passed. WAN/netem and non-zero probe/CRUD axes
-deliberately fail closed
-until typed drivers exist; native CI is functional evidence only and is not a
-measured single-node capacity envelope.
+The typed WAN driver applies only exact camera-source IPv4/TCP flows at receiver
+ingress through `clsact/flower` into a dedicated IFB and pinned netem qdisc. Raw
+evidence binds per-flow action counters, qdisc accounting, loss envelope, drain,
+tool identity and direct-control comparison. Hardened native amd64/arm64 CI
+`31527148623` covers the complete functional harness, including real
+procfs/cgroup v2/dpkg/mapped-library runtime capture, scoped netem traffic/control
+flows and the H.264/H.265 RTSP/TCP contract on both native runners. Repeat
+Standards/Spec review passed. Non-zero probe/CRUD axes deliberately fail closed
+until their typed drivers exist; native CI is functional evidence only and is
+not a measured single-node capacity envelope.
 
 The runtime/hardware manifest code is implemented, but no production-equivalent
 hardware manifest or capacity run has been published. A finalized functional

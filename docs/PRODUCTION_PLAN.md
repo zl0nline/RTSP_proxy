@@ -1003,6 +1003,7 @@ Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
 
 - RTSP pull-server generator and fixtures;
 - manifest/raw artifacts;
+- scoped camera-ingress WAN/netem driver and direct-control evidence;
 - untuned baselines and resource slopes;
 - single-node knee, 24h soak, fault/churn matrix;
 - safe envelope and hardware/network profile.
@@ -1094,18 +1095,49 @@ invalidates the A/B pair. Missing, stale, cross-machine or architecture-mismatch
 evidence fails finalization. This collector targets the documented Ubuntu 24.04
 native host shape equally on amd64 and arm64.
 
-Hardened native amd64/arm64 CI run `31511231574` covers the complete functional
+The typed network driver implements the named WAN contract exactly: `50 ms`
+added RTT, `10 ms` jitter and `0.5%` random loss at camera-side receiver
+ingress. For proxy runs the receiver site is the SUT and exact upstream source
+server IPv4/TCP endpoints are selected; for direct-control, the receiver sites
+are generator hosts carrying reader shards and the same remote source leg is
+selected. Traffic is redirected by owned chain-0 `clsact/flower` rules into a
+dedicated MTU-matched IFB with one pinned root netem qdisc. Other host traffic
+and adjacent source ports are not impaired.
+
+Install/remove is a privileged operator boundary, separate from application
+services. It refuses pre-existing/foreign ingress, egress, chain, duplicate or
+IFB qdisc state, resolves distro `tc`/`ip` symlinks to regular binaries, and
+records canonical paths, SHA-256 and versions. Timeout/interruption after a
+possible kernel mutation performs exact read-back cleanup; ambiguous ownership
+fails closed rather than deleting `clsact`. The driver leaves IFB creation and
+deletion to the operator and accepts no routable IFB address.
+
+Every impaired run requires per-site raw observations from before the anchor
+through the role-specific quiescent drain and a summary recomputed by the
+finalizer. The contract binds interface indexes/MTU, canonical plan, clock,
+machine/boot and tool identity; exact flower action counters are reconciled with
+netem dequeued+dropped packet counters. Positive action drops/overlimits,
+counter reset/drift, missing scoped traffic, queue saturation, random loss above
+the statistical envelope, accounting mismatch, boundary backlog or continuing
+traffic at the final two samples fails. The profile scenario seed does not claim
+a deterministic dropped-packet sequence because Ubuntu 24.04 iproute2 6.1 does
+not expose a supported netem seed. Cold A/B copies and hashes direct raw netem,
+summary, launch and runtime evidence into the proxy bundle, then recomputes and
+compares it.
+
+Hardened native amd64/arm64 CI run `31527148623` covers the complete functional
 harness. On both native runners it executes the runtime collector against real
 procfs, non-root cgroup v2 constraints, dpkg and mapped GStreamer libraries,
-then executes the H.264/H.265 RTSP/TCP contract. Repeat Standards/Spec review
-passed.
+proves scoped matching/control flows and cleanup in isolated Linux network
+namespaces, then executes the H.264/H.265 RTSP/TCP contract. Repeat
+Standards/Spec review passed.
 Per-host hardware/architecture and dynamically linked GStreamer package/build
 evidence is now mandatory in the finalizer, but no production-equivalent host
-manifest or capacity result has been published. WAN/netem and non-zero probe/CRUD
-profiles currently fail closed until typed drivers and their evidence verifiers
-are implemented. CI is not capacity evidence; dedicated LAN/WAN hardware,
-untuned baselines, saturation knee, complete fault matrix and 24h soak remain
-mandatory before the Phase 0B exit decision.
+manifest or capacity result has been published. Non-zero probe/CRUD profiles
+currently fail closed until their typed drivers and evidence verifiers are
+implemented. CI is not WAN or capacity evidence; dedicated LAN/WAN hardware,
+untuned baselines, direct A/B, saturation knee, complete fault matrix and 24h
+soak remain mandatory before the Phase 0B exit decision.
 
 #### 0C. Conditional topology spike
 
@@ -1236,8 +1268,8 @@ Product/release is ready only when:
 - pilot exits green and owner gives `GO`;
 - every 10k claim is bounded by the actually measured workload envelope.
 
-Phase 0 is authorized and in progress. The next valid action is to finish the
-remaining typed Phase 0B drivers, execute Spike #0 on production-equivalent
-amd64/arm64 stands, and then decide `SINGLE_NODE BASELINE` or authorize the
+Phase 0 is authorized and in progress. The next valid action is to implement
+the non-zero probe/CRUD Phase 0B evidence drivers, execute Spike #0 on
+production-equivalent amd64/arm64 stands, and then decide `SINGLE_NODE BASELINE` or authorize the
 conditional topology spike. Until those artifacts exist, dependent product
 behavior and production rollout remain `NO-GO`.
