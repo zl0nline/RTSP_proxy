@@ -1,1280 +1,769 @@
 # Production-план RTSP Proxy
 
-> Актуализировано 10 августа 2026 года по текущим телам и обсуждениям
+> Актуализировано 12 августа 2026 года по owner consensus и текущим телам
 > [issues #1–#14](https://github.com/zl0nline/RTSP_proxy/issues).
 >
-> **PLANNING CONSENSUS: COMPLETE · SPEC CORRECTIONS: COMPLETE · PHASE 0:
-> IN PROGRESS · FOUNDATION: IN PROGRESS · PRODUCTION: NO-GO · 10K: NOT CLAIMED**
+> **ARCHITECTURE: BOUNDED MEDIA NODES · IMPLEMENTATION: IN PROGRESS ·
+> PRODUCTION: NO-GO UNTIL EVIDENCE**
 
-Этот документ — единая исполнимая спецификация проекта. Он описывает, что
-следует построить, в каком порядке принимать решения и какими артефактами
-доказывается готовность каждого этапа. Он не утверждает, что система уже
-реализована, готова к production или выдерживает 10 000 одновременно активных
-потоков.
+Этот документ — нормативный план продукта и реализации. Он заменяет прежнюю
+гипотезу «один MediaMTX до 10k, затем gateway/L7». Текущая topology выбрана
+владельцем: один Linux-сервер содержит несколько независимых MediaMTX nodes,
+каждая ограничена 100 зарегистрированными камерами и собственным внешним RTSP
+портом. Исторические issue comments и research notes не применяются там, где
+они противоречат этому документу и актуальным телам issues.
 
-Consensus означает, что согласованы инварианты, порядок экспериментов и
-acceptance criteria. Владелец разрешил Phase 0 и foundation implementation 10
-августа 2026. Product behavior, зависящий от неподтверждённых fork decisions,
-pilot и каждая следующая migration wave требуют прохождения своих gates и
-отдельного решения владельца проекта.
+Документ не утверждает, что product behavior уже реализован или что один сервер
+обязательно выдержит 50/100 nodes. Такие характеристики появляются только после
+воспроизводимых испытаний на конкретном hardware profile.
 
 ## 1. Иерархия решений
 
 Приоритет источников:
 
-1. Принятый ADR с приложенными evidence-артефактами.
+1. Accepted ADR и явно приложенные evidence-артефакты.
 2. Этот production-план.
-3. Актуальные тела issues #1–#14.
-4. Исторические consensus/review comments.
+3. Актуальные тела GitHub issues #1–#14.
+4. README и эксплуатационная документация.
+5. Исторические comments/research notes.
 
-Если эксперимент опровергает planning-гипотезу, реализация не подгоняет
-результат под план. Создаётся versioned ADR, обновляются SLO/capacity
-assumptions, затронутые issues, этот документ и README. Молчаливое ослабление
-threshold или смена topology запрещены.
+При изменении решения одновременно обновляются ADR, issues, план, README,
+runbooks и executable tests. Нельзя молча ослабить лимит, SLO или security
+boundary.
 
-Численные значения разделяются на:
+Численные значения имеют разный смысл:
 
-- **SLO** — пользовательский или эксплуатационный контракт;
-- **evidence gate** — порог допуска результата;
-- **spike budget** — критерий сравнения вариантов, не production-обещание;
-- **capacity envelope** — измеренная комбинация workload и инфраструктуры.
+- **hard product invariant** — например 100 registered cameras/node;
+- **configuration limit** — default `max_nodes=50`, configurable до 100;
+- **SLO** — пользовательский/эксплуатационный target;
+- **evidence gate** — pass/fail испытания;
+- **capacity envelope** — измеренная комбинация workload и hardware.
 
 ## 2. Цель продукта
 
-Система заменяет отдельные внешние RTSP-порты камер одним настраиваемым
-endpoint, по умолчанию `:9999`.
-
-Внешний адрес:
+Система скрывает private camera endpoint и source credentials за ordinary RTSP
+endpoint выбранной media node:
 
 ```text
-rtsp://<external-user>:<external-password>@<host>:9999/<public_id>
+rtsp://<downstream-user>:<downstream-password>@<server>:<node_port>/<public_id>
 ```
 
-Это стандартный RTSP URL. Consumer выполняет обычный DESCRIBE/SETUP/PLAY и не
-получает proxy-specific scheme, redirect, header или setup step. External grant
-скрывает source credentials камеры. Для недоверенной сети confidentiality
-обеспечивается внешним VPN/private L3 transport, который не меняет `rtsp://`
-URL или handshake.
+Consumer выполняет стандартные DESCRIBE/SETUP/PLAY/TEARDOWN и считает endpoint
+обычной RTSP-камерой. Proxy-specific protocol, redirect, RTSPS scheme или
+дополнительный gateway handshake отсутствуют. Если канал недоверенный,
+confidentiality обеспечивает внешний VPN/private L3 transport без изменения
+`rtsp://`.
 
-Целевой результат:
+Control plane должен:
 
-- внешний FFmpeg consumer не получает IP и source credentials камеры;
-- оператор управляет каталогом, группами, grants и диагностикой через HTTPS
-  dashboard без ручной правки БД или MediaMTX config;
-- изменение одной камеры не перезапускает media node и не влияет на другие
-  paths;
-- PostgreSQL хранит desired state, MediaMTX обслуживает медиапоток;
-- capacity, security, availability, restore и rollback доказываются тестами;
-- миграция со старых port-forward URL идёт волнами с явным go/no-go.
+- управлять всеми nodes одного Linux-сервера;
+- автоматически или вручную размещать cameras;
+- не превышать 100 зарегистрированных cameras/node;
+- управлять жизненным циклом node, drain, move и port change;
+- агрегировать health/statistics всех nodes;
+- применять IP allowlist до camera login/password;
+- допускать только одного downstream reader/camera;
+- уведомлять по email об аварии и восстановлении node;
+- не участвовать в RTP forwarding.
 
-`10k` всегда раскладывается на независимые workload axes:
+## 3. Термины и invariants
 
-- registered и enabled paths;
-- одновременно active sources;
-- readers per source и fan-out skew;
-- bitrate, codec, audio, GOP и packet rate;
-- session duration, connect/disconnect churn и reconnect storms;
-- CRUD, reconcile, probes, TSDB и dashboard load.
+### 3.1 Server
 
-`10k registered` не означает `10k active`. Поддерживаемой считается только
-комбинация осей, опубликованная вместе с hardware/network manifest и raw
-результатами испытаний.
+Один поддерживаемый Linux host. На нём работают control plane, PostgreSQL и
+media nodes. Multi-server cluster, автоматический failover и межсерверная
+миграция не входят в текущую версию.
 
-## 3. Scope и non-goals
+### 3.2 Media node
+
+Один independently managed MediaMTX runtime:
+
+- отдельный process и systemd instance;
+- отдельный generated config, runtime directory и log identity;
+- один внешний RTSP listener port;
+- loopback-only management API/metrics ports;
+- не более 100 registered cameras;
+- отдельный media failure domain.
+
+Node может содержать 0..100 камер. Распределение 50/10/80/100 валидно.
+
+### 3.3 Camera и placement
+
+Camera — catalog record одного source path. Registered camera считается в
+лимите независимо от enabled/active/occupied состояния. Camera имеет ровно одну
+current placement на node.
+
+Move создаёт новую placement generation. Поскольку внешний порт принадлежит
+node, move может изменить URL. Transparent routing/redirect не обещается.
+
+### 3.4 Occupied stream
+
+Path занят, если у него есть один active downstream reader. Второй reader не
+ждёт slot и получает RTSP `453 Not Enough Bandwidth`. После TEARDOWN/disconnect
+slot освобождается.
+
+### 3.5 Drain
+
+Drain запрещает новые downstream sessions и новые placements на node, но
+сохраняет текущий reader до disconnect/deadline. Forced completion требует
+явного подтверждения и имеет показанный blast radius.
+
+## 4. Scope и non-goals
 
 В scope:
 
-- Python 3.12, FastAPI, Jinja2/HTMX и PostgreSQL для control plane;
-- pinned MediaMTX version и binary SHA-256 для media plane;
-- on-demand pull источников;
-- RTSP-over-TCP interleaved снаружи и до камеры;
-- FFmpeg + supervisor как эталонный внешний consumer;
-- каталог, camera profiles, groups, RBAC, grants, audit и probes;
-- observability, load/chaos, deployment, restore, drain и rollback;
-- single-node baseline и доказуемый путь к scale-out;
-- controlled migration со старой системы.
-- direct Linux deployment на amd64 и arm64 с одинаковыми SLO/security/release
-  gates и нативными tests для каждой архитектуры.
+- Python 3.12, FastAPI, Jinja2/HTMX, PostgreSQL;
+- pinned MediaMTX/FFmpeg/ffprobe;
+- ordinary RTSP interleaved TCP снаружи и до source;
+- on-demand source pull;
+- node registry, port allocator, lifecycle и config generation;
+- automatic/manual placement и camera moves;
+- internet/local CIDR policies и per-camera downstream credentials;
+- dashboard, RBAC, audit, metrics, probes и email incidents;
+- direct Linux systemd deployment на amd64/arm64;
+- load/chaos, backup/restore, rollback и pilot.
 
 Не входят:
 
-- NVR, запись и архив видео;
-- transcoding и изменение media profile;
-- HLS, WebRTC, playback или publish как внешний production contract;
-- UDP/multicast RTP;
-- публичный интеграционный API;
-- собственный RTSP router до провала готовых вариантов;
-- сохранение живого TCP-сеанса при потере media node;
-- автоматическое добавление инфраструктуры без измеренной причины.
+- Docker/Kubernetes/container runtime;
+- RTSPS/TLS listener и UDP/multicast media;
+- multi-server cluster, gateway tier и единый внешний порт;
+- automatic camera failover/migration при node failure;
+- сохранение TCP session при restart/forced move;
+- более одного downstream reader/camera;
+- NVR/archive, transcoding, HLS/WebRTC;
+- публичный third-party integration API.
 
-## 4. Статусы и decision rights
-
-| Уровень | Статус | Условие перехода |
-|---|---|---|
-| Planning consensus | COMPLETE | Issues согласованы, corrections внесены |
-| Phase 0 | IN PROGRESS | Owner authorization получено 2026-08-10 |
-| Phase 0A compatibility | COMPLETE | Standards/Spec PASS; native amd64/arm64 contract CI |
-| Phase 0B harness / Spike #0 | IN PROGRESS | Functional harness review/CI passed; dedicated hardware evidence absent |
-| Scale-out topology | EVIDENCE BLOCKED | Провален single-node gate и пройден topology spike #10 |
-| Foundation implementation | REVIEWED | Health/release/package/Linux artifacts прошли exit review |
-| Product behavior | EVIDENCE GATED | Зелёные обязательные Phase 0 fork decisions |
-| Production pilot | NO-GO | Зелёные artifacts #1–#12 и owner sign-off |
-| Scale after pilot 100 | NO-GO | 7-day exit gate #13 и опубликованный envelope |
-| 10k claim | NOT CLAIMED | Production-like evidence конкретного workload |
-
-Права решения:
-
-- project owner разрешает phase, pilot и следующую wave;
-- technical owner останавливает rollout при SLO/integrity/capacity breach;
-- security owner останавливает при auth, secret, audit или network-boundary breach;
-- operations owner принимает restore, drain, rollback и runbook evidence;
-- on-call вправе объявить `STOP`; возобновление требует нового owner `GO`.
-
-## 5. Архитектурные инварианты
-
-1. Один внешний configurable RTSP endpoint, default port `9999`.
-2. **RTSP-over-TCP interleaved — единственный поддерживаемый transport** снаружи
-   и до источника. UDP/multicast выключены. `sockets_per_session = 1`. Изменение
-   транспорта требует отдельного ADR и пересчёта capacity. Внешняя схема всегда
-   обычная `rtsp://`; consumer не должен отличать proxy endpoint от прямой
-   RTSP-камеры.
-3. Python не находится в media datapath и не proxy/remux/transcode video.
-4. MediaMTX запускается только из release artifact с pinned version/SHA-256 и
-   compatibility manifest.
-5. PostgreSQL — единственный source of truth desired state. JSON/CSV используются
-   только для import/export.
-6. API подтверждает `desired accepted`, а не ложно обещает `applied`.
-7. Desired revision, outbox и нормативный audit фиксируются одной synchronous
-   quorum transaction. Async commit разрешён только probes и ненормативной
-   derived telemetry, не `audit_events`.
-8. Reconciler идемпотентно сводит desired и actual state; exactly-once не
-   обещается.
-9. Штатный CRUD одной камеры не вызывает restart/reload MediaMTX и не меняет
-   TCP/bytes/PTS других paths.
-10. Established media sessions не требуют synchronous request-time доступа к
-    DB/control plane. New sessions при auth outage следуют явной fail-closed/cache
-    policy.
-11. `public_id` не credential. Это 25 равномерных lowercase base36 characters,
-    regex `^[a-z0-9]{25}$`, пространство ≈129.25 bit; имя не переиспользуется.
-12. L4 frontend не path-aware. Схема `L4 → assigned origin shard` отвергнута.
-13. Single-node first: scale-out появляется только после измеренного провала или
-    capacity forecast и отдельного spike.
-14. Security, audit, observability, restore, rollback и capacity — release
-    gates, а не post-launch work.
-15. Неизвестные возможности MediaMTX подтверждаются executable tests конкретных
-    version и binary SHA-256.
-16. Cold start = `proxy_overhead + wait_for_keyframe(GOP)`. SLO предъявляется к
-    нашей части; GOP фиксируется в camera profile.
-17. Linux amd64 и arm64 — равноправные production targets. Release manifest,
-    native binary checksum, compatibility suite, clean-host smoke, load envelope
-    и rollback evidence формируются отдельно для каждой архитектуры; evidence
-    одной архитектуры не переносится на другую.
-
-## 6. Логическая архитектура
-
-### 6.1 Single-node baseline
+## 5. Logical architecture
 
 ```text
 Operator browser
       |
+      | HTTPS, management LAN
       v
-HTTPS Dashboard/API -----------------------> PostgreSQL
-      |                                      desired state
-      |                                      audit/outbox/jobs
-      v                                             |
-web / worker / reconciler / probe scheduler <-------+
-      |                         |
-      |                         +--> sandboxed ffprobe --> cameras
-      v
-MediaMTX management boundary
-      ^
+Dashboard / Control API ---------> PostgreSQL
+      |                               |
+      +-> outbox / workers            +-> nodes / cameras / placement
+      +-> reconciler                  +-> ACL / credentials / audit
+      +-> metrics collector
       |
-External FFmpeg + supervisor --> RTSP/TCP :9999 --> MediaMTX --> cameras
-                                                        |
-                                                        +--> metrics/events
-                                                               |
-                                                               v
-                                                        collector / TSDB
+      +---- loopback ----> Media node A: RTSP :p1 -> cameras A
+      +---- loopback ----> Media node B: RTSP :p2 -> cameras B
+      +---- loopback ----> Media node N: RTSP :pN -> cameras N
+
+External consumer -------- RTSP/TCP :pN/<public_id> --------^
 ```
 
-Runtime roles:
+Python не проксирует, не декодирует и не транскодирует media. Для каждой node
+control plane знает stable node id и внутренние API/metrics endpoints. Browser
+никогда не обращается к MediaMTX API напрямую.
 
-- `web` — dashboard/API, browser sessions и authorization;
-- `worker` — outbox/jobs и фоновые commands;
-- `reconciler` — desired/actual convergence;
-- `probe` — bounded source/path checks;
-- `collector` — media/host signals и TSDB ingestion.
+## 6. Node configuration
 
-### 6.2 Conditional multi-node candidate
+### 6.1 Global settings
 
-Topology не выбрана заранее. Первый candidate после провала single-node:
+Typed schema включает минимум:
 
 ```text
-External FFmpeg
-      |
-      v
-L4 TCP frontend :9999
-      |
-      +------> any replicated gateway -------+
-      |                                      |
-      +------> any replicated gateway        v
-                                         assigned origin shard --> camera
+max_nodes = 50                 # 1..100
+node_port_range_start
+node_port_range_end
+node_port_reserved = [...]
+management_https_bind
+mediamtx_api_loopback_range
+mediamtx_metrics_loopback_range
+drain_default_timeout
+smtp settings / recipients
 ```
 
-Здесь два независимых уровня:
+Validation fail-fast:
 
-- **external routing:** L4 выбирает любой healthy gateway и не читает RTSP path;
-- **origin ownership:** БД определяет origin, владеющий source pull.
+- `max_nodes` вне 1..100;
+- пустой/перевёрнутый/слишком маленький port range;
+- пересечение external range с internal/control/reserved ports;
+- unknown config keys;
+- non-loopback node API/metrics bind;
+- architecture/release manifest mismatch.
 
-Gateway имеет proxy path для любого внешнего `public_id`; camera credentials не
-покидают origin. Если gateway tier не проходит SLO/security/capacity, проверяется
-готовый RTSP-aware L7. Самописный router — последний резерв.
+### 6.2 Per-node desired config
 
-## 7. Camera contract
+- stable UUID/node id и display name;
+- external RTSP port;
+- internal API/metrics ports;
+- desired lifecycle/admin state;
+- config generation and applied generation;
+- maintenance/drain policy;
+- pinned MediaMTX release id.
 
-Параметры источника — отдельный versioned артефакт `docs/CAMERA_PROFILE.md` и
-таблица профилей в БД. Шаблон создаётся в Phase 0; реальные profiles обязательны
-для pilot и полностью заполнены до pilot 100.
+Config генерируется во временный root-owned file, полностью валидируется и
+атомарно активируется. Secret material не пишется в world-readable config.
 
-| Поле | Назначение |
-|---|---|
-| model / firmware | воспроизводимость и support matrix |
-| main/sub normalized paths | uniqueness и probe templates |
-| codec/audio | compatibility matrix |
-| bitrate / packet rate | per-hop capacity |
-| GOP / keyframe interval | cold-start decomposition и load profile |
-| `max_concurrent_rtsp_sessions` | probes, overlap и migration cutover |
-| RTSP-over-TCP support | production admission |
-| timeout/keepalive limits | end-to-end timeout budget |
+### 6.3 Config mutation classes
 
-Preflight проверяет профиль на текущей camera load. Неизвестный GOP или session
-limit не заменяется удобной synthetic constant: camera/cohort блокируется либо
-получает явно принятый risk.
-
-## 8. SLI, SLO и numerical gates
-
-### 8.1 Normative initial SLO
-
-| SLI | Initial SLO |
-|---|---:|
-| Warm `DESCRIBE → PLAY`, p99 | `≤ 500 ms` |
-| Cold on-demand `proxy_overhead`, p99 | `≤ 1 s` |
-| Cold end-to-end, informative | `≤ 1 s + GOP_max` profile |
-| Catalog read, p99 | `≤ 200 ms` |
-| CRUD mutation, p99 | `≤ 1 s` |
-| `deep_observation_freshness` | `≥95%` routine-enabled не старше `2 × configured_interval` |
-| `manual_confirmation_start` | `≥99%` внутри queue-delay SLO |
-| Control-plane availability | `≥99.5% / month`, planned maintenance excluded |
-| Established media-session availability | `≥99.0% / month` |
-
-Безусловный `cold ≤3s` отменён: он зависит от GOP. Performance suite отдельно
-публикует `proxy_overhead`, wait-for-keyframe и end-to-end latency минимум для
-typical и worst-known GOP.
-
-Measurement rules:
-
-- warm/cold и p50/p95/p99 публикуются раздельно, pass/fail использует p99;
-- latency измеряет внешний FFmpeg consumer на production-like network;
-- failures входят в success-rate SLI и не исчезают из latency report;
-- platform/network failure отделяется от camera-origin failure;
-- health freshness считается отдельно по site/subnet;
-- scheduler overload меняет `observation_state`, а не camera health.
-
-### 8.2 Operational gates
-
-| Contract | Gate |
-|---|---:|
-| Dashboard authz downgrade/revoke | `≤2s`, fail closed |
-| Dashboard authz upgrade | `≤30s` |
-| Media-grant revoke for new sessions | candidate `≤10s`; positive cache `≤5s` |
-| FFmpeg supervisor recovery | p95 `≤10s`, max `≤35s` |
-| Steady successful handshakes | `≥99.9%` outside injected failures |
-| Control/data impact on media | throughput `≤5%`, latency `≤10%`, errors `≤0.1pp` |
-| PostgreSQL backup/PITR | RPO `≤5m`, control-plane RTO `≤30m` |
-| Critical desired+audit HA failover | RPO `0` only with proven synchronous quorum |
-| Global resource envelope | each hard resource `<70%`, headroom `≥30%` |
-| Restore drill / critical game day | monthly / quarterly |
-
-Spike #0 additionally uses stricter ceilings where applicable: CPU `≤65%`,
-NIC/packet-rate `≤60%`, FD `<70%`, RAM `<70%`. Ослабление — только ADR с
-evidence.
-
-## 9. Foundation и immutable deployment
-
-### 9.1 Linux release и supply chain
-
-- Docker/containers не используются; target — direct Linux deployment;
-- target architectures — amd64 и arm64; CI запускает application и pinned
-  MediaMTX contract нативно на обеих архитектурах без эмуляции;
-- release manifest фиксирует application wheel/lock hash, MediaMTX binary
-  version/SHA-256, FFmpeg/ffprobe versions, schema/config compatibility;
-- CI проверяет checksums, provenance/signature где доступна, SBOM, dependencies,
-  wheel/sdist, lockfile и clean Linux install;
-- production release размещается root-owned в
-  `/opt/rtsp-proxy/releases/<version>` и не изменяется service users;
-- `/opt/rtsp-proxy/current` переключается atomic symlink; предыдущий release
-  сохраняется для rollback;
-- runtime host не требует compiler/dev tools/hot reload;
-- startup smoke выполняется против реально запущенных binaries.
-
-### 9.2 MediaMTX contract levels
-
-1. **Build/deploy:** binary/wheel checksums и release manifest immutable.
-2. **Startup:** executable API/auth/metrics/RTSP compatibility probe.
-3. **Runtime:** readiness читает minimal effective contract конкретного node.
-
-Readiness проверяет effective config через API:
-
-- TCP-only transport;
-- API/metrics не слушают внешний interface;
-- HLS/WebRTC/playback/record и ненужные listeners выключены;
-- reported version и SHA-256 установленного binary соответствуют manifest.
-
-### 9.3 Linux process layout
-
-- `uv sync --locked` используется в development; production устанавливает
-  проверенный wheel/venv из lockfile в versioned release directory;
-- web, worker, reconciler, probe, collector и MediaMTX — отдельные `systemd`
-  services под dedicated non-login users;
-- units фиксируют config/environment files, working directory, restart policy,
-  timeouts, `LimitNOFILE`, memory/CPU limits и dependencies;
-- hardening baseline: `NoNewPrivileges=yes`, `ProtectSystem=strict`,
-  `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictSUIDSGID=yes`, empty capability
-  set by default и allowlisted `ReadWritePaths`;
-- config/secrets root-managed; service получает только минимальный read access;
-- startup/readiness и journal logging не зависят от container runtime.
-
-### 9.4 Config classes
-
-| Класс | Примеры | Изменение |
+| Class | Examples | Behavior |
 |---|---|---|
-| `runtime` | paths, credentials, per-camera settings | API/hot-update без разрыва unrelated sessions |
-| `restart-node` | RTSP listen address/port, transports | drain, maintenance, restart, smoke |
-| `restart-control-plane` | pool size, tracing, sessions | rolling control-plane update |
+| live-control | UI limits, email routing | typed reload |
+| reconcile-path | camera source/auth/ACL | target path CRUD, no restart |
+| restart-node | external port/listener/transport | drain/force + only this node restart |
+| restart-control | DB pool, HTTPS bind | control-plane rolling restart |
 
-Смена `RTSP_PORT` — не CRUD. Она обрывает sessions узла и выполняется только по
-runbook #12.
+## 7. Port allocation
 
-### 9.5 PostgreSQL connection budget
+### 7.1 Automatic
 
-```text
-sum(replicas_by_role * (pool_size + max_overflow))
-    <= 0.70 * PostgreSQL max_connections
-```
+1. Read allowed range and exclusions.
+2. Lock allocation namespace/rows in PostgreSQL.
+3. Compute DB-free candidate set.
+4. Select candidate randomly, not lowest-first.
+5. Reserve by unique constraint.
+6. Verify host bindability before activation.
+7. On race/conflict perform bounded retry.
+8. If exhausted, return `нет свободных портов для регистрации новой ноды`.
 
-Не менее 30% остаётся migrations/ops/failover/emergency. Initial upper bounds:
-web `10+10`, worker `5+5`, reconciler `2+2`, collector `2+2`. Advisory-lock
-reconciler использует отдельный direct/session-pooled DSN; statement pooling
-запрещён.
+Random selection is placement policy, not a security primitive. Testability is
+provided by an injected random-choice boundary.
 
-Обязательны bounded pool timeout, recycle/pre-ping, idle transaction timeout,
-role-specific statement timeout и pool metrics.
+### 7.2 Manual/change
 
-### 9.6 Health и migrations
-
-- `/health/live` проверяет process/event loop; dependency failure не создаёт
-  restart loop;
-- `/health/ready` role-specific, со stable reason code без secrets;
-- schema ahead/behind делает incompatible binary not ready;
-- Alembic revisions immutable, single head;
-- migration — отдельный singleton job с advisory lock;
-- `expand → bounded backfill → switch → contract`, N/N-1 compatibility;
-- production rollback не использует destructive down migration: compatible
-  image, pause/resume backfill или forward-fix.
-
-## 10. PostgreSQL data contract
-
-### 10.1 Identifiers и endpoint
-
-- `camera_id`: UUID v7/v4, internal PK;
-- `public_id`: exactly 25 uniform lowercase base36 characters, CSPRNG rejection
-  sampling without modulo bias, regex `^[a-z0-9]{25}$`, ≥128-bit space;
-- `grant_id`: separate non-secret grant identifier;
-- canonical endpoint fingerprint используется для duplicate warning;
-- partial unique `(host, port, normalized_path)` только для non-deleted rows;
-- collision с soft-deleted camera предлагает restore;
-- `camera_public_ids` — единое namespace active/alias/revoked/tombstoned names.
-
-Rotation:
+Manual port must be in range, not reserved, unique in DB and bindable. Port
+change follows:
 
 ```text
-create new id -> reconcile/auth ready -> atomic switch
-              -> revoke old -> drain/terminate -> permanent tombstone
+VALIDATE -> DRAIN or FORCE -> STOP -> RESERVE/SWAP -> GENERATE
+-> START -> RTSP SMOKE -> COMMIT
 ```
 
-Unknown, revoked и unauthorized existing paths проходят no-oracle parity по
-status, headers, body и timing.
+Failure after stop rolls back to previous reserved port/config when possible.
+Port is not reusable until old listener is proven stopped and DB transition is
+committed.
 
-### 10.2 Lifecycle
+## 8. Node placement
 
-- lifecycle: `PROVISIONING | ACTIVE | DELETE_PENDING | DELETED | PURGED`;
-- admin mode: `ENABLED | MAINTENANCE | DISABLED`;
-- soft delete в одной transaction ставит `DELETE_PENDING/DISABLED`, отзывает
-  grants и создаёт audit/outbox;
-- restore до purge создаёт новую desired revision и не реактивирует secrets или
-  grants неявно.
+### 8.1 Eligibility
 
-### 10.3 Entities
+Eligible automatic/manual target:
 
-`cameras`, `camera_sources`, `camera_public_ids`, `camera_secret_versions`,
-`camera_groups`, `camera_group_memberships`, `access_grants`, `media_nodes`,
-`camera_placements`, `reconcile_outbox`, `camera_health_current`,
-`probe_results`, `audit_events` и versioned camera profiles.
+- desired/runtime state is RUNNING;
+- health and management API freshness green;
+- not maintenance/draining/deleting;
+- registered count <100;
+- current release/config compatible.
 
-Raw source URL с userinfo не хранится. Source secrets, access verifiers и
-ordinary metadata физически разделены.
+### 8.2 Automatic selection
 
-### 10.4 Transactions и durability
+Default policy:
 
-- optimistic revision/row lock исключает lost update;
-- desired revision, required `audit_event` и outbox atomic and synchronous;
-- destructive/security/sensitive read operation fail-closed без durable audit;
-- `synchronous_commit=off` разрешён только `probe_results` и отдельной
-  non-normative telemetry;
-- applied revision хранится по `camera × target/placement_generation`;
-- API ack при HA policy следует только после quorum acknowledgement;
-- backup/PITR RPO≤5m не подменяет HA-failover RPO0.
+1. minimum registered camera count;
+2. minimum active source count;
+3. stable node id.
 
-### 10.5 Ordering, queries и churn
+Selection and admission use a transaction/lock and recheck count before
+commit. Runtime active count is only a tie-breaker; correctness never depends
+on a stale metric.
 
-- probe ordering: `(camera_id, source_revision, probe_generation)`;
-- timestamps — observability, не ordering key;
-- `camera_health_current` принимает только newer generation;
-- list/search use keyset/cursor pagination;
-- query shapes утверждаются до indexes и проверяются `EXPLAIN (ANALYZE,
-  BUFFERS)` на production-like data;
-- outbox/health current получают measured fillfactor и aggressive per-table
-  autovacuum;
-- bloat и p99 enqueue/dequeue проверяются 24h soak;
-- partitioning вводится по rows/day, bytes/day, WAL, autovacuum и restore time.
+If eligible target is absent, auto placement may create a new node if:
 
-### 10.6 Retention
+- current node count < `max_nodes`;
+- a free external port exists;
+- process/config provisioning succeeds.
 
-| Data | Retention |
+Otherwise the API returns a typed `node_capacity_exhausted`,
+`max_nodes_reached` or exact no-free-port error.
+
+### 8.3 Manual selection
+
+Operator may choose a specific eligible node. Capacity 100 is never bypassed.
+Maintenance/admin workflows may prepare a stopped target only through a
+separate privileged command; ordinary create never silently selects it.
+
+## 9. Node lifecycle
+
+Canonical states:
+
+```text
+PROVISIONING -> STOPPED -> STARTING -> RUNNING
+RUNNING -> DRAINING -> MAINTENANCE/STOPPING -> STOPPED
+STARTING/RUNNING/... -> FAILED
+STOPPED/FAILED + zero cameras -> DELETING
+```
+
+Every transition has desired state, observed state, generation, actor, reason,
+deadline and audit record.
+
+### 9.1 Operations
+
+- **Create:** reserve port, persist node, generate config, start, smoke, RUNNING.
+- **Start:** reject stale config/release/port collision, then smoke.
+- **Stop:** requires drained/no readers or force confirmation.
+- **Restart:** scoped to node; same drain/force rule.
+- **Maintenance:** removes node from placement and new-session admission.
+- **Port change:** disruptive restart of all streams on node.
+- **Delete:** only empty and stopped/failed; release port after cleanup proof.
+
+### 9.2 Failure
+
+FAILED node keeps camera placements unchanged. No auto migration/failover.
+Incident lifecycle and message delivery are independent state machines:
+
+```text
+incident:          HEALTHY -> OPEN -> RECOVERED -> CLOSED
+failure delivery: NOT_REQUESTED -> PENDING -> SENT | FAILED_FINAL
+recovery delivery: NOT_REQUESTED -> PENDING -> SENT | FAILED_FINAL
+```
+
+Recovery can be recorded regardless of failure-email delivery outcome. If both
+messages are pending, outbox ordering preserves failure-before-recovery. Every
+message has its own stable dedupe key and bounded delivery retries. A recovery
+message identifies the incident and failure-delivery outcome; recurring outage
+reminders are forbidden.
+
+## 10. PostgreSQL model
+
+### 10.1 Core entities
+
+- `media_nodes`;
+- `cameras`;
+- `camera_placements` and append-only placement history;
+- `camera_access_policies`;
+- `camera_credentials` / secret references;
+- `reconcile_targets/jobs`;
+- `groups/memberships`;
+- `probe_observations`;
+- `notification_incidents`;
+- `audit_events` and transactional outbox.
+
+### 10.2 Database invariants
+
+- unique external node port;
+- one current placement/camera;
+- max 100 camera placements/node enforced transactionally;
+- delete node blocked by FK/current placement;
+- canonical `public_id`: lowercase base32, 26 chars, ≥128-bit CSPRNG,
+  non-reserved and permanently tombstoned;
+- optimistic revisions on nodes/cameras/access policies;
+- normative desired state, audit and outbox in one synchronous transaction.
+
+Telemetry may use a different durability policy. Normative audit is never
+`synchronous_commit=off`.
+
+### 10.3 Secrets
+
+Camera source secrets use envelope encryption/key versions. Downstream
+passwords use a slow salted verifier or high-entropy generated secret with
+one-time display. Raw secrets never enter audit/outbox/log/metrics/SSE.
+
+## 11. Control API and dashboard
+
+### 11.1 Public application seams
+
+Tests and clients observe only:
+
+- HTTP control API for node/camera commands and queries;
+- Linux process adapter for systemd/process lifecycle;
+- Media-node adapter for pinned MediaMTX API;
+- ordinary external RTSP endpoint;
+- PostgreSQL behavior through application commands.
+
+Private repository/helper call order is not a contract.
+
+### 11.2 Node API
+
+- list/detail/create;
+- automatic/manual port;
+- start/stop/restart;
+- drain/maintenance/force;
+- port change;
+- delete empty;
+- health/stats/incidents.
+
+### 11.3 Camera API
+
+- create with auto placement default or manual node;
+- edit/enable/disable/delete;
+- move ordinary/forced;
+- rotate downstream credentials/public id;
+- internet/local CIDR policy;
+- current endpoint and occupied state.
+
+Disruptive commands require a short-lived confirmation token bound to current
+revision and exact blast radius. Stale revision returns 409 with a safe diff.
+
+### 11.4 Dashboard
+
+- server capacity/port overview;
+- all nodes with state, cameras, active/occupied counts and resources;
+- node detail/actions;
+- camera catalog/groups/search/filter;
+- placement/move/ACL/auth forms;
+- incident and email delivery status;
+- keyset pagination and bounded metric queries;
+- keyboard/focus/contrast/semantic status accessibility.
+
+Management UI/API listens only on configured management interface and HTTPS.
+
+## 12. Camera lifecycle and move
+
+Camera create/update/delete A uses targeted path config and must not restart
+node or interrupt B..N.
+
+### 12.1 Move saga
+
+```text
+VALIDATE
+-> PREPARE_TARGET
+-> VERIFY_TARGET
+-> SWITCH_PLACEMENT
+-> DISABLE_SOURCE_PATH
+-> CLEANUP_SOURCE
+-> COMPLETE
+```
+
+- Unoccupied camera may move immediately.
+- Occupied ordinary move returns conflict.
+- Forced move requires confirmation and disconnects current reader.
+- Response includes old/new node, port and URL.
+- Target capacity is rechecked inside switch transaction.
+- Crash recovery leaves exactly one current placement and converges cleanup.
+
+Because there is no gateway, seamless endpoint switch is not promised.
+
+## 13. Reconciler and MediaMTX adapter
+
+One active logical writer per node. Writer obtains PostgreSQL advisory/session
+lock, reads node inventory and performs minimal convergent writes.
+
+Apply sequence:
+
+1. Verify node id, pinned version/API and generation.
+2. Read configured path state.
+3. Compare normalized desired state.
+4. Replace/delete only target path.
+5. Read configured state back synchronously.
+6. Observe runtime state asynchronously.
+7. Commit applied revision with fencing condition.
+8. Unknown outcome -> read-back and forward repair.
+
+Configured state and runtime ready/readers are separate. On-demand path with no
+reader may be correctly configured and idle.
+
+Startup rebuild is bounded by 100 paths/node. A node is not RUNNING-ready until
+required platform config and registered path set are applied.
+
+## 14. RTSP/media contract
+
+- `rtsp://server:<node_port>/<public_id>`;
+- RTSP interleaved TCP only on both legs;
+- MediaMTX pulls source on demand;
+- no consumer knowledge of proxy/source credentials;
+- one downstream reader/path;
+- second concurrent reader receives RTSP 453;
+- after reader exit, a later reader can acquire slot;
+- new sessions denied during drain;
+- existing session continues during drain;
+- restart/port change/forced move disconnects only affected node/path;
+- camera CRUD on A preserves RTP progress of B.
+
+Pinned native tests cover H.264/H.265, cold/warm, source offline/recovery,
+simultaneous connects, ACL/auth and absence of media UDP sockets on amd64/arm64.
+
+If MediaMTX cannot natively produce exact 453/race-safe single-reader behavior,
+the implementation requires an accepted admission/auth adapter at the node
+boundary; silently returning another code is not acceptable.
+
+## 15. Access control and auth
+
+Each camera access policy contains two independent normalized CIDR sets:
+
+- `internet`;
+- `local`.
+
+Authorization order:
+
+1. Observe TCP peer address directly.
+2. If both sets empty, pass IP stage.
+3. Otherwise require membership in at least one configured set.
+4. Only then verify camera username/password.
+5. Acquire the single-reader slot.
+
+Forwarded headers are ignored. Unknown path, denied IP, unknown username and
+wrong password use a stable no-oracle response shape allowed by the pinned RTSP
+contract. Metrics classify reasons internally without exposing them to client.
+
+Plain RTSP is unencrypted. Internet use without trusted/private L3 or an
+explicit accepted risk is production NO-GO.
+
+## 16. Health and probes
+
+Health has independent layers:
+
+- control/dependency readiness;
+- node process/API/metrics/listener health;
+- configured path convergence;
+- source probe health;
+- occupied reader/session progress.
+
+Routine `path_probe` must not consume the only downstream reader slot. It runs
+only when unoccupied or uses a pinned non-reader observation mechanism.
+Scheduler has global server, per-node and per-site limits, jitter, fairness,
+deadline aging and bounded subprocess isolation.
+
+Node FAILED suppresses retry storms. Recovery triggers one bounded smoke and
+the recovery incident transition.
+
+## 17. Observability and email
+
+### 17.1 Node/server signals
+
+- node count/max, used/free ports;
+- desired/observed state and freshness;
+- registered/enabled/active/occupied counts;
+- CPU/RSS/FD/sockets/ephemeral ports;
+- NIC bytes/packets;
+- restarts, reconcile queue/lag/errors;
+- port allocation and capacity failures.
+
+### 17.2 Camera signals
+
+- assigned node/port;
+- desired/applied revision;
+- source ready, reader 0/1, bitrate/progress;
+- connect/ACL/auth/453 counters;
+- probe freshness/result;
+- move/drain status.
+
+Credentials, raw source URLs, client IPs and unbounded errors are forbidden in
+labels.
+
+### 17.3 Email semantics
+
+Node outage produces one email per incident. No periodic reminder. Recovery
+produces one confirmation. Outbox/dedupe state survives process restart; SMTP
+retry is bounded and observable.
+
+## 18. SLO and capacity
+
+### 18.1 Initial SLO
+
+| Metric | Target |
 |---|---:|
-| Audit hot searchable | 12 months |
-| Audit WORM/archive | 3 years; legal hold overrides |
-| Probe raw | 30 days |
-| Probe aggregates | 12 months |
-| Metrics high-resolution | 30 days |
-| Metrics downsampled | 13 months |
+| Warm DESCRIBE->PLAY p99 | <=500 ms |
+| Cold proxy overhead p99 | <=1 s |
+| Cold end-to-end | informative <=1 s + GOP_max |
+| Catalog read API p99 | <=200 ms |
+| CRUD/node command p99 | <=1 s |
+| Control availability | >=99.5% / month |
+| Established media availability | >=99.0% / month |
+| Camera CRUD unrelated interruption | 0 |
+| Cross-node lifecycle interruption | 0 |
+| Second reader result | RTSP 453 |
+| Hard-resource headroom | >=30% |
+| Candidate soak | 24 h |
+| PostgreSQL PITR RPO | <=5 min |
+| Control-plane recovery RTO | <=30 min |
 
-## 11. Dashboard, RBAC и browser boundary
+Warm/cold/error distributions are separate. Cold waits for random-access unit;
+GOP component is reported separately from proxy overhead.
 
-Dashboard показывает catalog, groups, desired/applied state, health freshness,
-readers/bitrate, errors и audit, но не декодирует media.
+### 18.2 Per-node qualification
 
-### 11.1 Authorization
+Ladder:
 
-- roles admin/operator, least privilege;
-- monotonic `authz_version` per user/session;
-- downgrade/revoke `≤2s` fail-closed, upgrade `≤30s`;
-- one no-oracle policy for list/count/search/direct/export/SSE;
-- SSE uses authz/resource epochs and pre-delivery checks;
-- break-glass requires MFA, alert, runbook and drill;
-- changed IdP claims do not auto-upgrade active session.
+- registered 1/10/50/80/100;
+- active sources 10/50/100;
+- readers 10/50/100 with max one/path;
+- H.264/H.265, representative audio;
+- 1/2/4/8 Mbit/s and GOP profiles;
+- warm/cold, churn/burst, source outage;
+- camera CRUD and reader race.
 
-### 11.2 CRUD, conflicts и bulk
+### 18.3 Per-server qualification
 
-UI различает:
+Node ladder 1/5/10/25/50. Optional 100 only after config/port range change and
+evidence. Include balanced and uneven occupancy, simultaneous process count,
+collector/reconciler/DB overhead and lifecycle isolation.
 
-1. desired changed by another actor — conflict/merge;
-2. own desired accepted, applied behind — wait for reconcile;
-3. apply failed — diagnostic error and retry.
+No per-node cgroup quotas are required in baseline. Therefore capacity decision
+is based on server aggregate plus per-process attribution. `max_nodes=50` is a
+configuration default, not proof that any host can run 50 fully active nodes.
 
-Merge semantics фиксируются ADR/executable matrix. Placement, credentials,
-`public_id` rotation, lifecycle/admin mode не auto-merge.
+### 18.4 Gates
 
-Bulk разрешён только closed enum. Каждая operation определяет required role,
-atomic/best-effort semantics, per-object result и terminal-subset retry. Всё вне
-allowlist deny by default.
+- every hard resource <70% over representative window;
+- RSS slope <=1%/h, no FD/session/port leak;
+- clean profile proxy-added RTP loss = 0;
+- no interruption outside intended path/node;
+- incident/recovery exactly once;
+- raw evidence binds commit, binaries, config, hardware, clock and workload;
+- amd64/arm64 functional equality, capacity published per hardware profile.
 
-### 11.3 Secrets и audit
+## 19. Direct-Linux deployment
 
-- URL по default копируется без userinfo;
-- secret reveal — standalone privileged single-use `no-store` surface, auto-clear
-  30s, no Service Worker, `Referrer-Policy: no-referrer`;
-- clipboard является secret-storage boundary: long-lived secret запрещён;
-- reveal/export/sensitive read audited;
-- application role has INSERT-only access to append-only audit;
-- critical events replicated to WORM sink;
-- destructive action fail-closed if required audit cannot commit.
-
-Hostile browser extension или compromised client host остаётся за documented
-trust boundary.
-
-## 12. Reconciler и MediaMTX hot-update
-
-### 12.1 Delivery
-
-```text
-API transaction:
-optimistic lock -> desired revision -> audit -> outbox -> synchronous commit
-
-Reconciler:
-claim -> lock/fence -> read actual -> minimal diff -> apply -> verify
-      -> commit applied
-```
-
-- claim через `FOR UPDATE SKIP LOCKED`, lease, per-camera serialization;
-- до proven MediaMTX CAS — one writer per node via PostgreSQL session advisory
-  lock;
-- lost DB connection cancels in-flight apply;
-- new writer acquires lock and reads inventory first;
-- exactly-once not promised; bounded inconsistency + forward repair.
-
-### 12.2 Apply loop
-
-1. Validate pinned API contract before write.
-2. Read configured state and compute minimal diff.
-3. Apply convergent/idempotent single-path operation.
-4. Synchronously verify **configured state** — determines job success.
-5. Asynchronously verify **runtime state**; no active source is normal for
-   on-demand path.
-6. Commit applied revision only if desired/fencing still current.
-7. Resolve timeout/unknown outcome through read-back and forward reconcile.
-
-Fast revisions coalesce only within one placement generation. Placement change:
+Immutable layout:
 
 ```text
-PREPARE_NEW -> SWITCH -> DRAIN_OLD -> DELETE_OLD -> COMPLETE
+/opt/rtsp-proxy/releases/<release-id>/
+/opt/rtsp-proxy/current -> releases/<release-id>
+/etc/rtsp-proxy/control-plane/
+/etc/rtsp-proxy/nodes/<node_id>/mediamtx.yml
+/var/lib/rtsp-proxy/nodes/<node_id>/
 ```
 
-If switch cannot be proven, migration is disruptive and requires maintenance.
-
-### 12.3 Delete и restart recovery
-
-- `IMMEDIATE`: stop new sessions, revoke, delete; active may break;
-- `GRACEFUL(deadline)`: stop new, wait readers/deadline, then delete or
-  disabled+blocked;
-- actual RTSP codes/session fate come from pinned spike.
-
-Path persistence after MediaMTX restart is a required contract test. If API
-changes are not persistent, node cannot become ready before minimum inventory is
-restored, or exposes only explicitly defined degraded admission. Blind 10k
-rewrite and thundering herd are prohibited.
-
-## 13. Health plane
-
-Signals:
-
-- Level 1 — MediaMTX API/metrics: cheap operational state;
-- Level 2 — bounded ffprobe: deep verification.
-
-| Probe | Target | Constraint |
-|---|---|---|
-| `source_probe` | camera directly | CIDR/egress allowlist and camera session budget |
-| `path_probe` | external proxy path | sampling only; starts on-demand pull |
-
-`path_probe` never runs across all 10k and respects source-on-demand close timer.
-`source_probe` cannot consume the final session slot of an active camera.
-
-Independent states:
-
-- health: `UNKNOWN | HEALTHY | SUSPECT | UNHEALTHY | RECOVERING`;
-- observation: `FRESH | STALE | OVERDUE`;
-- admin: `ENABLED | MAINTENANCE | DISABLED`.
-
-Every enabled camera gets a max deep-observation interval. Risk sampling adds
-frequency for new/recovered/suspect and random control group, not replaces the
-guarantee. Scheduler uses bounded concurrency, single-flight, jitter, reserved
-capacity, deadline aging, per-site/subnet limits and adaptive backoff.
-
-ffprobe:
-
-- pinned version, subprocess without shell;
-- exact timeout option and microsecond unit covered by unit test;
-- network timeout and hard process kill tested separately;
-- CPU/RAM/process/time/stderr limits and process-group cleanup;
-- canonical parse, IDNA, all A/AAAA and IPv4-mapped IPv6 validation;
-- approved literal `IP:port` + immutable endpoint generation;
-- redirects/re-resolve prohibited;
-- egress only to approved target;
-- no credentials in logs/errors/artifacts.
-
-## 14. FFmpeg + supervisor contract
-
-Compatibility matrix includes production-pinned FFmpeg and previous supported
-line, exact build flags and recommended command.
-
-Coverage: H264/H265, audio/no-audio, OMNY fixtures, DNS/IPv4/bracketed IPv6,
-non-default port, RTSP handshake/TEARDOWN, multiple readers, abort/timeouts,
-source recovery, path update/delete, credential rotation/revoke and on-demand
-races.
-
-Supervisor:
-
-- EOF/timeout/transport failure starts a new full handshake;
-- exponential full-jitter backoff `1s → 30s`, reset after `60s` stable;
-- max one active and one terminating process per stream;
-- permanent auth/path failures never tight-loop;
-- recovery p95 `≤10s`, max `≤35s` from source/server ready to first packet.
-
-Keepalive, FFmpeg connect/read timeouts, L4/NAT idle timeout and `SETUP→PLAY`
-deadline form one versioned budget. Server does not promise old TCP resume.
-
-URL uses structured encoder. Since some builds expose URL in argv, compatibility
-test reads cmdline/environ. Production compensation: separate service account/PID
-namespace, least-scope grants, redaction and rotation.
-
-TCP-only is active-tested: UDP `SETUP` denied; media process opens no RTP/RTCP
-UDP sockets during TCP session.
-
-## 15. Security contract
-
-### 15.1 Access grants и auth fork
-
-Source credentials and external grants are separate. Grant token is CSPRNG,
-URL-safe and ≥128 bit. Default scope is read one `public_id`; group scope opt-in.
-Publish/management deny by default.
-
-Phase 0 spike selects one proven pinned MediaMTX model:
-
-- external auth callback; or
-- static/runtime user configuration.
-
-Before the spike there is no promise of selective terminate, external-auth
-availability or exact rotation behavior.
-
-Revoke-new candidate `≤10s`; positive cache TTL `≤5s`. Push invalidation is an
-optimization; bounded TTL provides correctness. During auth outage new sessions
-fail closed. Established continue only if pinned contract proves setup-only auth.
-Callback model requires at least two auth instances, internal LB and mTLS.
-
-### 15.2 Secrets и keys
-
-- source secrets: per-record DEK, KEK in KMS/Vault outside PostgreSQL;
-- access token stored as verifier + `pepper_key_id`, raw shown once;
-- pepper rotation: active + verify-only previous key;
-- KEK/DEK rotation: resumable bounded batches with progress metric;
-- old key removed only after 100% re-encryption and backup recovery window;
-- crypto-erasure restore marks `UNRECOVERABLE/REISSUE_REQUIRED`.
-
-### 15.3 Transparent RTSP, network boundary и abuse protection
-
-- management API/metrics never public;
-- camera egress limited to approved CIDR/destination;
-- edge/pre-auth/auth/post-auth/media limits are separate;
-- unknown path/user/wrong password have no-oracle parity;
-- Slowloris controls accept, headers, auth and `SETUP→PLAY` deadlines;
-- external media contract is ordinary `rtsp://` over TCP interleaved; consumer
-  must not receive proxy-specific protocol behavior;
-- RTSPS/TLS listener is outside scope;
-- untrusted WAN/Internet path requires WireGuard/IPsec/managed VPN or private L3
-  transport outside RTSP; without it deployment is NO-GO or needs explicit owner
-  risk acceptance;
-- L4/VPN boundary preserves source IP directly or through proven PROXY protocol;
-  otherwise rate-limit/audit impact is an explicit blocker/trade-off.
-
-MediaMTX logs are inside secret-scan perimeter.
-
-## 16. Observability contract
-
-### 16.1 Signal inventory и budgets
-
-Versioned catalog defines `signal → source → exact schema → labels/cardinality →
-interval → reset/staleness → recording rule → consumer`.
-
-| Budget | Initial value |
-|---|---:|
-| Active series at 10k registered | `≤100k` |
-| Series per enabled camera | `≤6` |
-| Overview queries/refresh | `≤20` |
-| Camera view | `≤10` + one bounded SSE |
-| Interactive query p95 | `≤2s` |
-| Recording rule evaluation | `<50%` interval |
-
-Credential, URL, IP, raw error and trace ID are forbidden metric labels.
-
-Conditional signals:
-
-| Signal | When required | Semantics |
-|---|---|---|
-| `active_gateway_copies_per_path` | gateway topology | active gateway→origin pulls by internal camera key |
-| `origin_egress_amplification` | gateway topology | `origin_gateway_egress / camera_ingress`; zero denominator = unknown |
-| `legacy_active_sessions` | compatibility migration | bounded per cohort; stale/collector loss ≠ zero |
-
-Conditional series remain inside global cardinality budget. Gateway threshold
-comes from Spike #1. Legacy metric retained for 30-day window + 7 days and has a
-migration owner.
-
-### 16.2 Bitrate and series state
-
-```text
-bitrate_bps = 8 * max(0, delta(bytes_total)) / delta(monotonic_seconds)
-```
-
-Counter reset, stale gap and series absent are distinct. On-demand series absent
-with no readers means `idle`, not `offline`. Aggregates use fresh samples only
-and publish coverage ratio.
-
-### 16.3 UI, traces and alerts
-
-- overview/group: aggregate polling default 10s, configurable 5–30s;
-- camera view: one bounded SSE, heartbeat 15s, coalescing, slow-consumer
-  disconnect, bounded resume and `resync_required`;
-- trace context flows API → outbox → worker/reconciler/probe → adapter;
-- initial normal head sample 5%; exporter failure does not block requests;
-- alerts have owner, source, SLI, threshold/duration, severity, runbook,
-  dashboard, grouping and recovery condition;
-- critical → paging, warning → ops chat, info → dashboard;
-- node-down inhibits child alerts; single camera not page by default;
-- dead-man switch detects loss of telemetry itself.
-
-## 17. Capacity model and topology decision
-
-### 17.1 Formulas
-
-```text
-sessions = active_sources + total_readers + gateway_internal_pulls
-sockets_per_session = 1
-
-required_RAM = mediamtx_baseline
-             + heap_per_source * active_sources
-             + heap_per_reader * total_readers
-             + buffer_bytes_per_session * sessions
-             + control_plane_RAM
-
-required_FD = baseline_FD
-            + FD_per_source * active_sources
-            + FD_per_reader * total_readers
-            + control_DB_and_internal_connections
-
-camera_ingress        = sum(source_bitrate)
-origin_gateway_egress = sum(source_bitrate * active_gateway_copies_per_path)
-external_egress       = sum(source_bitrate * readers_per_path)
-```
-
-Each hop includes protocol/retransmit factor, packet rate, kernel sockets, NIC
-queues and CPU. Spike publishes baseline/slope, p95/p99 buffers, FD/sockets and
-churn; aggregate average cannot hide one-axis saturation.
-
-### 17.2 Spike #0: single-node
-
-Minimum matrix:
-
-- registered paths to 10k;
-- active sources 100/500/1000/2000 and onward to first knee;
-- readers/source 1/2/5 plus hot-path skew;
-- bitrate 1/2/4/8 Mbit/s;
-- H264/H265, audio variants, typical/worst GOP;
-- steady/ramp/burst reconnect;
-- representative probes/CRUD/observability load.
-
-Pass requires 24h soak, faults/churn, all SLO and resource headroom. If target
-fits, production baseline remains single-node. This does not prove HA: node loss
-is still full media failure domain and needs separate design.
-
-### 17.3 Spike #1: gateway → origin
-
-Runs only after single-node insufficiency. It proves:
-
-- one FFmpeg host reads paths from different origins through one endpoint;
-- every healthy gateway can serve every external path;
-- duplicate pulls and per-hop bandwidth bounded and observable;
-- H264/H265/audio cascade decodable, A/V skew `≤40ms`, added packet loss
-  `<0.01%` vs baseline;
-- warm overhead `≤+50ms`, cold `≤+500ms` vs direct-origin as spike budgets;
-- gateway/origin loss, storms, keepalive, TEARDOWN, PAUSE, backpressure and
-  timeouts pass;
-- two-level reconcile cannot delete healthy origin due to gateway failure;
-- camera credentials remain on origin;
-- gateway identities are unique, rotated/revoked, mTLS/allowlist/audit work.
-
-If it fails, Spike #2 evaluates ready-made RTSP-aware L7. Custom router only
-after documented ready-made failure.
-
-## 18. Performance and chaos
-
-### 18.1 Generator
-
-Main load uses N independent RTSP **servers** pulled on demand by MediaMTX. Push
-publication into MediaMTX cannot substitute this path.
-
-GStreamer fixtures control codec, audio, bitrate, packet rate and GOP. Load hosts
-are outside SUT and maintain ≥30% headroom; otherwise run invalid. At least two
-generator hosts confirm the generator knee is not mistaken for SUT capacity.
-The native source reparses video to complete access units, passes the first unit
-without clock wait for RTSP preroll and then uses per-media rational absolute
-monotonic deadlines. A buffer arriving more than one frame interval after its
-deadline rebases the schedule and waits one interval instead of producing a
-catch-up burst; otherwise absolute deadlines are preserved. Opus uses a
-separate 960-sample/20ms raw-buffer schedule before encoding and RTP payloading.
-Relative per-buffer sleeps and pipeline-clock pacing are not accepted because
-they respectively drift over a soak or can deadlock while gst-rtsp-server
-prepares blocked payloader pads.
-
-Every run saves commit and release-artifact SHA-256 values, versions, hardware,
-kernel/sysctl/ulimit/systemd resource limits, network, topology, workload axes,
-seed, synchronized time, raw series/events and summary.
-
-### 18.2 Test ladder
-
-- untuned baseline 100/500/1000;
-- registered 100 → 500 → 1k → 5k → 10k;
-- active sources and readers grow independently;
-- one warm anchor per active path is included in total reader load; measured
-  ramp, 15m warm-up, 30m measurement and candidate 24h soak are immutable,
-  separately evidenced epochs;
-- LAN and WAN/netem 50ms RTT, 0.5% loss, 10ms jitter;
-- extended DNS/half-open/150ms+2% loss/bandwidth/DB/auth/node/L4 chaos;
-- churn 10/s and 100/s, ramp 100/s, burst 1000/s;
-- outage cohorts 10/25/100%.
-
-Pass/fail uses p99 SLO from §8. Additional gates:
-
-- zero unexpected healthy-cohort disconnects;
-- maximum rolling RSS slope `≤1%/h` over every covered 6h window;
-- leaked FD/sessions `≤0.1%` or `≤10`;
-- added packet loss in healthy topology = 0;
-- A/B probes/CRUD/dashboard/observability within `5% / 10% / 0.1pp`.
-
-Cadence:
-
-- PR: 100 registered/active/readers, 10m;
-- nightly: 1k, 1h, LAN + bounded WAN/churn;
-- pre-release or MediaMTX upgrade: full ladder, chaos, 24h soak.
-
-## 19. Operations contract
-
-### 19.1 Drain and update
-
-```text
-SERVING -> STOP_NEW -> DRAINING -> FORCE_BATCH -> UPDATING -> SMOKE -> SERVING
-                                                     \-> ROLLBACK | QUARANTINED
-```
-
-- preflight: N-1 capacity, config/API compatibility, backup and previous release
-  artifacts/checksums;
-- `STOP_NEW` proven by connection test, not only LB removal;
-- initial drain deadline 15m;
-- force batch max one node and 5% fleet readers;
-- smoke: API/auth, H264/H265, multiple readers, reconnect, TCP-only;
-- observation window 5m;
-- failed smoke → rollback/quarantine, never automatic return.
-
-Same procedure is mandatory for RTSP listen address/port and transport changes.
-The media listener remains ordinary `rtsp://`; TLS/RTSPS is not introduced.
-Single-node maintenance honestly means media interruption without proven
-redundancy.
-
-### 19.2 Backup/PITR and post-restore safety
-
-- continuous WAL/PITR: RPO `≤5m`, control RTO `≤30m`;
-- DB backup and versioned encryption keys stored separately;
-- restore first isolated, checking schema, rows, integrity, sample decrypt and
-  audit chain;
-- monthly restore drill, quarterly game day and before major release.
-
-After PITR reconciler starts only in `report-only`:
-
-```text
-restored desired <-> actual paths
-        |
-        +--> to_create / to_update / to_delete
-```
-
-Create/update and delete require separate approvals. If `to_delete` exceeds
-safety threshold, apply blocks for admin approval. Drill includes cameras created
-after restore point and proves their paths are not auto-deleted.
-
-### 19.3 Logs and runbooks
-
-Structured logs have bounded buffers, runtime rotation/retention, disk budget,
-backpressure and redaction tests. Debug is allowlisted by component/correlation,
-max 15m, audited and auto-disabled.
-
-Every production alert links a versioned runbook with symptoms, blast radius,
-safe diagnostics/actions, rollback, escalation and verification. Runbook is
-ready only after another operator executes it. Required: DB/PITR, media/auth/
-queue, drift, probe backlog, saturation, credentials/certs, reconnect, migration,
-update, telemetry loss, listener change and post-restore reconcile.
-
-## 20. Release and migration
-
-### 20.1 Prerequisites and state model
-
-No production wave before green #1–#12, immutable release manifest, rollback
-evidence and overlap capacity.
-
-```text
-EXPECTED -> PREFLIGHT_OK -> IMPORTED -> APPLIED -> AUTH_OK -> READABLE
-         -> CUTOVER -> SOAK_OK
-```
-
-Batch report includes expected/skipped/imported/applied/readable/cut-over/failed/
-rolled-back/orphans. Camera never vanishes from report; retryable and terminal
-outcomes differ; repeat import/reconcile is idempotent.
-
-### 20.2 Camera and wave preflight
-
-Each camera: reachability, DNS, profile/firmware, codec/audio/GOP, source auth,
-`public_id`, owner, bitrate, resource budget and managed client rollback.
-
-Session limit checked under current load:
-
-```text
-existing_sessions + required_migration_pull <= camera_session_limit
-```
-
-If no slot, order changes: managed client cutover first, new proxy pull second.
-Camera-origin rejection is an abort signal, not mislabeled proxy failure.
-
-Wave preflight checks ≥30% headroom after old/new overlap, fresh backup/PITR,
-rollback artifacts, alerts/runbooks, on-call/change owner and freeze scope.
-
-### 20.3 Waves
-
-1. Lab: synthetic + representative OMNY.
-2. Pilot 10: one canary, then rest.
-3. Pilot 100: canary 5% (minimum 5), batches ≤25.
-4. 500/1k+: canary 5% (minimum 10, maximum 50) within envelope.
-5. Multi-node only after #10 evidence and repeated #11/#12 gates.
-
-Soak: canary 24h; pilot 100 — 7d; 500+ — at least 48h.
-
-Wave success:
-
-- 100% canary and ≥99% batch readable;
-- zero system-caused unplanned healthy-stream disconnects;
-- FFmpeg recovery and health freshness within SLO;
-- auth/path error growth `≤0.1pp`;
-- hard resources <70%, headroom ≥30%;
-- no open critical/high integrity/security/cross-camera issue;
-- operator sign-off without blocking manual workaround.
-
-Automatic `STOP`: security/data incident, cross-camera impact, rollback loss,
-observability loss, capacity breach, unexpected healthy disconnect or failed
-restore/readiness.
-
-### 20.4 Legacy coexistence and rollback
-
-- before cutover old system is authoritative; new runs shadow validation without
-  second upstream pull;
-- ownership switches atomically per camera/cohort;
-- legacy window lasts minimum 30 days after last cohort cutover;
-- legacy path disables only after 7 consecutive full days of fresh
-  `legacy_active_sessions = 0` immediately before change;
-- any legacy session resets the counter; stale/unknown metric blocks shutdown;
-- migration owner, date and explicit sign-off required;
-- uncontrolled dual pull prohibited;
-- client rollback requires managed supervisor config, service discovery, DNS or
-  cohort mapping;
-- hardcoded FFmpeg URLs without managed channel block cohort.
-
-Before client cutover rollback is full. After cutover it means restoring legacy
-path and reversing client config; this asymmetry is a go/no-go input.
+Systemd:
+
+- control API and background role units;
+- `rtsp-proxy-media@<node_id>.service` instance unit;
+- dedicated non-login users/groups and tmpfiles/sysusers;
+- hardening: NoNewPrivileges, ProtectSystem/Home, PrivateTmp, bounded writable
+  paths, AF/syscall/capability restrictions.
+
+Media process should not mutate release/config. Root/helper boundary performs
+strict allowlisted instance operations requested by control plane; browser/web
+never receives arbitrary systemctl authority.
+
+## 20. Operations
+
+Required runbooks:
+
+- create/start/stop/restart node;
+- drain/force and stuck reader;
+- port change/rollback;
+- no free ports/max_nodes;
+- move ordinary/forced;
+- delete-empty;
+- node failure/recovery with no auto migration;
+- reconcile drift/orphan/missing paths;
+- DB/PITR restore and report-only reconcile;
+- SMTP outage/dedupe;
+- resource/FD/NIC saturation;
+- release upgrade/rollback.
+
+Control-plane update must not restart media nodes. MediaMTX update proceeds one
+drained node at a time. Restore regenerates configs and validates current host
+ports before any node start.
+
+The supported one-server topology has no automatic PostgreSQL failover.
+Normative desired/audit/outbox writes still use synchronous durable
+transactions on the active database, while disaster recovery is a separate
+PITR target: RPO <=5 minutes and control-plane RTO <=30 minutes.
 
 ## 21. Implementation roadmap
 
-Phase 0 and foundation implementation began after explicit owner authorization
-on 2026-08-10. The evidence gates below still control dependent product
-behavior, pilot and rollout.
+Каждая фаза выполняется как vertical slice: failing public test -> minimal
+implementation -> refactor -> full gates -> Standards/Spec review -> fixes.
 
-### Pre-Phase 0 — specification bootstrap
+### Phase A — consensus and specifications
 
-- add ADR template/registry;
-- add SLI catalog and measurement points;
-- add `docs/CAMERA_PROFILE.md` template and owner;
-- create immutable release/compatibility manifest schema;
-- create capacity worksheet, failure-domain and risk register templates.
+- [x] Rewrite issues #1–#14 for bounded-node topology.
+- [x] Update production plan, README, domain language and ADR.
+- [ ] Review documentation for stale single-port/gateway claims.
 
-**Exit:** artifacts versioned, owners assigned, gates automatable.
+Exit: one non-contradictory normative model.
 
-### Phase 0 — evidence foundation
+### Phase B — node registry and placement foundation
 
-#### 0A. MediaMTX/FFmpeg/ffprobe compatibility lab — COMPLETE
+- extend typed settings (`max_nodes`, port range);
+- PostgreSQL/Alembic foundation;
+- `media_nodes`, `cameras`, `camera_placements`, audit/outbox migrations;
+- random/manual port allocator with transaction/concurrency tests;
+- node create/query commands;
+- auto/manual placement and 100-camera admission;
+- control API endpoints and error contracts.
 
-- pin versions and release-artifact checksums;
-- API create/update/delete/isolation/idempotency/read-back tests;
-- path persistence after node restart;
-- external callback vs static/runtime auth;
-- cache/revoke/established-session behavior;
-- transparent ordinary-RTSP contract and L4/VPN source-IP boundary;
-- metrics inventory;
-- TCP-only, FFmpeg, on-demand race and secret-leak tests.
+Exit: API tests prove max_nodes, port exhaustion/collisions, deterministic
+least-loaded placement and no 101st camera.
 
-**Exit:** critical forks have Proposed/Accepted ADR backed by evidence.
+### Phase C — per-node Linux runtime
 
-Exit review: Standards/Spec `PASS`; native Linux amd64/arm64 CI run
-`31406619869`. Proposed ADR constraints remain production gates.
+- per-node config renderer and secure directory layout;
+- systemd instance unit and narrow process adapter;
+- create/start/stop/restart/health smoke;
+- unique loopback API/metrics allocation;
+- node lifecycle persistence/recovery;
+- native two-node isolation test amd64/arm64.
 
-#### 0B. Reproducible load harness and Spike #0 — IN PROGRESS
+Exit: lifecycle operation on node A cannot change node B PID/listener/RTP.
 
-- RTSP pull-server generator and fixtures;
-- manifest/raw artifacts;
-- scoped camera-ingress WAN/netem driver and direct-control evidence;
-- untuned baselines and resource slopes;
-- single-node knee, 24h soak, fault/churn matrix;
-- safe envelope and hardware/network profile.
+### Phase D — camera reconciler and move
 
-**Exit:** `SINGLE_NODE BASELINE` decision or authorization for Spike #1.
+- node-aware MediaMTX client factory;
+- per-node writer lock/inventory/reconcile;
+- camera CRUD targeted path updates;
+- occupancy observation;
+- drain/maintenance;
+- move saga and forced confirmation;
+- port-change rollback and delete-empty.
 
-Implementation status: native GStreamer pull sources/readers and a digest-bound
-orchestrator are present. A stored profile generates exact per-host source and
-reader plans; active paths and reader counts remain independent. Reader events
-separate outgoing `DESCRIBE→PLAY` from the first parser-aligned
-IDR/IRAP random-access unit; header-only, delta, decode-only, corrupted and gap
-buffers are rejected. Cold pass/fail is accepted only from a compatible
-finalized direct-control pair; handshake deltas are compared while both GOP
-waits are published separately, and impaired pairs additionally publish the
-aggregate random-loss delta. Seeded steady/ramp/burst/outage primitives, interruption
-fail-closed and owner-only credentials are implemented. Warm proxy profiles
-reserve one reader from `total_readers` per active path as an anchor, start the
-anchors 60 seconds before measured ramp and require typed MediaMTX runtime
-polling through the ramp boundary. Anchors remain normal downstream sessions in
-the same reader processes/cgroups and therefore cannot hide generator or SUT
-load. Shards share future UTC anchor/ramp/measurement/soak epochs; completion records exact
-per-host reader counts/lifecycle slots, host/profile/reader-plan digests and
-kernel clock proof through workload end. A derived post-workload grace keeps
-PIDs observable for the final sampler interval without extending media load.
-Every injected disconnect binds the deterministic backoff to its same-cycle
-schedule and ordered next-cycle start→PLAY→first-decodable chain; orphan or
-skipped cycles fail finalization.
-Cold profiles use one reader per active path and require a typed reset/recreate
-plus unavailable-path preflight within 30 seconds of start. Until a bulk
-MediaMTX reset/snapshot path is proven, cold evidence uses a conservative
-implementation safety cap of 512 paths and 32 concurrent API workers; larger
-profiles fail validation. Generator evidence
-requires exact PID/cgroup membership, pinned executable digests/start times,
-NIC packet/MTU measurements, effective ephemeral-port capacity after reserved
-ports and finite CPU/memory/pids limits. Capacity policy enforces CPU `<=65%`,
-NIC byte/packet rate `<=60%`, and RAM/FD/socket/cgroup-pids `<70%`; measurement
-and soak are recomputed and gated separately. Finalization regenerates catalog/plans and exact typed
-summaries from raw evidence before sealing a hash-complete read-only bundle,
-which is then moved to root-owned immutable/WORM storage.
+Exit: contract tests prove CRUD isolation, crash convergence and exact blast
+radius.
 
-Fixture bytes alone are insufficient evidence: `prepare` requires a typed
-manifest produced with the pinned FFmpeg/ffprobe binaries and matching probed
-codec, FPS, bitrate, every internal GOP interval and the cyclic loop boundary.
-The Phase 0B harness is IPv4-only and rejects IPv6 literals until its native
-source/evidence path is fully dual-stack. Every proxy and capacity bundle requires
-a typed SUT series bound to the single MediaMTX PID/systemd cgroup and relevant
-NIC. Each SUT sample and loopback preflight carries Linux kernel clock proof;
-session/path counters remain cumulative across churn and use a pre-measurement
-baseline. Exact empty-family zero sentinels and active identities are bound;
-session history stays stable on `id+remoteAddr` across idle/read path changes,
-while every sample requires equal `id/path/remoteAddr/state` labels across
-selected families. State-specific RTP/RTCP/path-error fields and recomputed
-cumulative totals are bound; an observed path ready/notReady transition starts
-a counter generation, while a decrease within one continuously observed state
-fails closed. Reader
-completions independently reconcile per-reader/per-track video and configured
-Opus phase RTP with shard totals, compare successfully parsed receives with the
-sender RTP sequence-number span per cycle/track/phase, require video progress
-of at least 80% of pinned fixture FPS (Opus: 40 packets/s) during typed
-connected intervals, require first/last successful packets within one second
-of the interval boundaries and reject every gap, including one spanning
-measurement into soak.
-Recomputed gates enforce SUT headroom, maximum rolling RSS slope `<=1%/h` for
-every covered 6h window, including cross-phase windows,
-bounded FD delta, zero RTSP sessions and ready runtime paths after the pinned
-on-demand close/drain interval, and zero inbound/outbound RTP, RTCP and path
-loss/error delta. Every proxy bundle requires the same independent SUT
-identity/resource/session/loss series with the functional `<70%` headroom policy;
-capacity adds the 6h/24h leak/soak conclusions. Missing SUT or fixture evidence
-fails finalization rather than downgrading the claim.
+### Phase E — access and one-reader contract
 
-Every finalized run requires a typed manifest from each generator host; proxy
-and capacity runs also require the SUT manifest. It binds the canonical profile
-and brackets the complete capture with synchronized start/completion clock proofs.
-Native architecture, machine/boot, CPU/RAM/NIC, kernel/OS, the fixed sysctl set,
-full cgroup v2 constraint-chain digest, effective cgroup/RLIMIT values and the exact
-PID/start/executable identities already present in the resource series.
-Generator manifests additionally require the profile-pinned GStreamer version,
-the exact `libgstreamer1.0-0` dpkg build, a canonical installed-package ledger,
-and SHA-256/device/inode proof for GStreamer libraries mapped by every workload
-process. Capture rechecks process/cgroup/denominator identity before the completion
-proof and is bounded to the five minutes before the anchor through measurement
-start. Resource sampling gates usage of every limiting cgroup ancestor, including
-shared systemd slices, and binds unchanged RAM/NIC/cgroup/RLIMIT denominators back
-to this manifest. The typed `ip_local_port_range` and canonical reserved-port set
-must recompute the exact socket denominator and digest in the resource series.
-Cold proxy/direct bundles copy, hash and compare stable generator
-runtime environments; machine/boot/kernel/sysctl/cgroup/RLIMIT or GStreamer drift
-invalidates the A/B pair. Missing, stale, cross-machine or architecture-mismatched
-evidence fails finalization. This collector targets the documented Ubuntu 24.04
-native host shape equally on amd64 and arm64.
+- access policy schema/API/UI;
+- IPv4/IPv6 CIDR normalization;
+- ACL-before-password verifier;
+- downstream credential rotation/revoke;
+- race-safe reader admission and exact RTSP 453;
+- no-oracle and connection abuse controls;
+- ordinary FFmpeg H.264/H.265 tests.
 
-The typed network driver implements the named WAN contract exactly: `50 ms`
-added RTT, `10 ms` jitter and `0.5%` random loss at camera-side receiver
-ingress. For proxy runs the receiver site is the SUT and exact upstream source
-server IPv4/TCP endpoints are selected; for direct-control, the receiver sites
-are generator hosts carrying reader shards and the same remote source leg is
-selected. Traffic is redirected by owned chain-0 `clsact/flower` rules into a
-dedicated MTU-matched IFB with a pinned bounded delay/jitter root and a
-maximum-capacity random-loss child netem qdisc. Other host traffic
-and adjacent source ports are not impaired.
+Exit: security/RTSP review PASS and native amd64/arm64 contracts green.
 
-Install/remove is a privileged operator boundary, separate from application
-services. It refuses pre-existing/foreign ingress, egress, chain, duplicate or
-IFB qdisc state, resolves distro `tc`/`ip` symlinks to regular binaries, and
-records canonical paths, SHA-256 and versions. Timeout/interruption after a
-possible kernel mutation performs exact read-back cleanup; ambiguous ownership
-fails closed rather than deleting `clsact`. The driver leaves IFB creation and
-deletion to the operator and accepts no routable IFB address.
+### Phase F — dashboard, metrics and notifications
 
-Every impaired run requires per-site raw observations from before the anchor
-through the role-specific quiescent drain and a summary recomputed by the
-finalizer. The contract binds interface indexes/MTU, canonical plan, clock,
-machine/boot and tool identity; exact flower action counters are reconciled with
-both qdisc levels. Parent-minus-child drop delta is the cumulative queue-overflow
-signal and must remain zero; child drops must remain inside a two-sided
-statistical random-loss envelope and its attempt count remains below its
-`2^32-1` queue limit. Positive action drops/overlimits,
-counter reset/drift, missing scoped traffic, queue saturation, loss outside
-the statistical envelope, accounting mismatch, boundary backlog or continuing
-traffic at the final two samples fails. The profile scenario seed does not claim
-a deterministic dropped-packet sequence because Ubuntu 24.04 iproute2 6.1 does
-not expose a supported netem seed. Cold A/B copies and hashes direct raw netem,
-summary, launch and runtime evidence into the proxy bundle, then recomputes it
-and seals the aggregate proxy-minus-direct random-loss delta.
+- node/camera pages and actions;
+- RBAC/CSRF/session/audit;
+- metrics collector and bounded queries;
+- incident outbox, failure email and recovery confirmation;
+- SMTP retry/dedupe;
+- browser E2E for confirmations and accessibility.
 
-Hardened native amd64/arm64 CI run `31527148623` covers the complete functional
-harness. On both native runners it executes the runtime collector against real
-procfs, non-root cgroup v2 constraints, dpkg and mapped GStreamer libraries,
-proves scoped matching/control flows and cleanup in isolated Linux network
-namespaces, then executes the H.264/H.265 RTSP/TCP contract. Repeat
-Standards/Spec review passed.
-Per-host hardware/architecture and dynamically linked GStreamer package/build
-evidence is now mandatory in the finalizer, but no production-equivalent host
-manifest or capacity result has been published. Non-zero probe/CRUD profiles
-currently fail closed until their typed drivers and evidence verifiers are
-implemented. CI is not WAN or capacity evidence; dedicated LAN/WAN hardware,
-untuned baselines, direct A/B, saturation knee, complete fault matrix and 24h
-soak remain mandatory before the Phase 0B exit decision.
+Exit: operator workflows complete without direct DB/systemctl/MediaMTX access.
 
-#### 0C. Conditional topology spike
+### Phase G — probes and production evidence
 
-- gateway→origin matrix;
-- on failure, ready-made RTSP-aware L7 evaluation;
-- topology ADR with failure/security/rollout/rollback evidence.
+- isolated probe boundary ADR 0004;
+- source/path probe budgets respecting one-reader slot;
+- per-node 100-camera matrix;
+- multi-node server ladder and 24h soak;
+- chaos/failure/email/restore game days;
+- publish architecture/hardware-specific capacity envelope.
 
-**Exit:** selected topology never relies on L4 path awareness.
+Exit: explicit GO/HOLD for pilot.
 
-### Phase 1 — control/data/media vertical slices
+### Phase H — pilot
 
-1. **#2 Foundation:** package, roles, typed config, CI, immutable Linux release
-   artifacts, systemd units, health, Alembic and DB pools.
-2. **#3 Data:** IDs, profiles, lifecycle, groups, grants, sync audit/outbox,
-   ordering, retention and migrations.
-3. **#4 Dashboard/RBAC:** sessions, authz epochs, no-oracle, CRUD, conflicts,
-   bulk, reveal and WORM audit.
-4. **#5 Reconciler:** fencing, minimal path diff, read-back, delete, restart
-   recovery and drift metrics.
-5. **#6 Health:** scheduler, source/path probes, state machine, SSRF sandbox and
-   dashboard projection.
+Waves: one node 10 -> one node 50 -> one node 100 -> 5 -> 10 -> 25 -> 50
+nodes. Up to 100 nodes requires explicit config/evidence approval.
 
-Each slice ends with contract/integration tests, migration compatibility,
-redaction/audit assertions and rollback evidence.
+Every wave has soak, comparison, incident review and GO/HOLD/ROLLBACK.
 
-### Phase 2 — cross-cutting production contracts
+## 22. Review and CI policy
 
-1. **#7 Observability:** signal catalog, TSDB budgets, bitrate, traces, bounded
-   polling/SSE, alerts/dead-man.
-2. **#8 FFmpeg:** two-version matrix, supervisor, timeout/reconnect, TCP-only and
-   process-secret tests.
-3. **#9 Security:** auth/network-boundary decision, grants, keys, limits,
-   hardening and drills.
-4. **#11 Performance:** full A/B, load, chaos and 24h soak; publish envelope.
+After each phase:
 
-**Exit:** release candidate has evidenced SLO/security/resource limits and no
-unaccepted blocker/high finding.
+1. run unit/integration/contract tests, Ruff, mypy, build and diff check;
+2. run Standards review against repository rules;
+3. run Spec review against current issues/ADR/plan;
+4. fix all High/Medium findings;
+5. rerun reviews and both-architecture CI;
+6. update status/evidence links before starting next phase.
 
-### Phase 3 — operations and release
+Native functional CI is not a capacity claim. Physical-hardware/24h evidence
+cannot be replaced by mocks, emulation or generic hosted runners.
 
-1. **#12 Operations:** deploy automation, N/N-1 migration, drain/quarantine,
-   PITR/keys, post-restore report-only and game days.
-2. **#13 Release:** lab → pilot 10 → pilot 100 → measured 500/1k waves.
-3. Every gate ends in owner `GO | HOLD | ROLLBACK`.
+## 23. Product Definition of Done
 
-Parallel work is allowed only where it cannot hide a dependency/evidence gate.
-Multi-node and rollout never precede compatibility and Spike #0.
+Product is complete only when:
 
-## 22. Global go/no-go gates
-
-### Start Phase 0
-
-**SATISFIED 2026-08-10:** explicit owner message authorized plan execution and
-foundation code. Permitted infrastructure is direct Linux/systemd deployment;
-Docker/containers are excluded. Production and evidence-dependent feature gates
-remain `NO-GO` until their own conditions pass.
-
-### Start feature implementation
-
-Pinned compatibility results, accepted critical fork decisions, reproducible
-load harness and no architecture blocker in the topology being implemented.
-
-### Start production pilot
-
-- green artifacts #1–#12;
-- no blocker/high without accepted risk;
-- proven client rollback;
-- restore/security/drain/alert drills;
-- overlap capacity;
-- formal owner sign-off.
-
-### Exit pilot 100
-
-1. 7d soak and zero system-caused healthy disconnects.
-2. All SLO/error/capacity/probe thresholds green.
-3. No orphan paths/credentials; reconciliation converged.
-4. Restore, credential rotation, alert and rollback drills passed.
-5. Critical/high closed; medium owned or accepted.
-6. Operator review has no blocking workflow/manual workaround.
-7. Owner signed next-wave decision.
-
-## 23. Open evidence risks
-
-| Risk | Why consensus cannot close it | Evidence |
-|---|---|---|
-| R1 single-node capacity | 10k is multidimensional | Spike #0 and published envelope |
-| R2 multi-node topology | L4 not path-aware; gateway is hypothesis | Spike #1/#2 and ADR |
-| R3 MediaMTX semantics | API/auth/delete/persistence/transparent RTSP depend on binary version | pinned binary contract suite |
-| R4 client rollback | hardcoded external URL unmanaged | supervisor/service discovery/DNS/cohort mapping |
-| R5 environment drift | OMNY/WAN/NAT/kernel/NIC/overlap alter knee | preflight and production-like soak |
-| R6 auth/network fork | callback/static and VPN/L4 source-IP boundary unknown | Phase 0 security spike |
-| R7 restore deletes newer runtime paths | restored desired older than actual | report-only diff and delete approval |
-
-These are evidence gates, not internal specification contradictions. They block
-the corresponding feature, claim or rollout until proved.
-
-## 24. Evidence registry
-
-| Issue | Area |
-|---|---|
-| [#1](https://github.com/zl0nline/RTSP_proxy/issues/1) | ADR, SLO, capacity, camera assumptions, failures |
-| [#2](https://github.com/zl0nline/RTSP_proxy/issues/2) | Foundation, config classes, MediaMTX, migrations |
-| [#3](https://github.com/zl0nline/RTSP_proxy/issues/3) | Data, identifiers, secrets, retention |
-| [#4](https://github.com/zl0nline/RTSP_proxy/issues/4) | Dashboard, RBAC, conflicts, browser, audit |
-| [#5](https://github.com/zl0nline/RTSP_proxy/issues/5) | Outbox/reconciler, hot-update, placement, recovery |
-| [#6](https://github.com/zl0nline/RTSP_proxy/issues/6) | Health, probes, SSRF, profiles |
-| [#7](https://github.com/zl0nline/RTSP_proxy/issues/7) | Metrics, TSDB, UI, tracing, alerts |
-| [#8](https://github.com/zl0nline/RTSP_proxy/issues/8) | FFmpeg/supervisor and TCP-only regression |
-| [#9](https://github.com/zl0nline/RTSP_proxy/issues/9) | Threat model, auth, keys, network boundary, hardening |
-| [#10](https://github.com/zl0nline/RTSP_proxy/issues/10) | Single-node-first and topology spikes |
-| [#11](https://github.com/zl0nline/RTSP_proxy/issues/11) | Load generator, performance, chaos |
-| [#12](https://github.com/zl0nline/RTSP_proxy/issues/12) | Deploy, drain, migrations, PITR, runbooks |
-| [#13](https://github.com/zl0nline/RTSP_proxy/issues/13) | Pilot, coexistence, rollback, rollout |
-| [#14](https://github.com/zl0nline/RTSP_proxy/issues/14) | EPIC, dependencies, planning DoD |
-
-## 25. Product Definition of Done
-
-Product/release is ready only when:
-
-- operator performs normal CRUD/diagnostics without DB/MediaMTX CLI;
-- one path change does not break unrelated streams;
-- FFmpeg + supervisor passes pinned matrix;
-- authz/no-oracle/revoke, secrets, audit/WORM and browser gates are green;
-- camera profiles filled and preflight uses GOP/session limits;
-- published capacity envelope has load/chaos evidence;
-- restore cannot delete newer runtime paths without explicit decision;
-- drain, update, rollback and runbooks passed drills;
-- pilot exits green and owner gives `GO`;
-- every 10k claim is bounded by the actually measured workload envelope.
-
-Phase 0 is authorized and in progress. The next valid action is to implement
-the non-zero probe/CRUD Phase 0B evidence drivers, execute Spike #0 on
-production-equivalent amd64/arm64 stands, and then decide `SINGLE_NODE BASELINE` or authorize the
-conditional topology spike. Until those artifacts exist, dependent product
-behavior and production rollout remain `NO-GO`.
+- nodes enforce 100 registered cameras and configured max_nodes;
+- automatic/manual placement and random/manual ports are correct under races;
+- ordinary RTSP/TCP URL works and second reader receives 453;
+- ACL order, credentials and management boundary pass security tests;
+- camera/node operations respect declared blast radius;
+- drain/move/port-change/delete and failure/recovery email work end-to-end;
+- dashboard aggregates all nodes on the server;
+- direct-Linux amd64/arm64 install/upgrade/rollback passes;
+- backup/restore and all runbooks are exercised;
+- per-node and server capacity envelopes are published with raw evidence;
+- no unresolved High/Medium Standards or Spec findings remain;
+- owner signs production GO.

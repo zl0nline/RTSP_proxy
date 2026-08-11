@@ -5,7 +5,7 @@ filled from the pinned MediaMTX and application inventory during Phase 0.
 
 | SLI | Measurement point | Initial target | Error attribution |
 |---|---|---:|---|
-| Warm RTSP start | external FFmpeg, DESCRIBE to first playable packet | p99 ≤ 500 ms | platform/network vs camera |
+| Warm RTSP handshake | external client, first DESCRIBE byte sent to successful PLAY response received | p99 ≤ 500 ms | platform/network vs camera |
 | Cold proxy overhead | external FFmpeg minus measured keyframe wait | p99 ≤ 1 s | platform only |
 | Cold end-to-end | external FFmpeg | informative ≤ 1 s + profile GOP max | platform + camera GOP |
 | Catalog read | HTTP ingress to response | p99 ≤ 200 ms | control plane |
@@ -14,6 +14,10 @@ filled from the pinned MediaMTX and application inventory during Phase 0.
 | Manual confirmation start | accepted command to probe start | ≥ 99% within queue-delay SLO | scheduler |
 | Control-plane availability | external management probe | ≥ 99.5% / month | platform |
 | Established media availability | external consumer | ≥ 99.0% / month | platform vs camera |
+| Camera CRUD isolation | unrelated active consumer | 0 interruptions | target node/path vs unrelated |
+| Node lifecycle isolation | active consumer on another node | 0 interruptions | selected node vs server |
+| Second-reader admission | simultaneous external clients | RTSP 453 for non-winner | media admission |
+| Node failure notification | incident outbox/email | one failure + one recovery | control/SMTP |
 
 Rules:
 
@@ -48,3 +52,8 @@ Session `id` and `remoteAddr` are high-cardinality labels; the future collector
 must aggregate/drop them before long-retention storage while preserving bounded
 per-path signals. Deprecated `*_bytes_received/sent` metrics are not used for
 new queries. An enabled `rtsps_*` family is a startup-contract violation.
+
+All pinned signals are collected with stable `node_id`; port/PID reuse must not
+merge time series from different node generations. Server views aggregate
+bounded per-node series and keep registered, active and occupied counts
+separate.

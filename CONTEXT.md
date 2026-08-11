@@ -1,99 +1,154 @@
-# RTSP Proxy engineering context
+# RTSP Proxy domain language
 
-## Domain language
+Этот файл определяет язык проекта. Implementation details, status и планы
+находятся в [docs/PRODUCTION_PLAN.md](docs/PRODUCTION_PLAN.md); архитектурные
+решения — в [docs/adr](docs/adr).
 
-- **Camera** — catalog object representing one configured RTSP source path.
-- **Source** — private camera endpoint pulled by MediaMTX on demand.
-- **Public ID** — immutable external path name, never an access credential.
-- **Access grant** — proxy-owned external username/password and read scope.
-- **Desired state** — PostgreSQL configuration accepted by the control plane.
-- **Applied state** — configuration verified on a concrete media target.
-- **Media node** — one directly installed MediaMTX runtime.
-- **Consumer** — external FFmpeg process using ordinary `rtsp://`.
-- **Reconciler** — process converging desired and applied media-node state.
-- **Probe** — bounded observation of a source or external path.
+## Server
 
-## Confirmed test seams
+Один Linux host, на котором работают control plane, PostgreSQL и media nodes.
 
-Tests observe behavior only through these interfaces:
+_Не называйте server «node»: в проекте node всегда означает один MediaMTX
+runtime внутри server._
 
-1. HTTP application interface: health, catalog and camera commands.
-2. Media-node interface: one adapter hides MediaMTX HTTP/version details.
-3. External RTSP interface: real FFmpeg against ordinary RTSP-over-TCP.
-4. PostgreSQL behavior through application commands, not private repository
-   methods.
-5. Linux deployment interface: environment/config consumed by systemd-managed
-   processes and immutable release artifacts.
+## Control plane
 
-External dependencies may use test adapters at these seams. Tests do not mock
-our own internal modules or assert private call order.
+Dashboard/API, workers, reconciler, collector и PostgreSQL-состояние, которые
+управляют media plane, но не передают RTP.
 
-## Deployment contract
+## Media node
 
-- Direct Linux deployment on amd64 and arm64; both architectures have identical
-  release, compatibility and production gates. No Docker or container runtime.
-- Python 3.12 environment built from `uv.lock` and a verified wheel.
-- Immutable root-owned releases under `/opt/rtsp-proxy/releases/<version>`.
-- Atomic `/opt/rtsp-proxy/current` symlink for activation and rollback.
-- Dedicated non-login Linux users and hardened systemd units.
-- `deploy/artifact-catalog.json` is the single machine-readable candidate source
-  for architecture-specific MediaMTX, FFmpeg and ffprobe versions, URLs and
-  SHA-256 values. Release manifests copy those pins and are verified natively.
+Один независимо управляемый MediaMTX process/systemd instance с собственными
+config, runtime identity, log и одним внешним RTSP port. Media node содержит
+не более 100 registered cameras и является отдельным media failure domain.
 
-## Current implementation boundary
+_Не называйте media node «shard», «gateway» или физическим server._
 
-The repository is in Phase 0. The reviewed foundation provides fail-closed role
-readiness, native release verification and direct-Linux service artifacts. The
-Phase 0A compatibility layer passed Standards/Spec exit review and native
-amd64/arm64 CI. It provides a typed MediaMTX path adapter; executable lab
-contracts cover ordinary RTSP-over-TCP, on-demand pull, restart/cold restore,
-auth behavior and pinned metrics on real binaries. There is no production
-ffprobe runner until ADR 0004's process/egress boundary is accepted.
+## Node port
 
-Phase 0B is in progress. `tools/load` contains native GStreamer pull-source and
-multi-reader binaries plus a digest-bound per-host run orchestrator. Latency is
-split into RTSP handshake and first-decodable measurements; cold results require
-a finalized direct-control pair, subtract handshake latency without conflating
-unsynchronized GOP waits, and publish the aggregate WAN random-loss delta. A
-warm proxy run reserves one reader per active path
-inside `total_readers` as an anchor, starts those anchors 60 seconds before the
-measured ramp and proves them through the ramp boundary with typed API polling.
-Shards share future UTC anchor/ramp/measurement/soak epochs and remain observable
-through a derived post-workload sampling grace. Completion binds exact per-host
-counts and lifecycle slots to
-host/profile/reader-plan/clock evidence, including an end-of-workload clock
-proof and bounded early/late schedule deviation. Generator evidence binds the exact
-cgroup PID set to executable digests/start times and captures NIC packets/MTU
-plus effective ephemeral TCP capacity after reserved ports. An obligatory
-per-host runtime manifest brackets the full capture with synchronized clock proofs and binds profile, architecture,
-machine/boot, CPU/RAM/NIC/kernel/sysctl, effective cgroup/RLIMIT values and exact
-process identity; generator manifests also bind the dpkg GStreamer build and
-the SHA/device/inode of libraries mapped by every workload process. Measurement and
-soak headroom/session-health gates are recomputed separately;
-finalization regenerates plans and summaries from raw data before sealing the
-bundle. Every proxy bundle, and every capacity bundle, also requires an independent
-typed MediaMTX PID/cgroup/NIC series; capacity gates additionally include
-maximum rolling 6h RSS slope, FD/all-session/runtime-path drain, per-sample SUT
-clock proof, cumulative MediaMTX loss deltas and phase-bound reader RTP sequence
-reconciliation. A fixture
-manifest binds the pinned FFmpeg/ffprobe tools to probed codec/FPS/bitrate/GOP.
-The typed WAN driver applies only exact camera-source IPv4/TCP flows at receiver
-ingress through `clsact/flower` into a dedicated IFB and a pinned root-delay plus
-child-random-loss netem hierarchy. Raw evidence binds per-flow action counters,
-separate cumulative queue/random drops, a two-sided loss envelope, drain,
-tool identity and direct-control comparison. Hardened native amd64/arm64 CI
-`31527148623` covers the complete functional harness, including real
-procfs/cgroup v2/dpkg/mapped-library runtime capture, scoped netem traffic/control
-flows and the H.264/H.265 RTSP/TCP contract on both native runners. Repeat
-Standards/Spec review passed. Non-zero probe/CRUD axes deliberately fail closed
-until their typed drivers exist; native CI is functional evidence only and is
-not a measured single-node capacity envelope.
+Уникальный внешний TCP port media node на server. Он выбирается из configured
+range автоматически случайным образом или задаётся оператором вручную. Смена
+node port — disruptive node restart.
 
-The runtime/hardware manifest code is implemented, but no production-equivalent
-hardware manifest or capacity run has been published. A finalized functional
-bundle remains compatibility evidence, not a production capacity claim.
+## Camera
 
-Role processes do not yet run catalog, grant, reconciler, scheduler or
-observability loops. PostgreSQL durability, artifact provenance, capacity and
-production readiness have not been proven. Proposed ADRs and successful lab
-contracts must not be presented as production approval.
+Catalog object одного private RTSP source. Camera учитывается в node capacity,
+пока зарегистрирована, независимо от enabled, source-ready или occupied state.
+
+## Registered camera
+
+Camera с current placement на media node. Hard limit — 100 registered cameras
+на node.
+
+_Не используйте active source или reader count вместо registered count при
+admission._
+
+## Source
+
+Private camera RTSP endpoint, который MediaMTX pulls on demand. Source address и
+credentials никогда не раскрываются downstream consumer.
+
+## Public ID
+
+Opaque immutable external path name camera. Public ID идентифицирует path, но
+не является credential.
+
+## Placement
+
+Authoritative binding camera к ровно одной media node. Placement определяет
+node port и, следовательно, внешний endpoint camera.
+
+## Automatic placement
+
+Default placement policy: eligible node с минимальным registered count, затем
+минимальным active source count, затем минимальным stable node id. Если eligible
+node отсутствует, orchestrator может создать новую в пределах max_nodes/ports.
+
+## Manual placement
+
+Явный выбор eligible target node оператором. Manual placement не может обойти
+лимит 100 cameras/node.
+
+## Camera move
+
+Audited change placement generation. Move может изменить внешний URL. Occupied
+ordinary move запрещён; forced move требует подтверждения и disconnect.
+
+_Не называйте move failover: автоматического failover в текущем продукте нет._
+
+## Desired state
+
+Node/camera/config state, принятый control plane и committed в PostgreSQL.
+
+## Applied state
+
+Desired configuration, read-back verified на конкретной media node.
+
+## Runtime state
+
+Observed process/path/source/reader state. Runtime state не является source of
+truth и может быть stale/absent.
+
+## Eligible node
+
+RUNNING, healthy, fresh, not draining/maintenance/deleting media node с менее
+чем 100 registered cameras.
+
+## Occupied stream
+
+Camera path с одним active downstream reader. Второй concurrent reader получает
+RTSP 453 и не становится ожидающим вторым consumer.
+
+## Consumer
+
+External client, обычно FFmpeg, читающий ordinary
+`rtsp://server:node_port/public_id` по interleaved TCP.
+
+## Access policy
+
+Два независимых CIDR-набора `internet` и `local`. Если оба пусты, IP stage
+разрешает всех. Иначе directly observed TCP peer должен входить хотя бы в один
+набор. IP stage выполняется до downstream credential verification.
+
+## Downstream credentials
+
+Camera-specific username/password, которыми consumer авторизуется у proxy.
+Они отделены от source credentials.
+
+## Drain
+
+Node state, запрещающий new sessions и placements при сохранении existing
+reader до disconnect/deadline. Force завершает remaining sessions после
+explicit confirmation.
+
+## Maintenance
+
+Administrative node state вне automatic placement/admission. Maintenance может
+следовать после drain и не означает node failure.
+
+## Failure incident
+
+Один непрерывный outage media node. Incident создаёт одно failure email и после
+recovery одно confirmation email; repeated reminder отсутствует.
+
+## Reconciler
+
+Control-plane process, converging PostgreSQL desired state и configured state
+конкретных media nodes посредством targeted loopback management API calls.
+
+## Probe
+
+Bounded observation source/path/node health. Probe не должен занимать или
+вытеснять единственный downstream reader slot.
+
+## Capacity envelope
+
+Измеренная workload/hardware комбинация. Per-node envelope и per-server
+node-count envelope публикуются отдельно. `max_nodes` — configuration limit, не
+capacity evidence.
+
+## Blast radius
+
+Набор cameras/sessions, которые допустимо затронуть disruptive operation.
+Camera CRUD имеет path-only radius; node restart/port change — node-only radius;
+cross-node interruption запрещён.

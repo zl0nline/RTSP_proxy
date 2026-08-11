@@ -1,10 +1,11 @@
-# Direct Linux deployment artifacts
+# Direct Linux deployment
 
-Docker and container runtimes are not part of the deployment contract. The
-target is a systemd-based Linux host with Python 3.12. Linux amd64 and arm64 are
-equally supported; neither architecture may ship on evidence from the other.
+Docker/container runtime не входит в deployment contract. Target —
+systemd-based Linux host с Python 3.12 и несколькими bounded MediaMTX nodes.
+Linux amd64/arm64 имеют одинаковые functional/security/release gates; capacity
+публикуется отдельно для конкретного hardware.
 
-## Immutable layout
+## Desired immutable layout
 
 ```text
 /opt/rtsp-proxy/
@@ -18,62 +19,106 @@ equally supported; neither architecture may ship on evidence from the other.
 └── current -> releases/<release-id>
 
 /etc/rtsp-proxy/
-├── control-plane/       # 0750 root:rtsp-proxy
-│   └── rtsp-proxy.env
-└── mediamtx/            # 0750 root:mediamtx
-    └── mediamtx.yml
+├── control-plane/rtsp-proxy.env
+└── nodes/<node-id>/mediamtx.yml
+
+/var/lib/rtsp-proxy/
+└── nodes/<node-id>/
 ```
 
-Release directories and the `current` symlink are root-owned. Runtime users do
-not receive write access to them. The shared config parent contains no secrets
-and is traversable; each service can traverse and read only its root-managed
-subdirectory.
+Release directories and `current` are root-owned and immutable to runtime
+users. Per-node config is generated atomically from PostgreSQL desired state by
+a narrow privileged installation boundary. Browser/web input cannot become an
+arbitrary path, unit name or command.
 
-## Host integration
+## Services
 
-- `sysusers.d/rtsp-proxy.conf` creates separate non-login `rtsp-proxy` and
-  `mediamtx` users.
-- `tmpfiles.d/rtsp-proxy.conf` creates the allowed state/log/config paths.
-- `systemd/rtsp-proxy-web.service` runs the control-plane HTTP process.
-- `systemd/rtsp-proxy@.service` gives `worker`, `reconciler`, `probe` and
-  `collector` separate process/readiness boundaries. Their task loops and real
-  dependency providers are delivered by later phases; the current scaffold is
-  deliberately not ready when a provider is absent.
-- `systemd/mediamtx.service` runs the pinned media-plane binary.
-- `mediamtx.yml.example` exposes ordinary RTSP/TCP on `:9999`; API and metrics
-  remain on loopback and all unused media listeners are disabled.
+- `rtsp-proxy-web.service` — management HTTPS/control application boundary.
+- `rtsp-proxy@worker|reconciler|probe|collector.service` — background roles.
+- `rtsp-proxy-media@<node-id>.service` — one MediaMTX process per media node.
 
-The files are a Phase 0 baseline, not a production install bundle. Database,
-secrets, auth and resource-limit values must pass their later gates before a
-host is admitted.
+Each media instance has:
 
-`artifact-catalog.json` is the machine-readable source of candidate MediaMTX,
-FFmpeg and ffprobe versions, download URLs and architecture-specific SHA-256
-values. `release-manifest.amd64.example.json` and
-`release-manifest.arm64.example.json` show the resulting release identity. The
-Python wheel remains platform-independent; external binaries and every native
-dependency are verified per architecture. The current FFmpeg autobuild has no
-GitHub artifact attestation, so its catalog entry is a Phase 0 candidate and
-cannot pass the production provenance gate without an accepted security ADR.
+- one external ordinary RTSP/TCP port from the node registry;
+- unique loopback API/metrics ports;
+- stable node id in environment/log identity;
+- config/state paths restricted to that node;
+- no access to another node's writable state.
 
-## Activation contract
+The current repository still contains the original Phase 0 single
+`mediamtx.service` and `mediamtx.yml.example` compatibility-lab artifacts.
+Phase C replaces them with the instance unit/config renderer before production;
+they must not be interpreted as the final multi-node installer.
 
-Before changing `current`, installation automation must run from the candidate
-release environment:
+## Global config
+
+Typed control config includes:
+
+- external node port range and reserved ports;
+- `max_nodes=50`, configurable to at most 100;
+- management HTTPS bind;
+- PostgreSQL pools;
+- node API/metrics loopback ranges;
+- drain timeout;
+- SMTP recipients/delivery policy;
+- architecture-specific release manifest.
+
+Unknown fields, invalid/overlapping ranges, non-loopback node management binds
+and architecture/digest mismatch fail before readiness.
+
+## Node lifecycle
+
+Create:
+
+1. transactionally reserve a random/manual external port;
+2. persist node and internal endpoints;
+3. render/validate/fsync/rename config;
+4. start exact systemd instance;
+5. verify PID/release/config identity and loopback API/metrics;
+6. run ordinary RTSP/TCP smoke;
+7. mark RUNNING.
+
+Stop/restart/port change require drained state or explicit force confirmation.
+Only the selected instance is touched. Delete requires zero camera placements
+and stopped/failed state. Port is released only after listener/process cleanup
+proof.
+
+## Artifact catalog and activation
+
+`artifact-catalog.json` pins MediaMTX, FFmpeg and ffprobe versions, URLs and
+architecture-specific SHA-256. Example release manifests show resulting
+identity. Python wheel is platform-independent; native artifacts are verified
+per architecture.
+
+Before changing `current`, run from candidate environment:
 
 ```sh
-rtsp-proxy-verify-release \
+/opt/rtsp-proxy/releases/<release-id>/.venv/bin/rtsp-proxy-verify-release \
   --manifest /opt/rtsp-proxy/releases/<release-id>/release-manifest.json
 ```
 
-The verifier accepts no architecture or Python override. It reads the running
-interpreter and maps the native Linux machine `x86_64` to `amd64` or `aarch64`
-to `arm64`; non-Linux and every other architecture fail closed. It validates
-the lock, wheel, MediaMTX, FFmpeg and ffprobe checksums and executable versions,
-plus application/config/database schema compatibility. Any mismatch, missing
-file, symlink escape or invalid manifest aborts activation.
+Verifier reads actual Linux architecture, validates artifact paths/digests and
+version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
+activation.
 
-Activation creates a temporary symlink in `/opt/rtsp-proxy`, atomically renames
-it to `current`, reloads systemd, starts the units and checks role readiness plus
-the external RTSP smoke. Rollback performs the same atomic switch to the last
-verified release; it does not modify an old release in place.
+Activation atomically switches `current`, reloads systemd and updates control
+roles. It does not restart healthy media nodes unless the release procedure
+explicitly drains and upgrades those instances one at a time. Rollback switches
+to the last verified release and uses the same validation/smoke path.
+
+## Security
+
+- dedicated non-login users/groups;
+- `NoNewPrivileges`, `ProtectSystem`, `ProtectHome`, `PrivateTmp`, bounded
+  `ReadWritePaths`, address-family/syscall/capability restrictions;
+- node API/metrics/auth callback on loopback only;
+- external listener ordinary RTSP/TCP only;
+- no Docker socket or container dependency;
+- secrets absent from argv, logs and world-readable config.
+
+## Production admission
+
+These artifacts are not an install approval by themselves. Production requires
+node-instance isolation tests, PostgreSQL migrations/restore, ACL/auth/RTSP 453,
+drain/move/port rollback, native amd64/arm64 contracts and measured per-node/
+per-server capacity evidence described in the production plan.

@@ -1,5 +1,10 @@
 # Аудит и remediation GitHub issues RTSP Proxy
 
+> **Historical research snapshot.** Bounded-node owner decision 2026-08-12
+> supersedes this document's single-node/gateway topology analysis. Current
+> normative sources are the issue bodies, ADR 0005 and
+> `docs/PRODUCTION_PLAN.md`. This file is retained only for audit history.
+
 Дата проверки: 2026-08-10
 
 Репозиторий: `zl0nline/RTSP_proxy`

@@ -3,13 +3,13 @@
 ADRs live in this directory as `NNNN-short-title.md` and use
 [`0000-template.md`](0000-template.md).
 
-An ADR remains `Proposed` until every item in its Evidence section is linked to
-an executable test or retained experiment artifact. Planning consensus alone
-does not make an ADR `Accepted`.
+An ADR is `Accepted` when its decision owner commits to the architecture.
+Acceptance does not turn unexecuted capacity/security claims into evidence:
+those remain explicit validation gates in the ADR and production plan.
 
 Required early ADRs:
 
-- media topology and scale-out;
+- bounded media topology and server capacity;
 - queue/outbox semantics;
 - browser session storage;
 - authorization model;
@@ -23,5 +23,6 @@ Current records:
 |---|---|---|
 | [0001](0001-mediamtx-v1.20.0-phase-0-candidate.md) | Proposed | MediaMTX v1.20.0 Phase 0 candidate |
 | [0002](0002-ffmpeg-phase-0-candidate.md) | Proposed | FFmpeg/ffprobe Phase 0 candidate and provenance gate |
-| [0003](0003-single-node-http-auth-callback.md) | Proposed | Loopback HTTP callback for dynamic RTSP grants |
+| [0003](0003-per-node-http-auth-callback.md) | Proposed | Per-node loopback HTTP callback for RTSP access |
 | [0004](0004-isolated-probe-execution-boundary.md) | Proposed | Isolated source-probe process and egress boundary |
+| [0005](0005-bounded-media-nodes.md) | Accepted | Up to 100 cameras per MediaMTX node on one Linux server |

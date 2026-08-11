@@ -1,9 +1,16 @@
 # Phase 0B load harness evidence
 
-- Last reviewed: 2026-08-11
+- Last reviewed: 2026-08-12
 - Status: functional harness reviewed; no capacity decision
 - Deployment: direct Linux, no Docker/container runtime
 - Architectures: native `amd64` and `arm64`
+
+> The harness was originally built for one generic SUT and larger reader
+> ladders. Bounded-node profile validation, one-reader/RTSP-453 admission and
+> multi-SUT orchestration are **pending Phase C/G work**. Planned product
+> qualification will use it first for one node at no more than 100 registered
+> cameras/readers, then for multiple independent nodes on one server. Generic
+> fan-out/burst support is harness capability, not the product contract.
 
 ## Implemented contract
 
@@ -74,7 +81,8 @@
 - reader summary retains failed attempts, enforces `>=99.9%` establishment and
   warm proxy ramp p99 `<=500ms`; one anchor inside `total_readers` keeps every
   active path warm across ramp start, typed API polling proves the anchors, and
-  burst retains at least 1000 measured readers after anchors are reserved;
+  generic burst profiles can retain at least 1000 measured readers after
+  anchors are reserved;
   cold runs cannot claim proxy overhead without a
   paired direct-control handshake decomposition; GOP waits remain separate;
 - finalization semantically regenerates prepared plans and recomputes typed
@@ -127,8 +135,12 @@
 
 ## Functional CI boundary
 
-Hardened native amd64/arm64 run `31527148623` is green for all six application,
-release/media and pull-load-generator jobs. Repeat Standards/Spec review passed.
+Hardened native amd64/arm64
+[run 31529502107](https://github.com/zl0nline/RTSP_proxy/actions/runs/31529502107)
+is green for all six application, release/media and pull-load-generator jobs at
+commit
+[`1ea5137b4b51bba3736827ed3b5fa13f45912be9`](https://github.com/zl0nline/RTSP_proxy/commit/1ea5137b4b51bba3736827ed3b5fa13f45912be9).
+This records CI outcome, not a final Phase 0B exit-review PASS.
 
 The native jobs compile both C binaries with distro GStreamer development
 libraries, print exact package versions and binary SHA-256 values, prepare
@@ -141,10 +153,12 @@ impaired, an adjacent control flow is not, counters reconcile, drift is rejected
 and exact state is removed. All contracts run on both amd64 and arm64 before the
 H.264/H.265 RTSP/TCP checks.
 
-This proves functional compatibility only. It does not satisfy the Spike #0
-exit. None of the following evidence has been published: production-equivalent
+This proves functional compatibility only. It does not satisfy production
+per-node or per-server capacity qualification. None of the following evidence
+has been published: production-equivalent
 hardware capture, two-host generator convergence, production-equivalent LAN/WAN baseline,
-100/500/1000 ladder, knee, churn/fault matrix or 24-hour soak.
+1/10/50/80/100 per-node ladder, 1/5/10/25/50 node server ladder, knee,
+churn/fault matrix or 24-hour soak.
 
 Non-zero probe/CRUD axes currently fail profile validation until their typed
 drivers and verification evidence are implemented. This is an explicit Phase

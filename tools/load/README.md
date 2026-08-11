@@ -5,6 +5,14 @@ runtimes are outside the deployment and evidence contract. Functional jobs
 compile and execute the same source natively on Linux `amd64` and `arm64`;
 capacity envelopes are measured and published separately for each architecture.
 
+The current product topology is bounded media nodes: one MediaMTX process and
+external port per node, at most 100 registered cameras and one downstream
+reader per camera. The current harness still models one SUT and does not yet
+enforce the bounded-node/RTSP-453 or multi-SUT contracts. Phase C/G will add
+those profiles and orchestration before product qualification at 1/10/50/80/100
+inside one node and 1/5/10/25/50 nodes on one server (100 nodes is optional).
+Generic larger reader/burst profiles remain harness stress modes only.
+
 The source side is pull-only. `rtsp-pull-server` exposes prepared H.264/H.265
 fixtures as camera-like RTSP endpoints and MediaMTX connects on demand. Every
 remote source process verifies the profile-pinned fixture SHA-256 before
@@ -334,8 +342,9 @@ One immutable profile selects one lifecycle:
 - `single`: functional or steady-state hold without injected disconnects;
 - `steady`: aggregate 10/s or 100/s connect/disconnect;
 - `ramp`: controlled 100 readers/s;
-- `burst`: at least 1000 measured readers at 1000 readers/s after warm anchors
-  are reserved, with bounded retry/backoff/jitter;
+- `burst`: generic harness stress supports at least 1000 measured readers at
+  1000 readers/s after warm anchors; bounded-node product profiles use at most
+  100 readers/node, with bounded retry/backoff/jitter;
 - `outage`: an exact global 10%, 25% or 100% cohort, followed by deterministic
   jitter across the configured backoff window.
 
@@ -513,14 +522,19 @@ This is locally tamper-evident and read-only, not magical WORM: production
 evidence must then be transferred to root-owned immutable storage or the
 approved WORM target.
 
-Hardened native amd64/arm64 CI run `31527148623` proves compilation,
+Hardened native amd64/arm64
+[CI run 31529502107](https://github.com/zl0nline/RTSP_proxy/actions/runs/31529502107)
+at commit
+[`1ea5137b4b51bba3736827ed3b5fa13f45912be9`](https://github.com/zl0nline/RTSP_proxy/commit/1ea5137b4b51bba3736827ed3b5fa13f45912be9)
+proves compilation,
 runtime-manifest capture against real procfs/cgroup v2/dpkg/mapped libraries,
 scoped Linux camera-ingress `clsact/flower→IFB→netem`, H.264/H.265/Opus
 decodability, independent paths, fan-out, timing events, interruption failure
-and TCP-only sockets on Linux amd64/arm64. The same slice passed repeat
-Standards/Spec review. This does not prove production capacity. Spike #0 still
-requires dedicated hardware, production-equivalent LAN and camera-side WAN A/B, typical and
-worst GOP, untuned 100/500/1000 baselines, the full lifecycle/fault matrix and
+and TCP-only sockets on Linux amd64/arm64. This green run does not assert a
+final Phase 0B exit-review PASS or production capacity. Qualification
+still requires dedicated hardware, production-equivalent LAN and camera-side WAN A/B,
+typical and worst GOP, the 1/10/50/80/100 per-node and 1/5/10/25/50 node-server
+baselines, the full lifecycle/fault matrix and
 a 24-hour production-equivalent soak. Until typed non-zero probe/CRUD drivers
 land, profiles containing those axes fail closed instead of silently producing
 partial evidence.

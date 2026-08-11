@@ -5,6 +5,12 @@
 - Status: in progress; this is not production approval
 - Normative artifact pins: `deploy/artifact-catalog.json`
 
+> The 2026-08-12 bounded-node decision changes the product admission contract
+> to one downstream reader per camera. The four-reader checks below remain
+> historical MediaMTX fan-out/on-demand compatibility evidence; they are not a
+> production behavior claim. A new native contract must prove one winner and
+> RTSP 453 for concurrent additional readers.
+
 ## Confirmed contracts
 
 - external listener is ordinary `rtsp://`, RTSP-over-TCP interleaved only;
@@ -73,5 +79,7 @@ real-binary media contract jobs in
 - statistically powered timing no-oracle evidence for revoked, wrong-password,
   unknown-user and unknown-path denials;
 - native VPN source-IP preservation; L4/NAT and cross-host callback remain
-  explicitly prohibited for the single-node candidate until that evidence;
+  explicitly prohibited for direct node exposure until that evidence;
 - security-owner decision for FFmpeg build provenance.
+- per-node HTTP admission contract for ACL-before-password, drain and exact
+  one-reader/RTSP 453 behavior (ADR 0003).
