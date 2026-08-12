@@ -87,6 +87,38 @@ def test_operator_can_register_a_node_with_an_automatically_allocated_port() -> 
     }
 
 
+def test_node_creation_provision_lock_contention_is_a_retryable_public_error() -> None:
+    class BusyStore(InMemoryNodeStore):
+        @contextmanager
+        def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
+            raise NodeLifecycleBusy("node_lifecycle_busy")
+            yield
+
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=NodeControl(
+                store=BusyStore(),
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+                node_runtime=RecordingLifecycleRuntime(),
+                provision_on_create=True,
+            ),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "busy"})
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json()["detail"] == {"code": "node_lifecycle_busy"}
+
+
 def test_each_registered_node_reserves_unique_loopback_management_ports() -> None:
     node_ids = iter(
         (

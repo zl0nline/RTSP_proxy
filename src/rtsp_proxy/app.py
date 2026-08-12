@@ -222,6 +222,8 @@ def create_app(
                     "message": "порт уже используется другой нодой",
                 },
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except NodeRuntimeFailed as error:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
