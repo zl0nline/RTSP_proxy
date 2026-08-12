@@ -271,6 +271,32 @@ class PostgresNodeStore:
                     {"key": _NODE_PROVISIONING_LOCK_KEY},
                 )
 
+    @contextmanager
+    def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
+        """Serialize one node's external process mutation across web processes."""
+
+        with self._engine.connect() as connection:
+            parameters = {"node_id": str(node_id), "seed": _NODE_REGISTRY_LOCK_KEY}
+            connection.execute(
+                text(
+                    "SELECT pg_advisory_lock("
+                    "hashtextextended(CAST(:node_id AS text), :seed))"
+                ),
+                parameters,
+            )
+            try:
+                if self.get_node(node_id) is None:
+                    raise NodeNotFound("node_not_found")
+                yield
+            finally:
+                connection.execute(
+                    text(
+                        "SELECT pg_advisory_unlock("
+                        "hashtextextended(CAST(:node_id AS text), :seed))"
+                    ),
+                    parameters,
+                )
+
     def register_automatically(
         self,
         *,
@@ -514,6 +540,34 @@ class PostgresNodeStore:
                     "state": state.value,
                     "desired_revision": desired_revision,
                 },
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def advance_desired_revision(self, node_id: UUID) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            desired_revision = node.desired_revision + 1
+            row = connection.execute(
+                update(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .values(desired_revision=desired_revision)
+                .returning(*media_nodes.c)
+            ).mappings().one()
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.restart_requested",
+                payload={"desired_revision": desired_revision},
                 aggregate_revision=desired_revision,
             )
             return _media_node(row)

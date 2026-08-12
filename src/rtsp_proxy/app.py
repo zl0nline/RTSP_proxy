@@ -340,6 +340,11 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "node_not_running"},
             ) from None
+        except NodeNotEmpty:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "node_not_empty"},
+            ) from None
         except NodeRuntimeUnavailable:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

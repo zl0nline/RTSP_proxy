@@ -62,6 +62,7 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
     paths: ClassVar[dict[str, dict[str, object]]] = {}
     ready_paths: ClassVar[set[str]] = set()
     ready_on_put: ClassVar[set[str]] = set()
+    last_authorization: ClassVar[str | None] = None
 
     def do_POST(self) -> None:
         name = self.path.removeprefix("/v3/config/paths/replace/")
@@ -78,6 +79,7 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
         self._respond(200, b'{"status":"ok"}')
 
     def do_GET(self) -> None:
+        type(self).last_authorization = self.headers.get("Authorization")
         if self.path.startswith("/v3/paths/list?"):
             items = [
                 {"name": name, "ready": True, "readers": [{}]} for name in sorted(self.ready_paths)
@@ -178,6 +180,7 @@ def media_api() -> Iterator[str]:
     MediaMtxFixtureHandler.paths = {}
     MediaMtxFixtureHandler.ready_paths = set()
     MediaMtxFixtureHandler.ready_on_put = set()
+    MediaMtxFixtureHandler.last_authorization = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), MediaMtxFixtureHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -211,6 +214,26 @@ def test_media_path_operations_converge_without_exposing_http_routes(media_api: 
     client.delete_path(path.name)
     client.delete_path(path.name)
     assert client.get_path(path.name) is None
+
+
+def test_media_node_client_uses_node_scoped_basic_management_credentials(
+    media_api: str,
+) -> None:
+    client = MediaMtxClient(
+        api_url=media_api,
+        timeout_seconds=1,
+        username="node-a",
+        password="secret-a",
+    )
+
+    client.inventory_paths()
+
+    assert MediaMtxFixtureHandler.last_authorization == "Basic bm9kZS1hOnNlY3JldC1h"
+
+
+def test_media_node_client_rejects_partial_management_credentials() -> None:
+    with pytest.raises(ValueError, match="mediamtx_management_credentials_incomplete"):
+        MediaMtxClient(api_url="http://127.0.0.1:9997", timeout_seconds=1, username="node-a")
 
 
 def test_load_catalog_apply_is_on_demand_and_verifies_inventory_and_mapping(

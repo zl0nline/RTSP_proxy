@@ -5,10 +5,11 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=mediamtx
-Group=mediamtx
+DynamicUser=yes
 WorkingDirectory=/var/lib/rtsp-proxy/nodes/%i
-ExecStart=/opt/rtsp-proxy/current/bin/mediamtx /etc/rtsp-proxy/nodes/%i/mediamtx.yml
+EnvironmentFile=/etc/rtsp-proxy/nodes/%i/runtime.env
+LoadCredential=mediamtx.yml:/etc/rtsp-proxy/nodes/%i/mediamtx.yml
+ExecStart=/usr/bin/env ${RTSP_PROXY_MEDIAMTX_BINARY} /run/credentials/rtsp-proxy-media@%i.service/mediamtx.yml
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
@@ -21,6 +22,7 @@ LogsDirectory=rtsp-proxy/nodes/%i
 RuntimeDirectoryMode=0750
 StateDirectoryMode=0750
 LogsDirectoryMode=0750
+InaccessiblePaths=/etc/rtsp-proxy/nodes/%i/management.json
 ReadWritePaths=/run/rtsp-proxy/nodes/%i /var/lib/rtsp-proxy/nodes/%i /var/log/rtsp-proxy/nodes/%i
 
 NoNewPrivileges=yes

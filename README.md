@@ -194,6 +194,13 @@ that restart/stop of node A does not change node B process or its established
 ordinary RTSP/TCP session. Documentation is updated to COMPLETE only after
 independent review and green amd64/arm64 run.
 
+Каждая node получает отдельный случайный credential для loopback API/metrics и
+отдельный `DynamicUser`; process видит только собственный config через systemd
+credentials. Runtime использует абсолютный binary path конкретного verified
+release, поэтому переключение `/opt/rtsp-proxy/current` не подменяет MediaMTX у
+уже созданной node. Lifecycle одной node сериализован и не блокирует startup
+control plane при неисправности другой.
+
 Ещё не реализованы reconciler/move/drain, dashboard, one-reader admission,
 access policies, notifications и complete operations workflows.
 Наличие load harness не означает готовый product или published capacity.

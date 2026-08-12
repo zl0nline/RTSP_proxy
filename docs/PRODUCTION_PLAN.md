@@ -607,6 +607,8 @@ Immutable layout:
 /opt/rtsp-proxy/current -> releases/<release-id>
 /etc/rtsp-proxy/control-plane/
 /etc/rtsp-proxy/nodes/<node_id>/mediamtx.yml
+/etc/rtsp-proxy/nodes/<node_id>/management.json
+/etc/rtsp-proxy/nodes/<node_id>/runtime.env
 /var/lib/rtsp-proxy/nodes/<node_id>/
 ```
 
@@ -621,6 +623,13 @@ Systemd:
 Media process should not mutate release/config. Root/helper boundary performs
 strict allowlisted instance operations requested by control plane; browser/web
 never receives arbitrary systemctl authority.
+
+Each media instance uses `DynamicUser`, a systemd credential copy of its own
+config and a release-specific absolute MediaMTX path stored by the root helper.
+Per-node random Basic credentials protect loopback API/metrics; the process
+never receives another node's credential file. Helper requests have a bounded
+deadline and all lifecycle commands for one UUID are serialized by a
+PostgreSQL advisory lock and exact desired revision.
 
 ## 20. Operations
 
@@ -708,6 +717,13 @@ release and desired revision. Automatic placement is serialized across
 PostgreSQL requests and commits no camera before provision + API/metrics/plain
 RTSP/TCP smoke succeeds. A failed provision leaves an empty FAILED automatic
 node that can be retried; it never creates a ghost camera placement.
+
+The Phase-B-to-Phase-C `0005_node_runtime` migration is deliberately
+fail-closed when the old registry is non-empty: the old rows have no trustworthy
+management-port, release digest or per-node credential identity. Operators must
+export camera intent, drain/remove old node rows, migrate, then recreate nodes
+through the Phase-C provision path. The migration never fabricates runtime
+identity or silently remaps ports.
 
 ### Phase D — camera reconciler and move
 

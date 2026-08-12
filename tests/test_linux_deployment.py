@@ -20,6 +20,7 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
     assert "d /etc/rtsp-proxy 0755 root root -" in entries
     assert "d /etc/rtsp-proxy/control-plane 0750 root rtsp-proxy -" in entries
     assert "d /etc/rtsp-proxy/mediamtx 0750 root mediamtx -" in entries
+    assert "d /etc/rtsp-proxy/nodes 0700 root root -" in entries
 
     web = read_unit("rtsp-proxy-web.service")
     media = read_unit("mediamtx.service")
@@ -53,22 +54,23 @@ def test_background_roles_use_a_separate_systemd_template() -> None:
 def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
     service = read_unit("rtsp-proxy-media@.service")["Service"]
 
-    assert service["User"] == "mediamtx"
-    assert service["Group"] == "mediamtx"
+    assert service["DynamicUser"] == "yes"
+    assert service["EnvironmentFile"] == "/etc/rtsp-proxy/nodes/%i/runtime.env"
+    assert service["LoadCredential"] == ("mediamtx.yml:/etc/rtsp-proxy/nodes/%i/mediamtx.yml")
     assert service["ExecStart"] == (
-        "/opt/rtsp-proxy/current/bin/mediamtx "
-        "/etc/rtsp-proxy/nodes/%i/mediamtx.yml"
+        "/usr/bin/env ${RTSP_PROXY_MEDIAMTX_BINARY} "
+        "/run/credentials/rtsp-proxy-media@%i.service/mediamtx.yml"
     )
     assert service["RuntimeDirectory"] == "rtsp-proxy/nodes/%i"
     assert service["StateDirectory"] == "rtsp-proxy/nodes/%i"
     assert service["LogsDirectory"] == "rtsp-proxy/nodes/%i"
     assert service["ReadWritePaths"] == (
-        "/run/rtsp-proxy/nodes/%i /var/lib/rtsp-proxy/nodes/%i "
-        "/var/log/rtsp-proxy/nodes/%i"
+        "/run/rtsp-proxy/nodes/%i /var/lib/rtsp-proxy/nodes/%i /var/log/rtsp-proxy/nodes/%i"
     )
     assert service["NoNewPrivileges"] == "yes"
     assert service["ProtectSystem"] == "strict"
     assert service["CapabilityBoundingSet"] == ""
+    assert service["InaccessiblePaths"] == ("/etc/rtsp-proxy/nodes/%i/management.json")
 
 
 def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> None:
@@ -76,20 +78,44 @@ def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> 
     runtime_socket = read_unit("rtsp-proxy-node-runtime.socket")["Socket"]
 
     assert helper["User"] == "root"
-    assert helper["ExecStart"] == (
-        "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-node-helper"
-    )
+    assert helper["ExecStart"] == ("/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-node-helper")
     assert helper["EnvironmentFile"] == "/etc/rtsp-proxy/node-runtime.env"
     assert helper["ReadWritePaths"] == "/etc/rtsp-proxy/nodes"
     assert helper["NoNewPrivileges"] == "yes"
     assert helper["ProtectSystem"] == "strict"
     assert helper["CapabilityBoundingSet"] == ""
-    assert runtime_socket["ListenStream"] == (
-        "/run/rtsp-proxy-node-runtime/control.sock"
-    )
+    assert runtime_socket["ListenStream"] == ("/run/rtsp-proxy-node-runtime/control.sock")
     assert runtime_socket["SocketUser"] == "root"
     assert runtime_socket["SocketGroup"] == "rtsp-proxy"
     assert runtime_socket["SocketMode"] == "0660"
+
+
+def test_control_and_helper_examples_define_one_identical_runtime_policy() -> None:
+    control = dict(
+        line.split("=", 1)
+        for line in Path("deploy/rtsp-proxy.env.example").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    helper = dict(
+        line.split("=", 1)
+        for line in Path("deploy/node-runtime.env.example").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    pairs = (
+        ("NODE_PORT_RANGE_START", "EXTERNAL_PORT_START"),
+        ("NODE_PORT_RANGE_END", "EXTERNAL_PORT_END"),
+        ("NODE_API_PORT_RANGE_START", "API_PORT_START"),
+        ("NODE_API_PORT_RANGE_END", "API_PORT_END"),
+        ("NODE_METRICS_PORT_RANGE_START", "METRICS_PORT_START"),
+        ("NODE_METRICS_PORT_RANGE_END", "METRICS_PORT_END"),
+        ("NODE_RELEASE_ID", "RELEASE_ID"),
+        ("NODE_MEDIAMTX_BINARY_SHA256", "MEDIAMTX_BINARY_SHA256"),
+    )
+    for control_name, helper_name in pairs:
+        assert (
+            control[f"RTSP_PROXY_{control_name}"]
+            == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
+        )
 
 
 def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> None:

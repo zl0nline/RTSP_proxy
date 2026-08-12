@@ -209,6 +209,13 @@ class InMemoryNodeStore:
         with self._lock:
             yield
 
+    @contextmanager
+    def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
+        with self._lock:
+            if not any(node.id == node_id for node in self._nodes):
+                raise NodeNotFound("node_not_found")
+            yield
+
     def register_automatically(
         self,
         *,
@@ -344,6 +351,15 @@ class InMemoryNodeStore:
                 state=state,
                 desired_revision=node.desired_revision + 1,
             )
+            self._nodes[self._nodes.index(node)] = updated
+            return updated
+
+    def advance_desired_revision(self, node_id: UUID) -> MediaNode:
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            updated = replace(node, desired_revision=node.desired_revision + 1)
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
@@ -555,35 +571,42 @@ class NodeControl:
             )
 
     def start_node(self, node_id: UUID) -> MediaNode:
-        node = self._store.get_node(node_id)
-        if node is None:
-            raise NodeNotFound("node_not_found")
-        if self._node_runtime is None:
-            raise NodeRuntimeUnavailable("node_runtime_unavailable")
-        desired = self._store.request_desired_state(node_id, NodeState.RUNNING)
-        action = (
-            NodeRuntimeAction.PROVISION_START
-            if desired.applied_revision == 0
-            else NodeRuntimeAction.START
-        )
-        return self._execute_runtime(desired, action)
+        with self._store.lifecycle_guard(node_id):
+            node = self._store.get_node(node_id)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if self._node_runtime is None:
+                raise NodeRuntimeUnavailable("node_runtime_unavailable")
+            desired = self._store.request_desired_state(node_id, NodeState.RUNNING)
+            action = (
+                NodeRuntimeAction.PROVISION_START
+                if desired.applied_revision == 0
+                else NodeRuntimeAction.START
+            )
+            return self._execute_runtime(desired, action)
 
     def stop_node(self, node_id: UUID) -> MediaNode:
-        node = self._require_node_and_runtime(node_id)
-        if node.registered_cameras:
-            raise NodeNotEmpty("node_not_empty")
-        desired = self._store.request_desired_state(node_id, NodeState.STOPPED)
-        return self._execute_runtime(desired, NodeRuntimeAction.STOP)
+        with self._store.lifecycle_guard(node_id):
+            node = self._require_node_and_runtime(node_id)
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
+            desired = self._store.request_desired_state(node_id, NodeState.STOPPED)
+            return self._execute_runtime(desired, NodeRuntimeAction.STOP)
 
     def restart_node(self, node_id: UUID) -> MediaNode:
-        node = self._require_node_and_runtime(node_id)
-        if node.state is not NodeState.RUNNING:
-            raise NodeLifecycleConflict("node_not_running")
-        return self._execute_runtime(node, NodeRuntimeAction.RESTART)
+        with self._store.lifecycle_guard(node_id):
+            node = self._require_node_and_runtime(node_id)
+            if node.state is not NodeState.RUNNING:
+                raise NodeLifecycleConflict("node_not_running")
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
+            desired = self._store.advance_desired_revision(node_id)
+            return self._execute_runtime(desired, NodeRuntimeAction.RESTART)
 
     def observe_node(self, node_id: UUID) -> MediaNode:
-        node = self._require_node_and_runtime(node_id)
-        return self._execute_runtime(node, NodeRuntimeAction.OBSERVE)
+        with self._store.lifecycle_guard(node_id):
+            node = self._require_node_and_runtime(node_id)
+            return self._execute_runtime(node, NodeRuntimeAction.OBSERVE)
 
     def recover_runtime_state(self) -> tuple[MediaNode, ...]:
         if self._node_runtime is None:
@@ -592,14 +615,16 @@ class NodeControl:
         for node in self._store.list_nodes():
             if node.state is NodeState.DELETING:
                 continue
-            recovered.append(self._execute_runtime(node, NodeRuntimeAction.OBSERVE))
+            try:
+                recovered.append(self.observe_node(node.id))
+            except NodeRuntimeFailed:
+                failed = self._store.get_node(node.id)
+                if failed is not None:
+                    recovered.append(failed)
         return tuple(recovered)
 
     def _provision_reserved_node(self, node: MediaNode) -> MediaNode:
-        if self._node_runtime is None:
-            raise NodeRuntimeUnavailable("node_runtime_unavailable")
-        desired = self._store.request_desired_state(node.id, NodeState.RUNNING)
-        return self._execute_runtime(desired, NodeRuntimeAction.PROVISION_START)
+        return self.start_node(node.id)
 
     def _require_node_and_runtime(self, node_id: UUID) -> MediaNode:
         node = self._store.get_node(node_id)
@@ -628,7 +653,19 @@ class NodeControl:
                 ),
             )
             raise NodeRuntimeFailed("node_runtime_operation_failed", node_id=node.id) from error
-        return self._store.apply_runtime_observation(node.id, observation)
+        try:
+            return self._store.apply_runtime_observation(node.id, observation)
+        except Exception as error:
+            self._store.apply_runtime_observation(
+                node.id,
+                NodeRuntimeObservation(
+                    state=NodeState.FAILED,
+                    health=NodeHealth.UNHEALTHY,
+                    applied_revision=node.applied_revision,
+                    config_compatible=False,
+                ),
+            )
+            raise NodeRuntimeFailed("node_runtime_operation_failed", node_id=node.id) from error
 
 
 class CameraControl:
@@ -693,6 +730,8 @@ class CameraControl:
 class NodeStore(Protocol):
     def provisioning_guard(self) -> AbstractContextManager[None]: ...
 
+    def lifecycle_guard(self, node_id: UUID) -> AbstractContextManager[None]: ...
+
     def register_automatically(
         self,
         *,
@@ -715,6 +754,8 @@ class NodeStore(Protocol):
     def get_node(self, node_id: UUID) -> MediaNode | None: ...
 
     def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode: ...
+
+    def advance_desired_revision(self, node_id: UUID) -> MediaNode: ...
 
     def apply_runtime_observation(
         self,
@@ -816,6 +857,12 @@ def validate_runtime_observation(
 ) -> None:
     if observation.applied_revision < 0 or observation.applied_revision > node.desired_revision:
         raise InvalidNodeRuntimeObservation("runtime_applied_revision_invalid")
+    if (
+        observation.state in {NodeState.RUNNING, NodeState.STOPPED}
+        and observation.config_compatible
+        and observation.applied_revision != node.desired_revision
+    ):
+        raise InvalidNodeRuntimeObservation("runtime_observation_revision_stale")
     identity = (
         observation.process_id,
         observation.process_start_ticks,

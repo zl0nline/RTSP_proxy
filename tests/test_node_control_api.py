@@ -2,7 +2,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from threading import Barrier
+from threading import Barrier, Event, Lock
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -922,7 +922,7 @@ def test_management_freshness_migration_fails_closed_until_a_new_observation(
             )
         )
 
-    command.upgrade(migration, "head")
+    command.upgrade(migration, "0004_management_freshness")
 
     with engine.connect() as connection:
         observation = connection.execute(
@@ -932,6 +932,9 @@ def test_management_freshness_migration_fails_closed_until_a_new_observation(
             )
         ).one()
     assert observation == (False, None)
+
+    with pytest.raises(RuntimeError, match="requires an empty media_nodes registry"):
+        command.upgrade(migration, "head")
 
 
 def test_control_plane_refuses_to_start_on_an_older_database_revision(
@@ -1572,6 +1575,8 @@ def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
     stopped = client.post(f"/api/v1/nodes/{first_id}/stop")
 
     assert restarted.status_code == 200
+    assert restarted.json()["desired_revision"] == 3
+    assert restarted.json()["applied_revision"] == 3
     assert stopped.status_code == 200
     assert stopped.json()["runtime_state"] == "stopped"
     assert runtime.calls == [
@@ -1878,6 +1883,40 @@ def test_application_startup_recovers_persisted_runtime_identity() -> None:
     assert runtime.calls == [(NodeRuntimeAction.OBSERVE, node_id)]
 
 
+def test_startup_recovery_isolates_a_failed_node_and_continues_other_nodes() -> None:
+    first = UUID("00000000-0000-0000-0000-000000000001")
+    second = UUID("00000000-0000-0000-0000-000000000002")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(id=first, name="broken", external_port=12000),
+            MediaNode(id=second, name="healthy", external_port=12001),
+        )
+    )
+
+    class PartiallyFailingRuntime(NodeRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if node.id == first:
+                raise RuntimeError("transient probe failure")
+            return RecordingLifecycleRuntime().execute(action, node)
+
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=PartiallyFailingRuntime(),
+    )
+
+    recovered = control.recover_runtime_state()
+
+    assert [node.id for node in recovered] == [first, second]
+    assert recovered[0].runtime_state is NodeState.FAILED
+    assert recovered[1].runtime_state is NodeState.RUNNING
+
+
 @pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
 def test_lifecycle_commands_fail_closed_without_the_privileged_runtime(
     operation: str,
@@ -1968,6 +2007,90 @@ def test_stop_requires_an_empty_node_until_the_drain_phase() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "node_not_empty"
+
+
+def test_restart_requires_an_empty_node_until_the_drain_phase() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(
+            nodes=(
+                MediaNode(
+                    id=node_id,
+                    name="occupied",
+                    external_port=12000,
+                    state=NodeState.RUNNING,
+                    runtime_state=NodeState.RUNNING,
+                    registered_cameras=1,
+                ),
+            )
+        ),
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+    )
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
+    )
+
+    response = client.post(f"/api/v1/nodes/{node_id}/restart")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "node_not_empty"
+
+
+def test_concurrent_lifecycle_commands_serialize_process_and_revision() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.STOPPED,
+                runtime_state=NodeState.STOPPED,
+            ),
+        )
+    )
+    first_started = Event()
+    release_first = Event()
+    calls: list[NodeRuntimeAction] = []
+    calls_lock = Lock()
+
+    class BlockingRuntime(NodeRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            with calls_lock:
+                calls.append(action)
+            if action is NodeRuntimeAction.PROVISION_START:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+                return RecordingLifecycleRuntime().execute(action, node)
+            return RecordingLifecycleRuntime().execute(action, node)
+
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=BlockingRuntime(),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        start_future = executor.submit(control.start_node, node_id)
+        assert first_started.wait(timeout=1)
+        stop_future = executor.submit(control.stop_node, node_id)
+        time.sleep(0.05)
+        assert calls == [NodeRuntimeAction.PROVISION_START]
+        release_first.set()
+        started = start_future.result(timeout=2)
+        stopped = stop_future.result(timeout=2)
+
+    assert started.desired_revision == 2
+    assert stopped.desired_revision == 3
+    assert stopped.runtime_state is NodeState.STOPPED
+    assert calls == [NodeRuntimeAction.PROVISION_START, NodeRuntimeAction.STOP]
 
 
 @pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))

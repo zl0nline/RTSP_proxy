@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from base64 import b64encode
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -44,9 +45,23 @@ class MediaNodeProtocolError(MediaNodeError):
 class MediaMtxClient:
     """Version-specific MediaMTX operations used by the reconciler seam."""
 
-    def __init__(self, *, api_url: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        timeout_seconds: float,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        if (username is None) != (password is None):
+            raise ValueError("mediamtx_management_credentials_incomplete")
         self._api_url = api_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._authorization = (
+            None
+            if username is None or password is None
+            else "Basic " + b64encode(f"{username}:{password}".encode()).decode("ascii")
+        )
 
     def put_path(self, path: MediaPathConfig) -> None:
         name = _path_segment(path.name)
@@ -230,10 +245,13 @@ class MediaMtxClient:
         not_found_is_none: bool = False,
     ) -> Any:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        if self._authorization is not None:
+            headers["Authorization"] = self._authorization
         request = urllib.request.Request(
             f"{self._api_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"} if body is not None else {},
+            headers=headers,
             method=method,
         )
         try:

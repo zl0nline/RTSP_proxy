@@ -58,6 +58,14 @@ in `/etc/rtsp-proxy/node-runtime.env` from `node-runtime.env.example`, then
 enable the socket and helper. API and metrics always bind loopback; the external
 ordinary `rtsp://` listener is TCP-only.
 
+The helper, not the web process, creates a random Basic credential for each
+node, renders the complete config, writes root-only `management.json` and
+`runtime.env`, and pins the absolute verified binary path. The MediaMTX instance
+uses `DynamicUser` and receives only its own config through systemd credentials;
+it cannot traverse `/etc/rtsp-proxy/nodes` or read another node's management
+secret. Keep control/helper port ranges, release id and binary SHA identical;
+the shipped example files are checked together in CI.
+
 ## Global config
 
 Typed control config includes:
@@ -124,6 +132,13 @@ are bound to that exact head; startup reads live `alembic_version` and fails
 closed on an older or newer revision. Backup/restore and rollback gates still
 apply; an older binary must never start against an unsupported newer schema.
 
+`0005_node_runtime` intentionally rejects an upgrade when legacy Phase-B
+`media_nodes` rows exist. Those rows lack trustworthy per-node management
+ports, credentials and a release-specific binary identity. Export camera
+intent, drain and remove those old node records, apply the migration, then
+recreate nodes through the Phase-C create/provision workflow. Do not patch in
+placeholder digests or arbitrary ports.
+
 Activation atomically switches `current`, reloads systemd and updates control
 roles. It does not restart healthy media nodes unless the release procedure
 explicitly drains and upgrades those instances one at a time. Rollback switches
@@ -131,10 +146,11 @@ to the last verified release and uses the same validation/smoke path.
 
 ## Security
 
-- dedicated non-login users/groups;
+- dedicated control-plane users and per-instance systemd `DynamicUser`;
 - `NoNewPrivileges`, `ProtectSystem`, `ProtectHome`, `PrivateTmp`, bounded
   `ReadWritePaths`, address-family/syscall/capability restrictions;
-- node API/metrics/auth callback on loopback only;
+- node API/metrics/auth callback on loopback only and protected by a unique
+  per-node Basic credential;
 - external listener ordinary RTSP/TCP only;
 - no Docker socket or container dependency;
 - secrets absent from argv, logs and world-readable config.

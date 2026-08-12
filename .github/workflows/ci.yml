@@ -87,7 +87,8 @@ jobs:
       - name: Validate systemd units
         run: |
           sudo install -d /opt/rtsp-proxy/releases/ci/.venv/bin /opt/rtsp-proxy/releases/ci/bin
-          sudo install -d /etc/rtsp-proxy/control-plane /etc/rtsp-proxy/mediamtx /etc/rtsp-proxy/nodes
+          sudo install -d /etc/rtsp-proxy/control-plane /etc/rtsp-proxy/mediamtx
+          sudo install -d -m 0700 /etc/rtsp-proxy/nodes
           sudo install -d /var/lib/rtsp-proxy/nodes /var/log/rtsp-proxy/nodes
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-web
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-role
@@ -187,11 +188,6 @@ jobs:
           FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest -m contract tests/contract
 
-      - name: Verify two-node process and RTSP session isolation
-        env:
-          MEDIAMTX_BINARY: .artifacts/mediamtx/mediamtx
-        run: uv run pytest tests/contract/test_node_isolation.py -q
-
   pull-load-generator-contract:
     name: pull-load-generator-contract (${{ matrix.arch }})
     strategy:
@@ -274,3 +270,15 @@ jobs:
           FFMPEG_BINARY: .artifacts/ffmpeg/bin/ffmpeg
           FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest tests/contract/test_rtsp_pull_generator.py
+
+      - name: Verify two-node process and RTP session isolation
+        run: |
+          sudo install -m 0644 deploy/systemd/rtsp-proxy-media@.service /etc/systemd/system/
+          sudo systemd-analyze verify /etc/systemd/system/rtsp-proxy-media@.service
+          sudo env \
+            MEDIAMTX_BINARY="$PWD/.artifacts/mediamtx/mediamtx" \
+            RTSP_PULL_SERVER_BINARY="$PWD/tools/load/rtsp-pull-server" \
+            RTSP_LOAD_READER_BINARY="$PWD/tools/load/rtsp-load-reader" \
+            FFMPEG_BINARY="$PWD/.artifacts/ffmpeg/bin/ffmpeg" \
+            PATH="$PATH" \
+            "$PWD/.venv/bin/python" -m pytest tests/contract/test_node_isolation.py -q

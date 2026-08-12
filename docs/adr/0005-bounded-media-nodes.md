@@ -32,6 +32,9 @@ nodes on one physical Linux server.
 - There is no automatic failover or migration after node failure.
 - Dashboard/control plane manages and aggregates every node on the server.
 - MediaMTX management API and metrics remain loopback-only.
+- Every node has a unique random management credential and systemd
+  `DynamicUser`; its process receives only its own config and cannot traverse
+  another node's root-owned config/credential directory.
 - Multi-server topology, gateway tier and one unified external port are not part
   of this product version.
 

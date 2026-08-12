@@ -17,6 +17,14 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    connection = op.get_bind()
+    existing_nodes = connection.scalar(sa.text("SELECT count(*) FROM media_nodes"))
+    if existing_nodes:
+        raise RuntimeError(
+            "0005_node_runtime requires an empty media_nodes registry; "
+            "drain/remove Phase-B node records or perform the documented export/recreate "
+            "transition before upgrading"
+        )
     op.add_column("media_nodes", sa.Column("api_port", sa.Integer(), nullable=True))
     op.add_column("media_nodes", sa.Column("metrics_port", sa.Integer(), nullable=True))
     op.add_column(
@@ -66,35 +74,6 @@ def upgrade() -> None:
             nullable=False,
             server_default="0" * 64,
         ),
-    )
-    op.execute(
-        """
-        WITH ordered AS (
-            SELECT id, row_number() OVER (ORDER BY id) AS position,
-                   count(*) OVER () AS node_count
-            FROM media_nodes
-        ), candidates AS (
-            SELECT port, row_number() OVER (ORDER BY priority, port) AS position
-            FROM (
-                SELECT port, 0 AS priority
-                FROM generate_series(49152, 65535) AS port
-                UNION ALL
-                SELECT port, 1 AS priority
-                FROM generate_series(1024, 49151) AS port
-            ) AS candidate
-            WHERE NOT EXISTS (
-                SELECT 1 FROM media_nodes WHERE external_port = candidate.port
-            )
-        )
-        UPDATE media_nodes AS node
-        SET api_port = api.port,
-            metrics_port = metrics.port
-        FROM ordered
-        JOIN candidates AS api ON api.position = ordered.position
-        JOIN candidates AS metrics
-          ON metrics.position = ordered.position + ordered.node_count
-        WHERE node.id = ordered.id
-        """
     )
     op.alter_column("media_nodes", "api_port", nullable=False)
     op.alter_column("media_nodes", "metrics_port", nullable=False)
