@@ -929,18 +929,23 @@ ProcessIdentityReader = Callable[[Path, int], NodeProcessSnapshot]
 class SystemdNodeProcessController:
     """Translate a validated UUID spec into one exact systemd instance operation."""
 
+    _EXEC_TRANSITION_ATTEMPTS = 101
+    _EXEC_TRANSITION_DELAY_SECONDS = 0.01
+
     def __init__(
         self,
         *,
         systemctl: Path,
         run: CommandRunner | None = None,
         proc_root: Path = Path("/proc"),
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not systemctl.is_absolute():
             raise ValueError("systemctl_path_must_be_absolute")
         self._systemctl = systemctl
         self._run = run or self._run_command
         self._proc_root = proc_root
+        self._sleep = sleep
 
     def execute(
         self,
@@ -1004,7 +1009,18 @@ class SystemdNodeProcessController:
             )
         if pid < 1:
             raise NodeSupervisorError("systemd_active_node_missing_pid")
-        snapshot = self._read_process_identity(pid)
+        if action in {
+            NodeRuntimeAction.PROVISION_START,
+            NodeRuntimeAction.START,
+            NodeRuntimeAction.RESTART,
+        }:
+            snapshot = self._wait_for_exec_transition(
+                pid,
+                spec.mediamtx_binary_sha256,
+                deadline,
+            )
+        else:
+            snapshot = self._read_process_identity(pid)
         repeated = self._checked_run(
             (
                 str(self._systemctl),
@@ -1020,6 +1036,41 @@ class SystemdNodeProcessController:
         if repeated_properties != properties:
             raise NodeSupervisorError("systemd_node_identity_changed")
         return snapshot
+
+    def _wait_for_exec_transition(
+        self,
+        pid: int,
+        expected_sha256: str,
+        deadline: NodeOperationDeadline | None,
+    ) -> NodeProcessSnapshot:
+        snapshot: NodeProcessSnapshot | None = None
+        unavailable: NodeSupervisorError | None = None
+        for attempt in range(self._EXEC_TRANSITION_ATTEMPTS):
+            try:
+                current = self._read_process_identity(pid)
+            except NodeSupervisorError as error:
+                if str(error) != "node_process_identity_unavailable":
+                    raise
+                unavailable = error
+            else:
+                if snapshot is not None and (
+                    current.pid != snapshot.pid
+                    or current.process_start_ticks != snapshot.process_start_ticks
+                    or current.boot_id != snapshot.boot_id
+                ):
+                    raise NodeSupervisorError("systemd_node_identity_changed")
+                snapshot = current
+                if snapshot.executable_sha256 == expected_sha256:
+                    return snapshot
+            if attempt + 1 < self._EXEC_TRANSITION_ATTEMPTS:
+                delay = self._EXEC_TRANSITION_DELAY_SECONDS
+                if deadline is not None:
+                    delay = min(delay, deadline.remaining_seconds())
+                self._sleep(delay)
+        if snapshot is not None:
+            return snapshot
+        assert unavailable is not None
+        raise unavailable
 
     def _checked_run(
         self,

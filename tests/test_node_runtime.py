@@ -857,6 +857,139 @@ def test_systemd_adapter_binds_active_pid_start_boot_and_binary_identity(
     )
 
 
+def test_systemd_start_waits_for_env_to_exec_the_pinned_media_binary(
+    tmp_path: Path,
+) -> None:
+    transient = NodeProcessSnapshot(
+        active=True,
+        pid=1234,
+        process_start_ticks=5678,
+        boot_id=UUID("10000000-0000-0000-0000-000000000001"),
+        executable_sha256="e" * 64,
+    )
+    expected = NodeProcessSnapshot(
+        active=True,
+        pid=1234,
+        process_start_ticks=5678,
+        boot_id=UUID("10000000-0000-0000-0000-000000000001"),
+        executable_sha256="a" * 64,
+    )
+    identities = iter(
+        (
+            NodeSupervisorError("node_process_identity_unavailable"),
+            transient,
+            expected,
+        )
+    )
+    sleeps: list[float] = []
+
+    class ExecTransitionController(SystemdNodeProcessController):
+        def _read_process_identity(self, pid: int) -> NodeProcessSnapshot:
+            assert pid == 1234
+            identity = next(identities)
+            if isinstance(identity, NodeSupervisorError):
+                raise identity
+            return identity
+
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
+        return CompletedProcess(
+            arguments,
+            0,
+            "ActiveState=active\nMainPID=1234\n" if "show" in arguments else "",
+            "",
+        )
+
+    snapshot = ExecTransitionController(
+        systemctl=Path("/usr/bin/systemctl"),
+        run=run,
+        proc_root=tmp_path / "proc",
+        sleep=sleeps.append,
+    ).execute(NodeRuntimeAction.PROVISION_START, runtime_spec())
+
+    assert snapshot == expected
+    assert sleeps == [0.01, 0.01]
+
+
+def test_systemd_start_rejects_identity_change_during_exec_transition(
+    tmp_path: Path,
+) -> None:
+    identities = iter(
+        (
+            NodeProcessSnapshot(
+                active=True,
+                pid=1234,
+                process_start_ticks=5678,
+                boot_id=UUID("10000000-0000-0000-0000-000000000001"),
+                executable_sha256="e" * 64,
+            ),
+            NodeProcessSnapshot(
+                active=True,
+                pid=1234,
+                process_start_ticks=8765,
+                boot_id=UUID("10000000-0000-0000-0000-000000000001"),
+                executable_sha256="a" * 64,
+            ),
+        )
+    )
+
+    class ReplacedProcessController(SystemdNodeProcessController):
+        def _read_process_identity(self, pid: int) -> NodeProcessSnapshot:
+            assert pid == 1234
+            return next(identities)
+
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
+        return CompletedProcess(
+            arguments,
+            0,
+            "ActiveState=active\nMainPID=1234\n" if "show" in arguments else "",
+            "",
+        )
+
+    with pytest.raises(NodeSupervisorError, match="systemd_node_identity_changed"):
+        ReplacedProcessController(
+            systemctl=Path("/usr/bin/systemctl"),
+            run=run,
+            proc_root=tmp_path / "proc",
+            sleep=lambda seconds: None,
+        ).execute(NodeRuntimeAction.START, runtime_spec())
+
+
+def test_systemd_start_returns_wrong_release_identity_after_bounded_wait(
+    tmp_path: Path,
+) -> None:
+    transient = NodeProcessSnapshot(
+        active=True,
+        pid=1234,
+        process_start_ticks=5678,
+        boot_id=UUID("10000000-0000-0000-0000-000000000001"),
+        executable_sha256="e" * 64,
+    )
+
+    class WrongReleaseController(SystemdNodeProcessController):
+        _EXEC_TRANSITION_ATTEMPTS = 2
+
+        def _read_process_identity(self, pid: int) -> NodeProcessSnapshot:
+            assert pid == 1234
+            return transient
+
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
+        return CompletedProcess(
+            arguments,
+            0,
+            "ActiveState=active\nMainPID=1234\n" if "show" in arguments else "",
+            "",
+        )
+
+    snapshot = WrongReleaseController(
+        systemctl=Path("/usr/bin/systemctl"),
+        run=run,
+        proc_root=tmp_path / "proc",
+        sleep=lambda seconds: None,
+    ).execute(NodeRuntimeAction.START, runtime_spec())
+
+    assert snapshot == transient
+
+
 def test_supervisor_rechecks_process_identity_after_smoke(tmp_path: Path) -> None:
     root = tmp_path / "nodes-identity-bracket"
     root.mkdir(mode=0o700)
