@@ -31,9 +31,11 @@ from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.sql.base import Executable
+from sqlalchemy.sql.selectable import Select
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
+    CameraNotFound,
     CameraPlacement,
     EligibleNodeMissing,
     InvalidNodeRuntimeObservation,
@@ -833,7 +835,28 @@ class PostgresNodeStore:
             )
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
-        statement = (
+        with self._engine.connect() as connection:
+            return tuple(
+                _camera_placement(row)
+                for row in connection.execute(self._camera_query()).mappings()
+            )
+
+    def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
+        with self._engine.connect() as connection:
+            if connection.scalar(
+                select(func.count()).select_from(media_nodes).where(media_nodes.c.id == node_id)
+            ) == 0:
+                raise NodeNotFound("node_not_found")
+            return tuple(
+                _camera_placement(row)
+                for row in connection.execute(
+                    self._camera_query().where(camera_placements.c.node_id == node_id)
+                ).mappings()
+            )
+
+    @staticmethod
+    def _camera_query() -> Select[tuple[object, ...]]:
+        return (
             select(
                 cameras.c.id,
                 cameras.c.name,
@@ -843,14 +866,96 @@ class PostgresNodeStore:
                 cameras.c.applied_revision,
                 camera_placements.c.node_id,
                 camera_placements.c.placement_mode,
+                camera_placements.c.generation.label("placement_generation"),
                 media_nodes.c.external_port.label("node_port"),
             )
             .join(camera_placements, camera_placements.c.camera_id == cameras.c.id)
             .join(media_nodes, media_nodes.c.id == camera_placements.c.node_id)
             .order_by(cameras.c.id)
         )
-        with self._engine.connect() as connection:
-            return tuple(_camera_placement(row) for row in connection.execute(statement).mappings())
+
+    def update_camera(
+        self,
+        camera_id: UUID,
+        *,
+        name: str,
+        source_url: str,
+    ) -> CameraPlacement:
+        source_url = validate_camera_source_url(source_url)
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = connection.execute(
+                self._camera_query()
+                .where(cameras.c.id == camera_id)
+                .with_for_update(of=cameras)
+            ).mappings().one_or_none()
+            if current is None:
+                raise CameraNotFound("camera_not_found")
+            camera = _camera_placement(current)
+            if camera.name == name and camera.source_url == source_url:
+                return camera
+            desired_revision = camera.desired_revision + 1
+            connection.execute(
+                update(cameras)
+                .where(cameras.c.id == camera_id)
+                .values(
+                    name=name,
+                    source_url=source_url,
+                    desired_revision=desired_revision,
+                )
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera",
+                aggregate_id=camera_id,
+                event_type="camera.updated",
+                payload={
+                    "name": name,
+                    "node_id": str(camera.node_id),
+                    "placement_generation": camera.placement_generation,
+                    "desired_revision": desired_revision,
+                },
+                aggregate_revision=desired_revision,
+            )
+            return CameraPlacement(
+                id=camera.id,
+                name=name,
+                source_url=source_url,
+                public_id=camera.public_id,
+                node_id=camera.node_id,
+                node_port=camera.node_port,
+                placement_mode=camera.placement_mode,
+                placement_generation=camera.placement_generation,
+                desired_revision=desired_revision,
+                applied_revision=camera.applied_revision,
+            )
+
+    def mark_camera_applied(
+        self,
+        *,
+        camera_id: UUID,
+        node_id: UUID,
+        placement_generation: int,
+        desired_revision: int,
+    ) -> bool:
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                update(cameras)
+                .where(
+                    cameras.c.id == camera_id,
+                    cameras.c.desired_revision == desired_revision,
+                    camera_placements.c.camera_id == cameras.c.id,
+                    camera_placements.c.node_id == node_id,
+                    camera_placements.c.generation == placement_generation,
+                )
+                .values(applied_revision=desired_revision)
+            )
+            return result.rowcount == 1
+
+    @contextmanager
+    def reconcile_guard(self, node_id: UUID) -> Iterator[None]:
+        with self.lifecycle_guard(node_id):
+            yield
 
     def _lock_placements(self, connection: Connection) -> None:
         connection.execute(
@@ -993,6 +1098,7 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
         node_id=_uuid(row["node_id"]),
         node_port=int(row["node_port"]),
         placement_mode=PlacementMode(str(row["placement_mode"])),
+        placement_generation=int(row["placement_generation"]),
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),
     )

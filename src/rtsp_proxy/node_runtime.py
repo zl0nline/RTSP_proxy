@@ -16,21 +16,32 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import BoundedSemaphore, Lock
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from rtsp_proxy.identifiers import InvalidPublicId, PublicId
+from rtsp_proxy.media import (
+    MediaMtxClient,
+    MediaNodeError,
+    MediaNodeProtocolError,
+    MediaNodeUnavailable,
+    MediaPathConfig,
+    MediaPathInventory,
+)
 from rtsp_proxy.nodes import (
     MediaNode,
     NodeHealth,
     NodeRuntimeAction,
     NodeRuntimeObservation,
     NodeState,
+    validate_camera_source_url,
 )
 
 
@@ -206,6 +217,30 @@ class NodeRuntimeCommand:
         spec: NodeRuntimeSpec,
     ) -> NodeRuntimeCommand:
         return cls(action=action, spec=spec)
+
+
+class MediaPathOperation(StrEnum):
+    INVENTORY = "inventory"
+    GET = "get"
+    PUT = "put"
+    DELETE = "delete"
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPathCommand:
+    operation: MediaPathOperation
+    spec: NodeRuntimeSpec
+    path: MediaPathConfig | PublicId | None = None
+
+    def __post_init__(self) -> None:
+        if self.operation is MediaPathOperation.INVENTORY:
+            if self.path is not None:
+                raise ValueError("node_media_path_not_allowed")
+        elif self.operation is MediaPathOperation.PUT:
+            if not isinstance(self.path, MediaPathConfig):
+                raise ValueError("node_media_path_required")
+        elif not isinstance(self.path, PublicId):
+            raise ValueError("node_media_path_required")
 
 
 class SecureNodeConfigStore:
@@ -1330,6 +1365,40 @@ class _RuntimeResponsePayload(BaseModel):
     error: str | None
 
 
+class _MediaPathPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    name: str
+    source_url: str | None
+
+
+class _MediaRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: int
+    request_type: Literal["media_path"]
+    operation: MediaPathOperation
+    spec: _RuntimeSpecPayload
+    path: _MediaPathPayload | None
+
+
+class _MediaInventoryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    camera_ids: list[str]
+    no_oracle_matcher_present: bool
+
+
+class _MediaResponsePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: int
+    ok: bool
+    path: _MediaPathPayload | None
+    inventory: _MediaInventoryPayload | None
+    error: str | None
+
+
 class UnixNodeRuntimeClient:
     """Control-plane adapter for the root-owned, UUID-scoped local helper."""
 
@@ -1430,6 +1499,162 @@ class UnixNodeRuntimeClient:
         return encoded
 
 
+class UnixMediaNodeClientFactory:
+    """Create a node-scoped media adapter without exposing management credentials."""
+
+    def __init__(self, *, socket_path: Path, timeout_seconds: float) -> None:
+        if not socket_path.is_absolute():
+            raise ValueError("node_runtime_socket_must_be_absolute")
+        if timeout_seconds <= 0 or timeout_seconds > 60:
+            raise ValueError("node_runtime_timeout_invalid")
+        self._socket_path = socket_path
+        self._timeout_seconds = timeout_seconds
+
+    def for_node(self, node: MediaNode) -> UnixMediaNodeClient:
+        if (
+            node.state is not NodeState.RUNNING
+            or node.runtime_state is not NodeState.RUNNING
+            or node.health is not NodeHealth.HEALTHY
+            or not node.management_fresh
+            or not node.config_compatible
+            or node.applied_revision != node.desired_revision
+        ):
+            raise MediaNodeUnavailable("media_node_not_ready")
+        return UnixMediaNodeClient(
+            socket_path=self._socket_path,
+            timeout_seconds=self._timeout_seconds,
+            node=node,
+        )
+
+
+class UnixMediaNodeClient:
+    def __init__(
+        self,
+        *,
+        socket_path: Path,
+        timeout_seconds: float,
+        node: MediaNode,
+    ) -> None:
+        self._socket_path = socket_path
+        self._timeout_seconds = timeout_seconds
+        self._node = node
+
+    def put_path(self, path: MediaPathConfig) -> None:
+        response = self._request("put", name=path.name, source_url=path.source_url)
+        if response.path is not None or response.inventory is not None:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+
+    def get_path(self, name: PublicId) -> MediaPathConfig | None:
+        response = self._request("get", name=name)
+        if response.inventory is not None:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        if response.path is None:
+            return None
+        if response.path.source_url is None:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        try:
+            response_name = PublicId.parse(response.path.name)
+        except InvalidPublicId:
+            raise MediaNodeProtocolError("node_media_response_invalid") from None
+        if response_name != name:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        return MediaPathConfig(name=response_name, source_url=response.path.source_url)
+
+    def inventory_paths(self) -> MediaPathInventory:
+        response = self._request("inventory")
+        if response.path is not None or response.inventory is None:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        try:
+            camera_ids = tuple(
+                sorted(
+                    (PublicId.parse(value) for value in response.inventory.camera_ids),
+                    key=str,
+                )
+            )
+        except InvalidPublicId:
+            raise MediaNodeProtocolError("node_media_response_invalid") from None
+        if len(camera_ids) != len(set(camera_ids)):
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        return MediaPathInventory(
+            camera_ids=camera_ids,
+            no_oracle_matcher_present=response.inventory.no_oracle_matcher_present,
+        )
+
+    def delete_path(self, name: PublicId) -> None:
+        response = self._request("delete", name=name)
+        if response.path is not None or response.inventory is not None:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+
+    def _request(
+        self,
+        operation: str,
+        *,
+        name: PublicId | None = None,
+        source_url: str | None = None,
+    ) -> _MediaResponsePayload:
+        payload = {
+            "schema_version": 1,
+            "request_type": "media_path",
+            "operation": operation,
+            "spec": _runtime_spec_payload(self._node),
+            "path": (
+                None
+                if name is None
+                else {"name": str(name), "source_url": source_url}
+            ),
+        }
+        encoded = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        if len(encoded) > _MAX_RUNTIME_MESSAGE_BYTES:
+            raise MediaNodeUnavailable("node_media_request_too_large")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(self._timeout_seconds)
+                connection.connect(str(self._socket_path))
+                connection.sendall(encoded)
+                raw_response = connection.makefile("rb").readline(
+                    _MAX_RUNTIME_MESSAGE_BYTES + 1
+                )
+        except (OSError, TimeoutError) as error:
+            raise MediaNodeUnavailable("node_media_unavailable") from error
+        if (
+            not raw_response
+            or len(raw_response) > _MAX_RUNTIME_MESSAGE_BYTES
+            or not raw_response.endswith(b"\n")
+        ):
+            raise MediaNodeUnavailable("node_media_response_invalid")
+        try:
+            response = _MediaResponsePayload.model_validate_json(raw_response)
+        except ValidationError as error:
+            raise MediaNodeUnavailable("node_media_response_invalid") from error
+        if response.schema_version != 1:
+            raise MediaNodeUnavailable("node_media_response_invalid")
+        if not response.ok:
+            if (
+                response.error is None
+                or response.path is not None
+                or response.inventory is not None
+            ):
+                raise MediaNodeUnavailable("node_media_response_invalid")
+            raise MediaNodeUnavailable(response.error)
+        if response.error is not None:
+            raise MediaNodeUnavailable("node_media_response_invalid")
+        return response
+
+
+def _runtime_spec_payload(node: MediaNode) -> dict[str, object]:
+    return {
+        "node_id": str(node.id),
+        "external_port": node.external_port,
+        "api_port": node.api_port,
+        "metrics_port": node.metrics_port,
+        "desired_revision": node.desired_revision,
+        "release_id": node.release_id,
+        "mediamtx_binary_sha256": node.mediamtx_binary_sha256,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class NodeRuntimePolicy:
     external_port_start: int
@@ -1461,6 +1686,68 @@ class NodeRuntimePolicy:
             )
         if (spec.release_id, spec.mediamtx_binary_sha256) not in allowed:
             raise NodeSupervisorError("node_release_not_allowed")
+
+
+class RootMediaNodeAdapter:
+    """Execute one allowlisted MediaMTX path operation under root-owned credentials."""
+
+    def __init__(
+        self,
+        *,
+        config_store: SecureNodeConfigStore,
+        process: NodeProcessController,
+        timeout_seconds: float,
+    ) -> None:
+        if timeout_seconds <= 0 or timeout_seconds > 10:
+            raise ValueError("node_media_timeout_invalid")
+        self._config_store = config_store
+        self._process = process
+        self._timeout_seconds = timeout_seconds
+
+    def execute(
+        self,
+        command: MediaPathCommand,
+    ) -> MediaPathConfig | MediaPathInventory | None:
+        expected = self._config_store.expected(command.spec)
+        if expected is None:
+            raise NodeSupervisorError("node_config_not_applied")
+        rendered, credentials = expected
+        if self._config_store.digest(command.spec) != rendered.sha256:
+            raise NodeSupervisorError("node_config_not_applied")
+        before = self._process.execute(NodeRuntimeAction.OBSERVE, command.spec)
+        if not before.active or before.executable_sha256 != command.spec.mediamtx_binary_sha256:
+            raise NodeSupervisorError("node_process_release_mismatch")
+        client = MediaMtxClient(
+            api_url=f"http://127.0.0.1:{command.spec.api_port}",
+            timeout_seconds=self._timeout_seconds,
+            username=credentials.username,
+            password=credentials.password,
+        )
+        try:
+            result = self._execute_operation(client, command)
+        except MediaNodeError:
+            raise NodeSupervisorError("node_media_operation_failed") from None
+        after = self._process.execute(NodeRuntimeAction.OBSERVE, command.spec)
+        if after != before:
+            raise NodeSupervisorError("node_process_identity_changed")
+        return result
+
+    @staticmethod
+    def _execute_operation(
+        client: MediaMtxClient,
+        command: MediaPathCommand,
+    ) -> MediaPathConfig | MediaPathInventory | None:
+        if command.operation is MediaPathOperation.INVENTORY:
+            return client.inventory_paths()
+        if command.operation is MediaPathOperation.PUT:
+            assert isinstance(command.path, MediaPathConfig)
+            client.put_path(command.path)
+            return None
+        assert isinstance(command.path, PublicId)
+        if command.operation is MediaPathOperation.GET:
+            return client.get_path(command.path)
+        client.delete_path(command.path)
+        return None
 
 
 class _ScopedNodeLock:
@@ -1503,6 +1790,7 @@ class UnixNodeSupervisorServer:
         *,
         supervisor: LinuxNodeSupervisor,
         policy: NodeRuntimePolicy,
+        media: RootMediaNodeAdapter | None = None,
         request_timeout_seconds: float = 5,
         operation_timeout_seconds: float = 55,
         cleanup_reserve_seconds: float = 25,
@@ -1520,6 +1808,7 @@ class UnixNodeSupervisorServer:
             raise ValueError("node_runtime_workers_invalid")
         self._supervisor = supervisor
         self._policy = policy
+        self._media = media
         self._request_timeout_seconds = request_timeout_seconds
         self._operation_timeout_seconds = operation_timeout_seconds
         self._cleanup_reserve_seconds = cleanup_reserve_seconds
@@ -1533,6 +1822,14 @@ class UnixNodeSupervisorServer:
         try:
             connection.settimeout(self._request_timeout_seconds)
             request = connection.makefile("rb").readline(_MAX_RUNTIME_MESSAGE_BYTES + 1)
+            if self._is_media_request(request):
+                payload = self._serve_media_request(request)
+                encoded = (
+                    json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+                ).encode("utf-8")
+                with suppress(OSError, TimeoutError):
+                    connection.sendall(encoded)
+                return
             command, requested_deadline_unix_ms = self._decode_command(request)
             self._policy.validate(command.spec)
             deadline = self._operation_deadline(requested_deadline_unix_ms)
@@ -1554,6 +1851,28 @@ class UnixNodeSupervisorServer:
         )
         with suppress(OSError, TimeoutError):
             connection.sendall(encoded)
+
+    def _serve_media_request(self, request: bytes) -> dict[str, object]:
+        try:
+            if self._media is None:
+                raise NodeSupervisorError("node_media_unavailable")
+            command = self._decode_media_command(request)
+            self._policy.validate(command.spec)
+            with self._node_lock(command.spec.node_id):
+                result = self._media.execute(command)
+            return self._media_success_payload(command.operation, result)
+        except NodeSupervisorError as error:
+            return self._media_error_payload(str(error))
+        except Exception:
+            return self._media_error_payload("node_media_internal_error")
+
+    @staticmethod
+    def _is_media_request(request: bytes) -> bool:
+        try:
+            payload = json.loads(request)
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        return isinstance(payload, dict) and payload.get("request_type") == "media_path"
 
     def serve_forever(self, listener: socket.socket) -> None:
         capacity = BoundedSemaphore(self._max_workers)
@@ -1638,6 +1957,45 @@ class UnixNodeSupervisorServer:
             raise NodeSupervisorError("node_runtime_request_invalid") from error
 
     @staticmethod
+    def _decode_media_command(request: bytes) -> MediaPathCommand:
+        if not request or len(request) > _MAX_RUNTIME_MESSAGE_BYTES or not request.endswith(b"\n"):
+            raise NodeSupervisorError("node_media_request_invalid")
+        try:
+            payload = _MediaRequestPayload.model_validate_json(request)
+            if payload.schema_version != 1:
+                raise ValueError
+            spec = NodeRuntimeSpec(
+                node_id=payload.spec.node_id,
+                external_port=payload.spec.external_port,
+                api_port=payload.spec.api_port,
+                metrics_port=payload.spec.metrics_port,
+                desired_revision=payload.spec.desired_revision,
+                release_id=payload.spec.release_id,
+                mediamtx_binary_sha256=payload.spec.mediamtx_binary_sha256,
+            )
+            path: MediaPathConfig | PublicId | None = None
+            if payload.path is not None:
+                name = PublicId.parse(payload.path.name)
+                if payload.operation is MediaPathOperation.PUT:
+                    if payload.path.source_url is None:
+                        raise ValueError
+                    path = MediaPathConfig(
+                        name=name,
+                        source_url=validate_camera_source_url(payload.path.source_url),
+                    )
+                else:
+                    if payload.path.source_url is not None:
+                        raise ValueError
+                    path = name
+            return MediaPathCommand(
+                operation=payload.operation,
+                spec=spec,
+                path=path,
+            )
+        except (InvalidPublicId, ValidationError, ValueError) as error:
+            raise NodeSupervisorError("node_media_request_invalid") from error
+
+    @staticmethod
     def _success_payload(observation: NodeRuntimeObservation) -> dict[str, object]:
         return {
             "schema_version": 1,
@@ -1667,6 +2025,38 @@ class UnixNodeSupervisorServer:
             "schema_version": 1,
             "ok": False,
             "observation": None,
+            "error": error,
+        }
+
+    @staticmethod
+    def _media_success_payload(
+        operation: MediaPathOperation,
+        result: MediaPathConfig | MediaPathInventory | None,
+    ) -> dict[str, object]:
+        path = None
+        inventory = None
+        if operation is MediaPathOperation.GET and isinstance(result, MediaPathConfig):
+            path = {"name": str(result.name), "source_url": result.source_url}
+        if operation is MediaPathOperation.INVENTORY and isinstance(result, MediaPathInventory):
+            inventory = {
+                "camera_ids": [str(value) for value in result.camera_ids],
+                "no_oracle_matcher_present": result.no_oracle_matcher_present,
+            }
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "path": path,
+            "inventory": inventory,
+            "error": None,
+        }
+
+    @staticmethod
+    def _media_error_payload(error: str) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "path": None,
+            "inventory": None,
             "error": error,
         }
 
@@ -1762,28 +2152,30 @@ class NodeHelperSettings(BaseSettings):
 def run_node_runtime_helper() -> None:
     settings = NodeHelperSettings()  # type: ignore[call-arg]
     listener = _systemd_activation_listener()
+    config_store = SecureNodeConfigStore(
+        root=settings.config_root,
+        owner_uid=0,
+        binary_catalog={
+            (release_id, digest): binary
+            for release_id, digest, binary in (
+                (
+                    settings.release_id,
+                    settings.mediamtx_binary_sha256,
+                    settings.mediamtx_binary,
+                ),
+                (
+                    settings.previous_release_id,
+                    settings.previous_mediamtx_binary_sha256,
+                    settings.previous_mediamtx_binary,
+                ),
+            )
+            if release_id is not None and digest is not None and binary is not None
+        },
+    )
+    process = SystemdNodeProcessController(systemctl=settings.systemctl)
     supervisor = LinuxNodeSupervisor(
-        config_store=SecureNodeConfigStore(
-            root=settings.config_root,
-            owner_uid=0,
-            binary_catalog={
-                (release_id, digest): binary
-                for release_id, digest, binary in (
-                    (
-                        settings.release_id,
-                        settings.mediamtx_binary_sha256,
-                        settings.mediamtx_binary,
-                    ),
-                    (
-                        settings.previous_release_id,
-                        settings.previous_mediamtx_binary_sha256,
-                        settings.previous_mediamtx_binary,
-                    ),
-                )
-                if release_id is not None and digest is not None and binary is not None
-            },
-        ),
-        process=SystemdNodeProcessController(systemctl=settings.systemctl),
+        config_store=config_store,
+        process=process,
         smoke=MediaNodeSmokeProbe(timeout_seconds=settings.smoke_timeout_seconds),
         port_is_bindable=_loopback_and_wildcard_port_is_bindable,
         smoke_attempts=settings.smoke_attempts,
@@ -1792,6 +2184,11 @@ def run_node_runtime_helper() -> None:
     UnixNodeSupervisorServer(
         supervisor=supervisor,
         policy=settings.policy(),
+        media=RootMediaNodeAdapter(
+            config_store=config_store,
+            process=process,
+            timeout_seconds=settings.smoke_timeout_seconds,
+        ),
         request_timeout_seconds=settings.request_timeout_seconds,
         operation_timeout_seconds=settings.operation_timeout_seconds,
         cleanup_reserve_seconds=settings.cleanup_reserve_seconds,

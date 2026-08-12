@@ -113,6 +113,7 @@ class CameraPlacement:
     node_id: UUID
     node_port: int
     placement_mode: PlacementMode
+    placement_generation: int = 1
     desired_revision: int = 1
     applied_revision: int = 0
 
@@ -205,6 +206,10 @@ class InvalidCameraSource(ValueError):
     """A camera source endpoint is invalid or contains an unencrypted secret."""
 
 
+class CameraNotFound(LookupError):
+    """A requested camera does not exist."""
+
+
 class InMemoryNodeStore:
     """Thread-safe development adapter for the future PostgreSQL node store."""
 
@@ -226,6 +231,11 @@ class InMemoryNodeStore:
             if node_lock is None:
                 raise NodeNotFound("node_not_found")
         with node_lock:
+            yield
+
+    @contextmanager
+    def reconcile_guard(self, node_id: UUID) -> Iterator[None]:
+        with self.lifecycle_guard(node_id):
             yield
 
     def register_automatically(
@@ -523,6 +533,64 @@ class InMemoryNodeStore:
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         with self._lock:
             return tuple(self._cameras)
+
+    def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
+        with self._lock:
+            if not any(node.id == node_id for node in self._nodes):
+                raise NodeNotFound("node_not_found")
+            return tuple(camera for camera in self._cameras if camera.node_id == node_id)
+
+    def update_camera(
+        self,
+        camera_id: UUID,
+        *,
+        name: str,
+        source_url: str,
+    ) -> CameraPlacement:
+        source_url = validate_camera_source_url(source_url)
+        with self._lock:
+            camera = next(
+                (candidate for candidate in self._cameras if candidate.id == camera_id),
+                None,
+            )
+            if camera is None:
+                raise CameraNotFound("camera_not_found")
+            if camera.name == name and camera.source_url == source_url:
+                return camera
+            updated = replace(
+                camera,
+                name=name,
+                source_url=source_url,
+                desired_revision=camera.desired_revision + 1,
+            )
+            self._cameras[self._cameras.index(camera)] = updated
+            return updated
+
+    def mark_camera_applied(
+        self,
+        *,
+        camera_id: UUID,
+        node_id: UUID,
+        placement_generation: int,
+        desired_revision: int,
+    ) -> bool:
+        with self._lock:
+            camera = next(
+                (candidate for candidate in self._cameras if candidate.id == camera_id),
+                None,
+            )
+            if (
+                camera is None
+                or camera.node_id != node_id
+                or camera.placement_generation != placement_generation
+                or camera.desired_revision != desired_revision
+            ):
+                return False
+            self._cameras[self._cameras.index(camera)] = replace(
+                camera,
+                applied_revision=desired_revision,
+            )
+            return True
 
 
 class NodeControl:
@@ -841,6 +909,19 @@ class CameraControl:
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         return self._store.list_cameras()
 
+    def update_camera(
+        self,
+        camera_id: UUID,
+        *,
+        name: str,
+        source_url: str,
+    ) -> CameraPlacement:
+        return self._store.update_camera(
+            camera_id,
+            name=name,
+            source_url=source_url,
+        )
+
 
 class NodeStore(Protocol):
     def provisioning_guard(self) -> AbstractContextManager[None]: ...
@@ -912,6 +993,31 @@ class CameraStore(Protocol):
     ) -> CameraPlacement: ...
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]: ...
+
+    def update_camera(
+        self,
+        camera_id: UUID,
+        *,
+        name: str,
+        source_url: str,
+    ) -> CameraPlacement: ...
+
+
+class ReconcileStore(Protocol):
+    def reconcile_guard(self, node_id: UUID) -> AbstractContextManager[None]: ...
+
+    def get_node(self, node_id: UUID) -> MediaNode | None: ...
+
+    def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]: ...
+
+    def mark_camera_applied(
+        self,
+        *,
+        camera_id: UUID,
+        node_id: UUID,
+        placement_generation: int,
+        desired_revision: int,
+    ) -> bool: ...
 
 
 def tcp_port_is_bindable(port: int) -> bool:
