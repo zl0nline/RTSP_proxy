@@ -377,6 +377,7 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
 def _port_is_bindable(port: int) -> bool:
     try:
         with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", port))
     except OSError:
         return False
