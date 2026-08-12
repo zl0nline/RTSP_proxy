@@ -56,6 +56,8 @@ from rtsp_proxy.nodes import (
     NodeManagementPortRangeExhausted,
     NodeNotEmpty,
     NodeNotFound,
+    NodePortChange,
+    NodePortChangeState,
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
@@ -65,6 +67,7 @@ from rtsp_proxy.nodes import (
     PlacementMode,
     PortBindable,
     PortChoice,
+    camera_placement_fingerprint,
     is_node_eligible,
     select_port_with_bounded_recheck,
     validate_camera_source_url,
@@ -194,7 +197,6 @@ camera_placement_history = Table(
     Column(
         "node_id",
         Uuid(as_uuid=True),
-        ForeignKey("media_nodes.id", ondelete="RESTRICT"),
         nullable=False,
     ),
     Column("placement_mode", String(16), nullable=False),
@@ -222,13 +224,11 @@ camera_move_sagas = Table(
     Column(
         "source_node_id",
         Uuid(as_uuid=True),
-        ForeignKey("media_nodes.id", ondelete="RESTRICT"),
         nullable=False,
     ),
     Column(
         "target_node_id",
         Uuid(as_uuid=True),
-        ForeignKey("media_nodes.id", ondelete="RESTRICT"),
         nullable=False,
     ),
     Column("source_generation", BigInteger, nullable=False),
@@ -252,6 +252,40 @@ camera_move_sagas = Table(
     CheckConstraint("target_generation = source_generation + 1"),
     CheckConstraint("desired_revision >= 2"),
     CheckConstraint("state IN ('prepare_target', 'cleanup_source', 'complete')"),
+)
+
+node_port_change_sagas = Table(
+    "node_port_change_sagas",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column(
+        "node_id",
+        Uuid(as_uuid=True),
+        nullable=False,
+        index=True,
+    ),
+    Column("old_port", Integer, nullable=False),
+    Column("new_port", Integer, nullable=False),
+    Column("source_revision", BigInteger, nullable=False),
+    Column("target_revision", BigInteger, nullable=False),
+    Column("registered_cameras", Integer, nullable=False),
+    Column("blast_radius_sha256", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    ),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint("old_port BETWEEN 1 AND 65535"),
+    CheckConstraint("new_port BETWEEN 1 AND 65535"),
+    CheckConstraint("old_port <> new_port"),
+    CheckConstraint("source_revision >= 1"),
+    CheckConstraint("target_revision = source_revision + 1"),
+    CheckConstraint("registered_cameras BETWEEN 0 AND 100"),
+    CheckConstraint("blast_radius_sha256 ~ '^[0-9a-f]{64}$'"),
+    CheckConstraint("state IN ('prepared', 'complete', 'aborted')"),
 )
 
 audit_events = Table(
@@ -449,6 +483,13 @@ class PostgresNodeStore:
             if node_count is None or node_count >= max_nodes:
                 raise MaximumNodesReached("max_nodes_reached")
             occupied = set(connection.scalars(select(media_nodes.c.external_port)))
+            occupied.update(
+                connection.scalars(
+                    select(node_port_change_sagas.c.new_port).where(
+                        node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value
+                    )
+                )
+            )
             if preferred_port is not None and preferred_port in occupied:
                 raise NodePortInUse("node_port_in_use")
             available = tuple(port for port in allowed_ports if port not in occupied)
@@ -670,6 +711,408 @@ class PostgresNodeStore:
             )
             return _media_node(row)
 
+    def request_administrative_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+    ) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            current = (
+                connection.execute(
+                    select(media_nodes).where(media_nodes.c.id == node_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            allowed = {
+                NodeState.DRAINING: {NodeState.RUNNING},
+                NodeState.MAINTENANCE: {NodeState.DRAINING},
+                NodeState.RUNNING: {NodeState.DRAINING, NodeState.MAINTENANCE},
+            }
+            if state not in allowed or node.state not in allowed[state]:
+                if node.state is state:
+                    return node
+                raise NodeLifecycleConflict("node_administrative_transition_invalid")
+            desired_revision = node.desired_revision + 1
+            row = (
+                connection.execute(
+                    update(media_nodes)
+                    .where(media_nodes.c.id == node_id)
+                    .values(
+                        state=state.value,
+                        maintenance=state is NodeState.MAINTENANCE,
+                        desired_revision=desired_revision,
+                        applied_revision=desired_revision,
+                    )
+                    .returning(*media_nodes.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.administrative_state_changed",
+                payload={
+                    "previous_state": node.state.value,
+                    "state": state.value,
+                    "desired_revision": desired_revision,
+                },
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def begin_port_change(
+        self,
+        *,
+        change_id: UUID,
+        node_id: UUID,
+        new_port: int,
+        allowed_ports: Collection[int],
+        expected_revision: int,
+        expected_registered_cameras: int,
+        expected_blast_radius_sha256: str,
+    ) -> NodePortChange:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _NODE_REGISTRY_LOCK_KEY},
+            )
+            self._lock_placements(connection)
+            current = (
+                connection.execute(
+                    select(media_nodes).where(media_nodes.c.id == node_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            if new_port not in allowed_ports:
+                raise NodePortOutOfRange("node_port_out_of_range")
+            if node.state is not NodeState.RUNNING or node.runtime_state is not NodeState.RUNNING:
+                raise NodeLifecycleConflict("node_not_running")
+            if node.desired_revision != expected_revision:
+                raise NodeLifecycleConflict("node_revision_conflict")
+            placements = tuple(
+                (
+                    _uuid(row["camera_id"]),
+                    int(row["generation"]),
+                )
+                for row in connection.execute(
+                    select(
+                        camera_placements.c.camera_id,
+                        camera_placements.c.generation,
+                    ).where(camera_placements.c.node_id == node_id)
+                ).mappings()
+            )
+            blast_radius_sha256 = camera_placement_fingerprint(placements)
+            if (
+                node.registered_cameras != expected_registered_cameras
+                or len(placements) != expected_registered_cameras
+                or blast_radius_sha256 != expected_blast_radius_sha256
+            ):
+                raise NodeLifecycleConflict("node_blast_radius_changed")
+            if node.external_port == new_port:
+                raise NodeLifecycleConflict("node_port_unchanged")
+            reserved = connection.scalar(
+                select(func.count())
+                .select_from(media_nodes)
+                .where(
+                    media_nodes.c.external_port == new_port,
+                    media_nodes.c.id != node_id,
+                )
+            ) or connection.scalar(
+                select(func.count())
+                .select_from(node_port_change_sagas)
+                .where(
+                    node_port_change_sagas.c.new_port == new_port,
+                    node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value,
+                )
+            )
+            if reserved:
+                raise NodePortInUse("node_port_in_use")
+            active = connection.scalar(
+                select(func.count())
+                .select_from(node_port_change_sagas)
+                .where(
+                    node_port_change_sagas.c.node_id == node_id,
+                    node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value,
+                )
+            )
+            active_moves = connection.scalar(
+                select(func.count())
+                .select_from(camera_move_sagas)
+                .where(
+                    (
+                        (camera_move_sagas.c.source_node_id == node_id)
+                        | (camera_move_sagas.c.target_node_id == node_id)
+                    ),
+                    camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                )
+            )
+            if active or active_moves:
+                raise NodeLifecycleConflict("node_operation_in_progress")
+            row = (
+                connection.execute(
+                    insert(node_port_change_sagas)
+                    .values(
+                        id=change_id,
+                        node_id=node_id,
+                        old_port=node.external_port,
+                        new_port=new_port,
+                        source_revision=node.desired_revision,
+                        target_revision=node.desired_revision + 1,
+                        registered_cameras=expected_registered_cameras,
+                        blast_radius_sha256=expected_blast_radius_sha256,
+                        state=NodePortChangeState.PREPARED.value,
+                    )
+                    .returning(*node_port_change_sagas.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.port_change_prepared",
+                payload={
+                    "change_id": str(change_id),
+                    "blast_radius_sha256": expected_blast_radius_sha256,
+                    "old_port": node.external_port,
+                    "new_port": new_port,
+                    "registered_cameras": expected_registered_cameras,
+                    "target_revision": node.desired_revision + 1,
+                },
+                aggregate_revision=node.desired_revision + 1,
+            )
+            return _node_port_change(row)
+
+    def list_incomplete_port_changes(self) -> tuple[NodePortChange, ...]:
+        with self._engine.connect() as connection:
+            return tuple(
+                _node_port_change(row)
+                for row in connection.execute(
+                    select(node_port_change_sagas)
+                    .where(node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value)
+                    .order_by(node_port_change_sagas.c.created_at)
+                ).mappings()
+            )
+
+    def complete_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode:
+        return self._finish_port_change(change_id, observation, complete=True)
+
+    def abort_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode:
+        return self._finish_port_change(change_id, observation, complete=False)
+
+    def _finish_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+        *,
+        complete: bool,
+    ) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _NODE_REGISTRY_LOCK_KEY},
+            )
+            change_row = (
+                connection.execute(
+                    select(node_port_change_sagas)
+                    .where(node_port_change_sagas.c.id == change_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if change_row is None:
+                raise NodeNotFound("node_port_change_not_found")
+            change = _node_port_change(change_row)
+            node_row = (
+                connection.execute(
+                    select(media_nodes).where(media_nodes.c.id == change.node_id).with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            node = _media_node(node_row)
+            expected_state = (
+                NodePortChangeState.COMPLETE if complete else NodePortChangeState.ABORTED
+            )
+            if change.state is expected_state:
+                return node
+            if change.state is not NodePortChangeState.PREPARED:
+                raise NodeLifecycleConflict("node_port_change_not_prepared")
+            provisional = replace(
+                node,
+                external_port=change.new_port if complete else change.old_port,
+                desired_revision=(change.target_revision if complete else change.source_revision),
+            )
+            validate_runtime_observation(provisional, observation)
+            values = {
+                "state": provisional.state.value,
+                "external_port": provisional.external_port,
+                "desired_revision": provisional.desired_revision,
+                "runtime_state": observation.state.value,
+                "health": observation.health.value,
+                "management_fresh": observation.management_fresh,
+                "management_observed_at": (
+                    func.clock_timestamp() if observation.management_fresh else None
+                ),
+                "runtime_observed_at": func.clock_timestamp(),
+                "config_compatible": observation.config_compatible,
+                "applied_revision": observation.applied_revision,
+                "process_id": observation.process_id,
+                "process_start_ticks": observation.process_start_ticks,
+                "process_boot_id": observation.process_boot_id,
+                "observed_config_sha256": observation.config_sha256,
+                "observed_release_id": observation.release_id,
+            }
+            node_result = (
+                connection.execute(
+                    update(media_nodes)
+                    .where(media_nodes.c.id == node.id)
+                    .values(**values)
+                    .returning(*media_nodes.c)
+                )
+                .mappings()
+                .one()
+            )
+            connection.execute(
+                update(node_port_change_sagas)
+                .where(node_port_change_sagas.c.id == change_id)
+                .values(
+                    state=expected_state.value,
+                    completed_at=func.clock_timestamp(),
+                )
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node.id,
+                event_type=(
+                    "media_node.port_changed" if complete else "media_node.port_change_aborted"
+                ),
+                payload={
+                    "change_id": str(change.id),
+                    "old_port": change.old_port,
+                    "new_port": change.new_port,
+                },
+                aggregate_revision=(change.target_revision if complete else change.source_revision),
+            )
+            return _media_node(node_result)
+
+    def request_node_delete(self, node_id: UUID) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            current = (
+                connection.execute(
+                    select(media_nodes).where(media_nodes.c.id == node_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
+            if node.state not in {NodeState.STOPPED, NodeState.FAILED, NodeState.DELETING}:
+                raise NodeLifecycleConflict("node_delete_requires_stopped_or_failed")
+            active_move = connection.scalar(
+                select(func.count())
+                .select_from(camera_move_sagas)
+                .where(
+                    (
+                        (camera_move_sagas.c.source_node_id == node_id)
+                        | (camera_move_sagas.c.target_node_id == node_id)
+                    ),
+                    camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                )
+            )
+            active_port = connection.scalar(
+                select(func.count())
+                .select_from(node_port_change_sagas)
+                .where(
+                    node_port_change_sagas.c.node_id == node_id,
+                    node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value,
+                )
+            )
+            if active_move or active_port:
+                raise NodeLifecycleConflict("node_operation_in_progress")
+            if node.state is NodeState.DELETING:
+                return node
+            desired_revision = node.desired_revision + 1
+            row = (
+                connection.execute(
+                    update(media_nodes)
+                    .where(media_nodes.c.id == node_id)
+                    .values(
+                        state=NodeState.DELETING.value,
+                        desired_revision=desired_revision,
+                        management_fresh=False,
+                        management_observed_at=None,
+                    )
+                    .returning(*media_nodes.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.delete_requested",
+                payload={"desired_revision": desired_revision},
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def finalize_node_delete(self, node_id: UUID) -> None:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            current = (
+                connection.execute(
+                    select(media_nodes).where(media_nodes.c.id == node_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                return
+            node = _media_node(current)
+            if node.state is not NodeState.DELETING or node.registered_cameras:
+                raise NodeLifecycleConflict("node_delete_not_ready")
+            current_placements = connection.scalar(
+                select(func.count())
+                .select_from(camera_placements)
+                .where(camera_placements.c.node_id == node_id)
+            )
+            if current_placements:
+                raise NodeNotEmpty("node_not_empty")
+            connection.execute(delete(media_nodes).where(media_nodes.c.id == node_id))
+
     def request_stop(self, node_id: UUID) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -695,6 +1138,7 @@ class PostgresNodeStore:
                     .where(media_nodes.c.id == node_id)
                     .values(
                         state=NodeState.STOPPED.value,
+                        maintenance=False,
                         desired_revision=desired_revision,
                     )
                     .returning(*media_nodes.c)
@@ -839,6 +1283,7 @@ class PostgresNodeStore:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
+            self._lock_placements(connection)
             selected = (
                 connection.execute(
                     select(media_nodes)
@@ -853,6 +1298,12 @@ class PostgresNodeStore:
                         media_nodes.c.applied_revision == media_nodes.c.desired_revision,
                         media_nodes.c.maintenance.is_(False),
                         media_nodes.c.registered_cameras < media_nodes.c.camera_capacity,
+                        media_nodes.c.id.not_in(
+                            select(node_port_change_sagas.c.node_id).where(
+                                node_port_change_sagas.c.state
+                                == NodePortChangeState.PREPARED.value
+                            )
+                        ),
                     )
                     .order_by(
                         media_nodes.c.registered_cameras,
@@ -905,6 +1356,8 @@ class PostgresNodeStore:
             node = _media_node(selected)
             if node.registered_cameras >= node.camera_capacity:
                 raise NodeCameraCapacityReached("node_camera_capacity_reached")
+            if self._has_active_port_change(connection, node_id):
+                raise EligibleNodeMissing("manual_node_ineligible")
             database_now = connection.scalar(select(func.clock_timestamp()))
             if database_now is None or not is_node_eligible(
                 node,
@@ -1012,6 +1465,7 @@ class PostgresNodeStore:
         source_url = validate_camera_source_url(source_url)
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
+            self._lock_placements(connection)
             current = (
                 connection.execute(
                     self._camera_query()
@@ -1029,6 +1483,7 @@ class PostgresNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             self._require_no_active_camera_move(connection, camera_id)
+            self._require_no_active_port_change(connection, camera.node_id)
             if camera.name == name and camera.source_url == source_url:
                 return camera
             desired_revision = camera.desired_revision + 1
@@ -1076,6 +1531,7 @@ class PostgresNodeStore:
     ) -> CameraPlacement:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
+            self._lock_placements(connection)
             current = (
                 connection.execute(
                     self._camera_query()
@@ -1093,6 +1549,7 @@ class PostgresNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             self._require_no_active_camera_move(connection, camera_id)
+            self._require_no_active_port_change(connection, camera.node_id)
             target = CameraState.ENABLED if enabled else CameraState.DISABLED
             if camera.state is target:
                 return camera
@@ -1128,6 +1585,7 @@ class PostgresNodeStore:
     def request_camera_delete(self, camera_id: UUID) -> CameraPlacement:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
+            self._lock_placements(connection)
             current = (
                 connection.execute(
                     self._camera_query()
@@ -1145,6 +1603,7 @@ class PostgresNodeStore:
             if camera.state is CameraState.DELETING:
                 return camera
             self._require_no_active_camera_move(connection, camera_id)
+            self._require_no_active_port_change(connection, camera.node_id)
             desired_revision = camera.desired_revision + 1
             connection.execute(
                 update(cameras)
@@ -1213,6 +1672,8 @@ class PostgresNodeStore:
             if target_row is None:
                 raise NodeNotFound("node_not_found")
             target = _media_node(target_row)
+            self._require_no_active_port_change(connection, camera.node_id)
+            self._require_no_active_port_change(connection, target.id)
             database_now = connection.scalar(select(func.clock_timestamp()))
             if database_now is None or not is_node_eligible(target, now=database_now):
                 raise EligibleNodeMissing("manual_node_ineligible")
@@ -1331,6 +1792,8 @@ class PostgresNodeStore:
             database_now = connection.scalar(select(func.clock_timestamp()))
             if source is None or target is None:
                 raise CameraLifecycleConflict("camera_move_node_missing")
+            self._require_no_active_port_change(connection, source.id)
+            self._require_no_active_port_change(connection, target.id)
             if (
                 camera.node_id != move.source_node_id
                 or camera.placement_generation != move.source_generation
@@ -1442,6 +1905,29 @@ class PostgresNodeStore:
         )
         if active_move:
             raise CameraLifecycleConflict("camera_move_in_progress")
+
+    @staticmethod
+    def _require_no_active_port_change(
+        connection: Connection,
+        node_id: UUID,
+    ) -> None:
+        if PostgresNodeStore._has_active_port_change(connection, node_id):
+            raise CameraLifecycleConflict("node_port_change_in_progress")
+
+    @staticmethod
+    def _has_active_port_change(
+        connection: Connection,
+        node_id: UUID,
+    ) -> bool:
+        active_change = connection.scalar(
+            select(func.count())
+            .select_from(node_port_change_sagas)
+            .where(
+                node_port_change_sagas.c.node_id == node_id,
+                node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value,
+            )
+        )
+        return bool(active_change)
 
     def mark_camera_applied(
         self,
@@ -1694,6 +2180,20 @@ def _camera_move_with_camera(row: RowMapping, camera: CameraPlacement) -> Camera
         desired_revision=int(row["desired_revision"]),
         force=bool(row["force"]),
         state=CameraMoveState(str(row["state"])),
+    )
+
+
+def _node_port_change(row: RowMapping) -> NodePortChange:
+    return NodePortChange(
+        id=_uuid(row["id"]),
+        node_id=_uuid(row["node_id"]),
+        old_port=int(row["old_port"]),
+        new_port=int(row["new_port"]),
+        source_revision=int(row["source_revision"]),
+        target_revision=int(row["target_revision"]),
+        registered_cameras=int(row["registered_cameras"]),
+        blast_radius_sha256=str(row["blast_radius_sha256"]),
+        state=NodePortChangeState(str(row["state"])),
     )
 
 

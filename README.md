@@ -211,8 +211,16 @@ release, поэтому переключение `/opt/rtsp-proxy/current` не 
 convergence другой: startup reconciliation выполняется bounded-параллельно,
 а PostgreSQL lifecycle locks имеют отдельный ограниченный pool и timeout.
 
-Ещё не реализованы reconciler/move/drain, dashboard, one-reader admission,
-access policies, notifications и complete operations workflows.
+Phase D **code complete, review pending**: node-scoped reconciler and camera
+CRUD, occupancy observation, revision-fenced move saga, drain/maintenance,
+blast-radius-confirmed port change with crash recovery, and empty-node deletion
+are implemented. A prepared port change freezes the exact camera placement set
+and reserves both ports; failed/restarted operations converge to the old port.
+Phase E will add the admission half of drain plus internet/local ACL,
+credentials and exact one-reader RTSP `453` behavior.
+
+Ещё не реализованы dashboard, one-reader admission, access policies,
+notifications и complete operations workflows.
 Наличие load harness не означает готовый product или published capacity.
 
 ## Локальная разработка

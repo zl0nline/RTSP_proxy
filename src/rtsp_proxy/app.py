@@ -21,6 +21,7 @@ from rtsp_proxy.nodes import (
     MaximumNodesReached,
     NodeCameraCapacityReached,
     NodeControl,
+    NodeDisruptionConfirmationRequired,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
@@ -32,6 +33,7 @@ from rtsp_proxy.nodes import (
     NodeReleaseConflict,
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
+    NodeState,
 )
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
@@ -88,6 +90,21 @@ class NodeResponse(BaseModel):
 class NodeReleaseRequest(BaseModel):
     release_id: str = Field(min_length=1, max_length=128)
     mediamtx_binary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class NodePortChangeRequest(BaseModel):
+    new_port: int = Field(ge=1, le=65535)
+    confirmation_token: str | None = Field(default=None, max_length=4096)
+
+
+class NodePortChangePreviewResponse(BaseModel):
+    node_id: str
+    old_port: int
+    new_port: int
+    desired_revision: int
+    registered_cameras: int
+    blast_radius_sha256: str
+    confirmation_token: str
 
 
 class NodeListResponse(BaseModel):
@@ -504,6 +521,192 @@ def create_app(
             ) from None
         return _node_response(node)
 
+    def set_node_administrative_state(
+        node_id: UUID,
+        state: NodeState,
+    ) -> NodeResponse:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        try:
+            return _node_response(node_control.set_administrative_state(node_id, state))
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+
+    @app.post("/api/v1/nodes/{node_id}/drain", response_model=NodeResponse)
+    def drain_node(node_id: UUID) -> NodeResponse:
+        return set_node_administrative_state(node_id, NodeState.DRAINING)
+
+    @app.post("/api/v1/nodes/{node_id}/maintenance", response_model=NodeResponse)
+    def maintain_node(node_id: UUID) -> NodeResponse:
+        return set_node_administrative_state(node_id, NodeState.MAINTENANCE)
+
+    @app.post("/api/v1/nodes/{node_id}/resume", response_model=NodeResponse)
+    def resume_node(node_id: UUID) -> NodeResponse:
+        return set_node_administrative_state(node_id, NodeState.RUNNING)
+
+    @app.post(
+        "/api/v1/nodes/{node_id}/port-change/preview",
+        response_model=NodePortChangePreviewResponse,
+    )
+    def preview_node_port_change(
+        node_id: UUID,
+        request: NodePortChangeRequest,
+    ) -> NodePortChangePreviewResponse:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        try:
+            preview = node_control.preview_port_change(
+                node_id,
+                new_port=request.new_port,
+                allowed_ports=_allowed_node_ports(settings),
+            )
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodePortOutOfRange:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "node_port_out_of_range"},
+            ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        except NodeRuntimeUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_confirmation_unavailable"},
+            ) from None
+        return NodePortChangePreviewResponse(
+            node_id=str(preview.node_id),
+            old_port=preview.old_port,
+            new_port=preview.new_port,
+            desired_revision=preview.desired_revision,
+            registered_cameras=preview.registered_cameras,
+            blast_radius_sha256=preview.blast_radius_sha256,
+            confirmation_token=preview.confirmation_token,
+        )
+
+    @app.post(
+        "/api/v1/nodes/{node_id}/port-change",
+        response_model=NodeResponse,
+    )
+    def change_node_port(
+        node_id: UUID,
+        request: NodePortChangeRequest,
+    ) -> NodeResponse:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        try:
+            return _node_response(
+                node_control.change_port(
+                    node_id,
+                    new_port=request.new_port,
+                    allowed_ports=_allowed_node_ports(settings),
+                    confirmation_token=request.confirmation_token,
+                )
+            )
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
+        except NodePortOutOfRange:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "node_port_out_of_range"},
+            ) from None
+        except NodePortInUse:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "node_port_in_use"},
+            ) from None
+        except NodeDisruptionConfirmationRequired:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "node_disruption_confirmation_required"},
+            ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        except NodeRuntimeUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_runtime_unavailable"},
+            ) from None
+        except NodeRuntimeFailed as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": error.code, "node_id": str(error.node_id)},
+            ) from None
+
+    @app.delete(
+        "/api/v1/nodes/{node_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def delete_node(node_id: UUID) -> Response:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        try:
+            node_control.delete_node(node_id)
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
+        except NodeNotEmpty:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "node_not_empty"},
+            ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        except NodeRuntimeUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_runtime_unavailable"},
+            ) from None
+        except NodeRuntimeFailed as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": error.code, "node_id": str(error.node_id)},
+            ) from None
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.post("/api/v1/cameras", response_model=CameraResponse, status_code=201)
     def create_camera(request: CameraCreateRequest) -> CameraResponse:
         if camera_control is None:
@@ -876,4 +1079,13 @@ def _camera_move_response(move: CameraMove) -> CameraMoveResponse:
         desired_revision=move.desired_revision,
         force=move.force,
         state=move.state.value,
+    )
+
+
+def _allowed_node_ports(settings: Settings) -> tuple[int, ...]:
+    reserved = set(settings.node_port_reserved)
+    return tuple(
+        port
+        for port in range(settings.node_port_range_start, settings.node_port_range_end + 1)
+        if port not in reserved
     )

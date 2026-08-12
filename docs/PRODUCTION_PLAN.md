@@ -762,13 +762,25 @@ identity or silently remaps ports.
 
 ### Phase D — camera reconciler and move
 
-- node-aware MediaMTX client factory;
-- per-node writer lock/inventory/reconcile;
-- camera CRUD targeted path updates;
-- occupancy observation;
-- drain/maintenance;
-- move saga and forced confirmation;
-- port-change rollback and delete-empty.
+- [x] node-aware MediaMTX client factory;
+- [x] per-node writer lock/inventory/reconcile;
+- [x] camera CRUD targeted path updates;
+- [x] occupancy observation;
+- [x] drain/maintenance placement fencing; new-session admission follows in
+  Phase E;
+- [x] move saga and forced confirmation;
+- [x] port-change rollback/recovery and delete-empty;
+- [x] port-change confirmation bound to desired revision, camera count and
+  exact `camera_id:placement_generation` SHA-256; the persisted saga rechecks
+  that blast radius under the placement lock and fences camera mutations.
+
+Status: **code complete, review/native CI pending**. Ordinary camera CRUD never
+restarts a node. Port change is intentionally disruptive only to that node,
+retains its credentials, waits for the old listener to disappear, and commits
+the new endpoint only after runtime evidence. Crash recovery rolls an
+incomplete saga back to its old port. Delete stops the exact empty node,
+verifies listener teardown and removes only its owned config directory before
+the registry row and port are released.
 
 Exit: contract tests prove CRUD isolation, crash convergence and exact blast
 radius.

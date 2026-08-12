@@ -154,6 +154,11 @@ intent, drain and remove those old node records, apply the migration, then
 recreate nodes through the Phase-C create/provision workflow. Do not patch in
 placeholder digests or arbitrary ports.
 
+`0008_node_administration` adds durable port-change sagas and removes only the
+node foreign keys from append-only placement/move history. Historical UUIDs
+remain immutable evidence after an empty stopped node is deleted; current
+placements still prevent deletion.
+
 Activation atomically switches `current`, reloads systemd and updates control
 roles. The helper allowlist contains the verified current pin and, only during
 rollout, one verified previous pin, so old instances remain observable and

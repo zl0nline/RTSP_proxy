@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import socket
+import time
 from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from threading import Lock, RLock
 from typing import Protocol
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from rtsp_proxy.identifiers import PublicId
 
@@ -39,6 +41,8 @@ class NodeRuntimeAction(StrEnum):
     START = "start"
     STOP = "stop"
     RESTART = "restart"
+    RECONFIGURE_RESTART = "reconfigure_restart"
+    DELETE = "delete"
     OBSERVE = "observe"
 
 
@@ -130,6 +134,36 @@ class CameraMove:
     desired_revision: int
     force: bool
     state: CameraMoveState = CameraMoveState.PREPARE_TARGET
+
+
+class NodePortChangeState(StrEnum):
+    PREPARED = "prepared"
+    COMPLETE = "complete"
+    ABORTED = "aborted"
+
+
+@dataclass(frozen=True, slots=True)
+class NodePortChange:
+    id: UUID
+    node_id: UUID
+    old_port: int
+    new_port: int
+    source_revision: int
+    target_revision: int
+    registered_cameras: int
+    blast_radius_sha256: str
+    state: NodePortChangeState = NodePortChangeState.PREPARED
+
+
+@dataclass(frozen=True, slots=True)
+class NodePortChangePreview:
+    node_id: UUID
+    old_port: int
+    new_port: int
+    desired_revision: int
+    registered_cameras: int
+    blast_radius_sha256: str
+    confirmation_token: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +277,35 @@ class CameraLifecycleConflict(RuntimeError):
     """The camera command conflicts with its desired lifecycle state."""
 
 
+class NodeDisruptionConfirmations(Protocol):
+    def issue_node_port_change(
+        self,
+        *,
+        node_id: UUID,
+        old_port: int,
+        new_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+    ) -> str: ...
+
+    def verify_node_port_change(
+        self,
+        token: str,
+        *,
+        node_id: UUID,
+        old_port: int,
+        new_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+    ) -> bool: ...
+
+
+class NodeDisruptionConfirmationRequired(RuntimeError):
+    """A disruptive node operation lacks an exact current confirmation."""
+
+
 class InMemoryNodeStore:
     """Thread-safe development adapter for the future PostgreSQL node store."""
 
@@ -250,6 +313,7 @@ class InMemoryNodeStore:
         self._nodes: list[MediaNode] = list(nodes)
         self._cameras: list[CameraPlacement] = []
         self._camera_moves: list[CameraMove] = []
+        self._port_changes: list[NodePortChange] = []
         self._lock = RLock()
         self._lifecycle_locks = {node.id: Lock() for node in nodes}
 
@@ -294,6 +358,11 @@ class InMemoryNodeStore:
             if len(self._nodes) >= max_nodes:
                 raise MaximumNodesReached("max_nodes_reached")
             occupied = {node.external_port for node in self._nodes}
+            occupied.update(
+                change.new_port
+                for change in self._port_changes
+                if change.state is NodePortChangeState.PREPARED
+            )
             if preferred_port is not None and preferred_port in occupied:
                 raise NodePortInUse("node_port_in_use")
             available = tuple(port for port in allowed_ports if port not in occupied)
@@ -403,6 +472,242 @@ class InMemoryNodeStore:
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
+    def request_administrative_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+    ) -> MediaNode:
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            allowed = {
+                NodeState.DRAINING: {NodeState.RUNNING},
+                NodeState.MAINTENANCE: {NodeState.DRAINING},
+                NodeState.RUNNING: {NodeState.DRAINING, NodeState.MAINTENANCE},
+            }
+            if state not in allowed or node.state not in allowed[state]:
+                if node.state is state:
+                    return node
+                raise NodeLifecycleConflict("node_administrative_transition_invalid")
+            desired_revision = node.desired_revision + 1
+            updated = replace(
+                node,
+                state=state,
+                maintenance=state is NodeState.MAINTENANCE,
+                desired_revision=desired_revision,
+                applied_revision=desired_revision,
+            )
+            self._nodes[self._nodes.index(node)] = updated
+            return updated
+
+    def begin_port_change(
+        self,
+        *,
+        change_id: UUID,
+        node_id: UUID,
+        new_port: int,
+        allowed_ports: Collection[int],
+        expected_revision: int,
+        expected_registered_cameras: int,
+        expected_blast_radius_sha256: str,
+    ) -> NodePortChange:
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if new_port not in allowed_ports:
+                raise NodePortOutOfRange("node_port_out_of_range")
+            if node.state is not NodeState.RUNNING or node.runtime_state is not NodeState.RUNNING:
+                raise NodeLifecycleConflict("node_not_running")
+            if node.desired_revision != expected_revision:
+                raise NodeLifecycleConflict("node_revision_conflict")
+            cameras = tuple(
+                camera
+                for camera in self._cameras
+                if camera.node_id == node_id and camera.state is not CameraState.DELETED
+            )
+            blast_radius_sha256 = camera_placement_fingerprint(
+                tuple((camera.id, camera.placement_generation) for camera in cameras)
+            )
+            if (
+                node.registered_cameras != expected_registered_cameras
+                or len(cameras) != expected_registered_cameras
+                or blast_radius_sha256 != expected_blast_radius_sha256
+            ):
+                raise NodeLifecycleConflict("node_blast_radius_changed")
+            if node.external_port == new_port:
+                raise NodeLifecycleConflict("node_port_unchanged")
+            if any(
+                candidate.external_port == new_port and candidate.id != node_id
+                for candidate in self._nodes
+            ) or any(
+                change.new_port == new_port and change.state is NodePortChangeState.PREPARED
+                for change in self._port_changes
+            ):
+                raise NodePortInUse("node_port_in_use")
+            if any(
+                change.node_id == node_id and change.state is NodePortChangeState.PREPARED
+                for change in self._port_changes
+            ):
+                raise NodeLifecycleConflict("node_port_change_in_progress")
+            if self.list_node_active_moves(node_id):
+                raise NodeLifecycleConflict("node_camera_move_in_progress")
+            change = NodePortChange(
+                id=change_id,
+                node_id=node_id,
+                old_port=node.external_port,
+                new_port=new_port,
+                source_revision=node.desired_revision,
+                target_revision=node.desired_revision + 1,
+                registered_cameras=expected_registered_cameras,
+                blast_radius_sha256=expected_blast_radius_sha256,
+            )
+            self._port_changes.append(change)
+            return change
+
+    def list_incomplete_port_changes(self) -> tuple[NodePortChange, ...]:
+        with self._lock:
+            return tuple(
+                change
+                for change in self._port_changes
+                if change.state is NodePortChangeState.PREPARED
+            )
+
+    def complete_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode:
+        with self._lock:
+            change = next(
+                (candidate for candidate in self._port_changes if candidate.id == change_id),
+                None,
+            )
+            if change is None:
+                raise NodeNotFound("node_port_change_not_found")
+            node = next(candidate for candidate in self._nodes if candidate.id == change.node_id)
+            if change.state is NodePortChangeState.COMPLETE:
+                return node
+            if change.state is not NodePortChangeState.PREPARED:
+                raise NodeLifecycleConflict("node_port_change_not_prepared")
+            provisional = replace(
+                node,
+                external_port=change.new_port,
+                desired_revision=change.target_revision,
+            )
+            validate_runtime_observation(provisional, observation)
+            observed_at = datetime.now(UTC)
+            updated = replace(
+                provisional,
+                runtime_state=observation.state,
+                health=observation.health,
+                management_fresh=observation.management_fresh,
+                management_observed_at=(observed_at if observation.management_fresh else None),
+                runtime_observed_at=observed_at,
+                config_compatible=observation.config_compatible,
+                applied_revision=observation.applied_revision,
+                process_id=observation.process_id,
+                process_start_ticks=observation.process_start_ticks,
+                process_boot_id=observation.process_boot_id,
+                observed_config_sha256=observation.config_sha256,
+                observed_release_id=observation.release_id,
+            )
+            self._nodes[self._nodes.index(node)] = updated
+            self._cameras = [
+                replace(camera, node_port=change.new_port)
+                if camera.node_id == node.id and camera.state is not CameraState.DELETED
+                else camera
+                for camera in self._cameras
+            ]
+            self._port_changes[self._port_changes.index(change)] = replace(
+                change,
+                state=NodePortChangeState.COMPLETE,
+            )
+            return updated
+
+    def abort_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode:
+        with self._lock:
+            change = next(
+                (candidate for candidate in self._port_changes if candidate.id == change_id),
+                None,
+            )
+            if change is None:
+                raise NodeNotFound("node_port_change_not_found")
+            node = next(candidate for candidate in self._nodes if candidate.id == change.node_id)
+            if change.state is NodePortChangeState.ABORTED:
+                return node
+            if change.state is not NodePortChangeState.PREPARED:
+                raise NodeLifecycleConflict("node_port_change_not_prepared")
+            restored = replace(
+                node,
+                external_port=change.old_port,
+                desired_revision=change.source_revision,
+            )
+            validate_runtime_observation(restored, observation)
+            observed_at = datetime.now(UTC)
+            updated = replace(
+                restored,
+                runtime_state=observation.state,
+                health=observation.health,
+                management_fresh=observation.management_fresh,
+                management_observed_at=(observed_at if observation.management_fresh else None),
+                runtime_observed_at=observed_at,
+                config_compatible=observation.config_compatible,
+                applied_revision=observation.applied_revision,
+                process_id=observation.process_id,
+                process_start_ticks=observation.process_start_ticks,
+                process_boot_id=observation.process_boot_id,
+                observed_config_sha256=observation.config_sha256,
+                observed_release_id=observation.release_id,
+            )
+            self._nodes[self._nodes.index(node)] = updated
+            self._port_changes[self._port_changes.index(change)] = replace(
+                change,
+                state=NodePortChangeState.ABORTED,
+            )
+            return updated
+
+    def request_node_delete(self, node_id: UUID) -> MediaNode:
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
+            if node.state not in {NodeState.STOPPED, NodeState.FAILED, NodeState.DELETING}:
+                raise NodeLifecycleConflict("node_delete_requires_stopped_or_failed")
+            if self.list_node_active_moves(node_id) or any(
+                change.node_id == node_id and change.state is NodePortChangeState.PREPARED
+                for change in self._port_changes
+            ):
+                raise NodeLifecycleConflict("node_operation_in_progress")
+            if node.state is NodeState.DELETING:
+                return node
+            updated = replace(
+                node,
+                state=NodeState.DELETING,
+                desired_revision=node.desired_revision + 1,
+                management_fresh=False,
+                management_observed_at=None,
+            )
+            self._nodes[self._nodes.index(node)] = updated
+            return updated
+
+    def finalize_node_delete(self, node_id: UUID) -> None:
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                return
+            if node.state is not NodeState.DELETING or node.registered_cameras:
+                raise NodeLifecycleConflict("node_delete_not_ready")
+            self._nodes.remove(node)
+            self._lifecycle_locks.pop(node_id, None)
+
     def request_stop(self, node_id: UUID) -> MediaNode:
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
@@ -415,6 +720,7 @@ class InMemoryNodeStore:
             updated = replace(
                 node,
                 state=NodeState.STOPPED,
+                maintenance=False,
                 desired_revision=node.desired_revision + 1,
             )
             self._nodes[self._nodes.index(node)] = updated
@@ -488,6 +794,7 @@ class InMemoryNodeStore:
                     node,
                     management_freshness_seconds=management_freshness_seconds,
                 )
+                and not self._node_has_prepared_port_change(node.id)
             ]
             if not eligible:
                 raise EligibleNodeMissing("eligible_node_missing")
@@ -534,6 +841,8 @@ class InMemoryNodeStore:
                 raise NodeNotFound("node_not_found")
             if selected.registered_cameras >= selected.camera_capacity:
                 raise NodeCameraCapacityReached("node_camera_capacity_reached")
+            if self._node_has_prepared_port_change(node_id):
+                raise EligibleNodeMissing("manual_node_ineligible")
             if not is_node_eligible(
                 selected,
                 management_freshness_seconds=management_freshness_seconds,
@@ -612,6 +921,8 @@ class InMemoryNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             self._require_no_active_camera_move(camera_id)
+            if self._node_has_prepared_port_change(camera.node_id):
+                raise CameraLifecycleConflict("node_port_change_in_progress")
             if camera.name == name and camera.source_url == source_url:
                 return camera
             updated = replace(
@@ -639,6 +950,8 @@ class InMemoryNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             self._require_no_active_camera_move(camera_id)
+            if self._node_has_prepared_port_change(camera.node_id):
+                raise CameraLifecycleConflict("node_port_change_in_progress")
             target = CameraState.ENABLED if enabled else CameraState.DISABLED
             if camera.state is target:
                 return camera
@@ -661,6 +974,8 @@ class InMemoryNodeStore:
             if camera.state is CameraState.DELETING:
                 return camera
             self._require_no_active_camera_move(camera_id)
+            if self._node_has_prepared_port_change(camera.node_id):
+                raise CameraLifecycleConflict("node_port_change_in_progress")
             updated = replace(
                 camera,
                 state=CameraState.DELETING,
@@ -699,6 +1014,10 @@ class InMemoryNodeStore:
                 raise NodeNotFound("node_not_found")
             if not is_node_eligible(target):
                 raise EligibleNodeMissing("manual_node_ineligible")
+            if self._node_has_prepared_port_change(camera.node_id) or (
+                self._node_has_prepared_port_change(target_node_id)
+            ):
+                raise CameraLifecycleConflict("node_port_change_in_progress")
             if any(
                 move.camera_id == camera_id and move.state is not CameraMoveState.COMPLETE
                 for move in self._camera_moves
@@ -763,6 +1082,10 @@ class InMemoryNodeStore:
                 raise NodeCameraCapacityReached("node_camera_capacity_reached")
             if not is_node_eligible(target):
                 raise EligibleNodeMissing("manual_node_ineligible")
+            if self._node_has_prepared_port_change(source.id) or (
+                self._node_has_prepared_port_change(target.id)
+            ):
+                raise CameraLifecycleConflict("node_port_change_in_progress")
             self._nodes[self._nodes.index(source)] = replace(
                 source,
                 registered_cameras=source.registered_cameras - 1,
@@ -789,6 +1112,12 @@ class InMemoryNodeStore:
             for move in self._camera_moves
         ):
             raise CameraLifecycleConflict("camera_move_in_progress")
+
+    def _node_has_prepared_port_change(self, node_id: UUID) -> bool:
+        return any(
+            change.node_id == node_id and change.state is NodePortChangeState.PREPARED
+            for change in self._port_changes
+        )
 
     def complete_camera_move(self, move_id: UUID) -> CameraMove:
         with self._lock:
@@ -859,6 +1188,9 @@ class NodeControl:
         node_runtime: NodeRuntime | None = None,
         provision_on_create: bool = False,
         recovery_workers: int = 4,
+        confirmations: NodeDisruptionConfirmations | None = None,
+        new_operation_id: NodeIdFactory = uuid4,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if recovery_workers < 1 or recovery_workers > 16:
             raise ValueError("node_recovery_workers_invalid")
@@ -869,6 +1201,9 @@ class NodeControl:
         self._node_runtime = node_runtime
         self._provision_on_create = provision_on_create
         self._recovery_workers = recovery_workers
+        self._confirmations = confirmations
+        self._new_operation_id = new_operation_id
+        self._sleep = sleep
 
     def register_node(
         self,
@@ -987,6 +1322,268 @@ class NodeControl:
             desired = self._store.request_restart(node_id)
             return self._execute_runtime(desired, NodeRuntimeAction.RESTART)
 
+    def set_administrative_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+    ) -> MediaNode:
+        with self._store.lifecycle_guard(node_id):
+            if state not in {
+                NodeState.DRAINING,
+                NodeState.MAINTENANCE,
+                NodeState.RUNNING,
+            }:
+                raise NodeLifecycleConflict("node_administrative_transition_invalid")
+            return self._store.request_administrative_state(node_id, state)
+
+    def preview_port_change(
+        self,
+        node_id: UUID,
+        *,
+        new_port: int,
+        allowed_ports: Collection[int],
+    ) -> NodePortChangePreview:
+        with self._store.lifecycle_guard(node_id):
+            node = self._store.get_node(node_id)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if new_port not in allowed_ports:
+                raise NodePortOutOfRange("node_port_out_of_range")
+            if node.state is not NodeState.RUNNING or node.runtime_state is not NodeState.RUNNING:
+                raise NodeLifecycleConflict("node_not_running")
+            if node.external_port == new_port:
+                raise NodeLifecycleConflict("node_port_unchanged")
+            if self._confirmations is None:
+                raise NodeRuntimeUnavailable("node_confirmation_unavailable")
+            blast_radius_sha256 = self._node_camera_fingerprint(node.id)
+            token = self._confirmations.issue_node_port_change(
+                node_id=node.id,
+                old_port=node.external_port,
+                new_port=new_port,
+                desired_revision=node.desired_revision,
+                registered_cameras=node.registered_cameras,
+                blast_radius_sha256=blast_radius_sha256,
+            )
+            return NodePortChangePreview(
+                node_id=node.id,
+                old_port=node.external_port,
+                new_port=new_port,
+                desired_revision=node.desired_revision,
+                registered_cameras=node.registered_cameras,
+                blast_radius_sha256=blast_radius_sha256,
+                confirmation_token=token,
+            )
+
+    def change_port(
+        self,
+        node_id: UUID,
+        *,
+        new_port: int,
+        allowed_ports: Collection[int],
+        confirmation_token: str | None,
+    ) -> MediaNode:
+        with self._store.lifecycle_guard(node_id):
+            current = self._require_node_and_runtime(node_id)
+            blast_radius_sha256 = self._node_camera_fingerprint(current.id)
+            if (
+                self._confirmations is None
+                or confirmation_token is None
+                or not (
+                    self._confirmations.verify_node_port_change(
+                        confirmation_token,
+                        node_id=current.id,
+                        old_port=current.external_port,
+                        new_port=new_port,
+                        desired_revision=current.desired_revision,
+                        registered_cameras=current.registered_cameras,
+                        blast_radius_sha256=blast_radius_sha256,
+                    )
+                )
+            ):
+                raise NodeDisruptionConfirmationRequired("node_disruption_confirmation_required")
+            if not self._is_port_bindable(new_port):
+                raise NodePortInUse("node_port_in_use")
+            change = self._store.begin_port_change(
+                change_id=self._new_operation_id(),
+                node_id=node_id,
+                new_port=new_port,
+                allowed_ports=allowed_ports,
+                expected_revision=current.desired_revision,
+                expected_registered_cameras=current.registered_cameras,
+                expected_blast_radius_sha256=blast_radius_sha256,
+            )
+            target = replace(
+                current,
+                external_port=change.new_port,
+                desired_revision=change.target_revision,
+            )
+            assert self._node_runtime is not None
+            try:
+                target_observation = self._node_runtime.execute(
+                    NodeRuntimeAction.RECONFIGURE_RESTART,
+                    target,
+                )
+            except Exception as change_error:
+                self._rollback_port_change(current, change, change_error)
+                raise AssertionError("unreachable") from change_error
+            if not self._wait_for_port_release(change.old_port):
+                self._rollback_port_change(
+                    current,
+                    change,
+                    RuntimeError("node_old_port_still_listening"),
+                )
+                raise AssertionError("unreachable")
+            try:
+                return self._store.complete_port_change(change.id, target_observation)
+            except Exception as commit_error:
+                try:
+                    committed = self._store.get_node(current.id)
+                    incomplete_ids = {
+                        candidate.id
+                        for candidate in self._store.list_incomplete_port_changes()
+                    }
+                except Exception:
+                    raise NodeRuntimeFailed(
+                        "node_port_change_commit_unknown",
+                        node_id=current.id,
+                    ) from commit_error
+                if (
+                    committed is not None
+                    and committed.external_port == change.new_port
+                    and committed.desired_revision == change.target_revision
+                    and committed.applied_revision == change.target_revision
+                    and change.id not in incomplete_ids
+                ):
+                    return committed
+                if (
+                    committed is None
+                    or committed.external_port != change.old_port
+                    or committed.desired_revision != change.source_revision
+                ):
+                    raise NodeRuntimeFailed(
+                        "node_port_change_commit_unknown",
+                        node_id=current.id,
+                    ) from commit_error
+                self._rollback_port_change(current, change, commit_error)
+                raise AssertionError("unreachable") from commit_error
+
+    def _rollback_port_change(
+        self,
+        current: MediaNode,
+        change: NodePortChange,
+        change_error: Exception,
+    ) -> None:
+        assert self._node_runtime is not None
+        try:
+            rollback_observation = self._node_runtime.execute(
+                NodeRuntimeAction.RECONFIGURE_RESTART,
+                current,
+            )
+        except Exception as rollback_error:
+            with suppress(Exception):
+                self._store.apply_runtime_observation(
+                    current.id,
+                    NodeRuntimeObservation(
+                        state=NodeState.FAILED,
+                        health=NodeHealth.UNHEALTHY,
+                        applied_revision=current.applied_revision,
+                        config_compatible=False,
+                    ),
+                )
+            raise NodeRuntimeFailed(
+                "node_port_change_rollback_failed",
+                node_id=current.id,
+            ) from rollback_error
+        try:
+            self._store.abort_port_change(change.id, rollback_observation)
+        except Exception as rollback_commit_error:
+            try:
+                committed = self._store.get_node(current.id)
+                incomplete_ids = {
+                    candidate.id
+                    for candidate in self._store.list_incomplete_port_changes()
+                }
+            except Exception:
+                raise NodeRuntimeFailed(
+                    "node_port_change_rollback_commit_unknown",
+                    node_id=current.id,
+                ) from rollback_commit_error
+            if not (
+                committed is not None
+                and committed.external_port == change.old_port
+                and committed.desired_revision == change.source_revision
+                and committed.applied_revision == change.source_revision
+                and change.id not in incomplete_ids
+            ):
+                with suppress(Exception):
+                    self._store.apply_runtime_observation(
+                        current.id,
+                        NodeRuntimeObservation(
+                            state=NodeState.FAILED,
+                            health=NodeHealth.UNHEALTHY,
+                            applied_revision=min(
+                                current.applied_revision,
+                                committed.desired_revision
+                                if committed is not None
+                                else current.desired_revision,
+                            ),
+                            config_compatible=False,
+                        ),
+                    )
+                raise NodeRuntimeFailed(
+                    "node_port_change_rollback_failed",
+                    node_id=current.id,
+                ) from rollback_commit_error
+        raise NodeRuntimeFailed(
+            "node_port_change_rolled_back",
+            node_id=current.id,
+        ) from change_error
+
+    def _wait_for_port_release(self, port: int) -> bool:
+        for attempt in range(21):
+            if self._is_port_bindable(port):
+                return True
+            if attempt < 20:
+                self._sleep(0.05)
+        return False
+
+    def _node_camera_fingerprint(self, node_id: UUID) -> str:
+        return camera_placement_fingerprint(
+            tuple(
+                (camera.id, camera.placement_generation)
+                for camera in self._store.list_node_cameras(node_id)
+            )
+        )
+
+    def delete_node(self, node_id: UUID) -> None:
+        with self._store.lifecycle_guard(node_id):
+            self._require_node_and_runtime(node_id)
+            assert self._node_runtime is not None
+            deleting = self._store.request_node_delete(node_id)
+            try:
+                observation = self._node_runtime.execute(
+                    NodeRuntimeAction.DELETE,
+                    deleting,
+                )
+                if observation.state is not NodeState.STOPPED:
+                    raise RuntimeError("node_delete_not_stopped")
+                self._store.finalize_node_delete(node_id)
+            except Exception as error:
+                with suppress(Exception):
+                    self._store.apply_runtime_observation(
+                        deleting.id,
+                        NodeRuntimeObservation(
+                            state=NodeState.FAILED,
+                            health=NodeHealth.UNHEALTHY,
+                            applied_revision=deleting.applied_revision,
+                            config_compatible=False,
+                        ),
+                    )
+                raise NodeRuntimeFailed(
+                    "node_delete_failed",
+                    node_id=node_id,
+                ) from error
+
     def observe_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             return self._observe_node_locked(node_id)
@@ -1009,6 +1606,8 @@ class NodeControl:
     def recover_runtime_state(self) -> tuple[MediaNode, ...]:
         if self._node_runtime is None:
             raise NodeRuntimeUnavailable("node_runtime_unavailable")
+        self._recover_port_changes()
+        self._recover_node_deletions()
         candidates = tuple(
             node for node in self._store.list_nodes() if node.state is not NodeState.DELETING
         )
@@ -1019,6 +1618,62 @@ class NodeControl:
             thread_name_prefix="node-recovery",
         ) as workers:
             return tuple(workers.map(self._recover_node, candidates))
+
+    def _recover_port_changes(self) -> None:
+        if self._node_runtime is None:
+            return
+        for change in self._store.list_incomplete_port_changes():
+            node = self._store.get_node(change.node_id)
+            if node is None:
+                continue
+            try:
+                with self._store.lifecycle_guard(node.id):
+                    rollback = replace(
+                        node,
+                        external_port=change.old_port,
+                        desired_revision=change.source_revision,
+                    )
+                    observation = self._node_runtime.execute(
+                        NodeRuntimeAction.RECONFIGURE_RESTART,
+                        rollback,
+                    )
+                    self._store.abort_port_change(change.id, observation)
+            except Exception:
+                self._store.apply_runtime_observation(
+                    node.id,
+                    NodeRuntimeObservation(
+                        state=NodeState.FAILED,
+                        health=NodeHealth.UNHEALTHY,
+                        applied_revision=node.applied_revision,
+                        config_compatible=False,
+                    ),
+                )
+
+    def _recover_node_deletions(self) -> None:
+        if self._node_runtime is None:
+            return
+        for node in self._store.list_nodes():
+            if node.state is not NodeState.DELETING:
+                continue
+            try:
+                with self._store.lifecycle_guard(node.id):
+                    observation = self._node_runtime.execute(
+                        NodeRuntimeAction.DELETE,
+                        node,
+                    )
+                    if observation.state is not NodeState.STOPPED:
+                        raise RuntimeError("node_delete_not_stopped")
+                    self._store.finalize_node_delete(node.id)
+            except Exception:
+                self._store.apply_runtime_observation(
+                    node.id,
+                    NodeRuntimeObservation(
+                        state=NodeState.FAILED,
+                        health=NodeHealth.UNHEALTHY,
+                        applied_revision=node.applied_revision,
+                        config_compatible=False,
+                    ),
+                )
 
     def _recover_node(self, node: MediaNode) -> MediaNode:
         try:
@@ -1215,7 +1870,45 @@ class NodeStore(Protocol):
 
     def get_node(self, node_id: UUID) -> MediaNode | None: ...
 
+    def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]: ...
+
     def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode: ...
+
+    def request_administrative_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+    ) -> MediaNode: ...
+
+    def begin_port_change(
+        self,
+        *,
+        change_id: UUID,
+        node_id: UUID,
+        new_port: int,
+        allowed_ports: Collection[int],
+        expected_revision: int,
+        expected_registered_cameras: int,
+        expected_blast_radius_sha256: str,
+    ) -> NodePortChange: ...
+
+    def list_incomplete_port_changes(self) -> tuple[NodePortChange, ...]: ...
+
+    def complete_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode: ...
+
+    def abort_port_change(
+        self,
+        change_id: UUID,
+        observation: NodeRuntimeObservation,
+    ) -> MediaNode: ...
+
+    def request_node_delete(self, node_id: UUID) -> MediaNode: ...
+
+    def finalize_node_delete(self, node_id: UUID) -> None: ...
 
     def request_stop(self, node_id: UUID) -> MediaNode: ...
 
@@ -1371,6 +2064,19 @@ class NodeRuntimeSpecLike:
             raise ValueError("node_release_id_invalid")
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError("node_binary_sha256_invalid")
+
+
+def camera_placement_fingerprint(
+    placements: Collection[tuple[UUID, int]],
+) -> str:
+    payload = "\n".join(
+        f"{camera_id}:{generation}"
+        for camera_id, generation in sorted(
+            placements,
+            key=lambda item: item[0].int,
+        )
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 def is_node_eligible(

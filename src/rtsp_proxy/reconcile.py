@@ -153,9 +153,7 @@ class ConfirmationTokenService:
             disconnect_readers=disconnect_readers,
             expires_at=int(self._wall_time()) + self._lifetime_seconds,
         )
-        encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-        signature = hmac.new(self._secret, payload, hashlib.sha256).hexdigest()
-        return f"{encoded}.{signature}"
+        return self._sign(payload)
 
     def verify(
         self,
@@ -167,13 +165,11 @@ class ConfirmationTokenService:
         desired_revision: int,
         disconnect_readers: int,
     ) -> bool:
-        try:
-            encoded, signature = token.split(".", 1)
-            payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-            decoded = json.loads(payload)
-            expires_at = decoded["expires_at"]
-        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        decoded_token = self._decode(token)
+        if decoded_token is None:
             return False
+        payload, signature, decoded = decoded_token
+        expires_at = decoded.get("expires_at")
         if (
             not isinstance(decoded, dict)
             or not isinstance(expires_at, int)
@@ -194,6 +190,114 @@ class ConfirmationTokenService:
             signature,
             expected_signature,
         )
+
+    def issue_node_port_change(
+        self,
+        *,
+        node_id: UUID,
+        old_port: int,
+        new_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+    ) -> str:
+        return self._sign(
+            self._node_port_payload(
+                node_id=node_id,
+                old_port=old_port,
+                new_port=new_port,
+                desired_revision=desired_revision,
+                registered_cameras=registered_cameras,
+                blast_radius_sha256=blast_radius_sha256,
+                expires_at=int(self._wall_time()) + self._lifetime_seconds,
+            )
+        )
+
+    def verify_node_port_change(
+        self,
+        token: str,
+        *,
+        node_id: UUID,
+        old_port: int,
+        new_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+    ) -> bool:
+        if len(blast_radius_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in blast_radius_sha256
+        ):
+            return False
+        decoded_token = self._decode(token)
+        if decoded_token is None:
+            return False
+        payload, signature, decoded = decoded_token
+        expires_at = decoded.get("expires_at")
+        if (
+            not isinstance(expires_at, int)
+            or isinstance(expires_at, bool)
+            or expires_at < int(self._wall_time())
+        ):
+            return False
+        expected = self._node_port_payload(
+            node_id=node_id,
+            old_port=old_port,
+            new_port=new_port,
+            desired_revision=desired_revision,
+            registered_cameras=registered_cameras,
+            blast_radius_sha256=blast_radius_sha256,
+            expires_at=expires_at,
+        )
+        expected_signature = hmac.new(self._secret, expected, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(payload, expected) and hmac.compare_digest(
+            signature,
+            expected_signature,
+        )
+
+    def _sign(self, payload: bytes) -> str:
+        encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        signature = hmac.new(self._secret, payload, hashlib.sha256).hexdigest()
+        return f"{encoded}.{signature}"
+
+    @staticmethod
+    def _decode(token: str) -> tuple[bytes, str, dict[str, object]] | None:
+        if len(token) > 4096:
+            return None
+        try:
+            encoded, signature = token.split(".", 1)
+            payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            decoded = json.loads(payload)
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        return payload, signature, decoded
+
+    @staticmethod
+    def _node_port_payload(
+        *,
+        node_id: UUID,
+        old_port: int,
+        new_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+        expires_at: int,
+    ) -> bytes:
+        return json.dumps(
+            {
+                "blast_radius_sha256": blast_radius_sha256,
+                "desired_revision": desired_revision,
+                "expires_at": expires_at,
+                "new_port": new_port,
+                "node_id": str(node_id),
+                "old_port": old_port,
+                "operation": "node_port_change",
+                "registered_cameras": registered_cameras,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
 
     @staticmethod
     def _payload(

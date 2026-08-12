@@ -304,6 +304,64 @@ class SecureNodeConfigStore:
         finally:
             os.close(root_fd)
 
+    def reconfigure(self, spec: NodeRuntimeSpec) -> RenderedNodeConfig:
+        credentials = self.credentials(spec)
+        reader_credentials = self.reader_credentials(spec)
+        if credentials is None or reader_credentials is None:
+            raise ValueError("node_credentials_missing")
+        rendered = MediaNodeConfigRenderer().render(
+            spec,
+            credentials,
+            reader_credentials,
+        )
+        self.install(
+            spec,
+            rendered,
+            credentials=credentials,
+            reader_credentials=reader_credentials,
+        )
+        return rendered
+
+    def delete(self, spec: NodeRuntimeSpec) -> None:
+        root_fd = self._open_root()
+        node_name = str(spec.node_id)
+        try:
+            try:
+                node_fd = self._open_node(root_fd, node_name)
+            except ValueError as error:
+                try:
+                    os.stat(node_name, dir_fd=root_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                raise error
+            try:
+                allowed = {
+                    "mediamtx.yml",
+                    "management.json",
+                    "reader.json",
+                    "runtime.env",
+                }
+                entries = set(os.listdir(node_fd))
+                if not entries.issubset(allowed):
+                    raise ValueError("node_config_directory_not_owned")
+                for name in sorted(entries):
+                    file_stat = os.stat(name, dir_fd=node_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(file_stat.st_mode)
+                        or stat.S_IMODE(file_stat.st_mode) != 0o600
+                        or file_stat.st_uid != self._owner_uid
+                    ):
+                        raise ValueError("node_private_file_unsafe")
+                for name in sorted(entries):
+                    os.unlink(name, dir_fd=node_fd)
+                os.fsync(node_fd)
+            finally:
+                os.close(node_fd)
+            os.rmdir(node_name, dir_fd=root_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+
     def install(
         self,
         spec: NodeRuntimeSpec,
@@ -708,6 +766,8 @@ class LinuxNodeSupervisor:
             NodeRuntimeAction.PROVISION_START,
             NodeRuntimeAction.START,
             NodeRuntimeAction.RESTART,
+            NodeRuntimeAction.RECONFIGURE_RESTART,
+            NodeRuntimeAction.DELETE,
         }
         work_deadline = deadline
         if deadline is not None:
@@ -720,6 +780,9 @@ class LinuxNodeSupervisor:
         credentials: NodeManagementCredentials | None
         if command.action is NodeRuntimeAction.PROVISION_START:
             expected, credentials = self._config_store.provision(command.spec)
+        elif command.action is NodeRuntimeAction.RECONFIGURE_RESTART:
+            expected = self._config_store.reconfigure(command.spec)
+            credentials = self._config_store.credentials(command.spec)
         else:
             expected_state = self._config_store.expected(command.spec)
             expected, credentials = (None, None) if expected_state is None else expected_state
@@ -730,6 +793,7 @@ class LinuxNodeSupervisor:
             NodeRuntimeAction.PROVISION_START,
             NodeRuntimeAction.START,
             NodeRuntimeAction.RESTART,
+            NodeRuntimeAction.RECONFIGURE_RESTART,
         } and (
             expected is None or credentials is None or installed_sha256 != expected.sha256
         ):
@@ -739,8 +803,15 @@ class LinuxNodeSupervisor:
             if work_deadline is not None:
                 work_deadline.remaining_seconds()
             snapshot = self._process.execute(command.action, command.spec, work_deadline)
-            if command.action is NodeRuntimeAction.STOP:
+            if command.action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE}:
                 self._require_stopped(command.spec, snapshot, deadline)
+                if command.action is NodeRuntimeAction.DELETE:
+                    self._config_store.delete(command.spec)
+                    return NodeRuntimeObservation(
+                        state=NodeState.STOPPED,
+                        health=NodeHealth.UNKNOWN,
+                        applied_revision=0,
+                    )
                 return self._stopped_observation(
                     command.spec,
                     installed_sha256=installed_sha256,
@@ -1007,11 +1078,14 @@ class SystemdNodeProcessController:
             NodeRuntimeAction.START: "start",
             NodeRuntimeAction.STOP: "stop",
             NodeRuntimeAction.RESTART: "restart",
+            NodeRuntimeAction.RECONFIGURE_RESTART: "restart",
+            NodeRuntimeAction.DELETE: "stop",
         }
         if action in verbs:
             command_deadline = (
                 deadline.before(5)
-                if action is NodeRuntimeAction.STOP and deadline is not None
+                if action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE}
+                and deadline is not None
                 else deadline
             )
             self._checked_run(
@@ -1061,6 +1135,7 @@ class SystemdNodeProcessController:
             NodeRuntimeAction.PROVISION_START,
             NodeRuntimeAction.START,
             NodeRuntimeAction.RESTART,
+            NodeRuntimeAction.RECONFIGURE_RESTART,
         }:
             snapshot = self._wait_for_exec_transition(
                 pid,
@@ -1190,10 +1265,10 @@ class DirectNodeProcessController:
     ) -> NodeProcessSnapshot:
         if deadline is not None:
             deadline.remaining_seconds()
-        if action is NodeRuntimeAction.STOP:
+        if action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE}:
             self._stop(spec.node_id, deadline)
             return self._inactive_snapshot()
-        if action is NodeRuntimeAction.RESTART:
+        if action in {NodeRuntimeAction.RESTART, NodeRuntimeAction.RECONFIGURE_RESTART}:
             self._stop(spec.node_id, deadline)
             self._start(spec)
         elif action in {NodeRuntimeAction.PROVISION_START, NodeRuntimeAction.START}:

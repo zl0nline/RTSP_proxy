@@ -102,6 +102,14 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         node_runtime=node_runtime,
         provision_on_create=node_runtime is not None,
         recovery_workers=settings.node_lifecycle_lock_pool_size,
+        confirmations=(
+            None
+            if settings.confirmation_secret is None
+            else ConfirmationTokenService(
+                secret=settings.confirmation_secret.encode("utf-8"),
+                lifetime_seconds=30,
+            )
+        ),
     )
     provisioning_policy = NodeProvisioningPolicy(
         port_range_start=settings.node_port_range_start,

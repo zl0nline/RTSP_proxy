@@ -369,14 +369,15 @@ class RecordingProcessController:
         deadline: object | None = None,
     ) -> NodeProcessSnapshot:
         self.commands.append((action, spec.node_id))
+        stopped = action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE}
         return NodeProcessSnapshot(
-            active=action is not NodeRuntimeAction.STOP,
-            pid=None if action is NodeRuntimeAction.STOP else 1234,
-            process_start_ticks=None if action is NodeRuntimeAction.STOP else 5678,
+            active=not stopped,
+            pid=None if stopped else 1234,
+            process_start_ticks=None if stopped else 5678,
             boot_id=None
-            if action is NodeRuntimeAction.STOP
+            if stopped
             else UUID("10000000-0000-0000-0000-000000000001"),
-            executable_sha256=None if action is NodeRuntimeAction.STOP else "a" * 64,
+            executable_sha256=None if stopped else "a" * 64,
         )
 
 
@@ -2066,3 +2067,209 @@ def helper_settings(
     }
     values.update(changes)
     return NodeHelperSettings(**values)  # type: ignore[arg-type]
+def test_reconfigure_preserves_credentials_and_changes_only_the_typed_config(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes"
+    root.mkdir(mode=0o700)
+    store = SecureNodeConfigStore(root=root)
+    original = runtime_spec()
+    store.install(
+        original,
+        MediaNodeConfigRenderer().render(
+            original,
+            management_credentials(),
+            reader_credentials(),
+        ),
+        credentials=management_credentials(),
+        reader_credentials=reader_credentials(),
+    )
+    changed = NodeRuntimeSpec(
+        node_id=original.node_id,
+        external_port=12099,
+        api_port=original.api_port,
+        metrics_port=original.metrics_port,
+        desired_revision=original.desired_revision + 1,
+        release_id=original.release_id,
+        mediamtx_binary_sha256=original.mediamtx_binary_sha256,
+    )
+
+    rendered = store.reconfigure(changed)
+
+    assert "rtspAddress: :12099" in rendered.content
+    assert store.credentials(changed) == management_credentials()
+    assert store.reader_credentials(changed) == reader_credentials()
+    assert store.digest(changed) == rendered.sha256
+
+
+def test_secure_delete_refuses_foreign_files_and_removes_only_owned_node_config(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes"
+    root.mkdir(mode=0o700)
+    store = SecureNodeConfigStore(root=root)
+    spec = runtime_spec()
+    store.install(
+        spec,
+        MediaNodeConfigRenderer().render(
+            spec,
+            management_credentials(),
+            reader_credentials(),
+        ),
+        credentials=management_credentials(),
+        reader_credentials=reader_credentials(),
+    )
+    node_dir = root / str(spec.node_id)
+    foreign = node_dir / "foreign"
+    foreign.write_text("do not delete", encoding="utf-8")
+    foreign.chmod(0o600)
+
+    with pytest.raises(ValueError, match="node_config_directory_not_owned"):
+        store.delete(spec)
+
+    assert foreign.read_text(encoding="utf-8") == "do not delete"
+    foreign.unlink()
+    store.delete(spec)
+    assert not node_dir.exists()
+
+
+def test_reconfigure_requires_both_existing_credential_sets(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-missing-credentials"
+    root.mkdir(mode=0o700)
+    spec = runtime_spec()
+    node_dir = root / str(spec.node_id)
+    node_dir.mkdir(mode=0o700)
+    (node_dir / "management.json").write_text(
+        json.dumps(
+            {
+                "password": management_credentials().password,
+                "username": management_credentials().username,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (node_dir / "management.json").chmod(0o600)
+
+    with pytest.raises(ValueError, match="node_credentials_missing"):
+        SecureNodeConfigStore(root=root).reconfigure(spec)
+
+
+def test_secure_delete_is_idempotent_and_rejects_unsafe_owned_file(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-delete-safety"
+    root.mkdir(mode=0o700)
+    store = SecureNodeConfigStore(root=root)
+    spec = runtime_spec()
+
+    store.delete(spec)
+    node_dir = root / str(spec.node_id)
+    node_dir.mkdir(mode=0o700)
+    private_file = node_dir / "mediamtx.yml"
+    private_file.write_text("owned", encoding="utf-8")
+    private_file.chmod(0o644)
+
+    with pytest.raises(ValueError, match="node_private_file_unsafe"):
+        store.delete(spec)
+
+    assert private_file.exists()
+
+    missing = root / str(UUID("00000000-0000-0000-0000-000000000002"))
+    missing.symlink_to(root / "does-not-exist")
+    with pytest.raises(ValueError):
+        store.delete(
+            NodeRuntimeSpec(
+                node_id=UUID("00000000-0000-0000-0000-000000000002"),
+                external_port=12002,
+                api_port=13002,
+                metrics_port=14002,
+                desired_revision=1,
+                release_id=spec.release_id,
+                mediamtx_binary_sha256=spec.mediamtx_binary_sha256,
+            )
+        )
+
+
+def test_supervisor_reconfigures_with_existing_credentials_before_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes-reconfigure"
+    root.mkdir(mode=0o700)
+    original = runtime_spec()
+    store = SecureNodeConfigStore(root=root)
+    store.install(
+        original,
+        MediaNodeConfigRenderer().render(
+            original,
+            management_credentials(),
+            reader_credentials(),
+        ),
+        credentials=management_credentials(),
+        reader_credentials=reader_credentials(),
+    )
+    changed = NodeRuntimeSpec(
+        node_id=original.node_id,
+        external_port=12099,
+        api_port=original.api_port,
+        metrics_port=original.metrics_port,
+        desired_revision=original.desired_revision + 1,
+        release_id=original.release_id,
+        mediamtx_binary_sha256=original.mediamtx_binary_sha256,
+    )
+    process = RecordingProcessController()
+
+    class ChangedSmoke:
+        def check(
+            self,
+            spec: NodeRuntimeSpec,
+            credentials: NodeManagementCredentials,
+            deadline: object | None = None,
+        ) -> None:
+            assert spec == changed
+            assert credentials == management_credentials()
+
+    observation = LinuxNodeSupervisor(
+        config_store=store,
+        process=process,
+        smoke=ChangedSmoke(),
+        port_is_bindable=lambda port: False,
+    ).execute(NodeRuntimeCommand.for_node(NodeRuntimeAction.RECONFIGURE_RESTART, changed))
+
+    assert observation.applied_revision == changed.desired_revision
+    assert "rtspAddress: :12099" in (root / str(changed.node_id) / "mediamtx.yml").read_text(
+        encoding="utf-8"
+    )
+    assert process.commands == [
+        (NodeRuntimeAction.RECONFIGURE_RESTART, changed.node_id),
+        (NodeRuntimeAction.OBSERVE, changed.node_id),
+    ]
+
+
+def test_supervisor_delete_stops_and_removes_only_exact_node_config(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-delete"
+    root.mkdir(mode=0o700)
+    spec = runtime_spec()
+    store = SecureNodeConfigStore(root=root)
+    store.install(
+        spec,
+        MediaNodeConfigRenderer().render(
+            spec,
+            management_credentials(),
+            reader_credentials(),
+        ),
+        credentials=management_credentials(),
+        reader_credentials=reader_credentials(),
+    )
+    process = RecordingProcessController()
+
+    observation = LinuxNodeSupervisor(
+        config_store=store,
+        process=process,
+        smoke=HealthySmokeProbe(),
+        port_is_bindable=lambda port: True,
+    ).execute(NodeRuntimeCommand.for_node(NodeRuntimeAction.DELETE, spec))
+
+    assert observation.state is NodeState.STOPPED
+    assert not (root / str(spec.node_id)).exists()
+    assert process.commands == [(NodeRuntimeAction.DELETE, spec.node_id)]

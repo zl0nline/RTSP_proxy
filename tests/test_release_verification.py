@@ -38,6 +38,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0007_camera_move_saga.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0008_node_administration.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -87,8 +92,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
         "schema_compatibility": {
-            "minimum": "0007_camera_move_saga",
-            "maximum": "0007_camera_move_saga",
+            "minimum": "0008_node_administration",
+            "maximum": "0008_node_administration",
         },
         "config_schema_version": 1,
     }

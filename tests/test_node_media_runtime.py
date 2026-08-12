@@ -13,10 +13,17 @@ from uuid import UUID, uuid4
 import pytest
 
 from rtsp_proxy.identifiers import PublicId
-from rtsp_proxy.media import MediaNodeUnavailable, MediaPathConfig
+from rtsp_proxy.media import (
+    MediaNodeProtocolError,
+    MediaNodeUnavailable,
+    MediaPathConfig,
+    MediaPathInventory,
+)
 from rtsp_proxy.node_runtime import (
     LinuxNodeSupervisor,
     MediaNodeConfigRenderer,
+    MediaPathCommand,
+    MediaPathOperation,
     NodeManagementCredentials,
     NodeProcessSnapshot,
     NodeRuntimePolicy,
@@ -82,8 +89,7 @@ def unix_answer(
     return thread
 
 
-def test_node_aware_media_client_uses_only_the_selected_node_identity(
-) -> None:
+def test_node_aware_media_client_uses_only_the_selected_node_identity() -> None:
     socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
     captured: dict[str, object] = {}
     server = unix_answer(
@@ -101,10 +107,14 @@ def test_node_aware_media_client_uses_only_the_selected_node_identity(
         captured,
     )
 
-    actual = UnixMediaNodeClientFactory(
-        socket_path=socket_path,
-        timeout_seconds=1,
-    ).for_node(ready_node()).get_path(PUBLIC_ID)
+    actual = (
+        UnixMediaNodeClientFactory(
+            socket_path=socket_path,
+            timeout_seconds=1,
+        )
+        .for_node(ready_node())
+        .get_path(PUBLIC_ID)
+    )
 
     server.join(timeout=2)
     socket_path.unlink(missing_ok=True)
@@ -169,6 +179,174 @@ def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> No
     server.join(timeout=2)
     socket_path.unlink(missing_ok=True)
     assert "camera.invalid" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("response", "operation", "error"),
+    (
+        (
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": {"name": str(PUBLIC_ID), "source_url": "x"},
+                "inventory": None,
+                "runtime": None,
+                "error": None,
+            },
+            "put",
+            "node_media_response_invalid",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": None,
+                "inventory": {"camera_ids": [str(PUBLIC_ID)], "no_oracle_matcher_present": True},
+                "runtime": None,
+                "error": None,
+            },
+            "get",
+            "node_media_response_invalid",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": {"name": str(PUBLIC_ID), "source_url": None},
+                "inventory": None,
+                "runtime": None,
+                "error": None,
+            },
+            "get",
+            "node_media_response_invalid",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": None,
+                "inventory": {
+                    "camera_ids": [str(PUBLIC_ID), str(PUBLIC_ID)],
+                    "no_oracle_matcher_present": True,
+                },
+                "runtime": None,
+                "error": None,
+            },
+            "inventory",
+            "node_media_response_invalid",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": None,
+                "inventory": None,
+                "runtime": {"ready": True, "reader_count": 1},
+                "error": None,
+            },
+            "delete",
+            "node_media_response_invalid",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": {"name": str(PUBLIC_ID), "source_url": "x"},
+                "inventory": None,
+                "runtime": None,
+                "error": None,
+            },
+            "runtime",
+            "node_media_response_invalid",
+        ),
+    ),
+)
+def test_node_media_client_rejects_cross_operation_payloads(
+    tmp_path: Path,
+    response: dict[str, object],
+    operation: str,
+    error: str,
+) -> None:
+    socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
+    server = unix_answer(socket_path, response, {})
+    client = UnixMediaNodeClientFactory(socket_path=socket_path, timeout_seconds=1).for_node(
+        ready_node()
+    )
+
+    with pytest.raises(MediaNodeProtocolError, match=error):
+        if operation == "put":
+            client.put_path(MediaPathConfig(name=PUBLIC_ID, source_url="rtsp://x.invalid/main"))
+        elif operation == "get":
+            client.get_path(PUBLIC_ID)
+        elif operation == "inventory":
+            client.inventory_paths()
+        elif operation == "delete":
+            client.delete_path(PUBLIC_ID)
+        else:
+            client.path_runtime_status(PUBLIC_ID)
+    server.join(timeout=1)
+    socket_path.unlink(missing_ok=True)
+
+
+def test_node_media_client_covers_inventory_delete_runtime_and_transport_failures(
+    tmp_path: Path,
+) -> None:
+    responses: tuple[tuple[str, dict[str, object]], ...] = (
+        (
+            "inventory",
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": None,
+                "inventory": {"camera_ids": [str(PUBLIC_ID)], "no_oracle_matcher_present": True},
+                "runtime": None,
+                "error": None,
+            },
+        ),
+        (
+            "delete",
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": None,
+                "inventory": None,
+                "runtime": None,
+                "error": None,
+            },
+        ),
+        (
+            "runtime-missing",
+            {
+                "schema_version": 1,
+                "ok": True,
+                "path": None,
+                "inventory": None,
+                "runtime": None,
+                "error": None,
+            },
+        ),
+    )
+    for operation, response in responses:
+        socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
+        server = unix_answer(socket_path, response, {})
+        client = UnixMediaNodeClientFactory(
+            socket_path=socket_path,
+            timeout_seconds=1,
+        ).for_node(ready_node())
+        if operation == "inventory":
+            assert client.inventory_paths().camera_ids == (PUBLIC_ID,)
+        elif operation == "delete":
+            client.delete_path(PUBLIC_ID)
+        else:
+            assert client.path_runtime_status(PUBLIC_ID) is None
+        server.join(timeout=1)
+        socket_path.unlink(missing_ok=True)
+
+    with pytest.raises(MediaNodeUnavailable, match="node_media_unavailable"):
+        UnixMediaNodeClientFactory(
+            socket_path=tmp_path / "missing.sock",
+            timeout_seconds=1,
+        ).for_node(ready_node()).get_path(PUBLIC_ID)
 
 
 class MediaApiHandler(BaseHTTPRequestHandler):
@@ -332,3 +510,120 @@ def test_node_media_command_converges_through_the_privileged_helper(
         media_api.shutdown()
         media_api.server_close()
         api_thread.join(timeout=2)
+
+
+def test_root_media_adapter_validates_config_process_and_every_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "nodes"
+    root.mkdir(mode=0o700)
+    store = SecureNodeConfigStore(root=root)
+    spec = NodeRuntimeSpec(
+        node_id=NODE_ID,
+        external_port=12000,
+        api_port=13000,
+        metrics_port=14000,
+        desired_revision=3,
+        release_id="v1.20.0",
+        mediamtx_binary_sha256="a" * 64,
+    )
+    with pytest.raises(ValueError, match="node_media_timeout_invalid"):
+        RootMediaNodeAdapter(
+            config_store=store,
+            process=StableProcess(
+                NodeProcessSnapshot(
+                    active=False,
+                    pid=None,
+                    process_start_ticks=None,
+                    boot_id=None,
+                    executable_sha256=None,
+                )
+            ),
+            timeout_seconds=0,
+        )
+    adapter = RootMediaNodeAdapter(
+        config_store=store,
+        process=StableProcess(
+            NodeProcessSnapshot(
+                active=False,
+                pid=None,
+                process_start_ticks=None,
+                boot_id=None,
+                executable_sha256=None,
+            )
+        ),
+        timeout_seconds=1,
+    )
+    with pytest.raises(Exception, match="node_config_not_applied"):
+        adapter.execute(MediaPathCommand(operation=MediaPathOperation.INVENTORY, spec=spec))
+
+    credentials = NodeManagementCredentials(
+        username=f"node-{NODE_ID}",
+        password="management-password-00000000000000000001",
+    )
+    store.install(
+        spec,
+        MediaNodeConfigRenderer().render(spec, credentials),
+        credentials=credentials,
+    )
+    with pytest.raises(Exception, match="node_process_release_mismatch"):
+        adapter.execute(MediaPathCommand(operation=MediaPathOperation.INVENTORY, spec=spec))
+
+    snapshot = NodeProcessSnapshot(
+        active=True,
+        pid=123,
+        process_start_ticks=456,
+        boot_id=UUID("10000000-0000-0000-0000-000000000001"),
+        executable_sha256="a" * 64,
+    )
+    stable = RootMediaNodeAdapter(
+        config_store=store,
+        process=StableProcess(snapshot),
+        timeout_seconds=1,
+    )
+
+    class FakeClient:
+        def inventory_paths(self) -> MediaPathInventory:
+            return MediaPathInventory(
+                camera_ids=(PUBLIC_ID,),
+                no_oracle_matcher_present=True,
+            )
+
+        def put_path(self, path: MediaPathConfig) -> None:
+            assert path.name == PUBLIC_ID
+
+        def get_path(self, name: PublicId) -> MediaPathConfig:
+            return MediaPathConfig(name=name, source_url="rtsp://x.invalid/main")
+
+        def path_runtime_status(self, name: PublicId) -> tuple[bool, int]:
+            return (True, 1)
+
+        def delete_path(self, name: PublicId) -> None:
+            assert name == PUBLIC_ID
+
+    fake = FakeClient()
+    assert stable._execute_operation(
+        fake,  # type: ignore[arg-type]
+        MediaPathCommand(operation=MediaPathOperation.INVENTORY, spec=spec),
+    ) == MediaPathInventory(camera_ids=(PUBLIC_ID,), no_oracle_matcher_present=True)
+    stable._execute_operation(
+        fake,  # type: ignore[arg-type]
+        MediaPathCommand(
+            operation=MediaPathOperation.PUT,
+            spec=spec,
+            path=MediaPathConfig(name=PUBLIC_ID, source_url="rtsp://x.invalid/main"),
+        ),
+    )
+    assert stable._execute_operation(
+        fake,  # type: ignore[arg-type]
+        MediaPathCommand(operation=MediaPathOperation.GET, spec=spec, path=PUBLIC_ID),
+    ) == MediaPathConfig(name=PUBLIC_ID, source_url="rtsp://x.invalid/main")
+    assert stable._execute_operation(
+        fake,  # type: ignore[arg-type]
+        MediaPathCommand(operation=MediaPathOperation.RUNTIME, spec=spec, path=PUBLIC_ID),
+    ) == (True, 1)
+    stable._execute_operation(
+        fake,  # type: ignore[arg-type]
+        MediaPathCommand(operation=MediaPathOperation.DELETE, spec=spec, path=PUBLIC_ID),
+    )

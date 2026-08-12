@@ -1,11 +1,12 @@
+import hashlib
 import socket
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from threading import Barrier, Event, Lock
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -24,25 +25,40 @@ from rtsp_proxy.identifiers import PublicId, generate_public_id
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.nodes import (
     CameraControl,
+    CameraLifecycleConflict,
+    CameraNotFound,
+    EligibleNodeMissing,
     InMemoryNodeStore,
     InvalidCameraSource,
     MediaNode,
+    NodeCameraCapacityReached,
     NodeControl,
+    NodeDisruptionConfirmationRequired,
     NodeHealth,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeNotEmpty,
+    NodeNotFound,
+    NodePortChange,
+    NodePortInUse,
+    NodePortOutOfRange,
     NodeProvisioningPolicy,
     NodeRuntime,
     NodeRuntimeAction,
+    NodeRuntimeFailed,
     NodeRuntimeObservation,
+    NodeRuntimeUnavailable,
     NodeState,
+    camera_placement_fingerprint,
     tcp_port_is_bindable,
 )
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
+    CameraOccupied,
+    CameraReaderInvariantViolation,
     CameraRuntimeObserver,
     ConfirmationTokenService,
+    MoveConfirmationRequired,
 )
 from rtsp_proxy.runtime import create_app_from_environment, create_background_app, run_web
 
@@ -1096,7 +1112,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
             )
         )
-    assert revision == "0007_camera_move_saga"
+    assert revision == "0008_node_administration"
     assert table_count == 4
 
 
@@ -1760,7 +1776,7 @@ class RecordingLifecycleRuntime(NodeRuntime):
         node: MediaNode,
     ) -> NodeRuntimeObservation:
         self.calls.append((action, node.id))
-        if action is NodeRuntimeAction.STOP:
+        if action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE}:
             return NodeRuntimeObservation(
                 state=NodeState.STOPPED,
                 health=NodeHealth.UNKNOWN,
@@ -3356,3 +3372,1746 @@ def test_concurrent_manual_and_automatic_node_creation_cannot_exceed_max_nodes(
     failed = next(response for response in responses if response.status_code == 409)
     assert failed.json()["detail"]["code"] == "max_nodes_reached"
     assert client.get("/api/v1/nodes").json()["count"] == 1
+
+def node_confirmation_service() -> ConfirmationTokenService:
+    return ConfirmationTokenService(
+        secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+        lifetime_seconds=30,
+        wall_time=lambda: 1_700_000_000.0,
+    )
+
+
+def test_drain_and_maintenance_exclude_placement_without_stopping_the_node() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
+
+    drained = client.post(f"/api/v1/nodes/{node_id}/drain")
+    maintained = client.post(f"/api/v1/nodes/{node_id}/maintenance")
+
+    assert drained.status_code == 200
+    assert drained.json()["state"] == "draining"
+    assert drained.json()["runtime_state"] == "running"
+    assert maintained.status_code == 200
+    assert maintained.json()["state"] == "maintenance"
+    with pytest.raises(EligibleNodeMissing, match="manual_node_ineligible"):
+        store.place_camera_manually(
+            camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+            name="blocked",
+            source_url="rtsp://camera.local/main",
+            public_id=PublicId.parse("a" * 26),
+            node_id=node_id,
+        )
+
+
+def test_node_administration_public_errors_are_typed() -> None:
+    unknown_id = UUID("00000000-0000-0000-0000-000000000099")
+    without_control = TestClient(create_app(Settings(role=RuntimeRole.WEB)))
+
+    assert without_control.post(f"/api/v1/nodes/{unknown_id}/drain").status_code == 503
+    assert (
+        without_control.post(
+            f"/api/v1/nodes/{unknown_id}/port-change/preview",
+            json={"new_port": 12000},
+        ).status_code
+        == 503
+    )
+    assert (
+        without_control.post(
+            f"/api/v1/nodes/{unknown_id}/port-change",
+            json={"new_port": 12000},
+        ).status_code
+        == 503
+    )
+    assert without_control.delete(f"/api/v1/nodes/{unknown_id}").status_code == 503
+
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+            ),
+        )
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        confirmations=node_confirmation_service(),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=control,
+        )
+    )
+
+    missing = client.post(f"/api/v1/nodes/{unknown_id}/drain")
+    missing_resume = client.post(f"/api/v1/nodes/{unknown_id}/resume")
+    missing_preview = client.post(
+        f"/api/v1/nodes/{unknown_id}/port-change/preview",
+        json={"new_port": 12001},
+    )
+    missing_change = client.post(
+        f"/api/v1/nodes/{unknown_id}/port-change",
+        json={"new_port": 12001, "confirmation_token": "invalid"},
+    )
+    missing_delete = client.delete(f"/api/v1/nodes/{unknown_id}")
+    invalid_transition = client.post(f"/api/v1/nodes/{node_id}/maintenance")
+    out_of_range = client.post(
+        f"/api/v1/nodes/{node_id}/port-change/preview",
+        json={"new_port": 13000},
+    )
+    unchanged = client.post(
+        f"/api/v1/nodes/{node_id}/port-change/preview",
+        json={"new_port": 12000},
+    )
+    delete_running = client.delete(f"/api/v1/nodes/{node_id}")
+
+    assert missing.status_code == 404
+    assert missing_resume.status_code == 404
+    assert missing_preview.status_code == 404
+    assert missing_change.status_code == 404
+    assert missing_delete.status_code == 404
+    assert invalid_transition.status_code == 409
+    assert invalid_transition.json()["detail"]["code"] == (
+        "node_administrative_transition_invalid"
+    )
+    assert out_of_range.status_code == 422
+    assert unchanged.status_code == 409
+    assert unchanged.json()["detail"]["code"] == "node_port_unchanged"
+    assert delete_running.status_code == 409
+
+
+def test_node_administration_maps_busy_runtime_and_store_errors() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class AdministrationErrorStore(InMemoryNodeStore):
+        administrative_error: Exception | None = None
+        preview_error: Exception | None = None
+        port_error: Exception | None = None
+        delete_error: Exception | None = None
+
+        def request_administrative_state(
+            self,
+            requested_node_id: UUID,
+            state: NodeState,
+        ) -> MediaNode:
+            if self.administrative_error is not None:
+                raise self.administrative_error
+            return super().request_administrative_state(requested_node_id, state)
+
+        def get_node(self, requested_node_id: UUID) -> MediaNode | None:
+            if self.preview_error is not None:
+                raise self.preview_error
+            return super().get_node(requested_node_id)
+
+        def begin_port_change(
+            self,
+            *,
+            change_id: UUID,
+            node_id: UUID,
+            new_port: int,
+            allowed_ports: Collection[int],
+            expected_revision: int,
+            expected_registered_cameras: int,
+            expected_blast_radius_sha256: str,
+        ) -> NodePortChange:
+            if self.port_error is not None:
+                raise self.port_error
+            return super().begin_port_change(
+                change_id=change_id,
+                node_id=node_id,
+                new_port=new_port,
+                allowed_ports=allowed_ports,
+                expected_revision=expected_revision,
+                expected_registered_cameras=expected_registered_cameras,
+                expected_blast_radius_sha256=expected_blast_radius_sha256,
+            )
+
+        def request_node_delete(self, requested_node_id: UUID) -> MediaNode:
+            if self.delete_error is not None:
+                raise self.delete_error
+            return super().request_node_delete(requested_node_id)
+
+    store = AdministrationErrorStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+            ),
+        )
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=control,
+        )
+    )
+
+    store.administrative_error = NodeLifecycleBusy("node_lifecycle_busy")
+    assert client.post(f"/api/v1/nodes/{node_id}/drain").status_code == 503
+    store.administrative_error = None
+    store.preview_error = NodeRuntimeUnavailable("node_confirmation_unavailable")
+    assert (
+        client.post(
+            f"/api/v1/nodes/{node_id}/port-change/preview",
+            json={"new_port": 12001},
+        ).status_code
+        == 503
+    )
+    store.preview_error = None
+    preview = client.post(
+        f"/api/v1/nodes/{node_id}/port-change/preview",
+        json={"new_port": 12001},
+    ).json()
+    store.port_error = NodePortOutOfRange("node_port_out_of_range")
+    assert (
+        client.post(
+            f"/api/v1/nodes/{node_id}/port-change",
+            json={"new_port": 12001, "confirmation_token": preview["confirmation_token"]},
+        ).status_code
+        == 422
+    )
+    store.port_error = None
+    store.delete_error = NodeRuntimeUnavailable("node_runtime_unavailable")
+    assert client.delete(f"/api/v1/nodes/{node_id}").status_code == 503
+    store.delete_error = NodeLifecycleBusy("node_lifecycle_busy")
+    assert client.delete(f"/api/v1/nodes/{node_id}").status_code == 503
+    store.delete_error = NodeNotEmpty("node_not_empty")
+    assert client.delete(f"/api/v1/nodes/{node_id}").status_code == 409
+    store.delete_error = NodeRuntimeFailed("node_delete_failed", node_id=node_id)
+    response = client.delete(f"/api/v1/nodes/{node_id}")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "node_delete_failed"
+
+
+def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+            ),
+        )
+    )
+    confirmations = node_confirmation_service()
+
+    class PortChangeControl(NodeControl):
+        error: Exception | None = None
+
+        def change_port(
+            self,
+            node_id: UUID,
+            *,
+            new_port: int,
+            allowed_ports: Collection[int],
+            confirmation_token: str | None,
+        ) -> MediaNode:
+            if self.error is not None:
+                raise self.error
+            return super().change_port(
+                node_id,
+                new_port=new_port,
+                allowed_ports=allowed_ports,
+                confirmation_token=confirmation_token,
+            )
+
+    control = PortChangeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        confirmations=confirmations,
+        is_port_bindable=lambda _port: True,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=control,
+        )
+    )
+    token = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    ).confirmation_token
+
+    expected = (
+        (NodeLifecycleBusy("node_lifecycle_busy"), 503),
+        (NodePortInUse("node_port_in_use"), 409),
+        (NodeLifecycleConflict("node_not_running"), 409),
+        (NodeRuntimeUnavailable("node_runtime_unavailable"), 503),
+        (NodeRuntimeFailed("node_runtime_operation_failed", node_id=node_id), 503),
+    )
+    for error, status_code in expected:
+        control.error = error
+        response = client.post(
+            f"/api/v1/nodes/{node_id}/port-change",
+            json={"new_port": 12001, "confirmation_token": token},
+        )
+        assert response.status_code == status_code
+
+
+def test_port_change_requires_exact_confirmation_and_updates_camera_endpoint() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        new_operation_id=lambda: UUID("40000000-0000-0000-0000-000000000001"),
+        node_runtime=runtime,
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+            camera_control=camera_control,
+        )
+    )
+    client.post("/api/v1/nodes", json={"name": "media-a", "external_port": 12000})
+    camera_control.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_id,
+    )
+
+    rejected = client.post(
+        f"/api/v1/nodes/{node_id}/port-change",
+        json={"new_port": 12001},
+    )
+    preview = client.post(
+        f"/api/v1/nodes/{node_id}/port-change/preview",
+        json={"new_port": 12001},
+    )
+    changed = client.post(
+        f"/api/v1/nodes/{node_id}/port-change",
+        json={
+            "new_port": 12001,
+            "confirmation_token": preview.json()["confirmation_token"],
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "node_disruption_confirmation_required"
+    assert preview.json()["registered_cameras"] == 1
+    assert changed.status_code == 200
+    assert changed.json()["external_port"] == 12001
+    assert camera_control.list_cameras()[0].node_port == 12001
+    assert runtime.calls[-1] == (NodeRuntimeAction.RECONFIGURE_RESTART, node_id)
+
+
+def test_port_change_confirmation_binds_exact_camera_placements_not_only_count() -> None:
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    first_camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    second_camera_id = UUID("10000000-0000-0000-0000-000000000002")
+    now = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=tuple(
+            MediaNode(
+                id=node_id,
+                name=name,
+                external_port=port,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            )
+            for node_id, name, port in (
+                (source_id, "media-a", 12000),
+                (target_id, "media-b", 12001),
+            )
+        )
+    )
+    store.place_camera_manually(
+        camera_id=first_camera_id,
+        name="first",
+        source_url="rtsp://first.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=source_id,
+    )
+    store.place_camera_manually(
+        camera_id=second_camera_id,
+        name="second",
+        source_url="rtsp://second.local/main",
+        public_id=PublicId.parse("b" * 25 + "e"),
+        node_id=target_id,
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    preview = control.preview_port_change(
+        source_id,
+        new_port=12002,
+        allowed_ports=(12000, 12001, 12002),
+    )
+
+    first_move = store.create_camera_move(
+        move_id=UUID("30000000-0000-0000-0000-000000000001"),
+        camera_id=first_camera_id,
+        target_node_id=target_id,
+        expected_revision=1,
+        force=False,
+    )
+    store.switch_camera_move(first_move.id)
+    store.complete_camera_move(first_move.id)
+    second_move = store.create_camera_move(
+        move_id=UUID("30000000-0000-0000-0000-000000000002"),
+        camera_id=second_camera_id,
+        target_node_id=source_id,
+        expected_revision=1,
+        force=False,
+    )
+    store.switch_camera_move(second_move.id)
+    store.complete_camera_move(second_move.id)
+
+    with pytest.raises(NodeDisruptionConfirmationRequired):
+        control.change_port(
+            source_id,
+            new_port=12002,
+            allowed_ports=(12000, 12001, 12002),
+            confirmation_token=preview.confirmation_token,
+        )
+
+
+def test_prepared_port_change_fences_new_camera_placement() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    store.begin_port_change(
+        change_id=UUID("40000000-0000-0000-0000-000000000001"),
+        node_id=node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+        expected_revision=1,
+        expected_registered_cameras=0,
+        expected_blast_radius_sha256=hashlib.sha256(b"").hexdigest(),
+    )
+
+    with pytest.raises(EligibleNodeMissing, match="manual_node_ineligible"):
+        store.place_camera_manually(
+            camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+            name="blocked",
+            source_url="rtsp://camera.local/main",
+            public_id=PublicId.parse("a" * 26),
+            node_id=node_id,
+        )
+    with pytest.raises(EligibleNodeMissing, match="eligible_node_missing"):
+        store.place_camera_automatically(
+            camera_id=UUID("10000000-0000-0000-0000-000000000002"),
+            name="blocked-auto",
+            source_url="rtsp://camera.local/main",
+            public_id=PublicId.parse("b" * 25 + "e"),
+        )
+
+
+def test_failed_port_change_rolls_runtime_and_database_back_to_old_port() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class FailNewPortOnce(RecordingLifecycleRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if action is NodeRuntimeAction.RECONFIGURE_RESTART and node.external_port == 12001:
+                self.calls.append((action, node.id))
+                raise RuntimeError("new listener failed")
+            return super().execute(action, node)
+
+    runtime = FailNewPortOnce()
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        new_operation_id=lambda: UUID("40000000-0000-0000-0000-000000000001"),
+        node_runtime=runtime,
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12002,
+            ),
+            node_control=control,
+        )
+    )
+    client.post("/api/v1/nodes", json={"name": "media-a", "external_port": 12000})
+    preview = client.post(
+        f"/api/v1/nodes/{node_id}/port-change/preview",
+        json={"new_port": 12001},
+    ).json()
+
+    response = client.post(
+        f"/api/v1/nodes/{node_id}/port-change",
+        json={"new_port": 12001, "confirmation_token": preview["confirmation_token"]},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "node_port_change_rolled_back"
+    persisted = store.get_node(node_id)
+    assert persisted is not None and persisted.external_port == 12000
+    assert persisted.runtime_state is NodeState.RUNNING
+    assert store.list_incomplete_port_changes() == ()
+
+
+def test_port_change_commit_response_loss_returns_the_committed_node() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class ResponseLostAfterCommit(InMemoryNodeStore):
+        def complete_port_change(
+            self,
+            change_id: UUID,
+            observation: NodeRuntimeObservation,
+        ) -> MediaNode:
+            super().complete_port_change(change_id, observation)
+            raise RuntimeError("database response lost")
+
+    store = ResponseLostAfterCommit()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=RecordingLifecycleRuntime(),
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    control.register_node(
+        name="media-a",
+        port_range_start=12000,
+        port_range_end=12001,
+        max_nodes=1,
+        external_port=12000,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+
+    committed = control.change_port(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+        confirmation_token=preview.confirmation_token,
+    )
+
+    assert committed.external_port == 12001
+    assert store.list_incomplete_port_changes() == ()
+
+
+def test_port_change_fails_closed_when_commit_state_cannot_be_read() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class CommitAndReadUnavailable(InMemoryNodeStore):
+        fail_reads = False
+
+        def complete_port_change(
+            self,
+            change_id: UUID,
+            observation: NodeRuntimeObservation,
+        ) -> MediaNode:
+            self.fail_reads = True
+            raise RuntimeError("commit unavailable")
+
+        def get_node(self, requested_node_id: UUID) -> MediaNode | None:
+            if self.fail_reads:
+                raise RuntimeError("read unavailable")
+            return super().get_node(requested_node_id)
+
+    store = CommitAndReadUnavailable()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=RecordingLifecycleRuntime(),
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    control.register_node(
+        name="media-a",
+        port_range_start=12000,
+        port_range_end=12001,
+        max_nodes=1,
+        external_port=12000,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+
+    with pytest.raises(NodeRuntimeFailed, match="node_port_change_commit_unknown"):
+        control.change_port(
+            node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            confirmation_token=preview.confirmation_token,
+        )
+
+
+def test_port_change_rollback_failure_marks_only_the_node_failed() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class FailEveryReconfigure(RecordingLifecycleRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if action is NodeRuntimeAction.RECONFIGURE_RESTART:
+                raise RuntimeError("restart failed")
+            return super().execute(action, node)
+
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=FailEveryReconfigure(),
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    control.register_node(
+        name="media-a",
+        port_range_start=12000,
+        port_range_end=12001,
+        max_nodes=1,
+        external_port=12000,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+
+    with pytest.raises(NodeRuntimeFailed, match="node_port_change_rollback_failed"):
+        control.change_port(
+            node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            confirmation_token=preview.confirmation_token,
+        )
+
+    failed = store.get_node(node_id)
+    assert failed is not None and failed.runtime_state is NodeState.FAILED
+
+
+def test_startup_recovery_rolls_back_a_prepared_port_change_before_observation() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    runtime = RecordingLifecycleRuntime()
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        new_operation_id=lambda: UUID("40000000-0000-0000-0000-000000000001"),
+        node_runtime=runtime,
+        provision_on_create=True,
+    )
+    node = control.register_node(
+        name="media-a",
+        port_range_start=12000,
+        port_range_end=12002,
+        max_nodes=1,
+        external_port=12000,
+    )
+    store.begin_port_change(
+        change_id=UUID("40000000-0000-0000-0000-000000000001"),
+        node_id=node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001, 12002),
+        expected_revision=node.desired_revision,
+        expected_registered_cameras=0,
+        expected_blast_radius_sha256=hashlib.sha256(b"").hexdigest(),
+    )
+
+    recovered = control.recover_runtime_state()
+
+    persisted = store.get_node(node_id)
+    assert persisted is not None and persisted.external_port == 12000
+    assert store.list_incomplete_port_changes() == ()
+    assert recovered[0].runtime_state is NodeState.RUNNING
+    assert runtime.calls[1] == (NodeRuntimeAction.RECONFIGURE_RESTART, node_id)
+
+
+def test_prepared_port_change_reserves_target_for_new_node_registration() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    store.begin_port_change(
+        change_id=UUID("40000000-0000-0000-0000-000000000001"),
+        node_id=node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+        expected_revision=1,
+        expected_registered_cameras=0,
+        expected_blast_radius_sha256=hashlib.sha256(b"").hexdigest(),
+    )
+
+    with pytest.raises(NodePortInUse, match="node_port_in_use"):
+        store.register_automatically(
+            name="media-b",
+            allowed_ports=(12000, 12001),
+            max_nodes=2,
+            preferred_port=12001,
+            choose_port=lambda available: available[0],
+            new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000002"),
+        )
+
+
+def test_in_memory_port_change_and_delete_guards_are_fail_closed() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+
+    def store_with_camera() -> InMemoryNodeStore:
+        store = InMemoryNodeStore(
+            nodes=(
+                MediaNode(
+                    id=node_id,
+                    name="media-a",
+                    external_port=12000,
+                    state=NodeState.RUNNING,
+                    runtime_state=NodeState.RUNNING,
+                    health=NodeHealth.HEALTHY,
+                    management_fresh=True,
+                    management_observed_at=now,
+                    config_compatible=True,
+                    desired_revision=1,
+                    applied_revision=1,
+                ),
+            )
+        )
+        store.place_camera_manually(
+            camera_id=camera_id,
+            name="entrance",
+            source_url="rtsp://camera.local/main",
+            public_id=PublicId.parse("a" * 26),
+            node_id=node_id,
+        )
+        return store
+
+    cases = (
+        (UUID(int=99), 12001, (12000, 12001), 1, 1, "a" * 64, NodeNotFound),
+        (node_id, 13000, (12000, 12001), 1, 1, "a" * 64, NodePortOutOfRange),
+        (node_id, 12001, (12000, 12001), 2, 1, "a" * 64, NodeLifecycleConflict),
+        (node_id, 12001, (12000, 12001), 1, 0, "a" * 64, NodeLifecycleConflict),
+        (node_id, 12000, (12000, 12001), 1, 1, "a" * 64, NodeLifecycleConflict),
+    )
+    for requested, port, allowed, revision, count, fingerprint, error in cases:
+        with pytest.raises(error):
+            store_with_camera().begin_port_change(
+                change_id=UUID(int=4),
+                node_id=requested,
+                new_port=port,
+                allowed_ports=allowed,
+                expected_revision=revision,
+                expected_registered_cameras=count,
+                expected_blast_radius_sha256=fingerprint,
+            )
+
+    store = store_with_camera()
+    fingerprint = camera_placement_fingerprint(((camera_id, 1),))
+    change = store.begin_port_change(
+        change_id=UUID(int=4),
+        node_id=node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+        expected_revision=1,
+        expected_registered_cameras=1,
+        expected_blast_radius_sha256=fingerprint,
+    )
+    with pytest.raises(NodePortInUse):
+        store.register_automatically(
+            name="media-b",
+            allowed_ports=(12001,),
+            max_nodes=2,
+            preferred_port=12001,
+            choose_port=lambda ports: ports[0],
+            new_node_id=lambda: UUID(int=2),
+        )
+    with pytest.raises(NodeLifecycleConflict, match="node_port_change_in_progress"):
+        store.begin_port_change(
+            change_id=UUID(int=5),
+            node_id=node_id,
+            new_port=12002,
+            allowed_ports=(12000, 12001, 12002),
+            expected_revision=1,
+            expected_registered_cameras=1,
+            expected_blast_radius_sha256=fingerprint,
+        )
+    with pytest.raises(NodeNotFound):
+        store.complete_port_change(
+            UUID(int=99),
+            NodeRuntimeObservation(state=NodeState.FAILED, health=NodeHealth.UNHEALTHY),
+        )
+    store.abort_port_change(change.id, runtime_observation_for(node_id, revision=1))
+    assert store.abort_port_change(change.id, runtime_observation_for(node_id, revision=1))
+    with pytest.raises(NodeLifecycleConflict, match="node_port_change_not_prepared"):
+        store.complete_port_change(change.id, runtime_observation_for(node_id, revision=2))
+    with pytest.raises(NodeNotEmpty):
+        store.request_node_delete(node_id)
+    with pytest.raises(NodeNotFound):
+        store.request_node_delete(UUID(int=99))
+
+    empty = InMemoryNodeStore(
+        nodes=(MediaNode(id=node_id, name="empty", external_port=12000, state=NodeState.STOPPED),)
+    )
+    with pytest.raises(NodeLifecycleConflict):
+        empty.finalize_node_delete(node_id)
+    deleting = empty.request_node_delete(node_id)
+    assert empty.request_node_delete(node_id) == deleting
+    empty.finalize_node_delete(UUID("00000000-0000-0000-0000-000000000002"))
+    empty.finalize_node_delete(node_id)
+    empty.finalize_node_delete(node_id)
+
+
+def test_prepared_port_change_fences_camera_mutations_and_moves() -> None:
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=tuple(
+            MediaNode(
+                id=node_id,
+                name=name,
+                external_port=port,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            )
+            for node_id, name, port in (
+                (source_id, "source", 12000),
+                (target_id, "target", 12001),
+            )
+        )
+    )
+    camera = store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=source_id,
+    )
+    store.begin_port_change(
+        change_id=UUID(int=4),
+        node_id=source_id,
+        new_port=12002,
+        allowed_ports=(12000, 12001, 12002),
+        expected_revision=1,
+        expected_registered_cameras=1,
+        expected_blast_radius_sha256=camera_placement_fingerprint(((camera_id, 1),)),
+    )
+
+    operations: tuple[Callable[[], object], ...] = (
+        lambda: store.update_camera(
+            camera.id,
+            name="changed",
+            source_url="rtsp://camera.local/main",
+        ),
+        lambda: store.set_camera_enabled(camera.id, enabled=False),
+        lambda: store.request_camera_delete(camera.id),
+        lambda: store.create_camera_move(
+            move_id=UUID(int=3),
+            camera_id=camera.id,
+            target_node_id=target_id,
+            expected_revision=1,
+            force=False,
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(CameraLifecycleConflict, match="node_port_change_in_progress"):
+            operation()
+
+
+def test_in_memory_store_rejects_invalid_camera_and_move_transitions() -> None:
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+
+    def store_with_camera() -> InMemoryNodeStore:
+        store = InMemoryNodeStore(
+            nodes=tuple(
+                MediaNode(
+                    id=node_id,
+                    name=name,
+                    external_port=port,
+                    state=NodeState.RUNNING,
+                    runtime_state=NodeState.RUNNING,
+                    health=NodeHealth.HEALTHY,
+                    management_fresh=True,
+                    management_observed_at=now,
+                    config_compatible=True,
+                    desired_revision=1,
+                    applied_revision=1,
+                )
+                for node_id, name, port in (
+                    (source_id, "source", 12000),
+                    (target_id, "target", 12001),
+                )
+            )
+        )
+        store.place_camera_manually(
+            camera_id=camera_id,
+            name="entrance",
+            source_url="rtsp://camera.local/main",
+            public_id=PublicId.parse("a" * 26),
+            node_id=source_id,
+        )
+        return store
+
+    missing = UUID(int=99)
+    store = store_with_camera()
+    assert store.list_node_cameras(source_id)[0].id == camera_id
+    with pytest.raises(NodeNotFound):
+        store.list_node_cameras(missing)
+    operations: tuple[Callable[[], object], ...] = (
+        lambda: store.update_camera(
+            missing,
+            name="x",
+            source_url="rtsp://camera.local/main",
+        ),
+        lambda: store.set_camera_enabled(missing, enabled=False),
+        lambda: store.request_camera_delete(missing),
+    )
+    for operation in operations:
+        with pytest.raises(CameraNotFound):
+            operation()
+    assert store.update_camera(
+        camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+    ).desired_revision == 1
+    store.set_camera_enabled(camera_id, enabled=False)
+    assert store.set_camera_enabled(camera_id, enabled=False).state.value == "disabled"
+    with pytest.raises(CameraLifecycleConflict, match="camera_not_enabled"):
+        store.create_camera_move(
+            move_id=UUID(int=3),
+            camera_id=camera_id,
+            target_node_id=target_id,
+            expected_revision=2,
+            force=False,
+        )
+
+    store = store_with_camera()
+    invalid_moves = (
+        (missing, target_id, 1, CameraNotFound),
+        (camera_id, target_id, 2, CameraLifecycleConflict),
+        (camera_id, source_id, 1, CameraLifecycleConflict),
+        (camera_id, missing, 1, NodeNotFound),
+    )
+    for requested_camera, requested_target, revision, error in invalid_moves:
+        with pytest.raises(error):
+            store.create_camera_move(
+                move_id=uuid4(),
+                camera_id=requested_camera,
+                target_node_id=requested_target,
+                expected_revision=revision,
+                force=False,
+            )
+    move = store.create_camera_move(
+        move_id=UUID(int=3),
+        camera_id=camera_id,
+        target_node_id=target_id,
+        expected_revision=1,
+        force=False,
+    )
+    with pytest.raises(CameraLifecycleConflict, match="camera_move_in_progress"):
+        store.create_camera_move(
+            move_id=UUID(int=4),
+            camera_id=camera_id,
+            target_node_id=target_id,
+            expected_revision=2,
+            force=False,
+        )
+    with pytest.raises(CameraNotFound):
+        store.switch_camera_move(missing)
+    with pytest.raises(CameraNotFound):
+        store.complete_camera_move(missing)
+    with pytest.raises(CameraLifecycleConflict, match="camera_move_not_switched"):
+        store.complete_camera_move(move.id)
+    assert not store.mark_camera_applied(
+        camera_id=camera_id,
+        node_id=source_id,
+        placement_generation=1,
+        desired_revision=2,
+    )
+
+
+def test_node_control_fails_closed_on_old_listener_and_delete_runtime_mismatch() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    runtime = RecordingLifecycleRuntime()
+    store = InMemoryNodeStore()
+    port_checks: dict[int, int] = {}
+
+    def bindable(port: int) -> bool:
+        port_checks[port] = port_checks.get(port, 0) + 1
+        if port == 12000:
+            return port_checks[port] <= 2
+        return port != 12000
+
+    control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=bindable,
+        sleep=lambda _seconds: None,
+    )
+    control.register_node(
+        name="media-a",
+        port_range_start=12000,
+        port_range_end=12001,
+        max_nodes=1,
+        external_port=12000,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+    with pytest.raises(NodeRuntimeFailed, match="node_port_change_rolled_back"):
+        control.change_port(
+            node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            confirmation_token=preview.confirmation_token,
+        )
+
+    class BadDeleteRuntime(RecordingLifecycleRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if action is NodeRuntimeAction.DELETE:
+                return runtime_observation_for(node.id, revision=node.desired_revision)
+            return super().execute(action, node)
+
+    delete_store = InMemoryNodeStore(
+        nodes=(MediaNode(id=node_id, name="stopped", external_port=12000, state=NodeState.STOPPED),)
+    )
+    delete_control = NodeControl(
+        store=delete_store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=uuid4,
+        node_runtime=BadDeleteRuntime(),
+    )
+    with pytest.raises(NodeRuntimeFailed, match="node_delete_failed"):
+        delete_control.delete_node(node_id)
+    assert delete_store.get_node(node_id).runtime_state is NodeState.FAILED  # type: ignore[union-attr]
+
+
+def runtime_observation_for(node_id: UUID, *, revision: int) -> NodeRuntimeObservation:
+    return NodeRuntimeObservation(
+        state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        config_compatible=True,
+        applied_revision=revision,
+        process_id=100 + node_id.int,
+        process_start_ticks=1000,
+        process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
+        config_sha256="b" * 64,
+        release_id="v1.20.0",
+    )
+
+
+def test_delete_node_requires_empty_stopped_and_releases_its_port() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
+    client.post("/api/v1/nodes", json={"name": "media-a"})
+
+    running = client.delete(f"/api/v1/nodes/{node_id}")
+    client.post(f"/api/v1/nodes/{node_id}/stop")
+    deleted = client.delete(f"/api/v1/nodes/{node_id}")
+
+    assert running.status_code == 409
+    assert running.json()["detail"]["code"] == "node_delete_requires_stopped_or_failed"
+    assert deleted.status_code == 204
+    assert store.get_node(node_id) is None
+    assert runtime.calls[-1] == (NodeRuntimeAction.DELETE, node_id)
+
+
+def test_postgresql_deleted_node_keeps_append_only_placement_history(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+    node = store.request_desired_state(node.id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        node.id,
+        SuccessfulNodeRuntime().execute(NodeRuntimeAction.START, node),
+    )
+    camera = store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=node_id,
+    )
+    store.request_camera_delete(camera.id)
+    assert store.mark_camera_applied(
+        camera_id=camera.id,
+        node_id=node_id,
+        placement_generation=1,
+        desired_revision=2,
+    )
+    stopped = store.request_stop(node_id)
+    store.apply_runtime_observation(
+        node_id,
+        NodeRuntimeObservation(
+            state=NodeState.STOPPED,
+            health=NodeHealth.UNKNOWN,
+            config_compatible=True,
+            applied_revision=stopped.desired_revision,
+            config_sha256="b" * 64,
+            release_id=stopped.release_id,
+        ),
+    )
+    store.request_node_delete(node_id)
+    store.finalize_node_delete(node_id)
+
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        historical_node = connection.scalar(
+            text(
+                "SELECT node_id FROM camera_placement_history "
+                "WHERE camera_id = :camera_id AND generation = 1"
+            ),
+            {"camera_id": camera_id},
+        )
+    assert historical_node == node_id
+    assert store.get_node(node_id) is None
+    store.close()
+
+
+def test_postgresql_node_administration_happy_path_is_crash_durable(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        new_operation_id=lambda: UUID("40000000-0000-0000-0000-000000000001"),
+        node_runtime=RecordingLifecycleRuntime(),
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    cameras_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    control.register_node(
+        name="media-a",
+        port_range_start=12000,
+        port_range_end=12002,
+        max_nodes=1,
+        external_port=12000,
+    )
+    camera = cameras_control.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_id,
+    )
+
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001, 12002),
+    )
+    changed = control.change_port(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001, 12002),
+        confirmation_token=preview.confirmation_token,
+    )
+    drained = control.set_administrative_state(node_id, NodeState.DRAINING)
+    maintained = control.set_administrative_state(node_id, NodeState.MAINTENANCE)
+    resumed = control.set_administrative_state(node_id, NodeState.RUNNING)
+    deleting_camera = cameras_control.delete_camera(camera.id)
+    assert store.mark_camera_applied(
+        camera_id=camera.id,
+        node_id=node_id,
+        placement_generation=camera.placement_generation,
+        desired_revision=deleting_camera.desired_revision,
+    )
+    stopped = control.stop_node(node_id)
+    control.delete_node(node_id)
+
+    expected_blast_radius = hashlib.sha256(
+        f"{camera.id}:{camera.placement_generation}".encode("ascii")
+    ).hexdigest()
+    assert changed.external_port == 12001
+    assert preview.registered_cameras == 1
+    assert preview.blast_radius_sha256 == expected_blast_radius
+    assert drained.state is NodeState.DRAINING
+    assert maintained.state is NodeState.MAINTENANCE
+    assert resumed.state is NodeState.RUNNING
+    assert stopped.runtime_state is NodeState.STOPPED
+    assert store.get_node(node_id) is None
+    assert store.list_incomplete_port_changes() == ()
+
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        saga = connection.execute(
+            text(
+                "SELECT state, registered_cameras, blast_radius_sha256 "
+                "FROM node_port_change_sagas"
+            )
+        ).one()
+        historical_node = connection.scalar(
+            text("SELECT node_id FROM camera_placement_history WHERE camera_id = :camera_id"),
+            {"camera_id": camera_id},
+        )
+    assert saga == ("complete", 1, expected_blast_radius)
+    assert historical_node == node_id
+    store.close()
+
+
+def test_postgresql_node_administration_rejects_stale_or_conflicting_operations(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000, 12001),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: node_id,
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+    node = store.request_desired_state(node.id, NodeState.RUNNING)
+    store.apply_runtime_observation(node.id, runtime_observation_for(node.id, revision=2))
+
+    with pytest.raises(NodeNotFound):
+        store.request_administrative_state(UUID(int=99), NodeState.DRAINING)
+    drained = store.request_administrative_state(node.id, NodeState.DRAINING)
+    assert store.request_administrative_state(node.id, NodeState.DRAINING) == drained
+    store.request_administrative_state(node.id, NodeState.RUNNING)
+    with pytest.raises(NodeLifecycleConflict):
+        store.request_administrative_state(node.id, NodeState.MAINTENANCE)
+
+    fingerprint = camera_placement_fingerprint(())
+    cases = (
+        (UUID(int=99), 12001, (12000, 12001), 4, NodeNotFound),
+        (node_id, 13000, (12000, 12001), 4, NodePortOutOfRange),
+        (node_id, 12001, (12000, 12001), 99, NodeLifecycleConflict),
+        (node_id, 12000, (12000, 12001), 4, NodeLifecycleConflict),
+    )
+    for requested, port, allowed, revision, error in cases:
+        with pytest.raises(error):
+            store.begin_port_change(
+                change_id=uuid4(),
+                node_id=requested,
+                new_port=port,
+                allowed_ports=allowed,
+                expected_revision=revision,
+                expected_registered_cameras=0,
+                expected_blast_radius_sha256=fingerprint,
+            )
+    with pytest.raises(NodeLifecycleConflict, match="node_blast_radius_changed"):
+        store.begin_port_change(
+            change_id=uuid4(),
+            node_id=node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            expected_revision=4,
+            expected_registered_cameras=1,
+            expected_blast_radius_sha256="a" * 64,
+        )
+
+    change = store.begin_port_change(
+        change_id=UUID(int=4),
+        node_id=node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+        expected_revision=4,
+        expected_registered_cameras=0,
+        expected_blast_radius_sha256=fingerprint,
+    )
+    with pytest.raises(NodePortInUse):
+        store.begin_port_change(
+            change_id=UUID(int=5),
+            node_id=node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            expected_revision=4,
+            expected_registered_cameras=0,
+            expected_blast_radius_sha256=fingerprint,
+        )
+    with pytest.raises(NodeNotFound):
+        store.abort_port_change(UUID(int=99), runtime_observation_for(node_id, revision=4))
+    restored = store.abort_port_change(change.id, runtime_observation_for(node_id, revision=4))
+    repeated = store.abort_port_change(
+        change.id,
+        runtime_observation_for(node_id, revision=4),
+    )
+    assert repeated == restored
+    with pytest.raises(NodeLifecycleConflict, match="node_port_change_not_prepared"):
+        store.complete_port_change(change.id, runtime_observation_for(node_id, revision=5))
+
+    with pytest.raises(NodeLifecycleConflict):
+        store.request_node_delete(node_id)
+    stopped = store.request_stop(node_id)
+    store.apply_runtime_observation(
+        node_id,
+        NodeRuntimeObservation(
+            state=NodeState.STOPPED,
+            health=NodeHealth.UNKNOWN,
+            config_compatible=True,
+            applied_revision=stopped.desired_revision,
+            config_sha256="b" * 64,
+            release_id="v1.20.0",
+        ),
+    )
+    deleting = store.request_node_delete(node_id)
+    assert store.request_node_delete(node_id) == deleting
+    store.finalize_node_delete(UUID(int=99))
+    store.finalize_node_delete(node_id)
+    store.finalize_node_delete(node_id)
+    store.close()
+
+
+def test_postgresql_port_change_fences_camera_updates_and_moves(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    now = datetime.now(UTC)
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    for node_id, name, port, api_port, metrics_port in (
+        (source_id, "source", 12000, 13000, 14000),
+        (target_id, "target", 12001, 13001, 14001),
+    ):
+        def allocate_node_id(selected: UUID = node_id) -> UUID:
+            return selected
+
+        node = store.register_automatically(
+            name=name,
+            allowed_ports=(port,),
+            max_nodes=2,
+            preferred_port=port,
+            choose_port=lambda ports: ports[0],
+            new_node_id=allocate_node_id,
+            api_ports=(api_port,),
+            metrics_ports=(metrics_port,),
+        )
+        node = store.request_desired_state(node.id, NodeState.RUNNING)
+        observation = runtime_observation_for(node.id, revision=2)
+        store.apply_runtime_observation(node.id, observation)
+    camera = store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=source_id,
+        management_freshness_seconds=int((datetime.now(UTC) - now).total_seconds()) + 30,
+    )
+    store.begin_port_change(
+        change_id=UUID(int=4),
+        node_id=source_id,
+        new_port=12002,
+        allowed_ports=(12000, 12001, 12002),
+        expected_revision=2,
+        expected_registered_cameras=1,
+        expected_blast_radius_sha256=camera_placement_fingerprint(((camera_id, 1),)),
+    )
+
+    for operation in (
+        lambda: store.update_camera(
+            camera.id,
+            name="changed",
+            source_url="rtsp://camera.local/main",
+        ),
+        lambda: store.set_camera_enabled(camera.id, enabled=False),
+        lambda: store.request_camera_delete(camera.id),
+        lambda: store.create_camera_move(
+            move_id=UUID(int=3),
+            camera_id=camera.id,
+            target_node_id=target_id,
+            expected_revision=1,
+            force=False,
+        ),
+    ):
+        with pytest.raises(CameraLifecycleConflict, match="node_port_change_in_progress"):
+            operation()
+    assert store.list_node_active_moves(source_id) == ()
+    with pytest.raises(NodeNotFound):
+        store.list_node_cameras(UUID(int=99))
+    store.close()
+
+
+def test_camera_and_move_routes_cover_success_and_typed_failures() -> None:
+    node_a = UUID("00000000-0000-0000-0000-000000000001")
+    node_b = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=tuple(
+            MediaNode(
+                id=node_id,
+                name=name,
+                external_port=port,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=datetime.now(UTC),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            )
+            for node_id, name, port in (
+                (node_a, "media-a", 12000),
+                (node_b, "media-b", 12001),
+            )
+        )
+    )
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    camera = cameras.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_a,
+    )
+    observer = CameraRuntimeObserver(
+        store=store,
+        media_nodes=cast(Any, ApiRecordingMediaFactory(node_a, node_b)),
+    )
+    moves = CameraMoveControl(
+        store=store,
+        runtime=observer,
+        confirmations=node_confirmation_service(),
+        new_move_id=lambda: UUID("30000000-0000-0000-0000-000000000001"),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=cameras,
+            camera_runtime_observer=observer,
+            camera_move_control=moves,
+        )
+    )
+
+    updated = client.put(
+        f"/api/v1/cameras/{camera.id}",
+        json={"name": "front", "source_url": "rtsp://camera.local/sub"},
+    )
+    disabled = client.post(f"/api/v1/cameras/{camera.id}/disable")
+    enabled = client.post(f"/api/v1/cameras/{camera.id}/enable")
+    runtime = client.get(f"/api/v1/cameras/{camera.id}/runtime")
+    preview = client.post(
+        f"/api/v1/cameras/{camera.id}/moves/preview",
+        json={"target_node_id": str(node_b)},
+    )
+    requested = client.post(
+        f"/api/v1/cameras/{camera.id}/moves",
+        json={"target_node_id": str(node_b)},
+    )
+    move_id = requested.json()["id"]
+
+    assert updated.status_code == disabled.status_code == enabled.status_code == 200
+    assert runtime.json()["reader_count"] == 0
+    assert preview.status_code == 200
+    assert requested.status_code == 202
+    assert client.get(f"/api/v1/camera-moves/{move_id}").status_code == 200
+    missing_move = client.get(
+        "/api/v1/camera-moves/40000000-0000-0000-0000-000000000001"
+    )
+    assert missing_move.status_code == 404
+    assert client.delete(f"/api/v1/cameras/{camera.id}").status_code == 409
+    assert client.get("/api/v1/cameras").json()["count"] == 1
+
+
+class ApiRecordingMediaNode:
+    def __init__(self) -> None:
+        self.runtime: dict[PublicId, tuple[bool, int] | None] = {}
+
+    def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
+        return self.runtime.get(name, (False, 0))
+
+    def put_path(self, path: object) -> None:
+        raise AssertionError("unused")
+
+    def get_path(self, name: PublicId) -> None:
+        raise AssertionError("unused")
+
+    def inventory_paths(self) -> object:
+        raise AssertionError("unused")
+
+    def delete_path(self, name: PublicId) -> None:
+        raise AssertionError("unused")
+
+
+class ApiRecordingMediaFactory:
+    def __init__(self, *node_ids: UUID) -> None:
+        self.clients = {node_id: ApiRecordingMediaNode() for node_id in node_ids}
+
+    def for_node(self, node: MediaNode) -> ApiRecordingMediaNode:
+        return self.clients[node.id]
+
+
+def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> None:
+    missing = TestClient(create_app(Settings(role=RuntimeRole.WEB)))
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    node_id = UUID("00000000-0000-0000-0000-000000000002")
+    move_id = UUID("30000000-0000-0000-0000-000000000001")
+
+    assert missing.get("/api/v1/cameras").status_code == 503
+    assert missing.put(
+        f"/api/v1/cameras/{camera_id}",
+        json={"name": "x", "source_url": "rtsp://camera.local/main"},
+    ).status_code == 503
+    assert missing.get(f"/api/v1/cameras/{camera_id}/runtime").status_code == 503
+    assert missing.post(
+        f"/api/v1/cameras/{camera_id}/moves/preview",
+        json={"target_node_id": str(node_id)},
+    ).status_code == 503
+    assert missing.post(
+        f"/api/v1/cameras/{camera_id}/moves",
+        json={"target_node_id": str(node_id)},
+    ).status_code == 503
+    assert missing.get(f"/api/v1/camera-moves/{move_id}").status_code == 503
+
+    class ErrorCameraControl(CameraControl):
+        error: Exception = CameraNotFound("camera_not_found")
+
+        def update_camera(self, *args: object, **kwargs: object) -> Any:
+            raise self.error
+
+        def set_camera_enabled(self, *args: object, **kwargs: object) -> Any:
+            raise self.error
+
+        def delete_camera(self, *args: object, **kwargs: object) -> Any:
+            raise self.error
+
+    class ErrorMoveControl:
+        error: Exception = CameraNotFound("camera_not_found")
+
+        def preview(self, *args: object, **kwargs: object) -> Any:
+            raise self.error
+
+        def request_move(self, *args: object, **kwargs: object) -> Any:
+            raise self.error
+
+        def get_move(self, requested_move_id: UUID) -> None:
+            return None
+
+    class ErrorRuntimeObserver:
+        def observe(self, requested_camera_id: UUID) -> Any:
+            raise CameraNotFound("camera_not_found")
+
+    cameras = ErrorCameraControl(
+        store=InMemoryNodeStore(),
+        new_camera_id=uuid4,
+        new_public_id=lambda: "a" * 26,
+    )
+    moves = ErrorMoveControl()
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=cameras,
+            camera_runtime_observer=cast(CameraRuntimeObserver, ErrorRuntimeObserver()),
+            camera_move_control=cast(CameraMoveControl, moves),
+        )
+    )
+
+    def update() -> Response:
+        return client.put(
+            f"/api/v1/cameras/{camera_id}",
+            json={"name": "x", "source_url": "rtsp://camera.local/main"},
+        )
+
+    assert update().status_code == 404
+    cameras.error = CameraLifecycleConflict("camera_deleting")
+    assert update().status_code == 409
+    cameras.error = InvalidCameraSource("camera_source_secret_reference_required")
+    assert update().status_code == 422
+    cameras.error = CameraNotFound("camera_not_found")
+    assert client.post(f"/api/v1/cameras/{camera_id}/enable").status_code == 404
+    cameras.error = CameraLifecycleConflict("camera_deleting")
+    assert client.post(f"/api/v1/cameras/{camera_id}/disable").status_code == 409
+    assert client.delete(f"/api/v1/cameras/{camera_id}").status_code == 409
+    assert client.get(f"/api/v1/cameras/{camera_id}/runtime").status_code == 404
+
+    preview_request = {"target_node_id": str(node_id)}
+    for error, expected in (
+        (CameraNotFound("camera_not_found"), 404),
+        (NodeNotFound("node_not_found"), 404),
+        (CameraLifecycleConflict("camera_move_in_progress"), 409),
+        (CameraReaderInvariantViolation("camera_reader_limit_violated"), 409),
+    ):
+        moves.error = error
+        assert client.post(
+            f"/api/v1/cameras/{camera_id}/moves/preview", json=preview_request
+        ).status_code == expected
+    for request_error, expected in (
+        (CameraNotFound("camera_not_found"), 404),
+        (NodeNotFound("node_not_found"), 404),
+        (CameraOccupied("camera_occupied"), 409),
+        (CameraReaderInvariantViolation("camera_reader_limit_violated"), 409),
+        (MoveConfirmationRequired("move_confirmation_required"), 409),
+        (NodeCameraCapacityReached("node_camera_capacity_reached"), 409),
+    ):
+        moves.error = request_error
+        assert client.post(
+            f"/api/v1/cameras/{camera_id}/moves", json=preview_request
+        ).status_code == expected

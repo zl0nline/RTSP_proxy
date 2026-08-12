@@ -7,17 +7,24 @@ import pytest
 
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId
-from rtsp_proxy.media import MediaNodeUnavailable, MediaPathConfig, MediaPathInventory
+from rtsp_proxy.media import (
+    MediaNodeProtocolError,
+    MediaNodeUnavailable,
+    MediaPathConfig,
+    MediaPathInventory,
+)
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.nodes import (
     CameraControl,
     CameraLifecycleConflict,
+    CameraMove,
     CameraMoveState,
     CameraMoveStore,
     CameraState,
     InMemoryNodeStore,
     MediaNode,
     NodeHealth,
+    NodeLifecycleBusy,
     NodeRuntimeObservation,
     NodeState,
 )
@@ -342,6 +349,62 @@ def test_move_preview_fails_closed_when_reader_limit_is_already_violated() -> No
         control.preview(CAMERA_A, target_node_id=NODE_B)
 
 
+def test_node_port_confirmation_is_bound_to_blast_radius_and_expiry() -> None:
+    wall_time = [1_700_000_000.0]
+    confirmations = ConfirmationTokenService(
+        secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+        lifetime_seconds=30,
+        wall_time=lambda: wall_time[0],
+    )
+    fingerprint = "a" * 64
+    token = confirmations.issue_node_port_change(
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+    )
+
+    assert confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+    )
+    assert not confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256="invalid",
+    )
+    assert not confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12003,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+    )
+    wall_time[0] += 31
+    assert not confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+    )
+
+
 def move_services(
     store: CameraMoveStore,
     factory: RecordingMediaNodeFactory,
@@ -610,3 +673,112 @@ def test_delete_releases_capacity_only_after_path_absence_is_verified() -> None:
     assert after is not None and after.registered_cameras == 0
     assert store.list_cameras() == ()
     assert reconciler.reconcile_node(NODE_A).applied == 0
+
+
+def test_confirmation_decoder_rejects_malformed_tokens_and_invalid_expiry() -> None:
+    confirmations = ConfirmationTokenService(
+        secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+        lifetime_seconds=30,
+        wall_time=lambda: 1_700_000_000.0,
+    )
+    valid = confirmations.issue_node_port_change(
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12001,
+        desired_revision=1,
+        registered_cameras=0,
+        blast_radius_sha256="a" * 64,
+    )
+
+    for token in ("x" * 4097, "no-dot", "!bad!.signature", valid + ".extra"):
+        assert not confirmations.verify_node_port_change(
+            token,
+            node_id=NODE_A,
+            old_port=12000,
+            new_port=12001,
+            desired_revision=1,
+            registered_cameras=0,
+            blast_radius_sha256="a" * 64,
+        )
+    assert not confirmations.verify_node_port_change(
+        valid,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12001,
+        desired_revision=1,
+        registered_cameras=0,
+        blast_radius_sha256="invalid",
+    )
+
+
+def test_reconcile_failures_and_orphans_are_isolated_and_verified() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+    reconciler = CameraReconciler(store=store, media_nodes=factory)
+    client = factory.clients[NODE_A]
+    orphan = PublicId.parse("b" * 25 + "e")
+    client.paths[orphan] = MediaPathConfig(name=orphan, source_url="rtsp://old.invalid/main")
+
+    report = reconciler.reconcile_node(NODE_A)
+
+    assert report.applied == 1
+    assert report.deleted_orphans == 1
+    assert orphan not in client.paths
+    with pytest.raises(ReconcileRetry, match="camera_reconcile_node_unavailable"):
+        CameraReconciler(
+            store=InMemoryNodeStore(nodes=(MediaNode(id=NODE_A, name="down", external_port=1),)),
+            media_nodes=factory,
+        ).reconcile_node(NODE_A)
+    with pytest.raises(Exception, match="node_not_found"):
+        reconciler.reconcile_node(UUID(int=99))
+
+    class StubbornNode(RecordingMediaNode):
+        def delete_path(self, name: PublicId) -> None:
+            self.deletes.append(name)
+
+    stubborn = StubbornNode()
+    stubborn.paths[PUBLIC_A] = MediaPathConfig(
+        name=PUBLIC_A,
+        source_url="rtsp://camera.invalid/main",
+    )
+    with pytest.raises(ReconcileRetry, match="camera_reconcile_delete_unverified"):
+        CameraReconciler._remove_disabled_path(stubborn, PUBLIC_A)
+
+    class UnreadableNode(RecordingMediaNode):
+        def get_path(self, name: PublicId) -> MediaPathConfig | None:
+            raise MediaNodeProtocolError("bad")
+
+    with pytest.raises(ReconcileRetry, match="camera_reconcile_unverified"):
+        CameraReconciler._safe_read_back(
+            UnreadableNode(),
+            MediaPathConfig(name=PUBLIC_A, source_url="rtsp://camera.invalid/main"),
+        )
+    with pytest.raises(ReconcileRetry, match="camera_reconcile_orphan_unverified"):
+        CameraReconciler._safe_get(UnreadableNode(), PUBLIC_A)
+
+
+def test_reconcile_coordinator_counts_busy_moves_and_skips_stopped_nodes() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+
+    class BusyMoves(CameraMoveReconciler):
+        def resume(self, move_id: UUID) -> CameraMove:
+            raise NodeLifecycleBusy("busy")
+
+    move, _ = move_services(store, factory)
+    requested = move.request_move(CAMERA_A, target_node_id=NODE_B)
+    stopped = store.get_node(NODE_B)
+    assert stopped is not None
+    store.apply_runtime_observation(
+        NODE_B,
+        NodeRuntimeObservation(state=NodeState.STOPPED, health=NodeHealth.UNKNOWN),
+    )
+    report = ReconcileCoordinator(
+        store=store,
+        cameras=CameraReconciler(store=store, media_nodes=factory),
+        moves=BusyMoves(store=store, media_nodes=factory),
+    ).run_once()
+
+    assert requested.state is CameraMoveState.PREPARE_TARGET
+    assert report.retryable_failures == 1
+    assert report.reconciled_nodes == 1
