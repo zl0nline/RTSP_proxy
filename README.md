@@ -183,11 +183,19 @@ review, fixes и native amd64/arm64 CI.
 Phase B **complete**: independent Standards/Spec review и все шесть jobs
 [native amd64/arm64 CI](https://github.com/zl0nline/RTSP_proxy/actions/runs/31547513916)
 прошли. Credentialed/query-token source URLs сейчас fail closed: они не будут
-приниматься до encrypted secret-reference flow. Ещё не реализованы
-per-node systemd runtime и automatic missing-target provisioner; поэтому при
-отсутствии eligible RUNNING node camera create завершается fail closed без
-ghost placement. Также ещё не реализованы reconciler/move/drain, dashboard,
-one-reader admission, access policies, notifications и complete operations workflows.
+приниматься до encrypted secret-reference flow.
+
+Phase C **implemented, native CI pending**: per-node generated configs,
+`rtsp-proxy-media@<uuid>.service`, scoped root helper over a bounded Unix
+socket, unique loopback API/metrics ports, PID/start/boot/config/release
+identity, lifecycle recovery and automatic
+reserve→provision→smoke→place are in code. The two-node native contract proves
+that restart/stop of node A does not change node B process or its established
+ordinary RTSP/TCP session. Documentation is updated to COMPLETE only after
+independent review and green amd64/arm64 run.
+
+Ещё не реализованы reconciler/move/drain, dashboard, one-reader admission,
+access policies, notifications и complete operations workflows.
 Наличие load harness не означает готовый product или published capacity.
 
 ## Локальная разработка

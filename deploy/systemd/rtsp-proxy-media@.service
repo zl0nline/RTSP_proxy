@@ -1,0 +1,47 @@
+[Unit]
+Description=RTSP Proxy bounded MediaMTX node %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mediamtx
+Group=mediamtx
+WorkingDirectory=/var/lib/rtsp-proxy/nodes/%i
+ExecStart=/opt/rtsp-proxy/current/bin/mediamtx /etc/rtsp-proxy/nodes/%i/mediamtx.yml
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0027
+
+RuntimeDirectory=rtsp-proxy/nodes/%i
+StateDirectory=rtsp-proxy/nodes/%i
+LogsDirectory=rtsp-proxy/nodes/%i
+RuntimeDirectoryMode=0750
+StateDirectoryMode=0750
+LogsDirectoryMode=0750
+ReadWritePaths=/run/rtsp-proxy/nodes/%i /var/lib/rtsp-proxy/nodes/%i /var/log/rtsp-proxy/nodes/%i
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitNOFILE=131072
+
+[Install]
+WantedBy=multi-user.target

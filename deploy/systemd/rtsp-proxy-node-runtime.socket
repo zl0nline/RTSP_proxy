@@ -1,0 +1,13 @@
+[Unit]
+Description=RTSP Proxy scoped media-node runtime socket
+
+[Socket]
+ListenStream=/run/rtsp-proxy-node-runtime/control.sock
+SocketUser=root
+SocketGroup=rtsp-proxy
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -14,9 +14,11 @@ from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import generate_public_id
+from rtsp_proxy.node_runtime import UnixNodeRuntimeClient
 from rtsp_proxy.nodes import (
     CameraControl,
     NodeControl,
+    NodeProvisioningPolicy,
     tcp_port_is_bindable,
 )
 
@@ -27,10 +29,18 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_MAX_NODES": "max_nodes",
     "RTSP_PROXY_NODE_PORT_RANGE_START": "node_port_range_start",
     "RTSP_PROXY_NODE_PORT_RANGE_END": "node_port_range_end",
+    "RTSP_PROXY_NODE_API_PORT_RANGE_START": "node_api_port_range_start",
+    "RTSP_PROXY_NODE_API_PORT_RANGE_END": "node_api_port_range_end",
+    "RTSP_PROXY_NODE_METRICS_PORT_RANGE_START": "node_metrics_port_range_start",
+    "RTSP_PROXY_NODE_METRICS_PORT_RANGE_END": "node_metrics_port_range_end",
     "RTSP_PROXY_NODE_PORT_RESERVED": "node_port_reserved",
     "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": (
         "node_management_freshness_seconds"
     ),
+    "RTSP_PROXY_NODE_RUNTIME_SOCKET": "node_runtime_socket",
+    "RTSP_PROXY_NODE_RUNTIME_TIMEOUT_SECONDS": "node_runtime_timeout_seconds",
+    "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
+    "RTSP_PROXY_NODE_MEDIAMTX_BINARY_SHA256": "node_mediamtx_binary_sha256",
     "RTSP_PROXY_DATABASE_URL": "database_url",
 }
 
@@ -62,19 +72,65 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
     store = _open_verified_store(settings)
     if store is None:
         return create_app(settings)
+    node_runtime = (
+        None
+        if settings.node_runtime_socket is None
+        else UnixNodeRuntimeClient(
+            socket_path=settings.node_runtime_socket,
+            timeout_seconds=settings.node_runtime_timeout_seconds,
+        )
+    )
+    node_control = NodeControl(
+        store=store,
+        choose_port=secrets.choice,
+        new_node_id=uuid4,
+        is_port_bindable=tcp_port_is_bindable,
+        node_runtime=node_runtime,
+        provision_on_create=node_runtime is not None,
+    )
+    provisioning_policy = NodeProvisioningPolicy(
+        port_range_start=settings.node_port_range_start,
+        port_range_end=settings.node_port_range_end,
+        max_nodes=settings.max_nodes,
+        reserved_ports=settings.node_port_reserved,
+        api_ports=tuple(
+            range(
+                settings.node_api_port_range_start,
+                settings.node_api_port_range_end + 1,
+            )
+        ),
+        metrics_ports=tuple(
+            range(
+                settings.node_metrics_port_range_start,
+                settings.node_metrics_port_range_end + 1,
+            )
+        ),
+        release_id=settings.node_release_id,
+        mediamtx_binary_sha256=settings.node_mediamtx_binary_sha256,
+        management_freshness_seconds=settings.node_management_freshness_seconds,
+    )
+
+    def recover_runtime_state() -> None:
+        node_control.recover_runtime_state()
+
     return create_app(
         settings,
-        node_control=NodeControl(
-            store=store,
-            choose_port=secrets.choice,
-            new_node_id=uuid4,
-            is_port_bindable=tcp_port_is_bindable,
-        ),
+        node_control=node_control,
         camera_control=CameraControl(
             store=store,
             new_camera_id=uuid4,
             new_public_id=generate_public_id,
             management_freshness_seconds=settings.node_management_freshness_seconds,
+            ensure_automatic_capacity=(
+                None
+                if node_runtime is None
+                else lambda: node_control.ensure_automatic_capacity(
+                    provisioning_policy
+                )
+            ),
+        ),
+        startup=(
+            None if node_runtime is None else recover_runtime_state
         ),
         shutdown=store.close,
     )

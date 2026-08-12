@@ -223,6 +223,58 @@ def test_external_node_ports_cannot_overlap_the_control_listener() -> None:
         )
 
 
+def test_node_external_api_metrics_and_control_ports_must_be_disjoint() -> None:
+    with pytest.raises(ValidationError, match="node_port_ranges_overlap"):
+        Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=12000,
+            node_port_range_end=12010,
+            node_api_port_range_start=12010,
+            node_api_port_range_end=12109,
+        )
+
+    with pytest.raises(ValidationError, match="node_port_ranges_overlap"):
+        Settings(
+            role=RuntimeRole.WEB,
+            node_api_port_range_start=20000,
+            node_api_port_range_end=20099,
+            node_metrics_port_range_start=20099,
+            node_metrics_port_range_end=20199,
+        )
+
+    with pytest.raises(ValidationError, match="node_port_range_overlaps_control_port"):
+        Settings(
+            role=RuntimeRole.WEB,
+            http_port=20000,
+            node_api_port_range_start=20000,
+            node_api_port_range_end=20099,
+        )
+
+
+def test_reserved_host_ports_cannot_remain_in_a_management_range() -> None:
+    with pytest.raises(ValidationError, match="node_management_port_reserved"):
+        Settings(
+            role=RuntimeRole.WEB,
+            node_port_reserved=(20001,),
+        )
+
+
+def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity() -> None:
+    with pytest.raises(ValidationError, match="node_release_identity_required"):
+        Settings(
+            role=RuntimeRole.WEB,
+            node_runtime_socket=Path("/run/rtsp-proxy-node-runtime/control.sock"),
+        )
+
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        node_runtime_socket=Path("/run/rtsp-proxy-node-runtime/control.sock"),
+        node_mediamtx_binary_sha256="a" * 64,
+    )
+
+    assert settings.node_release_id == "v1.20.0"
+
+
 def test_invalid_http_port_fails_startup_validation() -> None:
     with pytest.raises(ValidationError):
         load_settings(

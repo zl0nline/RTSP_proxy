@@ -27,7 +27,9 @@ from rtsp_proxy.nodes import (
     MediaNode,
     NodeControl,
     NodeHealth,
+    NodeProvisioningPolicy,
     NodeRuntime,
+    NodeRuntimeAction,
     NodeRuntimeObservation,
     NodeState,
     tcp_port_is_bindable,
@@ -78,6 +80,81 @@ def test_operator_can_register_a_node_with_an_automatically_allocated_port() -> 
         "desired_revision": 1,
         "applied_revision": 0,
     }
+
+
+def test_each_registered_node_reserves_unique_loopback_management_ports() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=2,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+                node_api_port_range_start=13000,
+                node_api_port_range_end=13001,
+                node_metrics_port_range_start=14000,
+                node_metrics_port_range_end=14001,
+            ),
+            node_control=control,
+        )
+    )
+
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+    assert client.post("/api/v1/nodes", json={"name": "media-b"}).status_code == 201
+
+    nodes = control.list_nodes()
+    assert {(node.api_port, node.metrics_port) for node in nodes} == {
+        (13000, 14000),
+        (13001, 14001),
+    }
+
+
+def test_node_registration_reports_management_port_exhaustion_without_a_partial_node() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=2,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+                node_api_port_range_start=13000,
+                node_api_port_range_end=13000,
+                node_metrics_port_range_start=14000,
+                node_metrics_port_range_end=14000,
+            ),
+            node_control=control,
+        ),
+        raise_server_exceptions=False,
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+
+    response = client.post("/api/v1/nodes", json={"name": "media-b"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "node_management_ports_exhausted"
+    assert client.get("/api/v1/nodes").json()["count"] == 1
 
 
 def test_port_allocator_rechecks_bindability_and_retries_a_raced_candidate() -> None:
@@ -816,7 +893,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
             )
         )
-    assert revision == "0004_management_freshness"
+    assert revision == "0005_node_runtime"
     assert table_count == 4
 
 
@@ -944,12 +1021,16 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
                 "FROM outbox_messages ORDER BY occurred_at, id"
             )
         ).mappings().one()
-    expected_payload = {
-        "name": "audited",
-        "external_port": 12000,
-        "camera_capacity": 100,
-        "desired_revision": 1,
-    }
+        expected_payload = {
+            "name": "audited",
+            "external_port": 12000,
+            "api_port": 20000,
+            "metrics_port": 20100,
+            "release_id": "v1.20.0",
+            "creation_mode": "operator",
+            "camera_capacity": 100,
+            "desired_revision": 1,
+        }
     assert audit == {
         "aggregate_id": UUID("00000000-0000-0000-0000-000000000001"),
         "event_type": "media_node.created",
@@ -1116,6 +1197,12 @@ def test_database_constraint_errors_never_render_camera_source_credentials(
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             config_compatible=True,
+            applied_revision=2,
+            process_id=1001,
+            process_start_ticks=2001,
+            process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
+            config_sha256="b" * 64,
+            release_id="v1.20.0",
         ),
     )
     duplicate_public_id = "a" * 26
@@ -1160,6 +1247,12 @@ def test_postgresql_adapter_rejects_credentialed_source_urls_if_called_directly(
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             config_compatible=True,
+            applied_revision=1,
+            process_id=1001,
+            process_start_ticks=2001,
+            process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
+            config_sha256="b" * 64,
+            release_id="v1.20.0",
         ),
     )
 
@@ -1272,17 +1365,38 @@ def test_linux_port_probe_rejects_a_port_bound_only_on_ipv6() -> None:
 
 
 class SuccessfulNodeRuntime(NodeRuntime):
-    def start(self, node: MediaNode) -> NodeRuntimeObservation:
+    def execute(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+    ) -> NodeRuntimeObservation:
+        assert action in {
+            NodeRuntimeAction.PROVISION_START,
+            NodeRuntimeAction.START,
+            NodeRuntimeAction.RESTART,
+            NodeRuntimeAction.OBSERVE,
+        }
         return NodeRuntimeObservation(
             state=NodeState.RUNNING,
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             config_compatible=True,
+            applied_revision=node.desired_revision,
+            process_id=1001,
+            process_start_ticks=2001,
+            process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
+            config_sha256="b" * 64,
+            release_id=node.release_id,
         )
 
 
 class StartingNodeRuntime(NodeRuntime):
-    def start(self, node: MediaNode) -> NodeRuntimeObservation:
+    def execute(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+    ) -> NodeRuntimeObservation:
+        assert action is NodeRuntimeAction.PROVISION_START
         assert node.state is NodeState.RUNNING
         assert node.desired_revision == 2
         return NodeRuntimeObservation(
@@ -1351,6 +1465,545 @@ def test_operator_can_start_a_registered_node_through_the_linux_runtime_boundary
         "runtime_state": "running",
         "health": "healthy",
         "desired_revision": 2,
+        "applied_revision": 2,
+    }
+
+
+class RecordingLifecycleRuntime(NodeRuntime):
+    def __init__(self) -> None:
+        self.calls: list[tuple[NodeRuntimeAction, UUID]] = []
+
+    def execute(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+    ) -> NodeRuntimeObservation:
+        self.calls.append((action, node.id))
+        if action is NodeRuntimeAction.STOP:
+            return NodeRuntimeObservation(
+                state=NodeState.STOPPED,
+                health=NodeHealth.UNKNOWN,
+                config_compatible=True,
+                applied_revision=node.desired_revision,
+                config_sha256="c" * 64,
+                release_id=node.release_id,
+            )
+        return NodeRuntimeObservation(
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            config_compatible=True,
+            applied_revision=node.desired_revision,
+            process_id=3000 + len(self.calls),
+            process_start_ticks=4000 + len(self.calls),
+            process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
+            config_sha256="c" * 64,
+            release_id=node.release_id,
+        )
+
+
+def test_node_create_can_complete_provision_start_and_persist_applied_revision() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=control,
+        )
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "media-a"})
+
+    assert response.status_code == 201
+    assert response.json()["state"] == "running"
+    assert response.json()["runtime_state"] == "running"
+    assert response.json()["desired_revision"] == 2
+    assert response.json()["applied_revision"] == 2
+    assert runtime.calls == [(NodeRuntimeAction.PROVISION_START, node_id)]
+    persisted = control.list_nodes()[0]
+    assert persisted.process_id == 3001
+    assert persisted.observed_release_id == "v1.20.0"
+
+
+def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    runtime = RecordingLifecycleRuntime()
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+        node_runtime=runtime,
+        provision_on_create=True,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                max_nodes=2,
+                node_port_range_start=12000,
+                node_port_range_end=12001,
+            ),
+            node_control=control,
+        )
+    )
+    first = client.post("/api/v1/nodes", json={"name": "media-a"}).json()
+    second = client.post("/api/v1/nodes", json={"name": "media-b"}).json()
+    first_id = UUID(first["id"])
+    second_id = UUID(second["id"])
+    before_second = control.list_nodes()[1]
+
+    restarted = client.post(f"/api/v1/nodes/{first_id}/restart")
+    stopped = client.post(f"/api/v1/nodes/{first_id}/stop")
+
+    assert restarted.status_code == 200
+    assert stopped.status_code == 200
+    assert stopped.json()["runtime_state"] == "stopped"
+    assert runtime.calls == [
+        (NodeRuntimeAction.PROVISION_START, first_id),
+        (NodeRuntimeAction.PROVISION_START, second_id),
+        (NodeRuntimeAction.RESTART, first_id),
+        (NodeRuntimeAction.STOP, first_id),
+    ]
+    after_second = next(node for node in control.list_nodes() if node.id == second_id)
+    assert after_second == before_second
+
+
+class FailingNodeRuntime(NodeRuntime):
+    def execute(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+    ) -> NodeRuntimeObservation:
+        raise RuntimeError("must not escape")
+
+
+def test_failed_provisioning_keeps_a_failed_node_and_returns_only_a_typed_error() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=FailingNodeRuntime(),
+        provision_on_create=True,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=control,
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/v1/nodes", json={"name": "broken"})
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "node_runtime_operation_failed",
+            "node_id": str(node_id),
+        }
+    }
+    persisted = control.list_nodes()
+    assert len(persisted) == 1
+    assert persisted[0].state is NodeState.RUNNING
+    assert persisted[0].runtime_state is NodeState.FAILED
+    assert persisted[0].health is NodeHealth.UNHEALTHY
+
+
+def automatic_policy(*, max_nodes: int = 50) -> NodeProvisioningPolicy:
+    return NodeProvisioningPolicy(
+        port_range_start=12000,
+        port_range_end=12009,
+        max_nodes=max_nodes,
+        reserved_ports=(),
+        api_ports=tuple(range(13000, 13010)),
+        metrics_ports=tuple(range(14000, 14010)),
+        release_id="v1.20.0",
+        mediamtx_binary_sha256="0" * 64,
+    )
+
+
+def test_automatic_camera_creation_provisions_before_committing_placement() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore()
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+            automatic_policy()
+        ),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=node_control,
+            camera_control=camera_control,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["node_id"] == str(node_id)
+    assert runtime.calls == [(NodeRuntimeAction.PROVISION_START, node_id)]
+    assert node_control.list_nodes()[0].runtime_state is NodeState.RUNNING
+    assert node_control.list_nodes()[0].registered_cameras == 1
+
+
+def test_failed_automatic_provisioning_commits_no_camera_or_placement() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore()
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=FailingNodeRuntime(),
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+            automatic_policy()
+        ),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=node_control,
+            camera_control=camera_control,
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "node_runtime_operation_failed",
+        "node_id": str(node_id),
+    }
+    assert camera_control.list_cameras() == ()
+    assert len(node_control.list_nodes()) == 1
+    assert node_control.list_nodes()[0].runtime_state is NodeState.FAILED
+
+
+def test_concurrent_automatic_cameras_share_one_provisioned_node() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    store = InMemoryNodeStore()
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+        node_runtime=runtime,
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=uuid4,
+        new_public_id=generate_public_id,
+        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+            automatic_policy()
+        ),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=node_control,
+            camera_control=camera_control,
+        )
+    )
+    barrier = Barrier(2)
+
+    def create_camera(index: int) -> Response:
+        barrier.wait()
+        return client.post(
+            "/api/v1/cameras",
+            json={
+                "name": f"camera-{index}",
+                "source_url": f"rtsp://camera-{index}.local/main",
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = tuple(executor.map(create_camera, range(2)))
+
+    assert [response.status_code for response in responses] == [201, 201]
+    assert len(node_control.list_nodes()) == 1
+    assert node_control.list_nodes()[0].registered_cameras == 2
+    assert camera_control.list_cameras()[0].node_id == camera_control.list_cameras()[1].node_id
+    assert runtime.calls == [
+        (
+            NodeRuntimeAction.PROVISION_START,
+            UUID("00000000-0000-0000-0000-000000000001"),
+        )
+    ]
+
+
+def test_postgresql_serializes_cross_request_automatic_provisioning(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    node_ids = iter(
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            UUID("00000000-0000-0000-0000-000000000002"),
+        )
+    )
+    runtime = RecordingLifecycleRuntime()
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: next(node_ids),
+        node_runtime=runtime,
+        is_port_bindable=lambda port: True,
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=uuid4,
+        new_public_id=generate_public_id,
+        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+            automatic_policy()
+        ),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=node_control,
+            camera_control=camera_control,
+            shutdown=store.close,
+        )
+    )
+    barrier = Barrier(2)
+
+    def create_camera(index: int) -> Response:
+        barrier.wait()
+        return client.post(
+            "/api/v1/cameras",
+            json={
+                "name": f"camera-{index}",
+                "source_url": f"rtsp://camera-{index}.local/main",
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = tuple(executor.map(create_camera, range(2)))
+
+    assert [response.status_code for response in responses] == [201, 201]
+    assert len(store.list_nodes()) == 1
+    assert store.list_nodes()[0].registered_cameras == 2
+    assert len(store.list_cameras()) == 2
+    assert runtime.calls == [
+        (
+            NodeRuntimeAction.PROVISION_START,
+            UUID("00000000-0000-0000-0000-000000000001"),
+        )
+    ]
+
+
+def test_application_startup_recovers_persisted_runtime_identity() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="recover-me",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.FAILED,
+                health=NodeHealth.UNHEALTHY,
+                desired_revision=2,
+            ),
+        )
+    )
+    runtime = RecordingLifecycleRuntime()
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+    )
+    app = create_app(
+        Settings(role=RuntimeRole.WEB),
+        node_control=node_control,
+        startup=node_control.recover_runtime_state,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/nodes")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["runtime_state"] == "running"
+    assert response.json()["items"][0]["applied_revision"] == 2
+    assert runtime.calls == [(NodeRuntimeAction.OBSERVE, node_id)]
+
+
+@pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
+def test_lifecycle_commands_fail_closed_without_the_privileged_runtime(
+    operation: str,
+) -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=control,
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+
+    response = client.post(f"/api/v1/nodes/{node_id}/{operation}")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "node_runtime_unavailable"
+
+
+@pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
+def test_lifecycle_commands_report_an_unknown_exact_node(operation: str) -> None:
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+    )
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
+    )
+
+    response = client.post(
+        f"/api/v1/nodes/00000000-0000-0000-0000-000000000099/{operation}"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "node_not_found"
+
+
+def test_restart_requires_a_running_desired_node() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=RecordingLifecycleRuntime(),
+    )
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+
+    response = client.post(f"/api/v1/nodes/{node_id}/restart")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "node_not_running"
+
+
+def test_stop_requires_an_empty_node_until_the_drain_phase() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(
+            nodes=(
+                MediaNode(
+                    id=node_id,
+                    name="occupied",
+                    external_port=12000,
+                    state=NodeState.RUNNING,
+                    runtime_state=NodeState.RUNNING,
+                    registered_cameras=1,
+                ),
+            )
+        ),
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+    )
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
+    )
+
+    response = client.post(f"/api/v1/nodes/{node_id}/stop")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "node_not_empty"
+
+
+@pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
+def test_lifecycle_runtime_failures_return_a_sanitized_node_scoped_error(
+    operation: str,
+) -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=InMemoryNodeStore(
+            nodes=(
+                MediaNode(
+                    id=node_id,
+                    name="broken",
+                    external_port=12000,
+                    state=NodeState.RUNNING,
+                    runtime_state=NodeState.FAILED,
+                    desired_revision=2,
+                    applied_revision=1,
+                ),
+            )
+        ),
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=FailingNodeRuntime(),
+    )
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), node_control=control),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(f"/api/v1/nodes/{node_id}/{operation}")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "node_runtime_operation_failed",
+        "node_id": str(node_id),
     }
 
 

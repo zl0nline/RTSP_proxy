@@ -1,0 +1,37 @@
+[Unit]
+Description=RTSP Proxy privileged media-node runtime helper
+Requires=rtsp-proxy-node-runtime.socket
+After=rtsp-proxy-node-runtime.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/rtsp-proxy/node-runtime.env
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-node-helper
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0027
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/etc/rtsp-proxy/nodes
+
+[Install]
+WantedBy=multi-user.target

@@ -684,23 +684,30 @@ passed; all six native amd64/arm64 jobs are green in
 Source credentials remain fail-closed until the encrypted secret-reference
 slice; this Phase B code never persists URL userinfo/query tokens. The binary
 and release manifest are bound to packaged Alembic head
-`0004_management_freshness`; startup rejects any other live database revision.
-Until Phase C supplies the typed process/config provisioner, absence of an
-eligible RUNNING node fails closed and no camera or ghost placement is
-committed.
+`0005_node_runtime`; startup rejects any other live database revision.
 
 ### Phase C — per-node Linux runtime
 
-- per-node config renderer and secure directory layout;
-- systemd instance unit and narrow process adapter;
-- create/start/stop/restart/health smoke;
-- automatic missing-target reservation -> provision -> smoke -> camera
+- [x] per-node config renderer and secure directory layout;
+- [x] systemd instance unit and narrow process adapter;
+- [x] create/start/stop/restart/health smoke;
+- [x] automatic missing-target reservation -> provision -> smoke -> camera
   placement, with no placement committed before provisioning success;
-- unique loopback API/metrics allocation;
-- node lifecycle persistence/recovery;
-- native two-node isolation test amd64/arm64.
+- [x] unique loopback API/metrics allocation;
+- [x] node lifecycle persistence/recovery;
+- [x] native two-node isolation test amd64/arm64.
 
 Exit: lifecycle operation on node A cannot change node B PID/listener/RTP.
+
+Status: **IMPLEMENTED, NATIVE CI PENDING**. The control plane uses one bounded
+Unix-socket command for an exact UUID; the root helper accepts only pinned port
+ranges/release identity and translates it to one systemd instance. Config is
+installed with no-follow directory descriptors and fsync/rename. A healthy
+runtime observation binds PID, `/proc` start ticks, boot id, config SHA-256,
+release and desired revision. Automatic placement is serialized across
+PostgreSQL requests and commits no camera before provision + API/metrics/plain
+RTSP/TCP smoke succeeds. A failed provision leaves an empty FAILED automatic
+node that can be retried; it never creates a ghost camera placement.
 
 ### Phase D — camera reconciler and move
 

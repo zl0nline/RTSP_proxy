@@ -50,6 +50,48 @@ def test_background_roles_use_a_separate_systemd_template() -> None:
     assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env")
 
 
+def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
+    service = read_unit("rtsp-proxy-media@.service")["Service"]
+
+    assert service["User"] == "mediamtx"
+    assert service["Group"] == "mediamtx"
+    assert service["ExecStart"] == (
+        "/opt/rtsp-proxy/current/bin/mediamtx "
+        "/etc/rtsp-proxy/nodes/%i/mediamtx.yml"
+    )
+    assert service["RuntimeDirectory"] == "rtsp-proxy/nodes/%i"
+    assert service["StateDirectory"] == "rtsp-proxy/nodes/%i"
+    assert service["LogsDirectory"] == "rtsp-proxy/nodes/%i"
+    assert service["ReadWritePaths"] == (
+        "/run/rtsp-proxy/nodes/%i /var/lib/rtsp-proxy/nodes/%i "
+        "/var/log/rtsp-proxy/nodes/%i"
+    )
+    assert service["NoNewPrivileges"] == "yes"
+    assert service["ProtectSystem"] == "strict"
+    assert service["CapabilityBoundingSet"] == ""
+
+
+def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> None:
+    helper = read_unit("rtsp-proxy-node-runtime.service")["Service"]
+    runtime_socket = read_unit("rtsp-proxy-node-runtime.socket")["Socket"]
+
+    assert helper["User"] == "root"
+    assert helper["ExecStart"] == (
+        "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-node-helper"
+    )
+    assert helper["EnvironmentFile"] == "/etc/rtsp-proxy/node-runtime.env"
+    assert helper["ReadWritePaths"] == "/etc/rtsp-proxy/nodes"
+    assert helper["NoNewPrivileges"] == "yes"
+    assert helper["ProtectSystem"] == "strict"
+    assert helper["CapabilityBoundingSet"] == ""
+    assert runtime_socket["ListenStream"] == (
+        "/run/rtsp-proxy-node-runtime/control.sock"
+    )
+    assert runtime_socket["SocketUser"] == "root"
+    assert runtime_socket["SocketGroup"] == "rtsp-proxy"
+    assert runtime_socket["SocketMode"] == "0660"
+
+
 def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 

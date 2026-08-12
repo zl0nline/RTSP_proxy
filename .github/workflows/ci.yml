@@ -82,20 +82,23 @@ jobs:
           createdb --host 127.0.0.1 --port "$migration_port" --username postgres rtsp_proxy_migration_test
           RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
             .artifacts/clean-venv/bin/rtsp-proxy-migrate
-          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0004_management_freshness"
+          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0005_node_runtime"
 
       - name: Validate systemd units
         run: |
           sudo install -d /opt/rtsp-proxy/releases/ci/.venv/bin /opt/rtsp-proxy/releases/ci/bin
-          sudo install -d /etc/rtsp-proxy/control-plane /etc/rtsp-proxy/mediamtx
+          sudo install -d /etc/rtsp-proxy/control-plane /etc/rtsp-proxy/mediamtx /etc/rtsp-proxy/nodes
+          sudo install -d /var/lib/rtsp-proxy/nodes /var/log/rtsp-proxy/nodes
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-web
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-role
+          sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-node-helper
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/bin/mediamtx
           sudo ln -s releases/ci /opt/rtsp-proxy/current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy-worker.env
           sudo touch /etc/rtsp-proxy/mediamtx/mediamtx.yml
-          systemd-analyze verify deploy/systemd/*.service
+          sudo touch /etc/rtsp-proxy/node-runtime.env
+          systemd-analyze verify deploy/systemd/*
 
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})
@@ -183,6 +186,11 @@ jobs:
           FFMPEG_BINARY: .artifacts/ffmpeg/bin/ffmpeg
           FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest -m contract tests/contract
+
+      - name: Verify two-node process and RTSP session isolation
+        env:
+          MEDIAMTX_BINARY: .artifacts/mediamtx/mediamtx
+        run: uv run pytest tests/contract/test_node_isolation.py -q
 
   pull-load-generator-contract:
     name: pull-load-generator-contract (${{ matrix.arch }})

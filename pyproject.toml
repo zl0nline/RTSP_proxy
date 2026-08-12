@@ -24,6 +24,7 @@ rtsp-proxy-web = "rtsp_proxy.runtime:run_web"
 rtsp-proxy-role = "rtsp_proxy.runtime:run_background"
 rtsp-proxy-load = "rtsp_proxy.load_cli:main"
 rtsp-proxy-migrate = "rtsp_proxy.migrate:run_migrations"
+rtsp-proxy-node-helper = "rtsp_proxy.node_runtime:run_node_runtime_helper"
 
 [dependency-groups]
 dev = [

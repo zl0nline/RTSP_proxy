@@ -45,10 +45,18 @@ Each media instance has:
 - config/state paths restricted to that node;
 - no access to another node's writable state.
 
-The current repository still contains the original Phase 0 single
-`mediamtx.service` and `mediamtx.yml.example` compatibility-lab artifacts.
-Phase C replaces them with the instance unit/config renderer before production;
-they must not be interpreted as the final multi-node installer.
+`rtsp-proxy-media@<node-id>.service`, the per-node renderer and the scoped
+`rtsp-proxy-node-runtime.socket`/helper implement the Phase C runtime. The
+original single `mediamtx.service` and `mediamtx.yml.example` remain only as
+Phase 0 compatibility-lab artifacts; they are not a multi-node installer.
+
+The web process never executes `systemctl`. It sends one strict JSON line to
+`/run/rtsp-proxy-node-runtime/control.sock`. The root helper validates the UUID,
+allowed external/API/metrics ranges, pinned release and binary SHA-256; it can
+address only `rtsp-proxy-media@<uuid>.service`. Configure its identical policy
+in `/etc/rtsp-proxy/node-runtime.env` from `node-runtime.env.example`, then
+enable the socket and helper. API and metrics always bind loopback; the external
+ordinary `rtsp://` listener is TCP-only.
 
 ## Global config
 

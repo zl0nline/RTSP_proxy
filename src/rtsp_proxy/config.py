@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from ipaddress import IPv4Address
+from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field, IPvAnyAddress, field_validator, model_validator
@@ -29,8 +30,22 @@ class Settings(BaseSettings):
     max_nodes: int = Field(default=50, ge=1, le=100)
     node_port_range_start: int = Field(default=10000, ge=1, le=65535)
     node_port_range_end: int = Field(default=10999, ge=1, le=65535)
+    node_api_port_range_start: int = Field(default=20000, ge=1, le=65535)
+    node_api_port_range_end: int = Field(default=20099, ge=1, le=65535)
+    node_metrics_port_range_start: int = Field(default=20100, ge=1, le=65535)
+    node_metrics_port_range_end: int = Field(default=20199, ge=1, le=65535)
     node_port_reserved: tuple[Annotated[int, Field(ge=1, le=65535)], ...] = ()
     node_management_freshness_seconds: int = Field(default=30, ge=1, le=300)
+    node_runtime_socket: Path | None = None
+    node_runtime_timeout_seconds: float = Field(default=15, gt=0, le=60)
+    node_release_id: str = Field(
+        default="v1.20.0",
+        pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
+    )
+    node_mediamtx_binary_sha256: str = Field(
+        default="0" * 64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     database_url: str | None = None
 
     @field_validator("node_port_reserved", mode="before")
@@ -54,12 +69,28 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_node_port_range(self) -> Settings:
-        if self.node_port_range_start > self.node_port_range_end:
+        ranges = (
+            (self.node_port_range_start, self.node_port_range_end),
+            (self.node_api_port_range_start, self.node_api_port_range_end),
+            (self.node_metrics_port_range_start, self.node_metrics_port_range_end),
+        )
+        if any(start > end for start, end in ranges):
             raise ValueError("node_port_range_invalid")
-        configured = set(range(self.node_port_range_start, self.node_port_range_end + 1))
-        if self.http_port in configured:
+        external, api, metrics = (
+            set(range(start, end + 1)) for start, end in ranges
+        )
+        if external & api or external & metrics or api & metrics:
+            raise ValueError("node_port_ranges_overlap")
+        if any(self.http_port in configured for configured in (external, api, metrics)):
             raise ValueError("node_port_range_overlaps_control_port")
-        available = configured.difference(self.node_port_reserved)
+        if set(self.node_port_reserved) & (api | metrics):
+            raise ValueError("node_management_port_reserved")
+        available = external.difference(self.node_port_reserved)
         if not available:
             raise ValueError("node_port_range_too_small")
+        if self.node_runtime_socket is not None:
+            if not self.node_runtime_socket.is_absolute():
+                raise ValueError("node_runtime_socket_must_be_absolute")
+            if self.node_mediamtx_binary_sha256 == "0" * 64:
+                raise ValueError("node_release_identity_required")
         return self

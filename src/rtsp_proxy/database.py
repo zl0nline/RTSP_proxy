@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -32,11 +33,14 @@ from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
     CameraPlacement,
     EligibleNodeMissing,
+    InvalidNodeRuntimeObservation,
     MaximumNodesReached,
     MediaNode,
     NodeCameraCapacityReached,
+    NodeCreationMode,
     NodeHealth,
     NodeIdFactory,
+    NodeManagementPortRangeExhausted,
     NodeNotFound,
     NodePortInUse,
     NodePortOutOfRange,
@@ -47,7 +51,9 @@ from rtsp_proxy.nodes import (
     PortBindable,
     PortChoice,
     is_node_eligible,
+    select_port_with_bounded_recheck,
     validate_camera_source_url,
+    validate_runtime_observation,
 )
 from rtsp_proxy.release import APPLICATION_SCHEMA
 
@@ -59,6 +65,11 @@ media_nodes = Table(
     Column("id", Uuid(as_uuid=True), primary_key=True),
     Column("name", String(128), nullable=False),
     Column("external_port", Integer, nullable=False, unique=True),
+    Column("api_port", Integer, nullable=False, unique=True),
+    Column("metrics_port", Integer, nullable=False, unique=True),
+    Column("release_id", String(128), nullable=False),
+    Column("mediamtx_binary_sha256", String(64), nullable=False),
+    Column("creation_mode", String(16), nullable=False),
     Column("state", String(32), nullable=False),
     Column("runtime_state", String(32), nullable=False),
     Column("health", String(32), nullable=False),
@@ -68,10 +79,23 @@ media_nodes = Table(
     Column("maintenance", Boolean, nullable=False),
     Column("management_fresh", Boolean, nullable=False),
     Column("management_observed_at", DateTime(timezone=True), nullable=True),
+    Column("runtime_observed_at", DateTime(timezone=True), nullable=True),
     Column("config_compatible", Boolean, nullable=False),
     Column("desired_revision", BigInteger, nullable=False),
     Column("applied_revision", BigInteger, nullable=False),
+    Column("process_id", Integer, nullable=True),
+    Column("process_start_ticks", BigInteger, nullable=True),
+    Column("process_boot_id", Uuid(as_uuid=True), nullable=True),
+    Column("observed_config_sha256", String(64), nullable=True),
+    Column("observed_release_id", String(128), nullable=True),
     CheckConstraint("external_port BETWEEN 1 AND 65535"),
+    CheckConstraint("api_port BETWEEN 1 AND 65535"),
+    CheckConstraint("metrics_port BETWEEN 1 AND 65535"),
+    CheckConstraint("external_port <> api_port"),
+    CheckConstraint("external_port <> metrics_port"),
+    CheckConstraint("api_port <> metrics_port"),
+    CheckConstraint("mediamtx_binary_sha256 ~ '^[0-9a-f]{64}$'"),
+    CheckConstraint("creation_mode IN ('operator', 'automatic')"),
     CheckConstraint("registered_cameras BETWEEN 0 AND 100"),
     CheckConstraint("camera_capacity = 100"),
     CheckConstraint("active_sources >= 0"),
@@ -86,6 +110,12 @@ media_nodes = Table(
     CheckConstraint("health IN ('unknown', 'healthy', 'unhealthy')"),
     CheckConstraint("desired_revision >= 1"),
     CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+    CheckConstraint("process_id IS NULL OR process_id > 0"),
+    CheckConstraint("process_start_ticks IS NULL OR process_start_ticks > 0"),
+    CheckConstraint(
+        "observed_config_sha256 IS NULL OR "
+        "observed_config_sha256 ~ '^[0-9a-f]{64}$'"
+    ),
 )
 
 cameras = Table(
@@ -199,6 +229,7 @@ outbox_messages = Table(
 )
 
 _NODE_REGISTRY_LOCK_KEY = 0x52545350524F5859
+_NODE_PROVISIONING_LOCK_KEY = 0x4E4F444550524F56
 _CAMERA_PLACEMENT_LOCK_KEY = 0x43414D504C414345
 
 
@@ -225,6 +256,21 @@ class PostgresNodeStore:
         if revisions != (APPLICATION_SCHEMA,):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
 
+    @contextmanager
+    def provisioning_guard(self) -> Iterator[None]:
+        with self._engine.connect() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_lock(:key)"),
+                {"key": _NODE_PROVISIONING_LOCK_KEY},
+            )
+            try:
+                yield
+            finally:
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": _NODE_PROVISIONING_LOCK_KEY},
+                )
+
     def register_automatically(
         self,
         *,
@@ -234,6 +280,11 @@ class PostgresNodeStore:
         preferred_port: int | None,
         choose_port: PortChoice,
         new_node_id: NodeIdFactory,
+        api_ports: Collection[int] = tuple(range(20000, 20100)),
+        metrics_ports: Collection[int] = tuple(range(20100, 20200)),
+        release_id: str = "v1.20.0",
+        mediamtx_binary_sha256: str = "0" * 64,
+        creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
         is_port_bindable: PortBindable | None = None,
     ) -> MediaNode:
         with self._engine.begin() as connection:
@@ -254,6 +305,37 @@ class PostgresNodeStore:
             if not available:
                 raise NodePortRangeExhausted("node_port_range_exhausted")
             probe = is_port_bindable or (lambda port: True)
+            occupied_management = set(connection.scalars(select(media_nodes.c.api_port)))
+            occupied_management.update(
+                connection.scalars(select(media_nodes.c.metrics_port))
+            )
+            available_api = tuple(
+                port for port in api_ports if port not in occupied_management
+            )
+            available_metrics = tuple(
+                port for port in metrics_ports if port not in occupied_management
+            )
+            if not available_api or not available_metrics:
+                raise NodeManagementPortRangeExhausted(
+                    "node_management_port_range_exhausted"
+                )
+            try:
+                api_port = select_port_with_bounded_recheck(
+                    available_api,
+                    preferred_port=None,
+                    choose_port=lambda candidates: candidates[0],
+                    is_port_bindable=probe,
+                )
+                metrics_port = select_port_with_bounded_recheck(
+                    tuple(port for port in available_metrics if port != api_port),
+                    preferred_port=None,
+                    choose_port=lambda candidates: candidates[0],
+                    is_port_bindable=probe,
+                )
+            except NodePortRangeExhausted:
+                raise NodeManagementPortRangeExhausted(
+                    "node_management_port_range_exhausted"
+                ) from None
             candidates = list(available)
             node: MediaNode | None = None
             for _ in range(len(candidates)):
@@ -269,7 +351,16 @@ class PostgresNodeStore:
                         raise NodePortInUse("node_port_in_use")
                     candidates.remove(selected)
                     continue
-                candidate = MediaNode(id=new_node_id(), name=name, external_port=selected)
+                candidate = MediaNode(
+                    id=new_node_id(),
+                    name=name,
+                    external_port=selected,
+                    api_port=api_port,
+                    metrics_port=metrics_port,
+                    release_id=release_id,
+                    mediamtx_binary_sha256=mediamtx_binary_sha256,
+                    creation_mode=creation_mode,
+                )
                 try:
                     with connection.begin_nested():
                         connection.execute(
@@ -277,6 +368,13 @@ class PostgresNodeStore:
                                 id=candidate.id,
                                 name=candidate.name,
                                 external_port=candidate.external_port,
+                                api_port=candidate.api_port,
+                                metrics_port=candidate.metrics_port,
+                                release_id=candidate.release_id,
+                                mediamtx_binary_sha256=(
+                                    candidate.mediamtx_binary_sha256
+                                ),
+                                creation_mode=candidate.creation_mode.value,
                                 state=candidate.state.value,
                                 runtime_state=candidate.runtime_state.value,
                                 health=candidate.health.value,
@@ -286,9 +384,17 @@ class PostgresNodeStore:
                                 maintenance=candidate.maintenance,
                                 management_fresh=candidate.management_fresh,
                                 management_observed_at=candidate.management_observed_at,
+                                runtime_observed_at=candidate.runtime_observed_at,
                                 config_compatible=candidate.config_compatible,
                                 desired_revision=candidate.desired_revision,
                                 applied_revision=candidate.applied_revision,
+                                process_id=candidate.process_id,
+                                process_start_ticks=candidate.process_start_ticks,
+                                process_boot_id=candidate.process_boot_id,
+                                observed_config_sha256=(
+                                    candidate.observed_config_sha256
+                                ),
+                                observed_release_id=candidate.observed_release_id,
                             )
                         )
                 except IntegrityError as error:
@@ -310,6 +416,10 @@ class PostgresNodeStore:
                 payload={
                     "name": node.name,
                     "external_port": node.external_port,
+                    "api_port": node.api_port,
+                    "metrics_port": node.metrics_port,
+                    "release_id": node.release_id,
+                    "creation_mode": node.creation_mode.value,
                     "camera_capacity": node.camera_capacity,
                     "desired_revision": node.desired_revision,
                 },
@@ -335,6 +445,18 @@ class PostgresNodeStore:
         observation: NodeRuntimeObservation,
     ) -> MediaNode:
         with self._engine.begin() as connection:
+            current = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            try:
+                validate_runtime_observation(node, observation)
+            except InvalidNodeRuntimeObservation:
+                raise
             row = connection.execute(
                 update(media_nodes)
                 .where(media_nodes.c.id == node_id)
@@ -347,7 +469,14 @@ class PostgresNodeStore:
                     management_observed_at=(
                         func.clock_timestamp() if observation.management_fresh else None
                     ),
+                    runtime_observed_at=func.clock_timestamp(),
                     config_compatible=observation.config_compatible,
+                    applied_revision=observation.applied_revision,
+                    process_id=observation.process_id,
+                    process_start_ticks=observation.process_start_ticks,
+                    process_boot_id=observation.process_boot_id,
+                    observed_config_sha256=observation.config_sha256,
+                    observed_release_id=observation.release_id,
                 )
                 .returning(*media_nodes.c)
             ).mappings().one_or_none()
@@ -583,6 +712,11 @@ def _media_node(row: RowMapping) -> MediaNode:
         id=_uuid(row["id"]),
         name=str(row["name"]),
         external_port=int(row["external_port"]),
+        api_port=int(row["api_port"]),
+        metrics_port=int(row["metrics_port"]),
+        release_id=str(row["release_id"]),
+        mediamtx_binary_sha256=str(row["mediamtx_binary_sha256"]),
+        creation_mode=NodeCreationMode(str(row["creation_mode"])),
         state=NodeState(str(row["state"])),
         runtime_state=NodeState(str(row["runtime_state"])),
         health=NodeHealth(str(row["health"])),
@@ -592,9 +726,29 @@ def _media_node(row: RowMapping) -> MediaNode:
         maintenance=bool(row["maintenance"]),
         management_fresh=bool(row["management_fresh"]),
         management_observed_at=row["management_observed_at"],
+        runtime_observed_at=row["runtime_observed_at"],
         config_compatible=bool(row["config_compatible"]),
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),
+        process_id=(None if row["process_id"] is None else int(row["process_id"])),
+        process_start_ticks=(
+            None
+            if row["process_start_ticks"] is None
+            else int(row["process_start_ticks"])
+        ),
+        process_boot_id=(
+            None if row["process_boot_id"] is None else _uuid(row["process_boot_id"])
+        ),
+        observed_config_sha256=(
+            None
+            if row["observed_config_sha256"] is None
+            else str(row["observed_config_sha256"])
+        ),
+        observed_release_id=(
+            None
+            if row["observed_release_id"] is None
+            else str(row["observed_release_id"])
+        ),
     )
 
 

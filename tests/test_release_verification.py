@@ -23,6 +23,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0004_management_freshness.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0005_node_runtime.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -72,8 +77,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
         "schema_compatibility": {
-            "minimum": "0004_management_freshness",
-            "maximum": "0004_management_freshness",
+            "minimum": "0005_node_runtime",
+            "maximum": "0005_node_runtime",
         },
         "config_schema_version": 1,
     }
