@@ -548,6 +548,17 @@ class InMemoryNodeStore:
                 camera for camera in self._cameras if camera.state is not CameraState.DELETED
             )
 
+    def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
+        with self._lock:
+            return next(
+                (
+                    camera
+                    for camera in self._cameras
+                    if camera.id == camera_id and camera.state is not CameraState.DELETED
+                ),
+                None,
+            )
+
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
         with self._lock:
             if not any(node.id == node_id for node in self._nodes):
@@ -1081,6 +1092,8 @@ class CameraStore(Protocol):
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]: ...
 
+    def get_camera(self, camera_id: UUID) -> CameraPlacement | None: ...
+
     def update_camera(
         self,
         camera_id: UUID,
@@ -1105,6 +1118,8 @@ class ReconcileStore(Protocol):
     def get_node(self, node_id: UUID) -> MediaNode | None: ...
 
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]: ...
+
+    def get_camera(self, camera_id: UUID) -> CameraPlacement | None: ...
 
     def mark_camera_applied(
         self,

@@ -173,6 +173,7 @@ def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> No
 
 class MediaApiHandler(BaseHTTPRequestHandler):
     paths: ClassVar[dict[str, dict[str, object]]] = {}
+    runtime: ClassVar[dict[str, tuple[bool, int]]] = {}
 
     def do_POST(self) -> None:
         name = self.path.removeprefix("/v3/config/paths/replace/")
@@ -186,6 +187,21 @@ class MediaApiHandler(BaseHTTPRequestHandler):
         self._respond(200, {"status": "ok"})
 
     def do_GET(self) -> None:
+        if self.path.startswith("/v3/paths/get/"):
+            name = self.path.removeprefix("/v3/paths/get/")
+            runtime = self.runtime.get(name)
+            if runtime is None:
+                self._respond(404, {"error": "not found"})
+            else:
+                self._respond(
+                    200,
+                    {
+                        "name": name,
+                        "ready": runtime[0],
+                        "readers": [{} for _ in range(runtime[1])],
+                    },
+                )
+            return
         name = self.path.removeprefix("/v3/config/paths/get/")
         payload = self.paths.get(name)
         if payload is None:
@@ -228,6 +244,7 @@ def test_node_media_command_converges_through_the_privileged_helper(
     tmp_path: Path,
 ) -> None:
     MediaApiHandler.paths = {}
+    MediaApiHandler.runtime = {str(PUBLIC_ID): (True, 1)}
     media_api = ThreadingHTTPServer(("127.0.0.1", 0), MediaApiHandler)
     api_thread = Thread(target=media_api.serve_forever)
     api_thread.start()
@@ -284,11 +301,11 @@ def test_node_media_command_converges_through_the_privileged_helper(
     socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
-    listener.listen(2)
+    listener.listen(3)
 
     def serve_two() -> None:
         try:
-            for _ in range(2):
+            for _ in range(3):
                 connection, _ = listener.accept()
                 with connection:
                     server.serve_connection(connection)
@@ -308,6 +325,7 @@ def test_node_media_command_converges_through_the_privileged_helper(
     try:
         client.put_path(path)
         assert client.get_path(PUBLIC_ID) == path
+        assert client.path_runtime_status(PUBLIC_ID) == (True, 1)
     finally:
         helper_thread.join(timeout=2)
         socket_path.unlink(missing_ok=True)

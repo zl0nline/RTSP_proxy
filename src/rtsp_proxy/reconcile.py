@@ -7,6 +7,7 @@ from uuid import UUID
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError, MediaPathConfig, MediaPathInventory
 from rtsp_proxy.nodes import (
+    CameraNotFound,
     CameraState,
     MediaNode,
     NodeNotFound,
@@ -24,6 +25,8 @@ class MediaNodeClient(Protocol):
 
     def delete_path(self, name: PublicId) -> None: ...
 
+    def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None: ...
+
 
 class MediaNodeClientFactory(Protocol):
     def for_node(self, node: MediaNode) -> MediaNodeClient: ...
@@ -39,6 +42,45 @@ class ReconcileReport:
 
 class ReconcileRetry(RuntimeError):
     """The desired state remains authoritative but was not verified as applied."""
+
+
+@dataclass(frozen=True, slots=True)
+class CameraRuntimeObservation:
+    camera_id: UUID
+    node_id: UUID
+    ready: bool
+    reader_count: int
+    occupied: bool
+    reader_limit_violated: bool
+
+
+class CameraRuntimeObserver:
+    def __init__(
+        self,
+        *,
+        store: ReconcileStore,
+        media_nodes: MediaNodeClientFactory,
+    ) -> None:
+        self._store = store
+        self._media_nodes = media_nodes
+
+    def observe(self, camera_id: UUID) -> CameraRuntimeObservation:
+        camera = self._store.get_camera(camera_id)
+        if camera is None:
+            raise CameraNotFound("camera_not_found")
+        node = self._store.get_node(camera.node_id)
+        if node is None:
+            raise ReconcileRetry("camera_runtime_node_missing")
+        status = self._media_nodes.for_node(node).path_runtime_status(camera.public_id)
+        ready, readers = (False, 0) if status is None else status
+        return CameraRuntimeObservation(
+            camera_id=camera.id,
+            node_id=camera.node_id,
+            ready=ready,
+            reader_count=readers,
+            occupied=readers == 1,
+            reader_limit_violated=readers > 1,
+        )
 
 
 class CameraReconciler:

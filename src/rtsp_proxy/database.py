@@ -862,6 +862,16 @@ class PostgresNodeStore:
                 ).mappings()
             )
 
+    def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                self._camera_query().where(
+                    cameras.c.id == camera_id,
+                    cameras.c.state != CameraState.DELETED.value,
+                )
+            ).mappings().one_or_none()
+            return None if row is None else _camera_placement(row)
+
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
         with self._engine.connect() as connection:
             if connection.scalar(

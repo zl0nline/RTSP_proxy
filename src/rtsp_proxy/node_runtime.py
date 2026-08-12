@@ -224,6 +224,7 @@ class MediaPathOperation(StrEnum):
     GET = "get"
     PUT = "put"
     DELETE = "delete"
+    RUNTIME = "runtime"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1389,6 +1390,13 @@ class _MediaInventoryPayload(BaseModel):
     no_oracle_matcher_present: bool
 
 
+class _MediaRuntimePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    ready: bool
+    reader_count: int = Field(ge=0)
+
+
 class _MediaResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -1396,6 +1404,7 @@ class _MediaResponsePayload(BaseModel):
     ok: bool
     path: _MediaPathPayload | None
     inventory: _MediaInventoryPayload | None
+    runtime: _MediaRuntimePayload | None = None
     error: str | None
 
 
@@ -1541,12 +1550,16 @@ class UnixMediaNodeClient:
 
     def put_path(self, path: MediaPathConfig) -> None:
         response = self._request("put", name=path.name, source_url=path.source_url)
-        if response.path is not None or response.inventory is not None:
+        if (
+            response.path is not None
+            or response.inventory is not None
+            or response.runtime is not None
+        ):
             raise MediaNodeProtocolError("node_media_response_invalid")
 
     def get_path(self, name: PublicId) -> MediaPathConfig | None:
         response = self._request("get", name=name)
-        if response.inventory is not None:
+        if response.inventory is not None or response.runtime is not None:
             raise MediaNodeProtocolError("node_media_response_invalid")
         if response.path is None:
             return None
@@ -1562,7 +1575,11 @@ class UnixMediaNodeClient:
 
     def inventory_paths(self) -> MediaPathInventory:
         response = self._request("inventory")
-        if response.path is not None or response.inventory is None:
+        if (
+            response.path is not None
+            or response.inventory is None
+            or response.runtime is not None
+        ):
             raise MediaNodeProtocolError("node_media_response_invalid")
         try:
             camera_ids = tuple(
@@ -1582,8 +1599,20 @@ class UnixMediaNodeClient:
 
     def delete_path(self, name: PublicId) -> None:
         response = self._request("delete", name=name)
-        if response.path is not None or response.inventory is not None:
+        if (
+            response.path is not None
+            or response.inventory is not None
+            or response.runtime is not None
+        ):
             raise MediaNodeProtocolError("node_media_response_invalid")
+
+    def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
+        response = self._request("runtime", name=name)
+        if response.inventory is not None or response.path is not None:
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        if response.runtime is None:
+            return None
+        return response.runtime.ready, response.runtime.reader_count
 
     def _request(
         self,
@@ -1635,6 +1664,7 @@ class UnixMediaNodeClient:
                 response.error is None
                 or response.path is not None
                 or response.inventory is not None
+                or response.runtime is not None
             ):
                 raise MediaNodeUnavailable("node_media_response_invalid")
             raise MediaNodeUnavailable(response.error)
@@ -1707,7 +1737,7 @@ class RootMediaNodeAdapter:
     def execute(
         self,
         command: MediaPathCommand,
-    ) -> MediaPathConfig | MediaPathInventory | None:
+    ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | None:
         expected = self._config_store.expected(command.spec)
         if expected is None:
             raise NodeSupervisorError("node_config_not_applied")
@@ -1736,7 +1766,7 @@ class RootMediaNodeAdapter:
     def _execute_operation(
         client: MediaMtxClient,
         command: MediaPathCommand,
-    ) -> MediaPathConfig | MediaPathInventory | None:
+    ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | None:
         if command.operation is MediaPathOperation.INVENTORY:
             return client.inventory_paths()
         if command.operation is MediaPathOperation.PUT:
@@ -1746,6 +1776,8 @@ class RootMediaNodeAdapter:
         assert isinstance(command.path, PublicId)
         if command.operation is MediaPathOperation.GET:
             return client.get_path(command.path)
+        if command.operation is MediaPathOperation.RUNTIME:
+            return client.path_runtime_status(command.path)
         client.delete_path(command.path)
         return None
 
@@ -2031,10 +2063,11 @@ class UnixNodeSupervisorServer:
     @staticmethod
     def _media_success_payload(
         operation: MediaPathOperation,
-        result: MediaPathConfig | MediaPathInventory | None,
+        result: MediaPathConfig | MediaPathInventory | tuple[bool, int] | None,
     ) -> dict[str, object]:
         path = None
         inventory = None
+        runtime = None
         if operation is MediaPathOperation.GET and isinstance(result, MediaPathConfig):
             path = {"name": str(result.name), "source_url": result.source_url}
         if operation is MediaPathOperation.INVENTORY and isinstance(result, MediaPathInventory):
@@ -2042,11 +2075,14 @@ class UnixNodeSupervisorServer:
                 "camera_ids": [str(value) for value in result.camera_ids],
                 "no_oracle_matcher_present": result.no_oracle_matcher_present,
             }
+        if operation is MediaPathOperation.RUNTIME and isinstance(result, tuple):
+            runtime = {"ready": result[0], "reader_count": result[1]}
         return {
             "schema_version": 1,
             "ok": True,
             "path": path,
             "inventory": inventory,
+            "runtime": runtime,
             "error": None,
         }
 
@@ -2057,6 +2093,7 @@ class UnixNodeSupervisorServer:
             "ok": False,
             "path": None,
             "inventory": None,
+            "runtime": None,
             "error": error,
         }
 

@@ -20,6 +20,7 @@ from rtsp_proxy.nodes import (
 )
 from rtsp_proxy.reconcile import (
     CameraReconciler,
+    CameraRuntimeObserver,
     MediaNodeClient,
     MediaNodeClientFactory,
     ReconcileRetry,
@@ -37,6 +38,7 @@ class RecordingMediaNode(MediaNodeClient):
         self.puts: list[MediaPathConfig] = []
         self.deletes: list[PublicId] = []
         self.fail_put_after_apply = False
+        self.runtime: dict[PublicId, tuple[bool, int] | None] = {}
 
     def put_path(self, path: MediaPathConfig) -> None:
         self.paths[path.name] = path
@@ -57,6 +59,9 @@ class RecordingMediaNode(MediaNodeClient):
     def delete_path(self, name: PublicId) -> None:
         self.paths.pop(name, None)
         self.deletes.append(name)
+
+    def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
+        return self.runtime.get(name)
 
 
 class RecordingMediaNodeFactory(MediaNodeClientFactory):
@@ -295,6 +300,24 @@ def test_postgresql_camera_lifecycle_is_revisioned_until_verified_delete(
     assert after is not None and after.registered_cameras == 0
     assert store.list_cameras() == ()
     store.close()
+
+
+def test_runtime_observation_is_scoped_to_the_current_camera_node() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+    factory.clients[NODE_A].runtime[PUBLIC_A] = (True, 1)
+
+    observation = CameraRuntimeObserver(
+        store=store,
+        media_nodes=factory,
+    ).observe(CAMERA_A)
+
+    assert observation.ready is True
+    assert observation.reader_count == 1
+    assert observation.occupied is True
+    assert observation.reader_limit_violated is False
+    assert factory.requested == [NODE_A]
+    assert factory.clients[NODE_B].runtime == {}
 
 
 def test_disabled_camera_remains_registered_but_its_path_is_removed() -> None:
