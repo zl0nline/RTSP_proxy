@@ -106,8 +106,11 @@ Lifecycle reconciliation uses
 `RTSP_PROXY_NODE_LIFECYCLE_LOCK_POOL_SIZE` bounded workers/connections per web
 replica and fails a lock acquisition after
 `RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS` with retryable
-`node_lifecycle_busy`/`Retry-After: 1`. The root helper requires at least 20
-seconds of cleanup reserve; the default reserves 25
+`node_lifecycle_busy`/`Retry-After: 1` for operations on an existing node. If a
+manual create has already committed its node/port reservation, it instead
+returns `201`, the `PROVISIONING` node and its `Location`; continue with that
+node's `/start` endpoint and do not retry the create request. The root helper
+requires at least 20 seconds of cleanup reserve; the default reserves 25
 seconds of its 55-second operation budget for cleanup; the media unit stops in
 at most 15 seconds and the remaining time is kept for systemd status and port
 release proof.

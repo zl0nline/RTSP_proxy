@@ -87,13 +87,18 @@ def test_operator_can_register_a_node_with_an_automatically_allocated_port() -> 
     }
 
 
-def test_node_creation_provision_lock_contention_is_a_retryable_public_error() -> None:
+def test_node_creation_lock_contention_returns_one_reservation_for_later_start() -> None:
     class BusyStore(InMemoryNodeStore):
+        attempts = 0
+
         @contextmanager
         def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
-            raise NodeLifecycleBusy("node_lifecycle_busy")
+            self.attempts += 1
+            if self.attempts == 1:
+                raise NodeLifecycleBusy("node_lifecycle_busy")
             yield
 
+    store = BusyStore()
     client = TestClient(
         create_app(
             Settings(
@@ -102,7 +107,7 @@ def test_node_creation_provision_lock_contention_is_a_retryable_public_error() -
                 node_port_range_end=12000,
             ),
             node_control=NodeControl(
-                store=BusyStore(),
+                store=store,
                 choose_port=lambda available: available[0],
                 new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
                 node_runtime=RecordingLifecycleRuntime(),
@@ -114,9 +119,18 @@ def test_node_creation_provision_lock_contention_is_a_retryable_public_error() -
 
     response = client.post("/api/v1/nodes", json={"name": "busy"})
 
-    assert response.status_code == 503
-    assert response.headers["retry-after"] == "1"
-    assert response.json()["detail"] == {"code": "node_lifecycle_busy"}
+    assert response.status_code == 201
+    assert response.headers["location"] == (
+        "/api/v1/nodes/00000000-0000-0000-0000-000000000001"
+    )
+    assert response.json()["state"] == "provisioning"
+    assert len(store.list_nodes()) == 1
+
+    start_response = client.post(f"{response.headers['location']}/start")
+
+    assert start_response.status_code == 200
+    assert start_response.json()["state"] == "running"
+    assert len(store.list_nodes()) == 1
 
 
 def test_each_registered_node_reserves_unique_loopback_management_ports() -> None:

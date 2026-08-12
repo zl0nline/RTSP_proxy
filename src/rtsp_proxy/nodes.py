@@ -590,7 +590,12 @@ class NodeControl:
             is_port_bindable=self._is_port_bindable,
         )
         if self._provision_on_create or creation_mode is NodeCreationMode.AUTOMATIC:
-            return self._provision_reserved_node(node)
+            try:
+                return self._provision_reserved_node(node)
+            except NodeLifecycleBusy:
+                if creation_mode is NodeCreationMode.OPERATOR:
+                    return node
+                raise
         return node
 
     def list_nodes(self) -> tuple[MediaNode, ...]:

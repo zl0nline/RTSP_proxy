@@ -632,8 +632,12 @@ deadline and all lifecycle commands for one UUID are serialized by a
 PostgreSQL advisory lock and exact desired revision. Lifecycle lock acquisition
 uses a replica-local bounded pool and timeout; startup convergence runs with the
 same configured concurrency instead of serially multiplying one unhealthy-node
-deadline across the server. Contention is a typed retryable
-`node_lifecycle_busy` response, never a generic 500 or false state conflict.
+deadline across the server. Contention on an existing node is a typed retryable
+`node_lifecycle_busy` response, never a generic 500 or false state conflict. If
+manual create has already committed its reservation when provisioning meets
+contention, create returns `201` with that `PROVISIONING` node and its
+`Location`; the operator continues through the node's start endpoint instead of
+retrying create and reserving another port.
 
 ## 20. Operations
 
