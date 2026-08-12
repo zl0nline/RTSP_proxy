@@ -11,8 +11,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   Linux amd64/arm64.
 > - Phase 0B reproducible load/netem harness: **functional foundation complete**;
 >   production hardware capacity/24h soak ещё не выполнены.
-> - Node registry, PostgreSQL catalog, placement, dashboard и production
->   lifecycle: **implementation in progress**.
+> - Node registry/placement foundation and isolated per-node Linux runtime:
+>   **complete**; camera reconciler, access, dashboard and production evidence
+>   remain in progress.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -185,7 +186,9 @@ Phase B **complete**: independent Standards/Spec review и все шесть job
 прошли. Credentialed/query-token source URLs сейчас fail closed: они не будут
 приниматься до encrypted secret-reference flow.
 
-Phase C **implemented, native CI pending**: per-node generated configs,
+Phase C **complete**: independent Standards/Spec review and all six jobs in
+[native amd64/arm64 CI](https://github.com/zl0nline/RTSP_proxy/actions/runs/31565179680)
+passed. Per-node generated configs,
 `rtsp-proxy-media@<uuid>.service`, scoped root helper over a bounded Unix
 socket with parallel different-node execution and an end-to-end deadline,
 unique loopback API/metrics ports, PID/start/boot/config/release identity,
@@ -194,9 +197,10 @@ reserve→provision→smoke→place are in code. The two-node native contract pr
 that restart/stop of node A does not change node B process or its established
 ordinary RTSP/TCP session or packet progress. Restart is transactionally fenced
 against placement, and rolling activation keeps current/previous verified
-release pins while empty stopped nodes transition one at a time. Documentation
-is updated to COMPLETE only after
-independent review and green amd64/arm64 run.
+release pins while empty stopped nodes transition one at a time. The native
+test executes real systemd instances and proves process/listener/RTP isolation;
+its release identity and listener teardown checks remain fail closed while
+correctly accounting for exec transitions and completed TCP `TIME_WAIT` state.
 
 Каждая node получает разные случайные credentials для loopback API/metrics и
 path-scoped runtime RTSP probe, а также отдельный `DynamicUser`; process видит

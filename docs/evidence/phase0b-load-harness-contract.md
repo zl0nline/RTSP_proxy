@@ -6,11 +6,13 @@
 - Architectures: native `amd64` and `arm64`
 
 > The harness was originally built for one generic SUT and larger reader
-> ladders. Bounded-node profile validation, one-reader/RTSP-453 admission and
-> multi-SUT orchestration are **pending Phase C/G work**. Planned product
-> qualification will use it first for one node at no more than 100 registered
-> cameras/readers, then for multiple independent nodes on one server. Generic
-> fan-out/burst support is harness capability, not the product contract.
+> ladders. Phase C now provides and natively verifies isolated amd64/arm64 node
+> runtimes, but bounded-node capacity profiles, one-reader/RTSP-453 admission
+> and multi-node production orchestration remain **pending Phase E/G work**.
+> Planned product qualification will use the harness first for one node at no
+> more than 100 registered cameras/readers, then for multiple independent nodes
+> on one server. Generic fan-out/burst support is harness capability, not the
+> product contract.
 
 ## Implemented contract
 

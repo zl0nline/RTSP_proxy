@@ -716,7 +716,10 @@ and release manifest are bound to packaged Alembic head
 
 Exit: lifecycle operation on node A cannot change node B PID/listener/RTP.
 
-Status: **IMPLEMENTED, NATIVE CI PENDING**. The control plane uses one bounded
+Status: **COMPLETE**. Independent Standards/Spec reviews passed and all six
+native amd64/arm64 jobs are green in
+[CI run 31565179680](https://github.com/zl0nline/RTSP_proxy/actions/runs/31565179680).
+The control plane uses one bounded
 Unix-socket command for an exact UUID; its absolute deadline leaves a reserved
 cleanup window, same-node requests serialize and different nodes use a bounded
 worker pool. The cleanup reserve exceeds the media unit stop timeout and keeps a
@@ -743,6 +746,12 @@ other node, and PostgreSQL advisory-lock connections are capped per replica.
 Recovery re-reads current desired state while holding the same-node lifecycle
 guard across observe, decision and convergence, so stale startup snapshots
 cannot overwrite a newer operator STOP/release intent.
+
+The native test runs two real systemd MediaMTX instances, maintains an ordinary
+RTSP/TCP reader and RTP packet progress on node B while node A is restarted and
+stopped, and binds each process to the pinned executable digest. Exec identity
+and listener teardown use bounded convergence; completed TCP `TIME_WAIT` is not
+misclassified as a live listener.
 
 The Phase-B-to-Phase-C `0005_node_runtime` migration is deliberately
 fail-closed when the old registry is non-empty: the old rows have no trustworthy
