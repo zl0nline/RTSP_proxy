@@ -104,6 +104,13 @@ class PlacementMode(StrEnum):
     MANUAL = "manual"
 
 
+class CameraState(StrEnum):
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    DELETING = "deleting"
+    DELETED = "deleted"
+
+
 @dataclass(frozen=True, slots=True)
 class CameraPlacement:
     id: UUID
@@ -114,6 +121,7 @@ class CameraPlacement:
     node_port: int
     placement_mode: PlacementMode
     placement_generation: int = 1
+    state: CameraState = CameraState.ENABLED
     desired_revision: int = 1
     applied_revision: int = 0
 
@@ -208,6 +216,10 @@ class InvalidCameraSource(ValueError):
 
 class CameraNotFound(LookupError):
     """A requested camera does not exist."""
+
+
+class CameraLifecycleConflict(RuntimeError):
+    """The camera command conflicts with its desired lifecycle state."""
 
 
 class InMemoryNodeStore:
@@ -532,13 +544,19 @@ class InMemoryNodeStore:
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         with self._lock:
-            return tuple(self._cameras)
+            return tuple(
+                camera for camera in self._cameras if camera.state is not CameraState.DELETED
+            )
 
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
         with self._lock:
             if not any(node.id == node_id for node in self._nodes):
                 raise NodeNotFound("node_not_found")
-            return tuple(camera for camera in self._cameras if camera.node_id == node_id)
+            return tuple(
+                camera
+                for camera in self._cameras
+                if camera.node_id == node_id and camera.state is not CameraState.DELETED
+            )
 
     def update_camera(
         self,
@@ -555,12 +573,60 @@ class InMemoryNodeStore:
             )
             if camera is None:
                 raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETING:
+                raise CameraLifecycleConflict("camera_deleting")
             if camera.name == name and camera.source_url == source_url:
                 return camera
             updated = replace(
                 camera,
                 name=name,
                 source_url=source_url,
+                desired_revision=camera.desired_revision + 1,
+            )
+            self._cameras[self._cameras.index(camera)] = updated
+            return updated
+
+    def set_camera_enabled(
+        self,
+        camera_id: UUID,
+        *,
+        enabled: bool,
+    ) -> CameraPlacement:
+        with self._lock:
+            camera = next(
+                (candidate for candidate in self._cameras if candidate.id == camera_id),
+                None,
+            )
+            if camera is None or camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETING:
+                raise CameraLifecycleConflict("camera_deleting")
+            target = CameraState.ENABLED if enabled else CameraState.DISABLED
+            if camera.state is target:
+                return camera
+            updated = replace(
+                camera,
+                state=target,
+                desired_revision=camera.desired_revision + 1,
+            )
+            self._cameras[self._cameras.index(camera)] = updated
+            return updated
+
+    def request_camera_delete(self, camera_id: UUID) -> CameraPlacement:
+        with self._lock:
+            camera = next(
+                (candidate for candidate in self._cameras if candidate.id == camera_id),
+                None,
+            )
+            if camera is None or camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETING:
+                return camera
+            updated = replace(
+                camera,
+                state=CameraState.DELETING,
                 desired_revision=camera.desired_revision + 1,
             )
             self._cameras[self._cameras.index(camera)] = updated
@@ -586,10 +652,20 @@ class InMemoryNodeStore:
                 or camera.desired_revision != desired_revision
             ):
                 return False
-            self._cameras[self._cameras.index(camera)] = replace(
-                camera,
-                applied_revision=desired_revision,
-            )
+            if camera.state is CameraState.DELETING:
+                node = next(candidate for candidate in self._nodes if candidate.id == node_id)
+                self._nodes[self._nodes.index(node)] = replace(
+                    node,
+                    registered_cameras=node.registered_cameras - 1,
+                )
+                updated = replace(
+                    camera,
+                    state=CameraState.DELETED,
+                    applied_revision=desired_revision,
+                )
+            else:
+                updated = replace(camera, applied_revision=desired_revision)
+            self._cameras[self._cameras.index(camera)] = updated
             return True
 
 
@@ -922,6 +998,17 @@ class CameraControl:
             source_url=source_url,
         )
 
+    def set_camera_enabled(
+        self,
+        camera_id: UUID,
+        *,
+        enabled: bool,
+    ) -> CameraPlacement:
+        return self._store.set_camera_enabled(camera_id, enabled=enabled)
+
+    def delete_camera(self, camera_id: UUID) -> CameraPlacement:
+        return self._store.request_camera_delete(camera_id)
+
 
 class NodeStore(Protocol):
     def provisioning_guard(self) -> AbstractContextManager[None]: ...
@@ -1001,6 +1088,15 @@ class CameraStore(Protocol):
         name: str,
         source_url: str,
     ) -> CameraPlacement: ...
+
+    def set_camera_enabled(
+        self,
+        camera_id: UUID,
+        *,
+        enabled: bool,
+    ) -> CameraPlacement: ...
+
+    def request_camera_delete(self, camera_id: UUID) -> CameraPlacement: ...
 
 
 class ReconcileStore(Protocol):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -20,6 +21,7 @@ from sqlalchemy import (
     Text,
     Uuid,
     create_engine,
+    delete,
     func,
     insert,
     select,
@@ -35,8 +37,10 @@ from sqlalchemy.sql.selectable import Select
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
+    CameraLifecycleConflict,
     CameraNotFound,
     CameraPlacement,
+    CameraState,
     EligibleNodeMissing,
     InvalidNodeRuntimeObservation,
     MaximumNodesReached,
@@ -134,11 +138,26 @@ cameras = Table(
     Column("name", String(128), nullable=False),
     Column("source_url", Text, nullable=False),
     Column("public_id", String(26), nullable=False, unique=True),
+    Column("state", String(16), nullable=False),
     Column("desired_revision", BigInteger, nullable=False),
     Column("applied_revision", BigInteger, nullable=False),
     CheckConstraint("public_id ~ '^[a-z2-7]{25}[aeimquy4]$'"),
+    CheckConstraint("state IN ('enabled', 'disabled', 'deleting', 'deleted')"),
     CheckConstraint("desired_revision >= 1"),
     CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+)
+
+public_id_tombstones = Table(
+    "public_id_tombstones",
+    metadata,
+    Column("public_id", String(26), primary_key=True),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    ),
+    CheckConstraint("public_id ~ '^[a-z2-7]{25}[aeimquy4]$'"),
 )
 
 camera_placements = Table(
@@ -838,7 +857,9 @@ class PostgresNodeStore:
         with self._engine.connect() as connection:
             return tuple(
                 _camera_placement(row)
-                for row in connection.execute(self._camera_query()).mappings()
+                for row in connection.execute(
+                    self._camera_query().where(cameras.c.state != CameraState.DELETED.value)
+                ).mappings()
             )
 
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
@@ -862,6 +883,7 @@ class PostgresNodeStore:
                 cameras.c.name,
                 cameras.c.source_url,
                 cameras.c.public_id,
+                cameras.c.state,
                 cameras.c.desired_revision,
                 cameras.c.applied_revision,
                 camera_placements.c.node_id,
@@ -892,6 +914,10 @@ class PostgresNodeStore:
             if current is None:
                 raise CameraNotFound("camera_not_found")
             camera = _camera_placement(current)
+            if camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETING:
+                raise CameraLifecycleConflict("camera_deleting")
             if camera.name == name and camera.source_url == source_url:
                 return camera
             desired_revision = camera.desired_revision + 1
@@ -926,8 +952,104 @@ class PostgresNodeStore:
                 node_port=camera.node_port,
                 placement_mode=camera.placement_mode,
                 placement_generation=camera.placement_generation,
+                state=camera.state,
                 desired_revision=desired_revision,
                 applied_revision=camera.applied_revision,
+            )
+
+    def set_camera_enabled(
+        self,
+        camera_id: UUID,
+        *,
+        enabled: bool,
+    ) -> CameraPlacement:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = connection.execute(
+                self._camera_query()
+                .where(cameras.c.id == camera_id)
+                .with_for_update(of=cameras)
+            ).mappings().one_or_none()
+            if current is None:
+                raise CameraNotFound("camera_not_found")
+            camera = _camera_placement(current)
+            if camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETING:
+                raise CameraLifecycleConflict("camera_deleting")
+            target = CameraState.ENABLED if enabled else CameraState.DISABLED
+            if camera.state is target:
+                return camera
+            desired_revision = camera.desired_revision + 1
+            connection.execute(
+                update(cameras)
+                .where(cameras.c.id == camera_id)
+                .values(
+                    state=target.value,
+                    desired_revision=desired_revision,
+                )
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera",
+                aggregate_id=camera_id,
+                event_type=(
+                    "camera.enabled" if target is CameraState.ENABLED else "camera.disabled"
+                ),
+                payload={
+                    "node_id": str(camera.node_id),
+                    "placement_generation": camera.placement_generation,
+                    "desired_revision": desired_revision,
+                },
+                aggregate_revision=desired_revision,
+            )
+            return replace(
+                camera,
+                state=target,
+                desired_revision=desired_revision,
+            )
+
+    def request_camera_delete(self, camera_id: UUID) -> CameraPlacement:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = connection.execute(
+                self._camera_query()
+                .where(cameras.c.id == camera_id)
+                .with_for_update(of=cameras)
+            ).mappings().one_or_none()
+            if current is None:
+                raise CameraNotFound("camera_not_found")
+            camera = _camera_placement(current)
+            if camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is CameraState.DELETING:
+                return camera
+            desired_revision = camera.desired_revision + 1
+            connection.execute(
+                update(cameras)
+                .where(cameras.c.id == camera_id)
+                .values(
+                    state=CameraState.DELETING.value,
+                    desired_revision=desired_revision,
+                )
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera",
+                aggregate_id=camera_id,
+                event_type="camera.delete_requested",
+                payload={
+                    "node_id": str(camera.node_id),
+                    "placement_generation": camera.placement_generation,
+                    "mode": "immediate",
+                    "desired_revision": desired_revision,
+                },
+                aggregate_revision=desired_revision,
+            )
+            return replace(
+                camera,
+                state=CameraState.DELETING,
+                desired_revision=desired_revision,
             )
 
     def mark_camera_applied(
@@ -939,14 +1061,52 @@ class PostgresNodeStore:
         desired_revision: int,
     ) -> bool:
         with self._engine.begin() as connection:
+            current = connection.execute(
+                self._camera_query()
+                .where(
+                    cameras.c.id == camera_id,
+                    cameras.c.desired_revision == desired_revision,
+                    camera_placements.c.node_id == node_id,
+                    camera_placements.c.generation == placement_generation,
+                )
+                .with_for_update(of=(cameras, camera_placements))
+            ).mappings().one_or_none()
+            if current is None:
+                return False
+            camera = _camera_placement(current)
+            if camera.state is CameraState.DELETING:
+                connection.execute(
+                    delete(camera_placements).where(
+                        camera_placements.c.camera_id == camera_id,
+                        camera_placements.c.node_id == node_id,
+                        camera_placements.c.generation == placement_generation,
+                    )
+                )
+                connection.execute(
+                    update(media_nodes)
+                    .where(
+                        media_nodes.c.id == node_id,
+                        media_nodes.c.registered_cameras > 0,
+                    )
+                    .values(registered_cameras=media_nodes.c.registered_cameras - 1)
+                )
+                result = connection.execute(
+                    update(cameras)
+                    .where(
+                        cameras.c.id == camera_id,
+                        cameras.c.desired_revision == desired_revision,
+                    )
+                    .values(
+                        state=CameraState.DELETED.value,
+                        applied_revision=desired_revision,
+                    )
+                )
+                return result.rowcount == 1
             result = connection.execute(
                 update(cameras)
                 .where(
                     cameras.c.id == camera_id,
                     cameras.c.desired_revision == desired_revision,
-                    camera_placements.c.camera_id == cameras.c.id,
-                    camera_placements.c.node_id == node_id,
-                    camera_placements.c.generation == placement_generation,
                 )
                 .values(applied_revision=desired_revision)
             )
@@ -975,11 +1135,15 @@ class PostgresNodeStore:
         placement_mode: PlacementMode,
     ) -> CameraPlacement:
         connection.execute(
+            insert(public_id_tombstones).values(public_id=str(public_id))
+        )
+        connection.execute(
             insert(cameras).values(
                 id=camera_id,
                 name=name,
                 source_url=source_url,
                 public_id=str(public_id),
+                state=CameraState.ENABLED.value,
                 desired_revision=1,
                 applied_revision=0,
             )
@@ -1028,6 +1192,7 @@ class PostgresNodeStore:
             node_id=selected.id,
             node_port=selected.external_port,
             placement_mode=placement_mode,
+            state=CameraState.ENABLED,
             desired_revision=1,
             applied_revision=0,
         )
@@ -1099,6 +1264,7 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
         node_port=int(row["node_port"]),
         placement_mode=PlacementMode(str(row["placement_mode"])),
         placement_generation=int(row["placement_generation"]),
+        state=CameraState(str(row["state"])),
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),
     )

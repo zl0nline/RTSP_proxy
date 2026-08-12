@@ -28,6 +28,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0005_node_runtime.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0006_camera_reconcile.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -77,8 +82,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
         "schema_compatibility": {
-            "minimum": "0005_node_runtime",
-            "maximum": "0005_node_runtime",
+            "minimum": "0006_camera_reconcile",
+            "maximum": "0006_camera_reconcile",
         },
         "config_schema_version": 1,
     }

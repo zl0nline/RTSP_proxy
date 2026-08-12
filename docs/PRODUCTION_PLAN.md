@@ -700,8 +700,8 @@ passed; all six native amd64/arm64 jobs are green in
 [CI run 31547513916](https://github.com/zl0nline/RTSP_proxy/actions/runs/31547513916).
 Source credentials remain fail-closed until the encrypted secret-reference
 slice; this Phase B code never persists URL userinfo/query tokens. The binary
-and release manifest are bound to packaged Alembic head
-`0005_node_runtime`; startup rejects any other live database revision.
+and release manifest are bound to the packaged Alembic head named by the
+current phase; startup rejects any older or newer live database revision.
 
 ### Phase C — per-node Linux runtime
 

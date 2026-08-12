@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-APPLICATION_SCHEMA = "0005_node_runtime"
+APPLICATION_SCHEMA = "0006_camera_reconcile"
 CONFIG_SCHEMA_VERSION = 1
 
 

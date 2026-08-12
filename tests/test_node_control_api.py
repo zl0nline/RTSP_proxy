@@ -607,6 +607,8 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
         "node_id": "00000000-0000-0000-0000-000000000003",
         "node_port": 12002,
         "placement_mode": "automatic",
+        "state": "enabled",
+        "registered": True,
         "desired_revision": 1,
         "applied_revision": 0,
     }
@@ -839,6 +841,58 @@ def test_camera_source_credentials_are_rejected_before_persistence() -> None:
     assert client.get("/api/v1/cameras").json()["count"] == 0
 
 
+def test_camera_update_and_disable_are_revisioned_desired_state() -> None:
+    observed_at = datetime.now(UTC)
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=lambda: camera_id,
+                new_public_id=lambda: "a" * 26,
+            ),
+        )
+    )
+    assert client.post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
+    ).status_code == 201
+
+    updated = client.put(
+        f"/api/v1/cameras/{camera_id}",
+        json={"name": "entrance-new", "source_url": "rtsp://camera.local/new"},
+    )
+    disabled = client.post(f"/api/v1/cameras/{camera_id}/disable")
+
+    assert updated.status_code == 200
+    assert updated.json()["desired_revision"] == 2
+    assert updated.json()["applied_revision"] == 0
+    assert disabled.status_code == 200
+    assert disabled.json()["state"] == "disabled"
+    assert disabled.json()["desired_revision"] == 3
+    assert disabled.json()["registered"] is True
+    assert store.get_node(node_id).registered_cameras == 1  # type: ignore[union-attr]
+
+
 def test_manual_camera_placement_reports_missing_node_consistently() -> None:
     client = TestClient(
         create_app(
@@ -950,7 +1004,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
             )
         )
-    assert revision == "0005_node_runtime"
+    assert revision == "0006_camera_reconcile"
     assert table_count == 4
 
 

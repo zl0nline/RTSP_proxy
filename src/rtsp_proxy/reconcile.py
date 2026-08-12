@@ -6,7 +6,13 @@ from uuid import UUID
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError, MediaPathConfig, MediaPathInventory
-from rtsp_proxy.nodes import MediaNode, NodeNotFound, NodeState, ReconcileStore
+from rtsp_proxy.nodes import (
+    CameraState,
+    MediaNode,
+    NodeNotFound,
+    NodeState,
+    ReconcileStore,
+)
 
 
 class MediaNodeClient(Protocol):
@@ -55,11 +61,22 @@ class CameraReconciler:
             client = self._media_nodes.for_node(node)
             desired = self._store.list_node_cameras(node_id)
             inventory = client.inventory_paths()
-            desired_ids = {camera.public_id for camera in desired}
+            known_ids = {camera.public_id for camera in desired}
             applied = 0
             unchanged = 0
 
             for camera in desired:
+                if camera.state is not CameraState.ENABLED:
+                    self._remove_disabled_path(client, camera.public_id)
+                    if not self._store.mark_camera_applied(
+                        camera_id=camera.id,
+                        node_id=node_id,
+                        placement_generation=camera.placement_generation,
+                        desired_revision=camera.desired_revision,
+                    ):
+                        raise ReconcileRetry("camera_reconcile_fenced")
+                    applied += 1
+                    continue
                 path = MediaPathConfig(
                     name=camera.public_id,
                     source_url=camera.source_url,
@@ -88,7 +105,7 @@ class CameraReconciler:
                     unchanged += 1
 
             deleted = 0
-            for orphan in set(inventory.camera_ids).difference(desired_ids):
+            for orphan in set(inventory.camera_ids).difference(known_ids):
                 try:
                     client.delete_path(orphan)
                     remaining = client.get_path(orphan)
@@ -104,6 +121,18 @@ class CameraReconciler:
                 unchanged=unchanged,
                 deleted_orphans=deleted,
             )
+
+    @staticmethod
+    def _remove_disabled_path(client: MediaNodeClient, name: PublicId) -> None:
+        try:
+            if client.get_path(name) is None:
+                return
+            client.delete_path(name)
+            remaining = client.get_path(name)
+        except MediaNodeError:
+            remaining = CameraReconciler._safe_get(client, name)
+        if remaining is not None:
+            raise ReconcileRetry("camera_reconcile_delete_unverified")
 
     @staticmethod
     def _safe_read_back(

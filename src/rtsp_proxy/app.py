@@ -13,6 +13,8 @@ from rtsp_proxy.health import (
 )
 from rtsp_proxy.nodes import (
     CameraControl,
+    CameraLifecycleConflict,
+    CameraNotFound,
     EligibleNodeMissing,
     InvalidCameraSource,
     MaximumNodesReached,
@@ -92,6 +94,11 @@ class CameraCreateRequest(BaseModel):
     node_id: UUID | None = None
 
 
+class CameraUpdateRequest(BaseModel):
+    name: str
+    source_url: str
+
+
 class CameraResponse(BaseModel):
     id: str
     name: str
@@ -99,6 +106,8 @@ class CameraResponse(BaseModel):
     node_id: str
     node_port: int
     placement_mode: str
+    state: str
+    registered: bool
     desired_revision: int
     applied_revision: int
 
@@ -520,16 +529,67 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": "camera_source_secret_reference_required"},
             ) from None
-        return CameraResponse(
-            id=str(camera.id),
-            name=camera.name,
-            public_id=str(camera.public_id),
-            node_id=str(camera.node_id),
-            node_port=camera.node_port,
-            placement_mode=camera.placement_mode.value,
-            desired_revision=camera.desired_revision,
-            applied_revision=camera.applied_revision,
-        )
+        return _camera_response(camera)
+
+    @app.put("/api/v1/cameras/{camera_id}", response_model=CameraResponse)
+    def update_camera(camera_id: UUID, request: CameraUpdateRequest) -> CameraResponse:
+        control = _require_camera_control(camera_control)
+        try:
+            camera = control.update_camera(
+                camera_id,
+                name=request.name,
+                source_url=request.source_url,
+            )
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        except InvalidCameraSource:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "camera_source_secret_reference_required"},
+            ) from None
+        return _camera_response(camera)
+
+    def set_camera_enabled(camera_id: UUID, *, enabled: bool) -> CameraResponse:
+        control = _require_camera_control(camera_control)
+        try:
+            camera = control.set_camera_enabled(camera_id, enabled=enabled)
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        except CameraLifecycleConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_deleting"},
+            ) from None
+        return _camera_response(camera)
+
+    @app.post("/api/v1/cameras/{camera_id}/enable", response_model=CameraResponse)
+    def enable_camera(camera_id: UUID) -> CameraResponse:
+        return set_camera_enabled(camera_id, enabled=True)
+
+    @app.post("/api/v1/cameras/{camera_id}/disable", response_model=CameraResponse)
+    def disable_camera(camera_id: UUID) -> CameraResponse:
+        return set_camera_enabled(camera_id, enabled=False)
+
+    @app.delete(
+        "/api/v1/cameras/{camera_id}",
+        response_model=CameraResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def delete_camera(camera_id: UUID) -> CameraResponse:
+        control = _require_camera_control(camera_control)
+        try:
+            return _camera_response(control.delete_camera(camera_id))
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
 
     @app.get("/api/v1/cameras", response_model=CameraListResponse)
     def list_cameras() -> CameraListResponse:
@@ -539,16 +599,7 @@ def create_app(
                 detail={"code": "camera_control_unavailable"},
             )
         items = [
-            CameraResponse(
-                id=str(camera.id),
-                name=camera.name,
-                public_id=str(camera.public_id),
-                node_id=str(camera.node_id),
-                node_port=camera.node_port,
-                placement_mode=camera.placement_mode.value,
-                desired_revision=camera.desired_revision,
-                applied_revision=camera.applied_revision,
-            )
+            _camera_response(camera)
             for camera in camera_control.list_cameras()
         ]
         return CameraListResponse(items=items, count=len(items))
@@ -573,3 +624,31 @@ def _node_response(node: object) -> NodeResponse:
         desired_revision=node.desired_revision,
         applied_revision=node.applied_revision,
     )
+
+
+def _camera_response(camera: object) -> CameraResponse:
+    from rtsp_proxy.nodes import CameraPlacement, CameraState
+
+    if not isinstance(camera, CameraPlacement):
+        raise TypeError("camera_placement_required")
+    return CameraResponse(
+        id=str(camera.id),
+        name=camera.name,
+        public_id=str(camera.public_id),
+        node_id=str(camera.node_id),
+        node_port=camera.node_port,
+        placement_mode=camera.placement_mode.value,
+        state=camera.state.value,
+        registered=camera.state is not CameraState.DELETED,
+        desired_revision=camera.desired_revision,
+        applied_revision=camera.applied_revision,
+    )
+
+
+def _require_camera_control(camera_control: CameraControl | None) -> CameraControl:
+    if camera_control is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "camera_control_unavailable"},
+        )
+    return camera_control
