@@ -18,6 +18,7 @@ from rtsp_proxy.nodes import (
     MaximumNodesReached,
     NodeCameraCapacityReached,
     NodeControl,
+    NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
     NodeNotEmpty,
@@ -29,6 +30,14 @@ from rtsp_proxy.nodes import (
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
 )
+
+
+def _lifecycle_busy() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": "node_lifecycle_busy"},
+        headers={"Retry-After": "1"},
+    )
 
 
 class LiveStatus(BaseModel):
@@ -273,6 +282,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "node_not_found"},
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except NodeRuntimeUnavailable:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -310,6 +321,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "node_not_found"},
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except NodeNotEmpty:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -341,6 +354,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "node_not_found"},
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except NodeLifecycleConflict:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -377,6 +392,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "node_not_found"},
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except NodeRuntimeUnavailable:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -419,6 +436,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "node_not_found"},
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except NodeReleaseConflict:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -494,6 +513,8 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": error.code, "node_id": str(error.node_id)},
             ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
         except InvalidCameraSource:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

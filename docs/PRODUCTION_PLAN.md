@@ -632,7 +632,8 @@ deadline and all lifecycle commands for one UUID are serialized by a
 PostgreSQL advisory lock and exact desired revision. Lifecycle lock acquisition
 uses a replica-local bounded pool and timeout; startup convergence runs with the
 same configured concurrency instead of serially multiplying one unhealthy-node
-deadline across the server.
+deadline across the server. Contention is a typed retryable
+`node_lifecycle_busy` response, never a generic 500 or false state conflict.
 
 ## 20. Operations
 
@@ -735,6 +736,9 @@ revision-fenced release transition, then starts/smokes it; healthy old nodes sta
 manageable through the temporary previous-release allowlist. Recovery is
 bounded-parallel; one slow node does not delay observation/convergence of every
 other node, and PostgreSQL advisory-lock connections are capped per replica.
+Recovery re-reads current desired state while holding the same-node lifecycle
+guard across observe, decision and convergence, so stale startup snapshots
+cannot overwrite a newer operator STOP/release intent.
 
 The Phase-B-to-Phase-C `0005_node_runtime` migration is deliberately
 fail-closed when the old registry is non-empty: the old rows have no trustworthy

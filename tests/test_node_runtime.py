@@ -7,10 +7,11 @@ import os
 import socket
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from subprocess import CompletedProcess
-from threading import Thread
-from typing import ClassVar
+from threading import Event, Thread
+from typing import ClassVar, cast
 from uuid import UUID
 
 import pytest
@@ -35,7 +36,13 @@ from rtsp_proxy.node_runtime import (
     UnixNodeRuntimeClient,
     UnixNodeSupervisorServer,
 )
-from rtsp_proxy.nodes import MediaNode, NodeHealth, NodeRuntimeAction, NodeState
+from rtsp_proxy.nodes import (
+    MediaNode,
+    NodeHealth,
+    NodeRuntimeAction,
+    NodeRuntimeObservation,
+    NodeState,
+)
 
 
 def runtime_spec(*, node_suffix: int = 1) -> NodeRuntimeSpec:
@@ -1376,6 +1383,95 @@ def test_root_helper_ignores_a_disconnected_response_peer(tmp_path: Path) -> Non
     server_socket.close()
 
 
+def test_root_helper_runs_colliding_node_ids_independently(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-independent-locks"
+    root.mkdir(mode=0o700)
+    first_entered = Event()
+    release_first = Event()
+    second_entered = Event()
+
+    first_id = UUID(int=1)
+    second_id = UUID(int=5)  # collided with the old four-stripe implementation.
+
+    class BlockingSupervisor(LinuxNodeSupervisor):
+        def execute(
+            self,
+            command: NodeRuntimeCommand,
+            *,
+            deadline: NodeOperationDeadline | None = None,
+            cleanup_reserve_seconds: float = 3,
+        ) -> NodeRuntimeObservation:
+            if command.spec.node_id == first_id:
+                first_entered.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_entered.set()
+            return NodeRuntimeObservation(
+                state=NodeState.STOPPED,
+                health=NodeHealth.UNKNOWN,
+                config_compatible=False,
+            )
+
+    server = UnixNodeSupervisorServer(
+        supervisor=BlockingSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=RecordingProcessController(),
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda port: True,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12100,
+            api_port_start=13000,
+            api_port_end=13100,
+            metrics_port_start=14000,
+            metrics_port_end=14100,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+        max_workers=1,
+    )
+
+    def request(node_id: UUID, offset: int) -> dict[str, object]:
+        client, connection = socket.socketpair()
+        client.sendall(
+            (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "action": "observe",
+                        "spec": {
+                            "node_id": str(node_id),
+                            "external_port": 12000 + offset,
+                            "api_port": 13000 + offset,
+                            "metrics_port": 14000 + offset,
+                            "desired_revision": 1,
+                            "release_id": "release-2026.08.12",
+                            "mediamtx_binary_sha256": "a" * 64,
+                        },
+                        "config": None,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        server.serve_connection(connection)
+        response = cast(dict[str, object], json.loads(client.makefile("rb").readline()))
+        client.close()
+        connection.close()
+        return response
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(request, first_id, 1)
+        assert first_entered.wait(timeout=1)
+        second = executor.submit(request, second_id, 2)
+        assert second_entered.wait(timeout=1)
+        release_first.set()
+        assert isinstance(first.result(timeout=1)["ok"], bool)
+        assert isinstance(second.result(timeout=1)["ok"], bool)
+
+
+
 def test_root_helper_deadline_times_out_start_and_uses_reserved_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -1648,6 +1744,7 @@ def test_runtime_policy_rejects_an_incomplete_previous_release_pin() -> None:
     (
         {"request_timeout_seconds": 0},
         {"operation_timeout_seconds": 56},
+        {"cleanup_reserve_seconds": 19},
         {"cleanup_reserve_seconds": 55},
         {"max_workers": 0},
     ),

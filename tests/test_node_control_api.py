@@ -1,6 +1,8 @@
 import socket
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from threading import Barrier, Event, Lock
 from typing import cast
@@ -27,6 +29,7 @@ from rtsp_proxy.nodes import (
     MediaNode,
     NodeControl,
     NodeHealth,
+    NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeNotEmpty,
     NodeProvisioningPolicy,
@@ -2150,6 +2153,84 @@ def test_startup_recovery_converges_a_healthy_node_while_another_is_slow() -> No
     assert [node.id for node in recovered] == [slow, healthy]
 
 
+def test_startup_recovery_rechecks_operator_intent_after_its_initial_snapshot() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    snapshot_taken = Event()
+    release_snapshot = Event()
+
+    class PausingStore(InMemoryNodeStore):
+        def list_nodes(self) -> tuple[MediaNode, ...]:
+            nodes = super().list_nodes()
+            if not snapshot_taken.is_set():
+                snapshot_taken.set()
+                assert release_snapshot.wait(timeout=5)
+            return nodes
+
+    class StatefulRuntime(NodeRuntime):
+        def __init__(self) -> None:
+            self.active = True
+            self.calls: list[NodeRuntimeAction] = []
+
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            self.calls.append(action)
+            if action is NodeRuntimeAction.STOP:
+                self.active = False
+            elif action in {
+                NodeRuntimeAction.PROVISION_START,
+                NodeRuntimeAction.START,
+                NodeRuntimeAction.RESTART,
+            }:
+                self.active = True
+            if not self.active:
+                return NodeRuntimeObservation(
+                    state=NodeState.STOPPED,
+                    health=NodeHealth.UNKNOWN,
+                    config_compatible=True,
+                    applied_revision=node.desired_revision,
+                    config_sha256="c" * 64,
+                    release_id=node.release_id,
+                )
+            return SuccessfulNodeRuntime().execute(NodeRuntimeAction.OBSERVE, node)
+
+    runtime = StatefulRuntime()
+    store = PausingStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="operator-wins",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                desired_revision=2,
+                applied_revision=2,
+            ),
+        )
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        recovery = executor.submit(control.recover_runtime_state)
+        assert snapshot_taken.wait(timeout=1)
+        stopped = control.stop_node(node_id)
+        release_snapshot.set()
+        recovered = recovery.result(timeout=2)
+
+    assert stopped.state is NodeState.STOPPED
+    assert recovered[0].state is NodeState.STOPPED
+    assert recovered[0].runtime_state is NodeState.STOPPED
+    assert runtime.calls == [NodeRuntimeAction.STOP, NodeRuntimeAction.OBSERVE]
+
+
 @pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
 def test_lifecycle_commands_fail_closed_without_the_privileged_runtime(
     operation: str,
@@ -2211,6 +2292,100 @@ def test_restart_requires_a_running_desired_node() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "node_not_running"
+
+
+@pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
+def test_lifecycle_lock_contention_is_a_retryable_public_error(operation: str) -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class BusyStore(InMemoryNodeStore):
+        @contextmanager
+        def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
+            raise NodeLifecycleBusy("node_lifecycle_busy")
+            yield
+
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=NodeControl(
+                store=BusyStore(
+                    nodes=(MediaNode(id=node_id, name="busy", external_port=12000),)
+                ),
+                choose_port=lambda available: available[0],
+                new_node_id=uuid4,
+                node_runtime=RecordingLifecycleRuntime(),
+            ),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(f"/api/v1/nodes/{node_id}/{operation}")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "node_lifecycle_busy"}
+
+
+def test_release_lock_contention_is_a_retryable_public_error() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    class BusyStore(InMemoryNodeStore):
+        @contextmanager
+        def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
+            raise NodeLifecycleBusy("node_lifecycle_busy")
+            yield
+
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_release_id="release-2",
+                node_mediamtx_binary_sha256="b" * 64,
+            ),
+            node_control=NodeControl(
+                store=BusyStore(
+                    nodes=(MediaNode(id=node_id, name="busy", external_port=12000),)
+                ),
+                choose_port=lambda available: available[0],
+                new_node_id=uuid4,
+                node_runtime=RecordingLifecycleRuntime(),
+            ),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.put(
+        f"/api/v1/nodes/{node_id}/release",
+        json={"release_id": "release-2", "mediamtx_binary_sha256": "b" * 64},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "node_lifecycle_busy"}
+
+
+def test_automatic_capacity_lock_contention_is_a_retryable_public_error() -> None:
+    def busy_capacity() -> MediaNode:
+        raise NodeLifecycleBusy("node_lifecycle_busy")
+
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=CameraControl(
+                store=InMemoryNodeStore(),
+                new_camera_id=uuid4,
+                new_public_id=generate_public_id,
+                ensure_automatic_capacity=busy_capacity,
+            ),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "busy", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "node_lifecycle_busy"}
 
 
 def test_stop_requires_an_empty_node_until_the_drain_phase() -> None:

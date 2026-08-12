@@ -1400,6 +1400,38 @@ class NodeRuntimePolicy:
             raise NodeSupervisorError("node_release_not_allowed")
 
 
+class _ScopedNodeLock:
+    def __init__(
+        self,
+        *,
+        node_id: UUID,
+        guard: Lock,
+        locks: dict[UUID, tuple[Lock, int]],
+    ) -> None:
+        self._node_id = node_id
+        self._guard = guard
+        self._locks = locks
+        self._lock: Lock | None = None
+
+    def __enter__(self) -> None:
+        with self._guard:
+            lock, references = self._locks.get(self._node_id, (Lock(), 0))
+            self._locks[self._node_id] = (lock, references + 1)
+            self._lock = lock
+        lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        assert self._lock is not None
+        self._lock.release()
+        with self._guard:
+            lock, references = self._locks[self._node_id]
+            assert lock is self._lock and references > 0
+            if references == 1:
+                del self._locks[self._node_id]
+            else:
+                self._locks[self._node_id] = (lock, references - 1)
+
+
 class UnixNodeSupervisorServer:
     """Root-side one-request protocol with an allowlisted node policy."""
 
@@ -1419,7 +1451,7 @@ class UnixNodeSupervisorServer:
             raise ValueError("node_runtime_request_timeout_invalid")
         if operation_timeout_seconds <= 0 or operation_timeout_seconds > 55:
             raise ValueError("node_runtime_operation_timeout_invalid")
-        if cleanup_reserve_seconds <= 0 or cleanup_reserve_seconds >= operation_timeout_seconds:
+        if cleanup_reserve_seconds < 20 or cleanup_reserve_seconds >= operation_timeout_seconds:
             raise ValueError("node_runtime_cleanup_reserve_invalid")
         if max_workers < 1 or max_workers > 64:
             raise ValueError("node_runtime_workers_invalid")
@@ -1431,7 +1463,8 @@ class UnixNodeSupervisorServer:
         self._max_workers = max_workers
         self._wall_time = wall_time
         self._monotonic = monotonic
-        self._node_locks = tuple(Lock() for _ in range(max_workers * 4))
+        self._node_locks_guard = Lock()
+        self._node_locks: dict[UUID, tuple[Lock, int]] = {}
 
     def serve_connection(self, connection: socket.socket) -> None:
         try:
@@ -1482,8 +1515,12 @@ class UnixNodeSupervisorServer:
         finally:
             capacity.release()
 
-    def _node_lock(self, node_id: UUID) -> Lock:
-        return self._node_locks[node_id.int % len(self._node_locks)]
+    def _node_lock(self, node_id: UUID) -> _ScopedNodeLock:
+        return _ScopedNodeLock(
+            node_id=node_id,
+            guard=self._node_locks_guard,
+            locks=self._node_locks,
+        )
 
     def _operation_deadline(
         self,
@@ -1603,7 +1640,7 @@ class NodeHelperSettings(BaseSettings):
     smoke_retry_delay_seconds: float = Field(default=0.25, ge=0, le=5)
     request_timeout_seconds: float = Field(default=5, gt=0, le=30)
     operation_timeout_seconds: float = Field(default=55, gt=0, le=55)
-    cleanup_reserve_seconds: float = Field(default=25, gt=0, le=30)
+    cleanup_reserve_seconds: float = Field(default=25, ge=20, le=30)
     max_workers: int = Field(default=16, ge=1, le=64)
 
     @model_validator(mode="after")

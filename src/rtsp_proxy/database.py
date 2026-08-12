@@ -43,6 +43,7 @@ from rtsp_proxy.nodes import (
     NodeCreationMode,
     NodeHealth,
     NodeIdFactory,
+    NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
     NodeNotEmpty,
@@ -307,7 +308,7 @@ class PostgresNodeStore:
                         parameters,
                     )
         except SQLAlchemyTimeoutError:
-            raise NodeLifecycleConflict("node_lifecycle_busy") from None
+            raise NodeLifecycleBusy("node_lifecycle_busy") from None
 
     @contextmanager
     def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
@@ -337,7 +338,7 @@ class PostgresNodeStore:
                         parameters,
                     )
         except SQLAlchemyTimeoutError:
-            raise NodeLifecycleConflict("node_lifecycle_busy") from None
+            raise NodeLifecycleBusy("node_lifecycle_busy") from None
 
     def _acquire_advisory_lock(
         self,
@@ -351,7 +352,7 @@ class PostgresNodeStore:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise NodeLifecycleConflict("node_lifecycle_busy")
+                raise NodeLifecycleBusy("node_lifecycle_busy")
             time.sleep(min(0.05, remaining))
 
     def register_automatically(

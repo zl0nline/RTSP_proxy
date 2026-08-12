@@ -168,6 +168,10 @@ class NodeLifecycleConflict(RuntimeError):
     """The requested operation is not valid from the desired lifecycle state."""
 
 
+class NodeLifecycleBusy(NodeLifecycleConflict):
+    """Lifecycle serialization capacity is temporarily unavailable."""
+
+
 class NodeReleaseConflict(RuntimeError):
     """A release transition requires an empty, stopped and converged node."""
 
@@ -643,24 +647,11 @@ class NodeControl:
 
     def start_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            node = self._store.get_node(node_id)
-            if node is None:
-                raise NodeNotFound("node_not_found")
-            if self._node_runtime is None:
-                raise NodeRuntimeUnavailable("node_runtime_unavailable")
-            desired = self._store.request_desired_state(node_id, NodeState.RUNNING)
-            action = (
-                NodeRuntimeAction.PROVISION_START
-                if desired.applied_revision == 0
-                else NodeRuntimeAction.START
-            )
-            return self._execute_runtime(desired, action)
+            return self._start_node_locked(node_id)
 
     def stop_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            self._require_node_and_runtime(node_id)
-            desired = self._store.request_stop(node_id)
-            return self._execute_runtime(desired, NodeRuntimeAction.STOP)
+            return self._stop_node_locked(node_id)
 
     def restart_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
@@ -670,8 +661,7 @@ class NodeControl:
 
     def observe_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            node = self._require_node_and_runtime(node_id)
-            return self._execute_runtime(node, NodeRuntimeAction.OBSERVE)
+            return self._observe_node_locked(node_id)
 
     def update_node_release(
         self,
@@ -704,18 +694,20 @@ class NodeControl:
 
     def _recover_node(self, node: MediaNode) -> MediaNode:
         try:
-            observed = self.observe_node(node.id)
-            if (
-                node.state is NodeState.RUNNING
-                and observed.runtime_state is not NodeState.RUNNING
-            ):
-                return self.start_node(node.id)
-            if (
-                node.state is NodeState.STOPPED
-                and observed.runtime_state is NodeState.RUNNING
-            ):
-                return self.stop_node(node.id)
-            return observed
+            with self._store.lifecycle_guard(node.id):
+                current = self._require_node_and_runtime(node.id)
+                observed = self._execute_runtime(current, NodeRuntimeAction.OBSERVE)
+                if (
+                    current.state is NodeState.RUNNING
+                    and observed.runtime_state is not NodeState.RUNNING
+                ):
+                    return self._start_node_locked(node.id)
+                if (
+                    current.state is NodeState.STOPPED
+                    and observed.runtime_state is NodeState.RUNNING
+                ):
+                    return self._stop_node_locked(node.id)
+                return observed
         except (NodeRuntimeFailed, NodeNotEmpty, NodeLifecycleConflict, NodeNotFound):
             failed = self._store.get_node(node.id)
             if failed is None:
@@ -724,6 +716,25 @@ class NodeControl:
 
     def _provision_reserved_node(self, node: MediaNode) -> MediaNode:
         return self.start_node(node.id)
+
+    def _start_node_locked(self, node_id: UUID) -> MediaNode:
+        self._require_node_and_runtime(node_id)
+        desired = self._store.request_desired_state(node_id, NodeState.RUNNING)
+        action = (
+            NodeRuntimeAction.PROVISION_START
+            if desired.applied_revision == 0
+            else NodeRuntimeAction.START
+        )
+        return self._execute_runtime(desired, action)
+
+    def _stop_node_locked(self, node_id: UUID) -> MediaNode:
+        self._require_node_and_runtime(node_id)
+        desired = self._store.request_stop(node_id)
+        return self._execute_runtime(desired, NodeRuntimeAction.STOP)
+
+    def _observe_node_locked(self, node_id: UUID) -> MediaNode:
+        node = self._require_node_and_runtime(node_id)
+        return self._execute_runtime(node, NodeRuntimeAction.OBSERVE)
 
     def _require_node_and_runtime(self, node_id: UUID) -> MediaNode:
         node = self._store.get_node(node_id)
