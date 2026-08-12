@@ -22,7 +22,7 @@ LogsDirectory=rtsp-proxy/nodes/%i
 RuntimeDirectoryMode=0750
 StateDirectoryMode=0750
 LogsDirectoryMode=0750
-InaccessiblePaths=/etc/rtsp-proxy/nodes/%i/management.json
+InaccessiblePaths=/etc/rtsp-proxy/nodes/%i/management.json /etc/rtsp-proxy/nodes/%i/reader.json
 ReadWritePaths=/run/rtsp-proxy/nodes/%i /var/lib/rtsp-proxy/nodes/%i /var/log/rtsp-proxy/nodes/%i
 
 NoNewPrivileges=yes

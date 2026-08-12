@@ -496,8 +496,9 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             management_observed_at=observed_at,
-            config_compatible=True,
-            registered_cameras=50,
+                config_compatible=True,
+                applied_revision=1,
+                registered_cameras=50,
             active_sources=2,
         ),
         MediaNode(
@@ -509,8 +510,9 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             management_observed_at=observed_at,
-            config_compatible=True,
-            registered_cameras=10,
+                config_compatible=True,
+                applied_revision=1,
+                registered_cameras=10,
             active_sources=5,
         ),
         MediaNode(
@@ -522,8 +524,9 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             management_observed_at=observed_at,
-            config_compatible=True,
-            registered_cameras=10,
+                config_compatible=True,
+                applied_revision=1,
+                registered_cameras=10,
             active_sources=1,
         ),
     )
@@ -664,8 +667,9 @@ def test_automatic_placement_skips_maintenance_stale_or_incompatible_nodes() -> 
         health=NodeHealth.HEALTHY,
         management_fresh=True,
         management_observed_at=observed_at,
-        config_compatible=True,
-        registered_cameras=10,
+            config_compatible=True,
+            applied_revision=1,
+            registered_cameras=10,
     )
     store = InMemoryNodeStore(nodes=(*blocked, target))
     client = TestClient(
@@ -703,8 +707,9 @@ def test_operator_can_place_a_camera_on_a_specific_eligible_node() -> None:
                 health=NodeHealth.HEALTHY,
                 management_fresh=True,
                 management_observed_at=observed_at,
-                config_compatible=True,
-                registered_cameras=40,
+                    config_compatible=True,
+                    applied_revision=1,
+                    registered_cameras=40,
             ),
             MediaNode(
                 id=second_node_id,
@@ -715,8 +720,9 @@ def test_operator_can_place_a_camera_on_a_specific_eligible_node() -> None:
                 health=NodeHealth.HEALTHY,
                 management_fresh=True,
                 management_observed_at=observed_at,
-                config_compatible=True,
-                registered_cameras=1,
+                    config_compatible=True,
+                    applied_revision=1,
+                    registered_cameras=1,
             ),
         )
     )
@@ -1271,6 +1277,71 @@ def test_postgresql_adapter_rejects_credentialed_source_urls_if_called_directly(
     assert store.list_cameras() == ()
 
 
+def test_postgresql_release_transition_is_revisioned_and_audited(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+    )
+    running = store.request_desired_state(node_id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        node_id,
+        NodeRuntimeObservation(
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            config_compatible=True,
+            applied_revision=running.desired_revision,
+            process_id=1001,
+            process_start_ticks=2001,
+            process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
+            config_sha256="b" * 64,
+            release_id=running.release_id,
+        ),
+    )
+    stopping = store.request_desired_state(node_id, NodeState.STOPPED)
+    store.apply_runtime_observation(
+        node_id,
+        NodeRuntimeObservation(
+            state=NodeState.STOPPED,
+            health=NodeHealth.UNKNOWN,
+            config_compatible=True,
+            applied_revision=stopping.desired_revision,
+            config_sha256="b" * 64,
+            release_id=stopping.release_id,
+        ),
+    )
+
+    updated = store.request_release(
+        node_id,
+        release_id="release-2",
+        mediamtx_binary_sha256="c" * 64,
+    )
+
+    assert updated.release_id == "release-2"
+    assert updated.desired_revision == stopping.desired_revision + 1
+    assert updated.applied_revision == 0
+    assert updated.config_compatible is False
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        event = connection.execute(
+            text(
+                "SELECT event_type, payload FROM audit_events "
+                "WHERE aggregate_id = :node_id AND event_type = :event_type"
+            ),
+            {"node_id": node_id, "event_type": "media_node.release_changed"},
+        ).mappings().one()
+    assert event["payload"]["release_id"] == "release-2"
+
+
 def test_systemd_web_entrypoint_wires_the_persistent_node_control(
     postgres_database_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1589,6 +1660,55 @@ def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
     assert after_second == before_second
 
 
+def test_operator_updates_release_only_after_empty_stopped_convergence() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    runtime = RecordingLifecycleRuntime()
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=control,
+        )
+    )
+    created = client.post("/api/v1/nodes", json={"name": "media-a"}).json()
+
+    release_client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_release_id="release-2",
+                node_mediamtx_binary_sha256="b" * 64,
+            ),
+            node_control=control,
+        )
+    )
+    running = release_client.put(
+        f"/api/v1/nodes/{node_id}/release",
+        json={"release_id": "release-2", "mediamtx_binary_sha256": "b" * 64},
+    )
+    stopped = client.post(f"/api/v1/nodes/{node_id}/stop")
+    updated = release_client.put(
+        f"/api/v1/nodes/{node_id}/release",
+        json={"release_id": "release-2", "mediamtx_binary_sha256": "b" * 64},
+    )
+
+    assert running.status_code == 409
+    assert stopped.status_code == 200
+    assert updated.status_code == 200
+    assert updated.json()["desired_revision"] == created["desired_revision"] + 2
+    assert updated.json()["applied_revision"] == 0
+    persisted = control.list_nodes()[0]
+    assert persisted.release_id == "release-2"
+    assert persisted.mediamtx_binary_sha256 == "b" * 64
+    assert persisted.config_compatible is False
+
+
 class FailingNodeRuntime(NodeRuntime):
     def execute(
         self,
@@ -1881,6 +2001,59 @@ def test_application_startup_recovers_persisted_runtime_identity() -> None:
     assert response.json()["items"][0]["runtime_state"] == "running"
     assert response.json()["items"][0]["applied_revision"] == 2
     assert runtime.calls == [(NodeRuntimeAction.OBSERVE, node_id)]
+
+
+def test_application_startup_starts_a_persisted_running_node_after_host_reboot() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="recover-me",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.STOPPED,
+                health=NodeHealth.UNKNOWN,
+                config_compatible=True,
+                desired_revision=2,
+                applied_revision=2,
+            ),
+        )
+    )
+
+    class RebootRuntime(RecordingLifecycleRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if action is NodeRuntimeAction.OBSERVE:
+                self.calls.append((action, node.id))
+                return NodeRuntimeObservation(
+                    state=NodeState.STOPPED,
+                    health=NodeHealth.UNKNOWN,
+                    config_compatible=True,
+                    applied_revision=node.desired_revision,
+                    config_sha256="c" * 64,
+                    release_id=node.release_id,
+                )
+            return super().execute(action, node)
+
+    runtime = RebootRuntime()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+    )
+
+    recovered = control.recover_runtime_state()
+
+    assert recovered[0].runtime_state is NodeState.RUNNING
+    assert runtime.calls == [
+        (NodeRuntimeAction.OBSERVE, node_id),
+        (NodeRuntimeAction.START, node_id),
+    ]
 
 
 def test_startup_recovery_isolates_a_failed_node_and_continues_other_nodes() -> None:
@@ -2389,6 +2562,98 @@ def test_concurrent_manual_placements_cannot_cross_100_camera_limit(
     assert sorted(response.status_code for response in responses) == [201, 409]
     assert client.get("/api/v1/nodes").json()["items"][0]["registered_cameras"] == 100
     assert client.get("/api/v1/cameras").json()["count"] == 100
+
+
+def test_postgresql_restart_and_camera_placement_are_one_atomic_choice(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    runtime_entered = Event()
+    release_runtime = Event()
+
+    class BlockingRestartRuntime(SuccessfulNodeRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if action is NodeRuntimeAction.RESTART:
+                runtime_entered.set()
+                assert release_runtime.wait(timeout=5)
+            return super().execute(action, node)
+
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: node_id,
+                node_runtime=BlockingRestartRuntime(),
+            ),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=uuid4,
+                new_public_id=generate_public_id,
+            ),
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+    assert client.post(f"/api/v1/nodes/{node_id}/start").status_code == 200
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        restart = executor.submit(client.post, f"/api/v1/nodes/{node_id}/restart")
+        assert runtime_entered.wait(timeout=5)
+        placement = executor.submit(
+            client.post,
+            "/api/v1/cameras",
+            json={
+                "name": "must-wait",
+                "source_url": "rtsp://camera.local/main",
+                "node_id": str(node_id),
+            },
+        )
+        placement_response = placement.result(timeout=5)
+        release_runtime.set()
+        restart_response = restart.result(timeout=5)
+
+    assert restart_response.status_code == 200
+    assert placement_response.status_code == 409
+    assert placement_response.json()["detail"]["code"] == "eligible_node_missing"
+    assert store.get_node(node_id).registered_cameras == 0  # type: ignore[union-attr]
+
+
+def test_postgresql_lifecycle_guards_do_not_consume_the_bounded_work_pool(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_ids = tuple(UUID(f"00000000-0000-0000-0000-{index:012d}") for index in range(1, 17))
+    for index, node_id in enumerate(node_ids):
+        store.register_automatically(
+            name=f"media-{index}",
+            allowed_ports=tuple(range(12000, 12016)),
+            max_nodes=16,
+            preferred_port=12000 + index,
+            choose_port=lambda available: available[0],
+            new_node_id=lambda node_id=node_id: node_id,
+            api_ports=tuple(range(13000, 13016)),
+            metrics_ports=tuple(range(14000, 14016)),
+        )
+    barrier = Barrier(16)
+
+    def read_while_guarded(node_id: UUID) -> UUID:
+        with store.lifecycle_guard(node_id):
+            barrier.wait(timeout=5)
+            assert store.get_node(node_id) is not None
+            return node_id
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        observed = set(executor.map(read_while_guarded, node_ids))
+
+    assert observed == set(node_ids)
 
 
 def test_concurrent_node_creation_serializes_the_last_available_port(

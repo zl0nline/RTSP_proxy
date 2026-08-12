@@ -154,6 +154,7 @@ jobs:
           tar -xJf .artifacts/ffmpeg.tar.xz -C .artifacts/ffmpeg --strip-components=1
           echo "$ffmpeg_sha256  .artifacts/ffmpeg/bin/ffmpeg" | sha256sum --check
           echo "$ffprobe_sha256  .artifacts/ffmpeg/bin/ffprobe" | sha256sum --check
+
           expected_version=$(jq --raw-output '.ffmpeg.version' deploy/artifact-catalog.json)
           test "$(.artifacts/ffmpeg/bin/ffmpeg -version | awk 'NR == 1 {print $3}')" = "$expected_version"
           test "$(.artifacts/ffmpeg/bin/ffprobe -version | awk 'NR == 1 {print $3}')" = "$expected_version"
@@ -240,6 +241,20 @@ jobs:
           echo "$ffmpeg_sha256  .artifacts/ffmpeg/bin/ffmpeg" | sha256sum --check
           echo "$ffprobe_sha256  .artifacts/ffmpeg/bin/ffprobe" | sha256sum --check
 
+      - name: Download, verify and stage MediaMTX for node isolation (${{ matrix.arch }})
+        run: |
+          archive_url=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].archive_url' deploy/artifact-catalog.json)
+          archive_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].archive_sha256' deploy/artifact-catalog.json)
+          binary_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].binary_sha256' deploy/artifact-catalog.json)
+          mkdir -p .artifacts/mediamtx
+          curl --fail --location --silent --show-error --output .artifacts/mediamtx.tar.gz "$archive_url"
+          echo "$archive_sha256  .artifacts/mediamtx.tar.gz" | sha256sum --check
+          tar -xzf .artifacts/mediamtx.tar.gz -C .artifacts/mediamtx
+          echo "$binary_sha256  .artifacts/mediamtx/mediamtx" | sha256sum --check
+          sudo install -d /opt/rtsp-proxy/releases/native-contract/bin
+          sudo install -m 0755 .artifacts/mediamtx/mediamtx /opt/rtsp-proxy/releases/native-contract/bin/mediamtx
+          echo "$binary_sha256  /opt/rtsp-proxy/releases/native-contract/bin/mediamtx" | sha256sum --check
+
       - name: Build native GStreamer load binaries
         run: |
           gst-launch-1.0 --version
@@ -274,9 +289,10 @@ jobs:
       - name: Verify two-node process and RTP session isolation
         run: |
           sudo install -m 0644 deploy/systemd/rtsp-proxy-media@.service /etc/systemd/system/
+          sudo systemctl daemon-reload
           sudo systemd-analyze verify /etc/systemd/system/rtsp-proxy-media@.service
           sudo env \
-            MEDIAMTX_BINARY="$PWD/.artifacts/mediamtx/mediamtx" \
+            MEDIAMTX_BINARY="/opt/rtsp-proxy/releases/native-contract/bin/mediamtx" \
             RTSP_PULL_SERVER_BINARY="$PWD/tools/load/rtsp-pull-server" \
             RTSP_LOAD_READER_BINARY="$PWD/tools/load/rtsp-load-reader" \
             FFMPEG_BINARY="$PWD/.artifacts/ffmpeg/bin/ffmpeg" \

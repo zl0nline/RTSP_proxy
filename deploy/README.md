@@ -58,9 +58,11 @@ in `/etc/rtsp-proxy/node-runtime.env` from `node-runtime.env.example`, then
 enable the socket and helper. API and metrics always bind loopback; the external
 ordinary `rtsp://` listener is TCP-only.
 
-The helper, not the web process, creates a random Basic credential for each
-node, renders the complete config, writes root-only `management.json` and
-`runtime.env`, and pins the absolute verified binary path. The MediaMTX instance
+The helper, not the web process, creates separate random Basic credentials for
+loopback management and the path-scoped `__rtsp_proxy_runtime_probe` reader,
+renders the complete config, writes root-only `management.json`, `reader.json`
+and `runtime.env`, and pins the absolute verified binary path. Neither identity
+can perform the other's actions. The MediaMTX instance
 uses `DynamicUser` and receives only its own config through systemd credentials;
 it cannot traverse `/etc/rtsp-proxy/nodes` or read another node's management
 secret. Keep control/helper port ranges, release id and binary SHA identical;
@@ -140,9 +142,13 @@ recreate nodes through the Phase-C create/provision workflow. Do not patch in
 placeholder digests or arbitrary ports.
 
 Activation atomically switches `current`, reloads systemd and updates control
-roles. It does not restart healthy media nodes unless the release procedure
-explicitly drains and upgrades those instances one at a time. Rollback switches
-to the last verified release and uses the same validation/smoke path.
+roles. The helper allowlist contains the verified current pin and, only during
+rollout, one verified previous pin, so old instances remain observable and
+stoppable. Upgrade each node by draining it, stopping it, calling
+`PUT /api/v1/nodes/<uuid>/release` with the new release id/digest, and starting
+it again. The revision-fenced transition refuses a running, unconverged or
+non-empty node. Remove the previous pin only after every node is upgraded.
+Rollback uses the same stopped-node transition and validation/smoke path.
 
 ## Security
 

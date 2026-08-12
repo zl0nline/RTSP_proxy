@@ -167,6 +167,10 @@ class NodeLifecycleConflict(RuntimeError):
     """The requested operation is not valid from the desired lifecycle state."""
 
 
+class NodeReleaseConflict(RuntimeError):
+    """A release transition requires an empty, stopped and converged node."""
+
+
 class NodeNotFound(LookupError):
     """A requested node does not exist."""
 
@@ -354,12 +358,53 @@ class InMemoryNodeStore:
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
-    def advance_desired_revision(self, node_id: UUID) -> MediaNode:
+    def request_restart(self, node_id: UUID) -> MediaNode:
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            if node.state is not NodeState.RUNNING:
+                raise NodeLifecycleConflict("node_not_running")
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
             updated = replace(node, desired_revision=node.desired_revision + 1)
+            self._nodes[self._nodes.index(node)] = updated
+            return updated
+
+    def request_release(
+        self,
+        node_id: UUID,
+        *,
+        release_id: str,
+        mediamtx_binary_sha256: str,
+    ) -> MediaNode:
+        NodeRuntimeSpecLike.validate_release(release_id, mediamtx_binary_sha256)
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if (
+                node.state is not NodeState.STOPPED
+                or node.runtime_state is not NodeState.STOPPED
+                or node.registered_cameras
+                or node.applied_revision != node.desired_revision
+            ):
+                raise NodeReleaseConflict("node_release_transition_requires_stopped_empty")
+            if (
+                node.release_id == release_id
+                and node.mediamtx_binary_sha256 == mediamtx_binary_sha256
+            ):
+                return node
+            updated = replace(
+                node,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+                desired_revision=node.desired_revision + 1,
+                applied_revision=0,
+                config_compatible=False,
+                management_fresh=False,
+                management_observed_at=None,
+            )
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
@@ -595,18 +640,29 @@ class NodeControl:
 
     def restart_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            node = self._require_node_and_runtime(node_id)
-            if node.state is not NodeState.RUNNING:
-                raise NodeLifecycleConflict("node_not_running")
-            if node.registered_cameras:
-                raise NodeNotEmpty("node_not_empty")
-            desired = self._store.advance_desired_revision(node_id)
+            self._require_node_and_runtime(node_id)
+            desired = self._store.request_restart(node_id)
             return self._execute_runtime(desired, NodeRuntimeAction.RESTART)
 
     def observe_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             node = self._require_node_and_runtime(node_id)
             return self._execute_runtime(node, NodeRuntimeAction.OBSERVE)
+
+    def update_node_release(
+        self,
+        node_id: UUID,
+        *,
+        release_id: str,
+        mediamtx_binary_sha256: str,
+    ) -> MediaNode:
+        with self._store.lifecycle_guard(node_id):
+            self._require_node_and_runtime(node_id)
+            return self._store.request_release(
+                node_id,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+            )
 
     def recover_runtime_state(self) -> tuple[MediaNode, ...]:
         if self._node_runtime is None:
@@ -616,8 +672,20 @@ class NodeControl:
             if node.state is NodeState.DELETING:
                 continue
             try:
-                recovered.append(self.observe_node(node.id))
-            except NodeRuntimeFailed:
+                observed = self.observe_node(node.id)
+                if (
+                    node.state is NodeState.RUNNING
+                    and observed.runtime_state is not NodeState.RUNNING
+                ):
+                    recovered.append(self.start_node(node.id))
+                elif (
+                    node.state is NodeState.STOPPED
+                    and observed.runtime_state is NodeState.RUNNING
+                ):
+                    recovered.append(self.stop_node(node.id))
+                else:
+                    recovered.append(observed)
+            except (NodeRuntimeFailed, NodeNotEmpty, NodeLifecycleConflict, NodeNotFound):
                 failed = self._store.get_node(node.id)
                 if failed is not None:
                     recovered.append(failed)
@@ -755,7 +823,15 @@ class NodeStore(Protocol):
 
     def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode: ...
 
-    def advance_desired_revision(self, node_id: UUID) -> MediaNode: ...
+    def request_restart(self, node_id: UUID) -> MediaNode: ...
+
+    def request_release(
+        self,
+        node_id: UUID,
+        *,
+        release_id: str,
+        mediamtx_binary_sha256: str,
+    ) -> MediaNode: ...
 
     def apply_runtime_observation(
         self,
@@ -830,6 +906,15 @@ def validate_camera_source_url(value: str) -> str:
     return value
 
 
+class NodeRuntimeSpecLike:
+    @staticmethod
+    def validate_release(release_id: str, digest: str) -> None:
+        if not release_id or len(release_id) > 128:
+            raise ValueError("node_release_id_invalid")
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("node_binary_sha256_invalid")
+
+
 def is_node_eligible(
     node: MediaNode,
     *,
@@ -846,6 +931,7 @@ def is_node_eligible(
         and observed_at is not None
         and observed_at >= current_time - timedelta(seconds=management_freshness_seconds)
         and node.config_compatible
+        and node.applied_revision == node.desired_revision
         and not node.maintenance
         and node.registered_cameras < node.camera_capacity
     )

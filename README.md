@@ -187,15 +187,20 @@ Phase B **complete**: independent Standards/Spec review и все шесть job
 
 Phase C **implemented, native CI pending**: per-node generated configs,
 `rtsp-proxy-media@<uuid>.service`, scoped root helper over a bounded Unix
-socket, unique loopback API/metrics ports, PID/start/boot/config/release
-identity, lifecycle recovery and automatic
+socket with parallel different-node execution and an end-to-end deadline,
+unique loopback API/metrics ports, PID/start/boot/config/release identity,
+startup convergence and automatic
 reserve→provision→smoke→place are in code. The two-node native contract proves
 that restart/stop of node A does not change node B process or its established
-ordinary RTSP/TCP session. Documentation is updated to COMPLETE only after
+ordinary RTSP/TCP session or packet progress. Restart is transactionally fenced
+against placement, and rolling activation keeps current/previous verified
+release pins while empty stopped nodes transition one at a time. Documentation
+is updated to COMPLETE only after
 independent review and green amd64/arm64 run.
 
-Каждая node получает отдельный случайный credential для loopback API/metrics и
-отдельный `DynamicUser`; process видит только собственный config через systemd
+Каждая node получает разные случайные credentials для loopback API/metrics и
+path-scoped runtime RTSP probe, а также отдельный `DynamicUser`; process видит
+только собственный config через systemd
 credentials. Runtime использует абсолютный binary path конкретного verified
 release, поэтому переключение `/opt/rtsp-proxy/current` не подменяет MediaMTX у
 уже созданной node. Lifecycle одной node сериализован и не блокирует startup

@@ -18,6 +18,7 @@ import pytest
 from rtsp_proxy.node_runtime import (
     LinuxNodeSupervisor,
     MediaNodeSmokeProbe,
+    NodeManagementCredentials,
     NodeRuntimeCommand,
     NodeRuntimeSpec,
     SecureNodeConfigStore,
@@ -119,14 +120,50 @@ def wait_for_listener(process: subprocess.Popen[str], port: int) -> None:
     pytest.fail("source server did not listen")
 
 
-def reader_event_count(path: Path) -> int:
+def reader_event_count(path: Path, event: str) -> int:
     if not path.exists():
         return 0
     return sum(
         1
         for line in path.read_text(encoding="utf-8").splitlines()
-        if json.loads(line).get("event") == "reader_rtp_segment"
+        if json.loads(line).get("event") == event
     )
+
+
+def outbound_rtp_packets(
+    spec: NodeRuntimeSpec,
+    credentials: NodeManagementCredentials,
+) -> int:
+    username = credentials.username
+    password = credentials.password
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{spec.metrics_port}/metrics",
+        headers={
+            "Authorization": "Basic "
+            + b64encode(f"{username}:{password}".encode()).decode()
+        },
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        payload = response.read().decode("utf-8")
+    return sum(
+        int(float(line.rsplit(" ", 1)[1]))
+        for line in payload.splitlines()
+        if line.startswith("rtsp_sessions_outbound_rtp_packets{")
+    )
+
+
+def wait_for_rtp_progress(
+    spec: NodeRuntimeSpec,
+    credentials: NodeManagementCredentials,
+    previous: int,
+) -> int:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        current = outbound_rtp_packets(spec, credentials)
+        if current > previous:
+            return current
+        time.sleep(0.1)
+    pytest.fail("unaffected node did not keep forwarding RTP")
 
 
 def stop_process(process: subprocess.Popen[str]) -> None:
@@ -225,9 +262,12 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
         assert first_started.process_start_ticks is not None
         assert second_started.process_start_ticks is not None
         credentials = SecureNodeConfigStore(root=config_root).credentials(second)
+        reader_identity = SecureNodeConfigStore(root=config_root).reader_credentials(second)
         assert credentials is not None
+        assert reader_identity is not None
         api_request = urllib.request.Request(
-            f"http://127.0.0.1:{second.api_port}/v3/config/paths/replace/fixture-00000",
+            f"http://127.0.0.1:{second.api_port}/v3/config/paths/replace/"
+            "__rtsp_proxy_runtime_probe",
             data=json.dumps(
                 {
                     "source": f"rtsp://127.0.0.1:{source_port}/fixture-00000",
@@ -246,10 +286,10 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
         with urllib.request.urlopen(api_request, timeout=2):
             pass
         plan = tmp_path / "readers.tsv"
-        plan.write_text("fixture-00000\t1\t0\t0\t0\n", encoding="utf-8")
+        plan.write_text("__rtsp_proxy_runtime_probe\t1\t0\t0\t0\n", encoding="utf-8")
         reader_credentials = tmp_path / "reader-credentials.txt"
         reader_credentials.write_text(
-            f"{credentials.username}\n{credentials.password}\n",
+            f"{reader_identity.username}\n{reader_identity.password}\n",
             encoding="utf-8",
         )
         reader_credentials.chmod(0o600)
@@ -270,7 +310,7 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
                 "--connect-rate",
                 "10",
                 "--hold-seconds",
-                "8",
+                "20",
                 "--evidence-grace-seconds",
                 "1",
                 "--events-file",
@@ -291,10 +331,14 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
             text=True,
         )
         deadline = time.monotonic() + 5
-        while reader_event_count(events) < 1 and time.monotonic() < deadline:
+        while (
+            reader_event_count(events, "first_decodable_frame") < 1
+            and time.monotonic() < deadline
+        ):
             assert reader.poll() is None
             time.sleep(0.1)
-        assert reader_event_count(events) >= 1
+        assert reader_event_count(events, "first_decodable_frame") >= 1
+        before_restart = outbound_rtp_packets(second, credentials)
 
         first_restarted = supervisor.execute(
             NodeRuntimeCommand.for_node(NodeRuntimeAction.RESTART, first)
@@ -307,16 +351,18 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
         assert second_after_restart.process_id == second_started.process_id
         assert second_after_restart.process_start_ticks == second_started.process_start_ticks
         assert reader.poll() is None
-        reader_output, _ = reader.communicate(timeout=15)
-        assert reader.returncode == 0, reader_output
-        assert "SUMMARY started=1 decodable=1 failed=0 transport=tcp" in reader_output
-        assert reader_event_count(events) >= 1
+        after_restart = wait_for_rtp_progress(second, credentials, before_restart)
 
         supervisor.execute(NodeRuntimeCommand.for_node(NodeRuntimeAction.STOP, first))
         second_after_stop = supervisor.execute(
             NodeRuntimeCommand.for_node(NodeRuntimeAction.OBSERVE, second)
         )
         assert second_after_stop.process_id == second_started.process_id
+        wait_for_rtp_progress(second, credentials, after_restart)
+        assert reader.poll() is None
+        reader_output, _ = reader.communicate(timeout=25)
+        assert reader.returncode == 0, reader_output
+        assert "SUMMARY started=1 decodable=1 failed=0 transport=tcp" in reader_output
     finally:
         if reader is not None and reader.poll() is None:
             reader.kill()

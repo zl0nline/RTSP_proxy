@@ -28,6 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.pool import NullPool
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
@@ -40,11 +41,14 @@ from rtsp_proxy.nodes import (
     NodeCreationMode,
     NodeHealth,
     NodeIdFactory,
+    NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
+    NodeNotEmpty,
     NodeNotFound,
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
+    NodeReleaseConflict,
     NodeRuntimeObservation,
     NodeState,
     PlacementMode,
@@ -244,6 +248,12 @@ class PostgresNodeStore:
             pool_pre_ping=True,
             hide_parameters=True,
         )
+        self._lock_engine = create_engine(
+            database_url,
+            poolclass=NullPool,
+            pool_pre_ping=True,
+            hide_parameters=True,
+        )
 
     def assert_schema_compatible(self) -> None:
         try:
@@ -258,7 +268,7 @@ class PostgresNodeStore:
 
     @contextmanager
     def provisioning_guard(self) -> Iterator[None]:
-        with self._engine.connect() as connection:
+        with self._lock_engine.connect() as connection:
             connection.execute(
                 text("SELECT pg_advisory_lock(:key)"),
                 {"key": _NODE_PROVISIONING_LOCK_KEY},
@@ -275,7 +285,7 @@ class PostgresNodeStore:
     def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
         """Serialize one node's external process mutation across web processes."""
 
-        with self._engine.connect() as connection:
+        with self._lock_engine.connect() as connection:
             parameters = {"node_id": str(node_id), "seed": _NODE_REGISTRY_LOCK_KEY}
             connection.execute(
                 text(
@@ -544,9 +554,10 @@ class PostgresNodeStore:
             )
             return _media_node(row)
 
-    def advance_desired_revision(self, node_id: UUID) -> MediaNode:
+    def request_restart(self, node_id: UUID) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
+            self._lock_placements(connection)
             current = connection.execute(
                 select(media_nodes)
                 .where(media_nodes.c.id == node_id)
@@ -555,6 +566,10 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            if node.state is not NodeState.RUNNING:
+                raise NodeLifecycleConflict("node_not_running")
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
             desired_revision = node.desired_revision + 1
             row = connection.execute(
                 update(media_nodes)
@@ -568,6 +583,72 @@ class PostgresNodeStore:
                 aggregate_id=node_id,
                 event_type="media_node.restart_requested",
                 payload={"desired_revision": desired_revision},
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def request_release(
+        self,
+        node_id: UUID,
+        *,
+        release_id: str,
+        mediamtx_binary_sha256: str,
+    ) -> MediaNode:
+        if not release_id or len(release_id) > 128:
+            raise ValueError("node_release_id_invalid")
+        if len(mediamtx_binary_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in mediamtx_binary_sha256
+        ):
+            raise ValueError("node_binary_sha256_invalid")
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            current = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            if (
+                node.state is not NodeState.STOPPED
+                or node.runtime_state is not NodeState.STOPPED
+                or node.registered_cameras
+                or node.applied_revision != node.desired_revision
+            ):
+                raise NodeReleaseConflict("node_release_transition_requires_stopped_empty")
+            if (
+                node.release_id == release_id
+                and node.mediamtx_binary_sha256 == mediamtx_binary_sha256
+            ):
+                return node
+            desired_revision = node.desired_revision + 1
+            row = connection.execute(
+                update(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .values(
+                    release_id=release_id,
+                    mediamtx_binary_sha256=mediamtx_binary_sha256,
+                    desired_revision=desired_revision,
+                    applied_revision=0,
+                    management_fresh=False,
+                    management_observed_at=None,
+                    config_compatible=False,
+                )
+                .returning(*media_nodes.c)
+            ).mappings().one()
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.release_changed",
+                payload={
+                    "previous_release_id": node.release_id,
+                    "release_id": release_id,
+                    "desired_revision": desired_revision,
+                },
                 aggregate_revision=desired_revision,
             )
             return _media_node(row)
@@ -596,6 +677,7 @@ class PostgresNodeStore:
                     >= func.clock_timestamp()
                     - timedelta(seconds=management_freshness_seconds),
                     media_nodes.c.config_compatible.is_(True),
+                    media_nodes.c.applied_revision == media_nodes.c.desired_revision,
                     media_nodes.c.maintenance.is_(False),
                     media_nodes.c.registered_cameras < media_nodes.c.camera_capacity,
                 )
@@ -759,6 +841,7 @@ class PostgresNodeStore:
 
     def close(self) -> None:
         self._engine.dispose()
+        self._lock_engine.dispose()
 
 
 def _media_node(row: RowMapping) -> MediaNode:

@@ -25,6 +25,7 @@ from rtsp_proxy.nodes import (
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
+    NodeReleaseConflict,
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
 )
@@ -63,6 +64,11 @@ class NodeResponse(BaseModel):
     camera_capacity: int
     desired_revision: int
     applied_revision: int
+
+
+class NodeReleaseRequest(BaseModel):
+    release_id: str = Field(min_length=1, max_length=128)
+    mediamtx_binary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class NodeListResponse(BaseModel):
@@ -380,6 +386,43 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": error.code, "node_id": str(error.node_id)},
+            ) from None
+        return _node_response(node)
+
+    @app.put("/api/v1/nodes/{node_id}/release", response_model=NodeResponse)
+    def update_node_release(
+        node_id: UUID,
+        request: NodeReleaseRequest,
+    ) -> NodeResponse:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        if (
+            request.release_id != settings.node_release_id
+            or request.mediamtx_binary_sha256
+            != settings.node_mediamtx_binary_sha256
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "node_release_not_configured"},
+            )
+        try:
+            node = node_control.update_node_release(
+                node_id,
+                release_id=request.release_id,
+                mediamtx_binary_sha256=request.mediamtx_binary_sha256,
+            )
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodeReleaseConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "node_release_transition_requires_stopped_empty"},
             ) from None
         return _node_response(node)
 

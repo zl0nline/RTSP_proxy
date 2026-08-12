@@ -709,14 +709,25 @@ and release manifest are bound to packaged Alembic head
 Exit: lifecycle operation on node A cannot change node B PID/listener/RTP.
 
 Status: **IMPLEMENTED, NATIVE CI PENDING**. The control plane uses one bounded
-Unix-socket command for an exact UUID; the root helper accepts only pinned port
-ranges/release identity and translates it to one systemd instance. Config is
+Unix-socket command for an exact UUID; its absolute deadline leaves a reserved
+cleanup window, same-node requests serialize and different nodes use a bounded
+worker pool. The root helper accepts only pinned port ranges/current-or-previous
+verified release identity and translates it to one systemd instance. Config is
 installed with no-follow directory descriptors and fsync/rename. A healthy
 runtime observation binds PID, `/proc` start ticks, boot id, config SHA-256,
 release and desired revision. Automatic placement is serialized across
-PostgreSQL requests and commits no camera before provision + API/metrics/plain
+PostgreSQL requests, requires `applied_revision == desired_revision`, and
+commits no camera before provision + API/metrics/plain
 RTSP/TCP smoke succeeds. A failed provision leaves an empty FAILED automatic
 node that can be retried; it never creates a ghost camera placement.
+
+Management and path-scoped runtime-reader credentials are different root-only
+secrets. The native isolation contract gates on first decodable AU and proves
+RTP packet progress after restart and stop of the other node. Startup recovery
+observes every node independently and converges persisted RUNNING/STOPPED
+intent after host reboot. Rolling activation drains/stops one node, performs a
+revision-fenced release transition, then starts/smokes it; healthy old nodes stay
+manageable through the temporary previous-release allowlist.
 
 The Phase-B-to-Phase-C `0005_node_runtime` migration is deliberately
 fail-closed when the old registry is non-empty: the old rows have no trustworthy

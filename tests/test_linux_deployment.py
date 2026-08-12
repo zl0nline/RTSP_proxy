@@ -70,7 +70,10 @@ def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
     assert service["NoNewPrivileges"] == "yes"
     assert service["ProtectSystem"] == "strict"
     assert service["CapabilityBoundingSet"] == ""
-    assert service["InaccessiblePaths"] == ("/etc/rtsp-proxy/nodes/%i/management.json")
+    assert service["InaccessiblePaths"] == (
+        "/etc/rtsp-proxy/nodes/%i/management.json "
+        "/etc/rtsp-proxy/nodes/%i/reader.json"
+    )
 
 
 def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> None:

@@ -22,7 +22,9 @@ from rtsp_proxy.node_runtime import (
     MediaNodeSmokeProbe,
     NodeHelperSettings,
     NodeManagementCredentials,
+    NodeOperationDeadline,
     NodeProcessSnapshot,
+    NodeReaderCredentials,
     NodeRuntimeCommand,
     NodeRuntimePolicy,
     NodeRuntimeSpec,
@@ -53,6 +55,29 @@ def management_credentials() -> NodeManagementCredentials:
         username="node-00000000-0000-0000-0000-000000000001",
         password="test-management-password-000000000001",
     )
+
+
+def reader_credentials() -> NodeReaderCredentials:
+    return NodeReaderCredentials(
+        username="reader-00000000-0000-0000-0000-000000000001",
+        password="test-reader-password-0000000000000001",
+    )
+
+
+def test_renderer_keeps_management_and_rtsp_probe_identities_separate() -> None:
+    rendered = MediaNodeConfigRenderer().render(
+        runtime_spec(),
+        management_credentials(),
+        reader_credentials(),
+    )
+
+    assert "action: api" in rendered.content
+    assert "action: metrics" in rendered.content
+    assert "user: reader-" in rendered.content
+    assert "action: read\n        path: __rtsp_proxy_runtime_probe" in rendered.content
+    management_block, reader_block = rendered.content.split("  - user: reader-", maxsplit=1)
+    assert "action: read" not in management_block
+    assert "action: api" not in reader_block
 
 
 def test_renderer_produces_one_loopback_managed_ordinary_rtsp_tcp_node() -> None:
@@ -165,9 +190,11 @@ def test_secure_config_store_pins_release_binary_and_rotates_private_credentials
     assert (node_root / "runtime.env").read_text() == (f"RTSP_PROXY_MEDIAMTX_BINARY={binary}\n")
     assert (node_root / "runtime.env").stat().st_mode & 0o777 == 0o600
     assert (node_root / "management.json").stat().st_mode & 0o777 == 0o600
+    assert (node_root / "reader.json").stat().st_mode & 0o777 == 0o600
     assert first_credentials != second_credentials
     assert first_rendered.sha256 != second_rendered.sha256
     assert store.credentials(spec) == second_credentials
+    assert store.reader_credentials(spec) is not None
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="requires a non-root test process")
@@ -318,6 +345,7 @@ class HealthySmokeProbe:
         self,
         spec: NodeRuntimeSpec,
         credentials: NodeManagementCredentials,
+        deadline: object | None = None,
     ) -> None:
         assert spec == runtime_spec()
         assert credentials.username.startswith("node-")
@@ -331,6 +359,7 @@ class RecordingProcessController:
         self,
         action: NodeRuntimeAction,
         spec: NodeRuntimeSpec,
+        deadline: object | None = None,
     ) -> NodeProcessSnapshot:
         self.commands.append((action, spec.node_id))
         return NodeProcessSnapshot(
@@ -349,6 +378,7 @@ class FailingSmokeProbe:
         self,
         spec: NodeRuntimeSpec,
         credentials: NodeManagementCredentials,
+        deadline: object | None = None,
     ) -> None:
         raise NodeSupervisorError("node_api_smoke_failed")
 
@@ -361,6 +391,7 @@ class InactiveProcessController:
         self,
         action: NodeRuntimeAction,
         spec: NodeRuntimeSpec,
+        deadline: object | None = None,
     ) -> NodeProcessSnapshot:
         self.commands.append(action)
         return NodeProcessSnapshot(
@@ -377,6 +408,7 @@ class IndeterminateStartProcessController(InactiveProcessController):
         self,
         action: NodeRuntimeAction,
         spec: NodeRuntimeSpec,
+        deadline: object | None = None,
     ) -> NodeProcessSnapshot:
         self.commands.append(action)
         if action is NodeRuntimeAction.PROVISION_START:
@@ -398,6 +430,7 @@ class EventuallyHealthySmokeProbe:
         self,
         spec: NodeRuntimeSpec,
         credentials: NodeManagementCredentials,
+        deadline: object | None = None,
     ) -> None:
         self.calls += 1
         if self.calls == 1:
@@ -607,8 +640,9 @@ class WrongReleaseProcessController(RecordingProcessController):
         self,
         action: NodeRuntimeAction,
         spec: NodeRuntimeSpec,
+        deadline: object | None = None,
     ) -> NodeProcessSnapshot:
-        snapshot = super().execute(action, spec)
+        snapshot = super().execute(action, spec, deadline)
         if not snapshot.active:
             return snapshot
         return NodeProcessSnapshot(
@@ -664,7 +698,7 @@ def test_systemd_adapter_can_only_address_the_exact_uuid_instance(tmp_path: Path
     proc_root = tmp_path / "proc"
     proc_root.mkdir()
 
-    def run(arguments: tuple[str, ...]) -> CompletedProcess[str]:
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
         calls.append(arguments)
         if "show" in arguments:
             return CompletedProcess(
@@ -718,7 +752,7 @@ def test_systemd_adapter_binds_active_pid_start_boot_and_binary_identity(
     )
     (process_root / "exe").symlink_to(binary)
 
-    def run(arguments: tuple[str, ...]) -> CompletedProcess[str]:
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
         return CompletedProcess(
             arguments,
             0,
@@ -757,8 +791,9 @@ def test_supervisor_rechecks_process_identity_after_smoke(tmp_path: Path) -> Non
             self,
             action: NodeRuntimeAction,
             spec: NodeRuntimeSpec,
+            deadline: object | None = None,
         ) -> NodeProcessSnapshot:
-            snapshot = super().execute(action, spec)
+            snapshot = super().execute(action, spec, deadline)
             if action is NodeRuntimeAction.OBSERVE and snapshot.active:
                 return NodeProcessSnapshot(
                     active=True,
@@ -787,13 +822,59 @@ def test_supervisor_rechecks_process_identity_after_smoke(tmp_path: Path) -> Non
     ]
 
 
+def test_observe_rechecks_identity_without_mutating_the_process(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-observe-identity"
+    root.mkdir(mode=0o700)
+    spec = runtime_spec()
+    store = SecureNodeConfigStore(root=root)
+    store.install(
+        spec,
+        MediaNodeConfigRenderer().render(spec, management_credentials()),
+        credentials=management_credentials(),
+    )
+
+    class ReplacedProcessController(RecordingProcessController):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            spec: NodeRuntimeSpec,
+                deadline: object | None = None,
+            ) -> NodeProcessSnapshot:
+            snapshot = super().execute(action, spec, deadline)
+            if len(self.commands) == 2:
+                return NodeProcessSnapshot(
+                    active=True,
+                    pid=4321,
+                    process_start_ticks=8765,
+                    boot_id=snapshot.boot_id,
+                    executable_sha256=snapshot.executable_sha256,
+                )
+            return snapshot
+
+    process = ReplacedProcessController()
+    supervisor = LinuxNodeSupervisor(
+        config_store=store,
+        process=process,
+        smoke=HealthySmokeProbe(),
+        port_is_bindable=lambda port: False,
+    )
+
+    with pytest.raises(NodeSupervisorError, match="node_process_identity_changed"):
+        supervisor.execute(NodeRuntimeCommand.for_node(NodeRuntimeAction.OBSERVE, spec))
+
+    assert process.commands == [
+        (NodeRuntimeAction.OBSERVE, spec.node_id),
+        (NodeRuntimeAction.OBSERVE, spec.node_id),
+    ]
+
+
 def test_systemd_adapter_rejects_unsafe_path_command_failure_and_bad_status(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(ValueError, match="systemctl_path_must_be_absolute"):
         SystemdNodeProcessController(systemctl=Path("systemctl"))
 
-    def failed(arguments: tuple[str, ...]) -> CompletedProcess[str]:
+    def failed(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
         return CompletedProcess(arguments, 1, "", "secret diagnostic")
 
     with pytest.raises(NodeSupervisorError, match="systemd_node_command_failed"):
@@ -812,6 +893,7 @@ def test_systemd_adapter_rejects_unsafe_path_command_failure_and_bad_status(
 
             def show(
                 arguments: tuple[str, ...],
+                timeout: float,
                 output: str = output,
             ) -> CompletedProcess[str]:
                 return CompletedProcess(arguments, 0, output, "")
@@ -1189,6 +1271,75 @@ def test_root_helper_executes_a_valid_request_and_returns_bound_observation(
     assert response["observation"]["process_id"] == 1234
 
 
+def test_root_helper_ignores_a_disconnected_response_peer(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-disconnect"
+    root.mkdir(mode=0o700)
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=RecordingProcessController(),
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda port: False,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12099,
+            api_port_start=13000,
+            api_port_end=13099,
+            metrics_port_start=14000,
+            metrics_port_end=14099,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+    )
+    client_socket, server_socket = socket.socketpair()
+    client_socket.sendall(b"invalid\n")
+    client_socket.close()
+
+    server.serve_connection(server_socket)
+
+    server_socket.close()
+
+
+def test_root_helper_deadline_times_out_start_and_uses_reserved_cleanup(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes-deadline"
+    root.mkdir(mode=0o700)
+    observed_deadlines: list[object | None] = []
+
+    class DeadlineProcess(RecordingProcessController):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            spec: NodeRuntimeSpec,
+            deadline: object | None = None,
+        ) -> NodeProcessSnapshot:
+            observed_deadlines.append(deadline)
+            if action is NodeRuntimeAction.PROVISION_START:
+                raise NodeSupervisorError("node_runtime_operation_timeout")
+            return super().execute(action, spec, deadline)
+
+    process = DeadlineProcess()
+    supervisor = LinuxNodeSupervisor(
+        config_store=SecureNodeConfigStore(root=root),
+        process=process,
+        smoke=HealthySmokeProbe(),
+        port_is_bindable=lambda port: True,
+    )
+    deadline = NodeOperationDeadline(expires_monotonic=time.monotonic() + 1)
+
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        supervisor.execute(
+            NodeRuntimeCommand.for_node(NodeRuntimeAction.PROVISION_START, runtime_spec()),
+            deadline=deadline,
+            cleanup_reserve_seconds=0.2,
+        )
+
+    assert process.commands == [(NodeRuntimeAction.STOP, runtime_spec().node_id)]
+    assert observed_deadlines[0] != observed_deadlines[1]
+
+
 def test_root_helper_times_out_a_partial_request_without_blocking_forever(
     tmp_path: Path,
 ) -> None:
@@ -1277,20 +1428,281 @@ def test_helper_settings_reject_overlap_and_non_absolute_privileged_paths() -> N
     assert settings.policy().release_id == "release-2026.08.12"
 
 
-def helper_settings(
-    *,
-    api_port_start: int = 13000,
-    config_root: Path = Path("/etc/rtsp-proxy/nodes"),
-) -> NodeHelperSettings:
-    return NodeHelperSettings(
-        config_root=config_root,
-        mediamtx_binary=Path("/opt/rtsp-proxy/releases/release-2026.08.12/bin/mediamtx"),
+def test_helper_policy_allows_current_and_previous_verified_releases() -> None:
+    settings = helper_settings(
+        previous_release_id="release-2026.08.11",
+        previous_mediamtx_binary=Path(
+            "/opt/rtsp-proxy/releases/release-2026.08.11/bin/mediamtx"
+        ),
+        previous_mediamtx_binary_sha256="b" * 64,
+    )
+    previous = NodeRuntimeSpec(
+        node_id=runtime_spec().node_id,
+        external_port=runtime_spec().external_port,
+        api_port=runtime_spec().api_port,
+        metrics_port=runtime_spec().metrics_port,
+        desired_revision=3,
+        release_id="release-2026.08.11",
+        mediamtx_binary_sha256="b" * 64,
+    )
+
+    settings.policy().validate(previous)
+
+    with pytest.raises(NodeSupervisorError, match="node_release_not_allowed"):
+        settings.policy().validate(
+            NodeRuntimeSpec(
+                node_id=previous.node_id,
+                external_port=previous.external_port,
+                api_port=previous.api_port,
+                metrics_port=previous.metrics_port,
+                desired_revision=previous.desired_revision,
+                release_id="release-unknown",
+                mediamtx_binary_sha256="c" * 64,
+            )
+        )
+
+
+def test_secure_store_selects_the_binary_from_the_verified_release_catalog(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes-catalog"
+    root.mkdir(mode=0o700)
+    current = tmp_path / "release-current" / "mediamtx"
+    previous = tmp_path / "release-previous" / "mediamtx"
+    current.parent.mkdir()
+    previous.parent.mkdir()
+    current.write_bytes(b"current")
+    previous.write_bytes(b"previous")
+    previous_digest = hashlib.sha256(b"previous").hexdigest()
+    spec = NodeRuntimeSpec(
+        node_id=runtime_spec().node_id,
+        external_port=12001,
+        api_port=13001,
+        metrics_port=14001,
+        desired_revision=1,
+        release_id="release-previous",
+        mediamtx_binary_sha256=previous_digest,
+    )
+    store = SecureNodeConfigStore(
+        root=root,
+        binary_catalog={
+            ("release-current", hashlib.sha256(b"current").hexdigest()): current,
+            ("release-previous", previous_digest): previous,
+        },
+    )
+
+    store.provision(spec)
+
+    assert (root / str(spec.node_id) / "runtime.env").read_text() == (
+        f"RTSP_PROXY_MEDIAMTX_BINARY={previous}\n"
+    )
+
+
+def test_helper_settings_require_a_complete_distinct_previous_release() -> None:
+    with pytest.raises(ValueError, match="node_helper_previous_release_incomplete"):
+        helper_settings(previous_release_id="release-2026.08.11")
+    with pytest.raises(ValueError, match="node_helper_previous_release_duplicate"):
+        helper_settings(
+            previous_release_id="release-2026.08.12",
+            previous_mediamtx_binary=Path(
+                "/opt/rtsp-proxy/releases/release-2026.08.11/bin/mediamtx"
+            ),
+            previous_mediamtx_binary_sha256="b" * 64,
+        )
+
+
+def test_runtime_credentials_and_deadlines_reject_invalid_boundaries() -> None:
+    with pytest.raises(ValueError, match="node_management_credentials_invalid"):
+        NodeManagementCredentials(username="wrong", password="x" * 32)
+    with pytest.raises(ValueError, match="node_reader_credentials_invalid"):
+        NodeReaderCredentials(username="wrong", password="x" * 32)
+    expired = NodeOperationDeadline(expires_monotonic=0, monotonic=lambda: 1)
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        expired.remaining_seconds()
+    with pytest.raises(ValueError, match="node_runtime_deadline_reserve_invalid"):
+        NodeOperationDeadline(expires_monotonic=2, monotonic=lambda: 1).before(0)
+
+
+def test_runtime_policy_rejects_an_incomplete_previous_release_pin() -> None:
+    policy = NodeRuntimePolicy(
         external_port_start=12000,
         external_port_end=12099,
-        api_port_start=api_port_start,
+        api_port_start=13000,
         api_port_end=13099,
         metrics_port_start=14000,
         metrics_port_end=14099,
         release_id="release-2026.08.12",
         mediamtx_binary_sha256="a" * 64,
+        previous_release_id="release-2026.08.11",
     )
+
+    with pytest.raises(NodeSupervisorError, match="node_release_policy_invalid"):
+        policy.validate(runtime_spec())
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"request_timeout_seconds": 0},
+        {"operation_timeout_seconds": 56},
+        {"cleanup_reserve_seconds": 55},
+        {"max_workers": 0},
+    ),
+)
+def test_root_helper_rejects_unsafe_budget_or_worker_configuration(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    root = tmp_path / "nodes-invalid-server"
+    root.mkdir(mode=0o700)
+    values: dict[str, object] = {
+        "supervisor": LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=RecordingProcessController(),
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda port: True,
+        ),
+        "policy": NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12099,
+            api_port_start=13000,
+            api_port_end=13099,
+            metrics_port_start=14000,
+            metrics_port_end=14099,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError):
+        UnixNodeSupervisorServer(**values)  # type: ignore[arg-type]
+
+
+def test_root_helper_rejects_an_expired_client_deadline(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-expired"
+    root.mkdir(mode=0o700)
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=RecordingProcessController(),
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda port: True,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12099,
+            api_port_start=13000,
+            api_port_end=13099,
+            metrics_port_start=14000,
+            metrics_port_end=14099,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+        wall_time=lambda: 2,
+    )
+
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        server._operation_deadline(1000)
+
+
+def test_runtime_client_rejects_invalid_constructor_boundaries(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="node_runtime_socket_must_be_absolute"):
+        UnixNodeRuntimeClient(socket_path=Path("relative.sock"), timeout_seconds=1)
+    with pytest.raises(ValueError, match="node_runtime_timeout_invalid"):
+        UnixNodeRuntimeClient(socket_path=tmp_path / "runtime.sock", timeout_seconds=0)
+
+
+def test_root_helper_decoder_rejects_malformed_and_wrong_schema_requests() -> None:
+    for request in (
+        b"",
+        b"{}",
+        b"not-json\n",
+        b'{"schema_version":2}\n',
+    ):
+        with pytest.raises(NodeSupervisorError, match="node_runtime_request_invalid"):
+            UnixNodeSupervisorServer._decode_command(request)
+
+
+def test_runtime_client_rejects_structurally_invalid_error_response() -> None:
+    temporary = tempfile.TemporaryDirectory(prefix="rtsp-node-", dir="/tmp")
+    socket_path = Path(temporary.name) / "runtime.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+
+    def answer() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            connection.makefile("rb").readline(65537)
+            connection.sendall(
+                b'{"schema_version":1,"ok":false,"observation":null,"error":null}\n'
+            )
+
+    server = Thread(target=answer)
+    server.start()
+    node = MediaNode(
+        id=runtime_spec().node_id,
+        name="media-a",
+        external_port=12001,
+        api_port=13001,
+        metrics_port=14001,
+        release_id=runtime_spec().release_id,
+        mediamtx_binary_sha256="a" * 64,
+        desired_revision=3,
+    )
+
+    with pytest.raises(NodeSupervisorError, match="node_runtime_response_invalid"):
+        UnixNodeRuntimeClient(socket_path=socket_path, timeout_seconds=1).execute(
+            NodeRuntimeAction.OBSERVE,
+            node,
+        )
+
+    server.join(timeout=1)
+    listener.close()
+    temporary.cleanup()
+
+
+def test_secure_store_rejects_ambiguous_or_unknown_binary_catalog(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes-ambiguous"
+    root.mkdir(mode=0o700)
+    binary = tmp_path / "mediamtx"
+    binary.write_bytes(b"binary")
+    with pytest.raises(ValueError, match="node_binary_catalog_ambiguous"):
+        SecureNodeConfigStore(
+            root=root,
+            binary_path=binary,
+            binary_catalog={("release", "a" * 64): binary},
+        )
+    store = SecureNodeConfigStore(
+        root=root,
+        binary_catalog={("another-release", "b" * 64): binary},
+    )
+    with pytest.raises(ValueError, match="node_release_not_allowed"):
+        store.provision(runtime_spec())
+
+
+def helper_settings(
+    *,
+    api_port_start: int = 13000,
+    config_root: Path = Path("/etc/rtsp-proxy/nodes"),
+    **changes: object,
+) -> NodeHelperSettings:
+    values: dict[str, object] = {
+        "config_root": config_root,
+        "mediamtx_binary": Path(
+            "/opt/rtsp-proxy/releases/release-2026.08.12/bin/mediamtx"
+        ),
+        "external_port_start": 12000,
+        "external_port_end": 12099,
+        "api_port_start": api_port_start,
+        "api_port_end": 13099,
+        "metrics_port_start": 14000,
+        "metrics_port_end": 14099,
+        "release_id": "release-2026.08.12",
+        "mediamtx_binary_sha256": "a" * 64,
+    }
+    values.update(changes)
+    return NodeHelperSettings(**values)  # type: ignore[arg-type]

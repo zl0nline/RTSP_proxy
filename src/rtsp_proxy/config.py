@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     node_port_reserved: tuple[Annotated[int, Field(ge=1, le=65535)], ...] = ()
     node_management_freshness_seconds: int = Field(default=30, ge=1, le=300)
     node_runtime_socket: Path | None = None
-    node_runtime_timeout_seconds: float = Field(default=15, gt=0, le=60)
+    node_runtime_timeout_seconds: float = Field(default=60, gt=1, le=60)
     node_release_id: str = Field(
         default="v1.20.0",
         pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
