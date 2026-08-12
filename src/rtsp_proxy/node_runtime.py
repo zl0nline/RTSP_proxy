@@ -633,6 +633,9 @@ class NodeSupervisorError(RuntimeError):
 class LinuxNodeSupervisor:
     """Own config, exact process operation, identity and smoke as one module."""
 
+    _STOP_CONVERGENCE_ATTEMPTS = 21
+    _STOP_CONVERGENCE_DELAY_SECONDS = 0.05
+
     def __init__(
         self,
         *,
@@ -701,7 +704,7 @@ class LinuxNodeSupervisor:
                 work_deadline.remaining_seconds()
             snapshot = self._process.execute(command.action, command.spec, work_deadline)
             if command.action is NodeRuntimeAction.STOP:
-                self._require_stopped(command.spec, snapshot)
+                self._require_stopped(command.spec, snapshot, deadline)
                 return self._stopped_observation(
                     command.spec,
                     installed_sha256=installed_sha256,
@@ -737,7 +740,7 @@ class LinuxNodeSupervisor:
                     command.spec,
                     deadline,
                 )
-                self._require_stopped(command.spec, stopped)
+                self._require_stopped(command.spec, stopped, deadline)
             except Exception as cleanup_error:
                 raise NodeSupervisorError("node_start_failed_cleanup_failed") from cleanup_error
             raise
@@ -758,12 +761,21 @@ class LinuxNodeSupervisor:
         self,
         spec: NodeRuntimeSpec,
         snapshot: NodeProcessSnapshot,
+        deadline: NodeOperationDeadline | None = None,
     ) -> None:
         if snapshot.active:
             raise NodeSupervisorError("node_process_still_active")
         ports = (spec.external_port, spec.api_port, spec.metrics_port)
-        if not all(self._port_is_bindable(port) for port in ports):
-            raise NodeSupervisorError("node_listener_still_active")
+        for attempt in range(self._STOP_CONVERGENCE_ATTEMPTS):
+            available = tuple(self._port_is_bindable(port) for port in ports)
+            if all(available):
+                return
+            if attempt + 1 < self._STOP_CONVERGENCE_ATTEMPTS:
+                delay = self._STOP_CONVERGENCE_DELAY_SECONDS
+                if deadline is not None:
+                    delay = min(delay, deadline.remaining_seconds())
+                self._sleep(delay)
+        raise NodeSupervisorError("node_listener_still_active")
 
     @staticmethod
     def _stopped_observation(

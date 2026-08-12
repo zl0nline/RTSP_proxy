@@ -453,6 +453,7 @@ def test_supervisor_provisions_smokes_and_binds_the_applied_identity(tmp_path: P
         process=process,
         smoke=HealthySmokeProbe(),
         port_is_bindable=lambda port: False,
+        sleep=lambda seconds: None,
     )
     command = NodeRuntimeCommand.for_node(
         NodeRuntimeAction.PROVISION_START,
@@ -503,6 +504,32 @@ def test_supervisor_stop_requires_process_and_all_three_listeners_to_be_gone(
     assert observation.state is NodeState.STOPPED
     assert observation.health is NodeHealth.UNKNOWN
     assert observed_ports == [12001, 13001, 14001]
+
+
+def test_supervisor_stop_waits_for_all_three_listeners_to_release(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes-stop-convergence"
+    root.mkdir(mode=0o700)
+    availability = iter((False, True, True, True, True, True))
+    observed_ports: list[int] = []
+    sleeps: list[float] = []
+
+    def port_is_bindable(port: int) -> bool:
+        observed_ports.append(port)
+        return next(availability)
+
+    observation = LinuxNodeSupervisor(
+        config_store=SecureNodeConfigStore(root=root),
+        process=RecordingProcessController(),
+        smoke=HealthySmokeProbe(),
+        port_is_bindable=port_is_bindable,
+        sleep=sleeps.append,
+    ).execute(NodeRuntimeCommand.for_node(NodeRuntimeAction.STOP, runtime_spec()))
+
+    assert observation.state is NodeState.STOPPED
+    assert observed_ports == [12001, 13001, 14001, 12001, 13001, 14001]
+    assert sleeps == [0.05]
 
 
 def test_failed_start_smoke_stops_only_that_exact_process(tmp_path: Path) -> None:
