@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     node_metrics_port_range_end: int = Field(default=20199, ge=1, le=65535)
     node_port_reserved: tuple[Annotated[int, Field(ge=1, le=65535)], ...] = ()
     node_management_freshness_seconds: int = Field(default=30, ge=1, le=300)
+    node_lifecycle_lock_pool_size: int = Field(default=4, ge=2, le=16)
+    node_lifecycle_lock_timeout_seconds: float = Field(default=5, gt=0, le=30)
     node_runtime_socket: Path | None = None
     node_runtime_timeout_seconds: float = Field(default=60, gt=1, le=60)
     node_release_id: str = Field(

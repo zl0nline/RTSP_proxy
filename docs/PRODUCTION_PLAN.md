@@ -629,7 +629,10 @@ config and a release-specific absolute MediaMTX path stored by the root helper.
 Per-node random Basic credentials protect loopback API/metrics; the process
 never receives another node's credential file. Helper requests have a bounded
 deadline and all lifecycle commands for one UUID are serialized by a
-PostgreSQL advisory lock and exact desired revision.
+PostgreSQL advisory lock and exact desired revision. Lifecycle lock acquisition
+uses a replica-local bounded pool and timeout; startup convergence runs with the
+same configured concurrency instead of serially multiplying one unhealthy-node
+deadline across the server.
 
 ## 20. Operations
 
@@ -711,7 +714,9 @@ Exit: lifecycle operation on node A cannot change node B PID/listener/RTP.
 Status: **IMPLEMENTED, NATIVE CI PENDING**. The control plane uses one bounded
 Unix-socket command for an exact UUID; its absolute deadline leaves a reserved
 cleanup window, same-node requests serialize and different nodes use a bounded
-worker pool. The root helper accepts only pinned port ranges/current-or-previous
+worker pool. The cleanup reserve exceeds the media unit stop timeout and keeps a
+separate final status/listener-proof budget. The root helper accepts only pinned
+port ranges/current-or-previous
 verified release identity and translates it to one systemd instance. Config is
 installed with no-follow directory descriptors and fsync/rename. A healthy
 runtime observation binds PID, `/proc` start ticks, boot id, config SHA-256,
@@ -727,7 +732,9 @@ RTP packet progress after restart and stop of the other node. Startup recovery
 observes every node independently and converges persisted RUNNING/STOPPED
 intent after host reboot. Rolling activation drains/stops one node, performs a
 revision-fenced release transition, then starts/smokes it; healthy old nodes stay
-manageable through the temporary previous-release allowlist.
+manageable through the temporary previous-release allowlist. Recovery is
+bounded-parallel; one slow node does not delay observation/convergence of every
+other node, and PostgreSQL advisory-lock connections are capped per replica.
 
 The Phase-B-to-Phase-C `0005_node_runtime` migration is deliberately
 fail-closed when the old registry is non-empty: the old rows have no trustworthy

@@ -665,6 +665,18 @@ class LinuxNodeSupervisor:
     ) -> NodeRuntimeObservation:
         from rtsp_proxy.nodes import NodeHealth, NodeRuntimeObservation, NodeState
 
+        mutating = command.action in {
+            NodeRuntimeAction.PROVISION_START,
+            NodeRuntimeAction.START,
+            NodeRuntimeAction.RESTART,
+        }
+        work_deadline = deadline
+        if deadline is not None:
+            work_deadline = (
+                deadline.before(cleanup_reserve_seconds) if mutating else deadline
+            )
+            work_deadline.remaining_seconds()
+
         expected: RenderedNodeConfig | None
         credentials: NodeManagementCredentials | None
         if command.action is NodeRuntimeAction.PROVISION_START:
@@ -684,15 +696,9 @@ class LinuxNodeSupervisor:
         ):
             raise NodeSupervisorError("node_config_not_applied")
 
-        mutating = command.action in {
-            NodeRuntimeAction.PROVISION_START,
-            NodeRuntimeAction.START,
-            NodeRuntimeAction.RESTART,
-        }
-        work_deadline = deadline
-        if deadline is not None and mutating:
-            work_deadline = deadline.before(cleanup_reserve_seconds)
         try:
+            if work_deadline is not None:
+                work_deadline.remaining_seconds()
             snapshot = self._process.execute(command.action, command.spec, work_deadline)
             if command.action is NodeRuntimeAction.STOP:
                 self._require_stopped(command.spec, snapshot)
@@ -950,6 +956,11 @@ class SystemdNodeProcessController:
             NodeRuntimeAction.RESTART: "restart",
         }
         if action in verbs:
+            command_deadline = (
+                deadline.before(5)
+                if action is NodeRuntimeAction.STOP and deadline is not None
+                else deadline
+            )
             self._checked_run(
                 (
                     str(self._systemctl),
@@ -957,7 +968,7 @@ class SystemdNodeProcessController:
                     verbs[action],
                     unit,
                 ),
-                deadline,
+                command_deadline,
             )
         result = self._checked_run(
             (
@@ -1399,7 +1410,7 @@ class UnixNodeSupervisorServer:
         policy: NodeRuntimePolicy,
         request_timeout_seconds: float = 5,
         operation_timeout_seconds: float = 55,
-        cleanup_reserve_seconds: float = 15,
+        cleanup_reserve_seconds: float = 25,
         max_workers: int = 16,
         wall_time: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
@@ -1420,8 +1431,7 @@ class UnixNodeSupervisorServer:
         self._max_workers = max_workers
         self._wall_time = wall_time
         self._monotonic = monotonic
-        self._node_locks_guard = Lock()
-        self._node_locks: dict[UUID, Lock] = {}
+        self._node_locks = tuple(Lock() for _ in range(max_workers * 4))
 
     def serve_connection(self, connection: socket.socket) -> None:
         try:
@@ -1473,8 +1483,7 @@ class UnixNodeSupervisorServer:
             capacity.release()
 
     def _node_lock(self, node_id: UUID) -> Lock:
-        with self._node_locks_guard:
-            return self._node_locks.setdefault(node_id, Lock())
+        return self._node_locks[node_id.int % len(self._node_locks)]
 
     def _operation_deadline(
         self,
@@ -1594,7 +1603,7 @@ class NodeHelperSettings(BaseSettings):
     smoke_retry_delay_seconds: float = Field(default=0.25, ge=0, le=5)
     request_timeout_seconds: float = Field(default=5, gt=0, le=30)
     operation_timeout_seconds: float = Field(default=55, gt=0, le=55)
-    cleanup_reserve_seconds: float = Field(default=15, gt=0, le=30)
+    cleanup_reserve_seconds: float = Field(default=25, gt=0, le=30)
     max_workers: int = Field(default=16, ge=1, le=64)
 
     @model_validator(mode="after")

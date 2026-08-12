@@ -102,6 +102,14 @@ Only the selected instance is touched. Delete requires zero camera placements
 and stopped/failed state. Port is released only after listener/process cleanup
 proof.
 
+Lifecycle reconciliation uses
+`RTSP_PROXY_NODE_LIFECYCLE_LOCK_POOL_SIZE` bounded workers/connections per web
+replica and fails a lock acquisition after
+`RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS`. The root helper reserves 25
+seconds of its 55-second operation budget for cleanup; the media unit stops in
+at most 15 seconds and the remaining time is kept for systemd status and port
+release proof.
+
 ## Artifact catalog and activation
 
 `artifact-catalog.json` pins MediaMTX, FFmpeg and ffprobe versions, URLs and

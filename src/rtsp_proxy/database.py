@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Iterator
+import time
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import timedelta
 from uuid import UUID, uuid4
@@ -28,7 +29,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.sql.base import Executable
 
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
@@ -242,7 +244,17 @@ class DatabaseSchemaMismatch(RuntimeError):
 
 
 class PostgresNodeStore:
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        lifecycle_lock_pool_size: int = 4,
+        lifecycle_lock_timeout_seconds: float = 5,
+    ) -> None:
+        if lifecycle_lock_pool_size < 2 or lifecycle_lock_pool_size > 16:
+            raise ValueError("node_lifecycle_lock_pool_size_invalid")
+        if lifecycle_lock_timeout_seconds <= 0 or lifecycle_lock_timeout_seconds > 30:
+            raise ValueError("node_lifecycle_lock_timeout_invalid")
         self._engine = create_engine(
             database_url,
             pool_pre_ping=True,
@@ -250,10 +262,21 @@ class PostgresNodeStore:
         )
         self._lock_engine = create_engine(
             database_url,
-            poolclass=NullPool,
             pool_pre_ping=True,
             hide_parameters=True,
+            pool_size=lifecycle_lock_pool_size,
+            max_overflow=0,
+            pool_timeout=lifecycle_lock_timeout_seconds,
         )
+        self._provision_engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            hide_parameters=True,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=lifecycle_lock_timeout_seconds,
+        )
+        self._lifecycle_lock_timeout_seconds = lifecycle_lock_timeout_seconds
 
     def assert_schema_compatible(self) -> None:
         try:
@@ -268,44 +291,68 @@ class PostgresNodeStore:
 
     @contextmanager
     def provisioning_guard(self) -> Iterator[None]:
-        with self._lock_engine.connect() as connection:
-            connection.execute(
-                text("SELECT pg_advisory_lock(:key)"),
-                {"key": _NODE_PROVISIONING_LOCK_KEY},
-            )
-            try:
-                yield
-            finally:
-                connection.execute(
-                    text("SELECT pg_advisory_unlock(:key)"),
-                    {"key": _NODE_PROVISIONING_LOCK_KEY},
+        try:
+            with self._provision_engine.connect() as connection:
+                parameters: dict[str, object] = {"key": _NODE_PROVISIONING_LOCK_KEY}
+                self._acquire_advisory_lock(
+                    connection,
+                    text("SELECT pg_try_advisory_lock(:key)"),
+                    parameters,
                 )
+                try:
+                    yield
+                finally:
+                    connection.execute(
+                        text("SELECT pg_advisory_unlock(:key)"),
+                        parameters,
+                    )
+        except SQLAlchemyTimeoutError:
+            raise NodeLifecycleConflict("node_lifecycle_busy") from None
 
     @contextmanager
     def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
         """Serialize one node's external process mutation across web processes."""
 
-        with self._lock_engine.connect() as connection:
-            parameters = {"node_id": str(node_id), "seed": _NODE_REGISTRY_LOCK_KEY}
-            connection.execute(
-                text(
-                    "SELECT pg_advisory_lock("
-                    "hashtextextended(CAST(:node_id AS text), :seed))"
-                ),
-                parameters,
-            )
-            try:
-                if self.get_node(node_id) is None:
-                    raise NodeNotFound("node_not_found")
-                yield
-            finally:
-                connection.execute(
+        try:
+            with self._lock_engine.connect() as connection:
+                parameters = {"node_id": str(node_id), "seed": _NODE_REGISTRY_LOCK_KEY}
+                self._acquire_advisory_lock(
+                    connection,
                     text(
-                        "SELECT pg_advisory_unlock("
+                        "SELECT pg_try_advisory_lock("
                         "hashtextextended(CAST(:node_id AS text), :seed))"
                     ),
                     parameters,
                 )
+                try:
+                    if self.get_node(node_id) is None:
+                        raise NodeNotFound("node_not_found")
+                    yield
+                finally:
+                    connection.execute(
+                        text(
+                            "SELECT pg_advisory_unlock("
+                            "hashtextextended(CAST(:node_id AS text), :seed))"
+                        ),
+                        parameters,
+                    )
+        except SQLAlchemyTimeoutError:
+            raise NodeLifecycleConflict("node_lifecycle_busy") from None
+
+    def _acquire_advisory_lock(
+        self,
+        connection: Connection,
+        statement: Executable,
+        parameters: Mapping[str, object],
+    ) -> None:
+        deadline = time.monotonic() + self._lifecycle_lock_timeout_seconds
+        while True:
+            if connection.scalar(statement, parameters):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise NodeLifecycleConflict("node_lifecycle_busy")
+            time.sleep(min(0.05, remaining))
 
     def register_automatically(
         self,
@@ -548,6 +595,46 @@ class PostgresNodeStore:
                 payload={
                     "previous_state": node.state.value,
                     "state": state.value,
+                    "desired_revision": desired_revision,
+                },
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def request_stop(self, node_id: UUID) -> MediaNode:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            current = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .with_for_update()
+            ).mappings().one_or_none()
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
+            if node.state is NodeState.STOPPED:
+                return node
+            desired_revision = node.desired_revision + 1
+            row = connection.execute(
+                update(media_nodes)
+                .where(media_nodes.c.id == node_id)
+                .values(
+                    state=NodeState.STOPPED.value,
+                    desired_revision=desired_revision,
+                )
+                .returning(*media_nodes.c)
+            ).mappings().one()
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.desired_state_changed",
+                payload={
+                    "previous_state": node.state.value,
+                    "state": NodeState.STOPPED.value,
                     "desired_revision": desired_revision,
                 },
                 aggregate_revision=desired_revision,
@@ -842,6 +929,7 @@ class PostgresNodeStore:
     def close(self) -> None:
         self._engine.dispose()
         self._lock_engine.dispose()
+        self._provision_engine.dispose()
 
 
 def _media_node(row: RowMapping) -> MediaNode:

@@ -13,7 +13,7 @@ ExecStart=/usr/bin/env ${RTSP_PROXY_MEDIAMTX_BINARY} /run/credentials/rtsp-proxy
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
-TimeoutStopSec=30s
+TimeoutStopSec=15s
 UMask=0027
 
 RuntimeDirectory=rtsp-proxy/nodes/%i

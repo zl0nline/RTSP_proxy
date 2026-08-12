@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
-from rtsp_proxy.database import PostgresNodeStore
+from rtsp_proxy.database import DatabaseSchemaMismatch, PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId, generate_public_id
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.nodes import (
@@ -27,6 +27,8 @@ from rtsp_proxy.nodes import (
     MediaNode,
     NodeControl,
     NodeHealth,
+    NodeLifecycleConflict,
+    NodeNotEmpty,
     NodeProvisioningPolicy,
     NodeRuntime,
     NodeRuntimeAction,
@@ -955,6 +957,16 @@ def test_control_plane_refuses_to_start_on_an_older_database_revision(
 
     with pytest.raises(RuntimeError, match="database_schema_mismatch"):
         create_app_from_environment()
+
+
+def test_schema_check_sanitizes_database_connection_failures() -> None:
+    store = PostgresNodeStore(
+        "postgresql+psycopg://postgres@127.0.0.1:1/unavailable",
+        lifecycle_lock_timeout_seconds=0.1,
+    )
+
+    with pytest.raises(DatabaseSchemaMismatch, match="database_schema_mismatch"):
+        store.assert_schema_compatible()
 
 
 def test_control_plane_refuses_multiple_alembic_heads(
@@ -1988,10 +2000,14 @@ def test_application_startup_recovers_persisted_runtime_identity() -> None:
         new_node_id=uuid4,
         node_runtime=runtime,
     )
+
+    def recover() -> None:
+        node_control.recover_runtime_state()
+
     app = create_app(
         Settings(role=RuntimeRole.WEB),
         node_control=node_control,
-        startup=node_control.recover_runtime_state,
+        startup=recover,
     )
 
     with TestClient(app) as client:
@@ -2088,6 +2104,50 @@ def test_startup_recovery_isolates_a_failed_node_and_continues_other_nodes() -> 
     assert [node.id for node in recovered] == [first, second]
     assert recovered[0].runtime_state is NodeState.FAILED
     assert recovered[1].runtime_state is NodeState.RUNNING
+
+
+def test_startup_recovery_converges_a_healthy_node_while_another_is_slow() -> None:
+    slow = UUID("00000000-0000-0000-0000-000000000001")
+    healthy = UUID("00000000-0000-0000-0000-000000000002")
+    slow_entered = Event()
+    release_slow = Event()
+    healthy_observed = Event()
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(id=slow, name="slow", external_port=12000),
+            MediaNode(id=healthy, name="healthy", external_port=12001),
+        )
+    )
+
+    class SlowAndHealthyRuntime(RecordingLifecycleRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if node.id == slow:
+                slow_entered.set()
+                assert release_slow.wait(timeout=5)
+            else:
+                healthy_observed.set()
+            return super().execute(action, node)
+
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=SlowAndHealthyRuntime(),
+        recovery_workers=2,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        recovery = executor.submit(control.recover_runtime_state)
+        assert slow_entered.wait(timeout=1)
+        assert healthy_observed.wait(timeout=1)
+        release_slow.set()
+        recovered = recovery.result(timeout=2)
+
+    assert [node.id for node in recovered] == [slow, healthy]
 
 
 @pytest.mark.parametrize("operation", ("start", "stop", "restart", "observe"))
@@ -2625,35 +2685,233 @@ def test_postgresql_restart_and_camera_placement_are_one_atomic_choice(
     assert store.get_node(node_id).registered_cameras == 0  # type: ignore[union-attr]
 
 
-def test_postgresql_lifecycle_guards_do_not_consume_the_bounded_work_pool(
+def test_postgresql_stop_rechecks_empty_under_the_placement_lock(
     postgres_database_url: str,
 ) -> None:
     upgrade_database(postgres_database_url)
     store = PostgresNodeStore(postgres_database_url)
-    node_ids = tuple(UUID(f"00000000-0000-0000-0000-{index:012d}") for index in range(1, 17))
-    for index, node_id in enumerate(node_ids):
-        store.register_automatically(
-            name=f"media-{index}",
-            allowed_ports=tuple(range(12000, 12016)),
-            max_nodes=16,
-            preferred_port=12000 + index,
-            choose_port=lambda available: available[0],
-            new_node_id=lambda node_id=node_id: node_id,
-            api_ports=tuple(range(13000, 13016)),
-            metrics_ports=tuple(range(14000, 14016)),
-        )
-    barrier = Barrier(16)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+    running = store.request_desired_state(node.id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        node.id,
+        SuccessfulNodeRuntime().execute(NodeRuntimeAction.START, running),
+    )
+    store.place_camera_manually(
+        camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+        name="already-placed",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse(generate_public_id()),
+        node_id=node.id,
+    )
 
-    def read_while_guarded(node_id: UUID) -> UUID:
-        with store.lifecycle_guard(node_id):
-            barrier.wait(timeout=5)
-            assert store.get_node(node_id) is not None
+    with pytest.raises(NodeNotEmpty, match="node_not_empty"):
+        store.request_stop(node.id)
+
+    unchanged = store.get_node(node.id)
+    assert unchanged is not None
+    assert unchanged.state is NodeState.RUNNING
+    assert unchanged.registered_cameras == 1
+
+
+def test_postgresql_stop_and_camera_placement_are_one_atomic_choice(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            node_control=NodeControl(
+                store=store,
+                choose_port=lambda available: available[0],
+                new_node_id=lambda: node_id,
+                node_runtime=RecordingLifecycleRuntime(),
+            ),
+            camera_control=CameraControl(
+                store=store,
+                new_camera_id=uuid4,
+                new_public_id=generate_public_id,
+            ),
+        )
+    )
+    assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
+    assert client.post(f"/api/v1/nodes/{node_id}/start").status_code == 200
+    barrier = Barrier(2)
+
+    def stop() -> Response:
+        barrier.wait()
+        return client.post(f"/api/v1/nodes/{node_id}/stop")
+
+    def place() -> Response:
+        barrier.wait()
+        return client.post(
+            "/api/v1/cameras",
+            json={
+                "name": "atomic-choice",
+                "source_url": "rtsp://camera.local/main",
+                "node_id": str(node_id),
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stop_future = executor.submit(stop)
+        placement_future = executor.submit(place)
+        stop_response = stop_future.result(timeout=5)
+        placement_response = placement_future.result(timeout=5)
+
+    assert (stop_response.status_code, placement_response.status_code) in {
+        (200, 409),
+        (409, 201),
+    }
+    final = store.get_node(node_id)
+    assert final is not None
+    if stop_response.status_code == 200:
+        assert final.state is NodeState.STOPPED
+        assert final.registered_cameras == 0
+    else:
+        assert stop_response.json()["detail"]["code"] == "node_not_empty"
+        assert final.state is NodeState.RUNNING
+        assert final.registered_cameras == 1
+
+
+def test_postgresql_lifecycle_guard_has_a_bounded_dedicated_connection_pool(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(
+        postgres_database_url,
+        lifecycle_lock_pool_size=2,
+        lifecycle_lock_timeout_seconds=0.1,
+    )
+    node_ids = tuple(UUID(f"00000000-0000-0000-0000-{index:012d}") for index in range(1, 4))
+    for index, node_id in enumerate(node_ids):
+        def current_node_id(node_id: UUID = node_id) -> UUID:
             return node_id
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        observed = set(executor.map(read_while_guarded, node_ids))
+        store.register_automatically(
+            name=f"media-{index}",
+            allowed_ports=tuple(range(12000, 12003)),
+            max_nodes=3,
+            preferred_port=12000 + index,
+            choose_port=lambda available: available[0],
+            new_node_id=current_node_id,
+            api_ports=tuple(range(13000, 13003)),
+            metrics_ports=tuple(range(14000, 14003)),
+        )
+    acquired = Barrier(3)
+    release = Event()
 
-    assert observed == set(node_ids)
+    def hold_guard(node_id: UUID) -> UUID:
+        with store.lifecycle_guard(node_id):
+            acquired.wait(timeout=5)
+            assert release.wait(timeout=5)
+            return node_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = tuple(executor.submit(hold_guard, node_id) for node_id in node_ids[:2])
+        acquired.wait(timeout=5)
+        with (
+            pytest.raises(NodeLifecycleConflict, match="node_lifecycle_busy"),
+            store.lifecycle_guard(node_ids[2]),
+        ):
+            pytest.fail("unbounded lifecycle connection was acquired")
+        release.set()
+        observed = {future.result(timeout=5) for future in futures}
+
+    assert observed == set(node_ids[:2])
+
+
+def test_postgresql_lifecycle_guard_times_out_same_node_contention(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(
+        postgres_database_url,
+        lifecycle_lock_pool_size=2,
+        lifecycle_lock_timeout_seconds=0.1,
+    )
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+
+    def contend() -> str:
+        with (
+            pytest.raises(NodeLifecycleConflict, match="node_lifecycle_busy"),
+            store.lifecycle_guard(node.id),
+        ):
+            pytest.fail("same-node advisory lock was not bounded")
+        return "bounded"
+
+    with store.lifecycle_guard(node.id), ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(contend).result(timeout=1) == "bounded"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"lifecycle_lock_pool_size": 1},
+        {"lifecycle_lock_pool_size": 17},
+        {"lifecycle_lock_timeout_seconds": 0},
+        {"lifecycle_lock_timeout_seconds": 31},
+    ),
+)
+def test_postgresql_store_rejects_unbounded_lifecycle_lock_configuration(
+    postgres_database_url: str,
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match=r"node_lifecycle_lock_.+_invalid"):
+        PostgresNodeStore(postgres_database_url, **changes)  # type: ignore[arg-type]
+
+
+def test_postgresql_provisioning_guard_has_bounded_connection_acquisition(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(
+        postgres_database_url,
+        lifecycle_lock_timeout_seconds=0.1,
+    )
+
+    def contend() -> str:
+        with (
+            pytest.raises(NodeLifecycleConflict, match="node_lifecycle_busy"),
+            store.provisioning_guard(),
+        ):
+            pytest.fail("provisioning lock connection was not bounded")
+        return "bounded"
+
+    with store.provisioning_guard(), ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(contend).result(timeout=1) == "bounded"
+
+
+def test_postgresql_lifecycle_guard_rejects_an_unknown_node(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+
+    with pytest.raises(LookupError, match="node_not_found"), store.lifecycle_guard(
+        UUID("00000000-0000-0000-0000-000000000001")
+    ):
+        pytest.fail("unknown node entered lifecycle guard")
 
 
 def test_concurrent_node_creation_serializes_the_last_available_port(

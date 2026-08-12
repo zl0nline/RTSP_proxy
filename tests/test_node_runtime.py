@@ -635,6 +635,48 @@ def test_supervisor_refuses_missing_or_tampered_config_before_process_mutation(
     assert process.commands == []
 
 
+def test_supervisor_stops_a_process_that_never_becomes_active(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-inactive-start"
+    root.mkdir(mode=0o700)
+
+    class InactiveStartProcess(RecordingProcessController):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            spec: NodeRuntimeSpec,
+            deadline: object | None = None,
+        ) -> NodeProcessSnapshot:
+            self.commands.append((action, spec.node_id))
+            return NodeProcessSnapshot(
+                active=False,
+                pid=None,
+                process_start_ticks=None,
+                boot_id=None,
+                executable_sha256=None,
+            )
+
+    process = InactiveStartProcess()
+    supervisor = LinuxNodeSupervisor(
+        config_store=SecureNodeConfigStore(root=root),
+        process=process,
+        smoke=HealthySmokeProbe(),
+        port_is_bindable=lambda port: True,
+    )
+
+    with pytest.raises(NodeSupervisorError, match="node_process_not_active"):
+        supervisor.execute(
+            NodeRuntimeCommand.for_node(
+                NodeRuntimeAction.PROVISION_START,
+                runtime_spec(),
+            )
+        )
+
+    assert process.commands == [
+        (NodeRuntimeAction.PROVISION_START, runtime_spec().node_id),
+        (NodeRuntimeAction.STOP, runtime_spec().node_id),
+    ]
+
+
 class WrongReleaseProcessController(RecordingProcessController):
     def execute(
         self,
@@ -730,6 +772,39 @@ def test_systemd_adapter_can_only_address_the_exact_uuid_instance(tmp_path: Path
         ),
     ]
     assert snapshot.active is False
+
+
+def test_systemd_stop_reserves_time_for_status_and_listener_proof(tmp_path: Path) -> None:
+    timeouts: list[float] = []
+    current = [0.0]
+
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
+        timeouts.append(timeout)
+        if "stop" in arguments:
+            current[0] = 16.0
+            return CompletedProcess(arguments, 0, "", "")
+        return CompletedProcess(
+            arguments,
+            0,
+            "ActiveState=inactive\nMainPID=0\n",
+            "",
+        )
+
+    snapshot = SystemdNodeProcessController(
+        systemctl=Path("/usr/bin/systemctl"),
+        run=run,
+        proc_root=tmp_path / "proc",
+    ).execute(
+        NodeRuntimeAction.STOP,
+        runtime_spec(),
+        NodeOperationDeadline(
+            expires_monotonic=25,
+            monotonic=lambda: current[0],
+        ),
+    )
+
+    assert snapshot.active is False
+    assert timeouts == [20, 9]
 
 
 def test_systemd_adapter_binds_active_pid_start_boot_and_binary_identity(
@@ -1338,6 +1413,34 @@ def test_root_helper_deadline_times_out_start_and_uses_reserved_cleanup(
 
     assert process.commands == [(NodeRuntimeAction.STOP, runtime_spec().node_id)]
     assert observed_deadlines[0] != observed_deadlines[1]
+
+
+def test_expired_start_deadline_cannot_mutate_node_configuration(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-expired-before-mutation"
+    root.mkdir(mode=0o700)
+    process = RecordingProcessController()
+    supervisor = LinuxNodeSupervisor(
+        config_store=SecureNodeConfigStore(root=root),
+        process=process,
+        smoke=HealthySmokeProbe(),
+        port_is_bindable=lambda port: True,
+    )
+
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        supervisor.execute(
+            NodeRuntimeCommand.for_node(
+                NodeRuntimeAction.PROVISION_START,
+                runtime_spec(),
+            ),
+            deadline=NodeOperationDeadline(
+                expires_monotonic=0,
+                monotonic=lambda: 1,
+            ),
+            cleanup_reserve_seconds=0.2,
+        )
+
+    assert tuple(root.iterdir()) == ()
+    assert process.commands == []
 
 
 def test_root_helper_times_out_a_partial_request_without_blocking_forever(

@@ -3,11 +3,12 @@ from __future__ import annotations
 import errno
 import socket
 from collections.abc import Callable, Collection, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from threading import RLock
+from threading import Lock, RLock
 from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -207,6 +208,7 @@ class InMemoryNodeStore:
         self._nodes: list[MediaNode] = list(nodes)
         self._cameras: list[CameraPlacement] = []
         self._lock = RLock()
+        self._lifecycle_locks = {node.id: Lock() for node in nodes}
 
     @contextmanager
     def provisioning_guard(self) -> Iterator[None]:
@@ -216,8 +218,10 @@ class InMemoryNodeStore:
     @contextmanager
     def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
         with self._lock:
-            if not any(node.id == node_id for node in self._nodes):
+            node_lock = self._lifecycle_locks.get(node_id)
+            if node_lock is None:
                 raise NodeNotFound("node_not_found")
+        with node_lock:
             yield
 
     def register_automatically(
@@ -299,6 +303,7 @@ class InMemoryNodeStore:
                 creation_mode=creation_mode,
             )
             self._nodes.append(node)
+            self._lifecycle_locks[node.id] = Lock()
             return node
 
     def list_nodes(self) -> tuple[MediaNode, ...]:
@@ -353,6 +358,23 @@ class InMemoryNodeStore:
             updated = replace(
                 node,
                 state=state,
+                desired_revision=node.desired_revision + 1,
+            )
+            self._nodes[self._nodes.index(node)] = updated
+            return updated
+
+    def request_stop(self, node_id: UUID) -> MediaNode:
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if node.registered_cameras:
+                raise NodeNotEmpty("node_not_empty")
+            if node.state is NodeState.STOPPED:
+                return node
+            updated = replace(
+                node,
+                state=NodeState.STOPPED,
                 desired_revision=node.desired_revision + 1,
             )
             self._nodes[self._nodes.index(node)] = updated
@@ -509,13 +531,17 @@ class NodeControl:
         is_port_bindable: PortBindable | None = None,
         node_runtime: NodeRuntime | None = None,
         provision_on_create: bool = False,
+        recovery_workers: int = 4,
     ) -> None:
+        if recovery_workers < 1 or recovery_workers > 16:
+            raise ValueError("node_recovery_workers_invalid")
         self._store = store
         self._choose_port = choose_port
         self._new_node_id = new_node_id
         self._is_port_bindable = is_port_bindable or (lambda port: True)
         self._node_runtime = node_runtime
         self._provision_on_create = provision_on_create
+        self._recovery_workers = recovery_workers
 
     def register_node(
         self,
@@ -632,10 +658,8 @@ class NodeControl:
 
     def stop_node(self, node_id: UUID) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            node = self._require_node_and_runtime(node_id)
-            if node.registered_cameras:
-                raise NodeNotEmpty("node_not_empty")
-            desired = self._store.request_desired_state(node_id, NodeState.STOPPED)
+            self._require_node_and_runtime(node_id)
+            desired = self._store.request_stop(node_id)
             return self._execute_runtime(desired, NodeRuntimeAction.STOP)
 
     def restart_node(self, node_id: UUID) -> MediaNode:
@@ -667,29 +691,36 @@ class NodeControl:
     def recover_runtime_state(self) -> tuple[MediaNode, ...]:
         if self._node_runtime is None:
             raise NodeRuntimeUnavailable("node_runtime_unavailable")
-        recovered: list[MediaNode] = []
-        for node in self._store.list_nodes():
-            if node.state is NodeState.DELETING:
-                continue
-            try:
-                observed = self.observe_node(node.id)
-                if (
-                    node.state is NodeState.RUNNING
-                    and observed.runtime_state is not NodeState.RUNNING
-                ):
-                    recovered.append(self.start_node(node.id))
-                elif (
-                    node.state is NodeState.STOPPED
-                    and observed.runtime_state is NodeState.RUNNING
-                ):
-                    recovered.append(self.stop_node(node.id))
-                else:
-                    recovered.append(observed)
-            except (NodeRuntimeFailed, NodeNotEmpty, NodeLifecycleConflict, NodeNotFound):
-                failed = self._store.get_node(node.id)
-                if failed is not None:
-                    recovered.append(failed)
-        return tuple(recovered)
+        candidates = tuple(
+            node for node in self._store.list_nodes() if node.state is not NodeState.DELETING
+        )
+        if not candidates:
+            return ()
+        with ThreadPoolExecutor(
+            max_workers=min(self._recovery_workers, len(candidates)),
+            thread_name_prefix="node-recovery",
+        ) as workers:
+            return tuple(workers.map(self._recover_node, candidates))
+
+    def _recover_node(self, node: MediaNode) -> MediaNode:
+        try:
+            observed = self.observe_node(node.id)
+            if (
+                node.state is NodeState.RUNNING
+                and observed.runtime_state is not NodeState.RUNNING
+            ):
+                return self.start_node(node.id)
+            if (
+                node.state is NodeState.STOPPED
+                and observed.runtime_state is NodeState.RUNNING
+            ):
+                return self.stop_node(node.id)
+            return observed
+        except (NodeRuntimeFailed, NodeNotEmpty, NodeLifecycleConflict, NodeNotFound):
+            failed = self._store.get_node(node.id)
+            if failed is None:
+                raise NodeNotFound("node_not_found") from None
+            return failed
 
     def _provision_reserved_node(self, node: MediaNode) -> MediaNode:
         return self.start_node(node.id)
@@ -822,6 +853,8 @@ class NodeStore(Protocol):
     def get_node(self, node_id: UUID) -> MediaNode | None: ...
 
     def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode: ...
+
+    def request_stop(self, node_id: UUID) -> MediaNode: ...
 
     def request_restart(self, node_id: UUID) -> MediaNode: ...
 

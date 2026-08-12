@@ -204,7 +204,8 @@ path-scoped runtime RTSP probe, а также отдельный `DynamicUser`; 
 credentials. Runtime использует абсолютный binary path конкретного verified
 release, поэтому переключение `/opt/rtsp-proxy/current` не подменяет MediaMTX у
 уже созданной node. Lifecycle одной node сериализован и не блокирует startup
-control plane при неисправности другой.
+convergence другой: startup reconciliation выполняется bounded-параллельно,
+а PostgreSQL lifecycle locks имеют отдельный ограниченный pool и timeout.
 
 Ещё не реализованы reconciler/move/drain, dashboard, one-reader admission,
 access policies, notifications и complete operations workflows.

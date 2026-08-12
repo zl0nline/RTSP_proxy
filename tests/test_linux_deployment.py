@@ -74,6 +74,7 @@ def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
         "/etc/rtsp-proxy/nodes/%i/management.json "
         "/etc/rtsp-proxy/nodes/%i/reader.json"
     )
+    assert service["TimeoutStopSec"] == "15s"
 
 
 def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> None:

@@ -191,6 +191,8 @@ def test_node_limits_and_port_range_are_environment_driven() -> None:
             "RTSP_PROXY_NODE_PORT_RANGE_END": "12199",
             "RTSP_PROXY_NODE_PORT_RESERVED": "12005,12007",
             "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": "45",
+            "RTSP_PROXY_NODE_LIFECYCLE_LOCK_POOL_SIZE": "6",
+            "RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS": "7",
         }
     )
 
@@ -199,6 +201,8 @@ def test_node_limits_and_port_range_are_environment_driven() -> None:
     assert settings.node_port_range_end == 12199
     assert settings.node_port_reserved == (12005, 12007)
     assert settings.node_management_freshness_seconds == 45
+    assert settings.node_lifecycle_lock_pool_size == 6
+    assert settings.node_lifecycle_lock_timeout_seconds == 7
 
 
 def test_node_port_configuration_requires_capacity_after_exclusions() -> None:

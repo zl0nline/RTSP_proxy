@@ -37,6 +37,10 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": (
         "node_management_freshness_seconds"
     ),
+    "RTSP_PROXY_NODE_LIFECYCLE_LOCK_POOL_SIZE": "node_lifecycle_lock_pool_size",
+    "RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS": (
+        "node_lifecycle_lock_timeout_seconds"
+    ),
     "RTSP_PROXY_NODE_RUNTIME_SOCKET": "node_runtime_socket",
     "RTSP_PROXY_NODE_RUNTIME_TIMEOUT_SECONDS": "node_runtime_timeout_seconds",
     "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
@@ -87,6 +91,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         is_port_bindable=tcp_port_is_bindable,
         node_runtime=node_runtime,
         provision_on_create=node_runtime is not None,
+        recovery_workers=settings.node_lifecycle_lock_pool_size,
     )
     provisioning_policy = NodeProvisioningPolicy(
         port_range_start=settings.node_port_range_start,
@@ -155,7 +160,11 @@ def create_background_app(
 def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
     if settings.database_url is None:
         return None
-    store = PostgresNodeStore(settings.database_url)
+    store = PostgresNodeStore(
+        settings.database_url,
+        lifecycle_lock_pool_size=settings.node_lifecycle_lock_pool_size,
+        lifecycle_lock_timeout_seconds=settings.node_lifecycle_lock_timeout_seconds,
+    )
     try:
         store.assert_schema_compatible()
     except Exception:
