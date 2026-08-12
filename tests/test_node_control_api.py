@@ -39,6 +39,11 @@ from rtsp_proxy.nodes import (
     NodeState,
     tcp_port_is_bindable,
 )
+from rtsp_proxy.reconcile import (
+    CameraMoveControl,
+    CameraRuntimeObserver,
+    ConfirmationTokenService,
+)
 from rtsp_proxy.runtime import create_app_from_environment, create_background_app, run_web
 
 
@@ -893,6 +898,93 @@ def test_camera_update_and_disable_are_revisioned_desired_state() -> None:
     assert store.get_node(node_id).registered_cameras == 1  # type: ignore[union-attr]
 
 
+def test_camera_move_preview_and_request_expose_desired_saga_state() -> None:
+    observed_at = datetime.now(UTC)
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    store = InMemoryNodeStore(
+        nodes=tuple(
+            MediaNode(
+                id=node_id,
+                name=f"media-{node_id.int}",
+                external_port=port,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            )
+            for node_id, port in ((source_id, 12000), (target_id, 12001))
+        )
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    camera_control.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=source_id,
+    )
+
+    class Runtime:
+        def observe(self, selected_id: UUID) -> object:
+            assert selected_id == camera_id
+            from rtsp_proxy.reconcile import CameraRuntimeObservation
+
+            return CameraRuntimeObservation(
+                camera_id=camera_id,
+                node_id=source_id,
+                ready=True,
+                reader_count=0,
+                occupied=False,
+                reader_limit_violated=False,
+            )
+
+    move_control = CameraMoveControl(
+        store=store,
+        runtime=cast(CameraRuntimeObserver, Runtime()),
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+        new_move_id=lambda: UUID("30000000-0000-0000-0000-000000000001"),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=camera_control,
+            camera_move_control=move_control,
+        )
+    )
+
+    preview = client.post(
+        f"/api/v1/cameras/{camera_id}/moves/preview",
+        json={"target_node_id": str(target_id)},
+    )
+    requested = client.post(
+        f"/api/v1/cameras/{camera_id}/moves",
+        json={"target_node_id": str(target_id), "force": False},
+    )
+    status_response = client.get(
+        "/api/v1/camera-moves/30000000-0000-0000-0000-000000000001"
+    )
+
+    assert preview.status_code == 200
+    assert preview.json()["occupied"] is False
+    assert preview.json()["confirmation_token"] is None
+    assert requested.status_code == 202
+    assert requested.json()["state"] == "prepare_target"
+    assert requested.json()["source_node_id"] == str(source_id)
+    assert requested.json()["target_node_id"] == str(target_id)
+    assert status_response.json() == requested.json()
+
+
 def test_manual_camera_placement_reports_missing_node_consistently() -> None:
     client = TestClient(
         create_app(
@@ -1004,7 +1096,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
             )
         )
-    assert revision == "0006_camera_reconcile"
+    assert revision == "0007_camera_move_saga"
     assert table_count == 4
 
 

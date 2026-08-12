@@ -111,6 +111,27 @@ class CameraState(StrEnum):
     DELETED = "deleted"
 
 
+class CameraMoveState(StrEnum):
+    PREPARE_TARGET = "prepare_target"
+    CLEANUP_SOURCE = "cleanup_source"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True, slots=True)
+class CameraMove:
+    id: UUID
+    camera_id: UUID
+    public_id: PublicId
+    source_url: str
+    source_node_id: UUID
+    target_node_id: UUID
+    source_generation: int
+    target_generation: int
+    desired_revision: int
+    force: bool
+    state: CameraMoveState = CameraMoveState.PREPARE_TARGET
+
+
 @dataclass(frozen=True, slots=True)
 class CameraPlacement:
     id: UUID
@@ -228,6 +249,7 @@ class InMemoryNodeStore:
     def __init__(self, *, nodes: tuple[MediaNode, ...] = ()) -> None:
         self._nodes: list[MediaNode] = list(nodes)
         self._cameras: list[CameraPlacement] = []
+        self._camera_moves: list[CameraMove] = []
         self._lock = RLock()
         self._lifecycle_locks = {node.id: Lock() for node in nodes}
 
@@ -285,18 +307,14 @@ class InMemoryNodeStore:
                 is_port_bindable=probe,
             )
             occupied_management = {
-                port
-                for node in self._nodes
-                for port in (node.api_port, node.metrics_port)
+                port for node in self._nodes for port in (node.api_port, node.metrics_port)
             }
             available_api = tuple(port for port in api_ports if port not in occupied_management)
             available_metrics = tuple(
                 port for port in metrics_ports if port not in occupied_management
             )
             if not available_api or not available_metrics:
-                raise NodeManagementPortRangeExhausted(
-                    "node_management_port_range_exhausted"
-                )
+                raise NodeManagementPortRangeExhausted("node_management_port_range_exhausted")
             try:
                 api_port = select_port_with_bounded_recheck(
                     available_api,
@@ -306,9 +324,7 @@ class InMemoryNodeStore:
                 )
                 metrics_port = select_port_with_bounded_recheck(
                     tuple(
-                        port
-                        for port in available_metrics
-                        if port not in {external_port, api_port}
+                        port for port in available_metrics if port not in {external_port, api_port}
                     ),
                     preferred_port=None,
                     choose_port=lambda candidates: candidates[0],
@@ -359,9 +375,7 @@ class InMemoryNodeStore:
             updated = replace(
                 updated,
                 management_fresh=observation.management_fresh,
-                management_observed_at=(
-                    observed_at if observation.management_fresh else None
-                ),
+                management_observed_at=(observed_at if observation.management_fresh else None),
                 runtime_observed_at=observed_at,
                 config_compatible=observation.config_compatible,
                 applied_revision=observation.applied_revision,
@@ -569,6 +583,15 @@ class InMemoryNodeStore:
                 if camera.node_id == node_id and camera.state is not CameraState.DELETED
             )
 
+    def list_node_active_moves(self, node_id: UUID) -> tuple[CameraMove, ...]:
+        with self._lock:
+            return tuple(
+                move
+                for move in self._camera_moves
+                if node_id in {move.source_node_id, move.target_node_id}
+                and move.state is not CameraMoveState.COMPLETE
+            )
+
     def update_camera(
         self,
         camera_id: UUID,
@@ -588,6 +611,7 @@ class InMemoryNodeStore:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
+            self._require_no_active_camera_move(camera_id)
             if camera.name == name and camera.source_url == source_url:
                 return camera
             updated = replace(
@@ -614,6 +638,7 @@ class InMemoryNodeStore:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
+            self._require_no_active_camera_move(camera_id)
             target = CameraState.ENABLED if enabled else CameraState.DISABLED
             if camera.state is target:
                 return camera
@@ -635,12 +660,150 @@ class InMemoryNodeStore:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
                 return camera
+            self._require_no_active_camera_move(camera_id)
             updated = replace(
                 camera,
                 state=CameraState.DELETING,
                 desired_revision=camera.desired_revision + 1,
             )
             self._cameras[self._cameras.index(camera)] = updated
+            return updated
+
+    def create_camera_move(
+        self,
+        *,
+        move_id: UUID,
+        camera_id: UUID,
+        target_node_id: UUID,
+        expected_revision: int,
+        force: bool,
+    ) -> CameraMove:
+        with self._lock:
+            camera = next(
+                (candidate for candidate in self._cameras if candidate.id == camera_id),
+                None,
+            )
+            target = next(
+                (candidate for candidate in self._nodes if candidate.id == target_node_id),
+                None,
+            )
+            if camera is None or camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is not CameraState.ENABLED:
+                raise CameraLifecycleConflict("camera_not_enabled")
+            if camera.desired_revision != expected_revision:
+                raise CameraLifecycleConflict("camera_revision_conflict")
+            if camera.node_id == target_node_id:
+                raise CameraLifecycleConflict("camera_already_on_target")
+            if target is None:
+                raise NodeNotFound("node_not_found")
+            if not is_node_eligible(target):
+                raise EligibleNodeMissing("manual_node_ineligible")
+            if any(
+                move.camera_id == camera_id and move.state is not CameraMoveState.COMPLETE
+                for move in self._camera_moves
+            ):
+                raise CameraLifecycleConflict("camera_move_in_progress")
+            desired_revision = camera.desired_revision + 1
+            move = CameraMove(
+                id=move_id,
+                camera_id=camera.id,
+                public_id=camera.public_id,
+                source_url=camera.source_url,
+                source_node_id=camera.node_id,
+                target_node_id=target_node_id,
+                source_generation=camera.placement_generation,
+                target_generation=camera.placement_generation + 1,
+                desired_revision=desired_revision,
+                force=force,
+            )
+            self._camera_moves.append(move)
+            self._cameras[self._cameras.index(camera)] = replace(
+                camera,
+                desired_revision=desired_revision,
+            )
+            return move
+
+    def get_camera_move(self, move_id: UUID) -> CameraMove | None:
+        with self._lock:
+            return next((move for move in self._camera_moves if move.id == move_id), None)
+
+    def list_incomplete_camera_moves(self) -> tuple[CameraMove, ...]:
+        with self._lock:
+            return tuple(
+                move for move in self._camera_moves if move.state is not CameraMoveState.COMPLETE
+            )
+
+    def switch_camera_move(self, move_id: UUID) -> CameraMove:
+        with self._lock:
+            move = next(
+                (candidate for candidate in self._camera_moves if candidate.id == move_id),
+                None,
+            )
+            if move is None:
+                raise CameraNotFound("camera_move_not_found")
+            if move.state is not CameraMoveState.PREPARE_TARGET:
+                return move
+            camera = next(
+                candidate for candidate in self._cameras if candidate.id == move.camera_id
+            )
+            source = next(
+                candidate for candidate in self._nodes if candidate.id == move.source_node_id
+            )
+            target = next(
+                candidate for candidate in self._nodes if candidate.id == move.target_node_id
+            )
+            if (
+                camera.node_id != move.source_node_id
+                or camera.placement_generation != move.source_generation
+                or camera.desired_revision != move.desired_revision
+            ):
+                raise CameraLifecycleConflict("camera_move_fenced")
+            if target.registered_cameras >= target.camera_capacity:
+                raise NodeCameraCapacityReached("node_camera_capacity_reached")
+            if not is_node_eligible(target):
+                raise EligibleNodeMissing("manual_node_ineligible")
+            self._nodes[self._nodes.index(source)] = replace(
+                source,
+                registered_cameras=source.registered_cameras - 1,
+            )
+            self._nodes[self._nodes.index(target)] = replace(
+                target,
+                registered_cameras=target.registered_cameras + 1,
+            )
+            self._cameras[self._cameras.index(camera)] = replace(
+                camera,
+                node_id=target.id,
+                node_port=target.external_port,
+                placement_mode=PlacementMode.MANUAL,
+                placement_generation=move.target_generation,
+                applied_revision=move.desired_revision,
+            )
+            updated = replace(move, state=CameraMoveState.CLEANUP_SOURCE)
+            self._camera_moves[self._camera_moves.index(move)] = updated
+            return updated
+
+    def _require_no_active_camera_move(self, camera_id: UUID) -> None:
+        if any(
+            move.camera_id == camera_id and move.state is not CameraMoveState.COMPLETE
+            for move in self._camera_moves
+        ):
+            raise CameraLifecycleConflict("camera_move_in_progress")
+
+    def complete_camera_move(self, move_id: UUID) -> CameraMove:
+        with self._lock:
+            move = next(
+                (candidate for candidate in self._camera_moves if candidate.id == move_id),
+                None,
+            )
+            if move is None:
+                raise CameraNotFound("camera_move_not_found")
+            if move.state is CameraMoveState.COMPLETE:
+                return move
+            if move.state is not CameraMoveState.CLEANUP_SOURCE:
+                raise CameraLifecycleConflict("camera_move_not_switched")
+            updated = replace(move, state=CameraMoveState.COMPLETE)
+            self._camera_moves[self._camera_moves.index(move)] = updated
             return updated
 
     def mark_camera_applied(
@@ -661,6 +824,11 @@ class InMemoryNodeStore:
                 or camera.node_id != node_id
                 or camera.placement_generation != placement_generation
                 or camera.desired_revision != desired_revision
+            ):
+                return False
+            if any(
+                move.camera_id == camera_id and move.state is not CameraMoveState.COMPLETE
+                for move in self._camera_moves
             ):
                 return False
             if camera.state is CameraState.DELETING:
@@ -1117,7 +1285,11 @@ class ReconcileStore(Protocol):
 
     def get_node(self, node_id: UUID) -> MediaNode | None: ...
 
+    def list_nodes(self) -> tuple[MediaNode, ...]: ...
+
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]: ...
+
+    def list_node_active_moves(self, node_id: UUID) -> tuple[CameraMove, ...]: ...
 
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None: ...
 
@@ -1129,6 +1301,26 @@ class ReconcileStore(Protocol):
         placement_generation: int,
         desired_revision: int,
     ) -> bool: ...
+
+
+class CameraMoveStore(ReconcileStore, Protocol):
+    def create_camera_move(
+        self,
+        *,
+        move_id: UUID,
+        camera_id: UUID,
+        target_node_id: UUID,
+        expected_revision: int,
+        force: bool,
+    ) -> CameraMove: ...
+
+    def get_camera_move(self, move_id: UUID) -> CameraMove | None: ...
+
+    def list_incomplete_camera_moves(self) -> tuple[CameraMove, ...]: ...
+
+    def switch_camera_move(self, move_id: UUID) -> CameraMove: ...
+
+    def complete_camera_move(self, move_id: UUID) -> CameraMove: ...
 
 
 def tcp_port_is_bindable(port: int) -> bool:

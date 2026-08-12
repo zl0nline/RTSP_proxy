@@ -14,6 +14,7 @@ from rtsp_proxy.health import (
 from rtsp_proxy.nodes import (
     CameraControl,
     CameraLifecycleConflict,
+    CameraMove,
     CameraNotFound,
     EligibleNodeMissing,
     InvalidCameraSource,
@@ -31,6 +32,13 @@ from rtsp_proxy.nodes import (
     NodeReleaseConflict,
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
+)
+from rtsp_proxy.reconcile import (
+    CameraMoveControl,
+    CameraOccupied,
+    CameraReaderInvariantViolation,
+    CameraRuntimeObserver,
+    MoveConfirmationRequired,
 )
 
 
@@ -117,11 +125,54 @@ class CameraListResponse(BaseModel):
     count: int
 
 
+class CameraMoveRequest(BaseModel):
+    target_node_id: UUID
+    force: bool = False
+    confirmation_token: str | None = None
+
+
+class CameraMovePreviewRequest(BaseModel):
+    target_node_id: UUID
+
+
+class CameraMovePreviewResponse(BaseModel):
+    camera_id: str
+    source_node_id: str
+    target_node_id: str
+    desired_revision: int
+    occupied: bool
+    disconnect_readers: int
+    confirmation_token: str | None
+
+
+class CameraMoveResponse(BaseModel):
+    id: str
+    camera_id: str
+    source_node_id: str
+    target_node_id: str
+    source_generation: int
+    target_generation: int
+    desired_revision: int
+    force: bool
+    state: str
+
+
+class CameraRuntimeResponse(BaseModel):
+    camera_id: str
+    node_id: str
+    ready: bool
+    reader_count: int
+    occupied: bool
+    reader_limit_violated: bool
+
+
 def create_app(
     settings: Settings,
     readiness: ReadinessProvider | None = None,
     node_control: NodeControl | None = None,
     camera_control: CameraControl | None = None,
+    camera_move_control: CameraMoveControl | None = None,
+    camera_runtime_observer: CameraRuntimeObserver | None = None,
     startup: Callable[[], None] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -427,8 +478,7 @@ def create_app(
             )
         if (
             request.release_id != settings.node_release_id
-            or request.mediamtx_binary_sha256
-            != settings.node_mediamtx_binary_sha256
+            or request.mediamtx_binary_sha256 != settings.node_mediamtx_binary_sha256
         ):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -529,6 +579,11 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": "camera_source_secret_reference_required"},
             ) from None
+        except CameraLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
         return _camera_response(camera)
 
     @app.put("/api/v1/cameras/{camera_id}", response_model=CameraResponse)
@@ -544,6 +599,11 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
+            ) from None
+        except CameraLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
             ) from None
         except InvalidCameraSource:
             raise HTTPException(
@@ -561,10 +621,10 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
-        except CameraLifecycleConflict:
+        except CameraLifecycleConflict as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "camera_deleting"},
+                detail={"code": str(error)},
             ) from None
         return _camera_response(camera)
 
@@ -590,6 +650,160 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
+        except CameraLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+
+    @app.get(
+        "/api/v1/cameras/{camera_id}/runtime",
+        response_model=CameraRuntimeResponse,
+    )
+    def camera_runtime(camera_id: UUID) -> CameraRuntimeResponse:
+        if camera_runtime_observer is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_runtime_unavailable"},
+            )
+        try:
+            observation = camera_runtime_observer.observe(camera_id)
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        return CameraRuntimeResponse(
+            camera_id=str(observation.camera_id),
+            node_id=str(observation.node_id),
+            ready=observation.ready,
+            reader_count=observation.reader_count,
+            occupied=observation.occupied,
+            reader_limit_violated=observation.reader_limit_violated,
+        )
+
+    @app.post(
+        "/api/v1/cameras/{camera_id}/moves/preview",
+        response_model=CameraMovePreviewResponse,
+    )
+    def preview_camera_move(
+        camera_id: UUID,
+        request: CameraMovePreviewRequest,
+    ) -> CameraMovePreviewResponse:
+        if camera_move_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_move_unavailable"},
+            )
+        try:
+            preview = camera_move_control.preview(
+                camera_id,
+                target_node_id=request.target_node_id,
+            )
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except (
+            CameraLifecycleConflict,
+            EligibleNodeMissing,
+            NodeCameraCapacityReached,
+        ) as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        except CameraReaderInvariantViolation:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_reader_limit_violated"},
+            ) from None
+        return CameraMovePreviewResponse(
+            camera_id=str(preview.camera_id),
+            source_node_id=str(preview.source_node_id),
+            target_node_id=str(preview.target_node_id),
+            desired_revision=preview.desired_revision,
+            occupied=preview.occupied,
+            disconnect_readers=preview.disconnect_readers,
+            confirmation_token=preview.confirmation_token,
+        )
+
+    @app.post(
+        "/api/v1/cameras/{camera_id}/moves",
+        response_model=CameraMoveResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def request_camera_move(
+        camera_id: UUID,
+        request: CameraMoveRequest,
+    ) -> CameraMoveResponse:
+        if camera_move_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_move_unavailable"},
+            )
+        try:
+            move = camera_move_control.request_move(
+                camera_id,
+                target_node_id=request.target_node_id,
+                force=request.force,
+                confirmation_token=request.confirmation_token,
+            )
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except CameraOccupied:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_occupied"},
+            ) from None
+        except CameraReaderInvariantViolation:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_reader_limit_violated"},
+            ) from None
+        except MoveConfirmationRequired:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "move_confirmation_required"},
+            ) from None
+        except (CameraLifecycleConflict, EligibleNodeMissing, NodeCameraCapacityReached) as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        return _camera_move_response(move)
+
+    @app.get(
+        "/api/v1/camera-moves/{move_id}",
+        response_model=CameraMoveResponse,
+    )
+    def get_camera_move(move_id: UUID) -> CameraMoveResponse:
+        if camera_move_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_move_unavailable"},
+            )
+        move = camera_move_control.get_move(move_id)
+        if move is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_move_not_found"},
+            )
+        return _camera_move_response(move)
 
     @app.get("/api/v1/cameras", response_model=CameraListResponse)
     def list_cameras() -> CameraListResponse:
@@ -598,10 +812,7 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "camera_control_unavailable"},
             )
-        items = [
-            _camera_response(camera)
-            for camera in camera_control.list_cameras()
-        ]
+        items = [_camera_response(camera) for camera in camera_control.list_cameras()]
         return CameraListResponse(items=items, count=len(items))
 
     return app
@@ -652,3 +863,17 @@ def _require_camera_control(camera_control: CameraControl | None) -> CameraContr
             detail={"code": "camera_control_unavailable"},
         )
     return camera_control
+
+
+def _camera_move_response(move: CameraMove) -> CameraMoveResponse:
+    return CameraMoveResponse(
+        id=str(move.id),
+        camera_id=str(move.camera_id),
+        source_node_id=str(move.source_node_id),
+        target_node_id=str(move.target_node_id),
+        source_generation=move.source_generation,
+        target_generation=move.target_generation,
+        desired_revision=move.desired_revision,
+        force=move.force,
+        state=move.state.value,
+    )

@@ -1,8 +1,10 @@
 import argparse
 import json
+import logging
 import os
 import secrets
-from collections.abc import Mapping, Sequence
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -14,12 +16,20 @@ from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import generate_public_id
-from rtsp_proxy.node_runtime import UnixNodeRuntimeClient
+from rtsp_proxy.node_runtime import UnixMediaNodeClientFactory, UnixNodeRuntimeClient
 from rtsp_proxy.nodes import (
     CameraControl,
     NodeControl,
     NodeProvisioningPolicy,
     tcp_port_is_bindable,
+)
+from rtsp_proxy.reconcile import (
+    CameraMoveControl,
+    CameraMoveReconciler,
+    CameraReconciler,
+    CameraRuntimeObserver,
+    ConfirmationTokenService,
+    ReconcileCoordinator,
 )
 
 ENV_TO_FIELD = {
@@ -34,19 +44,19 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_NODE_METRICS_PORT_RANGE_START": "node_metrics_port_range_start",
     "RTSP_PROXY_NODE_METRICS_PORT_RANGE_END": "node_metrics_port_range_end",
     "RTSP_PROXY_NODE_PORT_RESERVED": "node_port_reserved",
-    "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": (
-        "node_management_freshness_seconds"
-    ),
+    "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": ("node_management_freshness_seconds"),
     "RTSP_PROXY_NODE_LIFECYCLE_LOCK_POOL_SIZE": "node_lifecycle_lock_pool_size",
-    "RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS": (
-        "node_lifecycle_lock_timeout_seconds"
-    ),
+    "RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS": ("node_lifecycle_lock_timeout_seconds"),
     "RTSP_PROXY_NODE_RUNTIME_SOCKET": "node_runtime_socket",
     "RTSP_PROXY_NODE_RUNTIME_TIMEOUT_SECONDS": "node_runtime_timeout_seconds",
+    "RTSP_PROXY_RECONCILE_INTERVAL_SECONDS": "reconcile_interval_seconds",
+    "RTSP_PROXY_CONFIRMATION_SECRET": "confirmation_secret",
     "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
     "RTSP_PROXY_NODE_MEDIAMTX_BINARY_SHA256": "node_mediamtx_binary_sha256",
     "RTSP_PROXY_DATABASE_URL": "database_url",
 }
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ConfigurationError(ValueError):
@@ -118,6 +128,33 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
     def recover_runtime_state() -> None:
         node_control.recover_runtime_state()
 
+    media_factory = (
+        None
+        if settings.node_runtime_socket is None
+        else UnixMediaNodeClientFactory(
+            socket_path=settings.node_runtime_socket,
+            timeout_seconds=min(10, settings.node_runtime_timeout_seconds),
+        )
+    )
+    camera_runtime = (
+        None
+        if media_factory is None
+        else CameraRuntimeObserver(store=store, media_nodes=media_factory)
+    )
+    move_control = (
+        None
+        if camera_runtime is None or settings.confirmation_secret is None
+        else CameraMoveControl(
+            store=store,
+            runtime=camera_runtime,
+            confirmations=ConfirmationTokenService(
+                secret=settings.confirmation_secret.encode("utf-8"),
+                lifetime_seconds=30,
+            ),
+            new_move_id=uuid4,
+        )
+    )
+
     return create_app(
         settings,
         node_control=node_control,
@@ -129,14 +166,12 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             ensure_automatic_capacity=(
                 None
                 if node_runtime is None
-                else lambda: node_control.ensure_automatic_capacity(
-                    provisioning_policy
-                )
+                else lambda: node_control.ensure_automatic_capacity(provisioning_policy)
             ),
         ),
-        startup=(
-            None if node_runtime is None else recover_runtime_state
-        ),
+        camera_move_control=move_control,
+        camera_runtime_observer=camera_runtime,
+        startup=(None if node_runtime is None else recover_runtime_state),
         shutdown=store.close,
     )
 
@@ -151,9 +186,56 @@ def create_background_app(
     if settings.role is not expected_role:
         raise ConfigurationError("background_role_mismatch")
     store = _open_verified_store(settings)
+    startup: Callable[[], None] | None = None
+    shutdown: Callable[[], None] | None = None if store is None else store.close
+    if (
+        store is not None
+        and expected_role is RuntimeRole.RECONCILER
+        and settings.node_runtime_socket is not None
+    ):
+        media = UnixMediaNodeClientFactory(
+            socket_path=settings.node_runtime_socket,
+            timeout_seconds=min(10, settings.node_runtime_timeout_seconds),
+        )
+        coordinator = ReconcileCoordinator(
+            store=store,
+            cameras=CameraReconciler(store=store, media_nodes=media),
+            moves=CameraMoveReconciler(store=store, media_nodes=media),
+        )
+        stop = threading.Event()
+        thread: threading.Thread | None = None
+
+        def reconcile_loop() -> None:
+            while not stop.is_set():
+                try:
+                    coordinator.run_once()
+                except Exception:
+                    LOGGER.exception("camera reconcile cycle failed")
+                stop.wait(settings.reconcile_interval_seconds)
+
+        def start_reconciler() -> None:
+            nonlocal thread
+            thread = threading.Thread(
+                target=reconcile_loop,
+                name="rtsp-proxy-reconciler",
+                daemon=False,
+            )
+            thread.start()
+
+        def stop_reconciler() -> None:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=settings.reconcile_interval_seconds + 10)
+                if thread.is_alive():
+                    raise RuntimeError("reconciler_shutdown_timeout")
+            store.close()
+
+        startup = start_reconciler
+        shutdown = stop_reconciler
     return create_app(
         settings,
-        shutdown=None if store is None else store.close,
+        startup=startup,
+        shutdown=shutdown,
     )
 
 

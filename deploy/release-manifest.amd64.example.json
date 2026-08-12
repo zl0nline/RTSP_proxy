@@ -23,8 +23,8 @@
     "ffprobe_sha256": "0f7a6c43858e8123f09b2f2236e7084165d76642e618d8d0ec9304cff3135d95"
   },
   "schema_compatibility": {
-    "minimum": "0006_camera_reconcile",
-    "maximum": "0006_camera_reconcile"
+    "minimum": "0007_camera_move_saga",
+    "maximum": "0007_camera_move_saga"
   },
   "config_schema_version": 1
 }

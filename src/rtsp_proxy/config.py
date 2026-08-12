@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     node_lifecycle_lock_timeout_seconds: float = Field(default=5, gt=0, le=30)
     node_runtime_socket: Path | None = None
     node_runtime_timeout_seconds: float = Field(default=60, gt=1, le=60)
+    reconcile_interval_seconds: float = Field(default=1, ge=0.1, le=60)
+    confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     node_release_id: str = Field(
         default="v1.20.0",
         pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
@@ -95,4 +97,6 @@ class Settings(BaseSettings):
                 raise ValueError("node_runtime_socket_must_be_absolute")
             if self.node_mediamtx_binary_sha256 == "0" * 64:
                 raise ValueError("node_release_identity_required")
+            if self.role is RuntimeRole.WEB and self.confirmation_secret is None:
+                raise ValueError("confirmation_secret_required")
         return self

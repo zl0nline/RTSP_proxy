@@ -274,9 +274,17 @@ def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity()
         role=RuntimeRole.WEB,
         node_runtime_socket=Path("/run/rtsp-proxy-node-runtime/control.sock"),
         node_mediamtx_binary_sha256="a" * 64,
+        confirmation_secret="test-confirmation-secret-that-is-at-least-43-bytes",
     )
 
     assert settings.node_release_id == "v1.20.0"
+
+    reconciler = Settings(
+        role=RuntimeRole.RECONCILER,
+        node_runtime_socket=Path("/run/rtsp-proxy-node-runtime/control.sock"),
+        node_mediamtx_binary_sha256="a" * 64,
+    )
+    assert reconciler.confirmation_secret is None
 
 
 def test_invalid_http_port_fails_startup_validation() -> None:
@@ -329,3 +337,26 @@ def test_background_entrypoint_fails_closed_when_config_changes_instance_role() 
             Settings(role=RuntimeRole.PROBE),
             expected_role=RuntimeRole.WORKER,
         )
+
+
+def test_reconciler_background_role_starts_and_stops_its_bounded_loop(
+    postgres_database_url: str,
+) -> None:
+    from pathlib import Path
+
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    app = create_background_app(
+        Settings(
+            role=RuntimeRole.RECONCILER,
+            database_url=postgres_database_url,
+            node_runtime_socket=Path("/run/missing-helper.sock"),
+            node_mediamtx_binary_sha256="a" * 64,
+            reconcile_interval_seconds=0.1,
+        ),
+        expected_role=RuntimeRole.RECONCILER,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/health/live").status_code == 200
