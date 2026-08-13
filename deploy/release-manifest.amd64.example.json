@@ -24,7 +24,7 @@
   },
   "schema_compatibility": {
     "minimum": "0010_camera_access",
-    "maximum": "0010_camera_access"
+    "maximum": "0011_observability"
   },
   "config_schema_version": 1
 }

@@ -112,7 +112,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         },
         "schema_compatibility": {
             "minimum": "0010_camera_access",
-            "maximum": "0010_camera_access",
+            "maximum": "0011_observability",
         },
         "config_schema_version": 1,
     }

@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
 APPLICATION_SCHEMA = "0010_camera_access"
+MAXIMUM_COMPATIBLE_SCHEMA = "0011_observability"
 CONFIG_SCHEMA_VERSION = 1
 
 
@@ -200,10 +201,9 @@ def verify_release(
         raise ReleaseVerificationError("untrusted_mediamtx_artifact")
     if manifest.config_schema_version != CONFIG_SCHEMA_VERSION:
         raise ReleaseVerificationError("config_schema_mismatch")
-    if not (
-        manifest.schema_compatibility.minimum
-        == APPLICATION_SCHEMA
-        == manifest.schema_compatibility.maximum
+    if (
+        manifest.schema_compatibility.minimum != APPLICATION_SCHEMA
+        or manifest.schema_compatibility.maximum != MAXIMUM_COMPATIBLE_SCHEMA
     ):
         raise ReleaseVerificationError("database_schema_mismatch")
 

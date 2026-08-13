@@ -481,7 +481,7 @@ class PostgresNodeStore:
                 )
         except SQLAlchemyError:
             raise DatabaseSchemaMismatch("database_schema_mismatch") from None
-        if revisions != (APPLICATION_SCHEMA,):
+        if revisions not in ((APPLICATION_SCHEMA,), ("0011_observability",)):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     @contextmanager

@@ -137,6 +137,13 @@ Verifier reads actual Linux architecture, validates artifact paths/digests and
 version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
 activation.
 
+Release `0.2.0` is the compatibility bridge for the next additive migration:
+its manifest and startup gate accept both `0010_camera_access` and
+`0011_observability`, while its own migration head remains 0010. Deploy and
+smoke this bridge on every control-plane process before any host advances the
+database to 0011. This ordering is what makes the subsequent N/N-1 rolling
+window executable rather than merely declarative.
+
 Before starting a control-plane release, apply the migrations packaged inside
 that exact wheel environment:
 

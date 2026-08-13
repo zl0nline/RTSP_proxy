@@ -1648,6 +1648,28 @@ def test_control_plane_refuses_to_start_on_an_older_database_revision(
         create_app_from_environment()
 
 
+def test_phase_e_bridge_accepts_future_additive_observability_schema(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE alembic_version SET version_num = '0011_observability' "
+                "WHERE version_num = '0010_camera_access'"
+            )
+        )
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+
+    app = create_app_from_environment()
+
+    with TestClient(app) as client:
+        assert client.get("/health/live").status_code == 200
+
+
 def test_schema_check_sanitizes_database_connection_failures() -> None:
     store = PostgresNodeStore(
         "postgresql+psycopg://postgres@127.0.0.1:1/unavailable",
