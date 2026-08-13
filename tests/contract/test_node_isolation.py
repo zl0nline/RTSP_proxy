@@ -428,7 +428,7 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
         first_media.put_path(
             MediaPathConfig(name=moved_name, source_url=moved_source, max_readers=-1)
         )
-        assert first_media.path_runtime_status(moved_name) is None
+        assert first_media.path_runtime_status(moved_name) == (False, 0)
         first_media.delete_path(moved_name)
         second_media.put_path(MediaPathConfig(name=moved_name, source_url=moved_source))
         assert first_media.get_path(moved_name) is None
