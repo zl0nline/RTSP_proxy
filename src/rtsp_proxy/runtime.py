@@ -5,9 +5,11 @@ import os
 import secrets
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import FastAPI
@@ -25,13 +27,26 @@ from rtsp_proxy.access import (
 from rtsp_proxy.app import create_app, create_media_auth_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
+from rtsp_proxy.health import RoleReadinessProvider
 from rtsp_proxy.identifiers import generate_public_id
-from rtsp_proxy.node_runtime import UnixMediaNodeClientFactory, UnixNodeRuntimeClient
+from rtsp_proxy.node_runtime import (
+    UnixMediaNodeClientFactory,
+    UnixNodeMetricSource,
+    UnixNodeRuntimeClient,
+)
 from rtsp_proxy.nodes import (
     CameraControl,
     NodeControl,
     NodeProvisioningPolicy,
+    NodeRuntimeAction,
     tcp_port_is_bindable,
+)
+from rtsp_proxy.observability import (
+    FleetCollector,
+    IncidentControl,
+    NotificationDispatcher,
+    PostgresObservabilityStore,
+    SmtpNotificationTransport,
 )
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
@@ -52,6 +67,17 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_AUTH_PORT": "auth_port",
     "RTSP_PROXY_AUTH_DATABASE_TIMEOUT_SECONDS": "auth_database_timeout_seconds",
     "RTSP_PROXY_ACCESS_PEPPER_FILE": "access_pepper_file",
+    "RTSP_PROXY_SMTP_HOST": "smtp_host",
+    "RTSP_PROXY_SMTP_PORT": "smtp_port",
+    "RTSP_PROXY_SMTP_USERNAME": "smtp_username",
+    "RTSP_PROXY_SMTP_PASSWORD_FILE": "smtp_password_file",
+    "RTSP_PROXY_SMTP_CA_FILE": "smtp_ca_file",
+    "RTSP_PROXY_SMTP_FROM_ADDRESS": "smtp_from_address",
+    "RTSP_PROXY_SMTP_TO_ADDRESS": "smtp_to_address",
+    "RTSP_PROXY_SMTP_STARTTLS": "smtp_starttls",
+    "RTSP_PROXY_SMTP_TIMEOUT_SECONDS": "smtp_timeout_seconds",
+    "RTSP_PROXY_NOTIFICATION_MAX_ATTEMPTS": "notification_max_attempts",
+    "RTSP_PROXY_NOTIFICATION_RETRY_SECONDS": "notification_retry_seconds",
     "RTSP_PROXY_MAX_NODES": "max_nodes",
     "RTSP_PROXY_NODE_PORT_RANGE_START": "node_port_range_start",
     "RTSP_PROXY_NODE_PORT_RANGE_END": "node_port_range_end",
@@ -66,6 +92,7 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_NODE_RUNTIME_SOCKET": "node_runtime_socket",
     "RTSP_PROXY_NODE_RUNTIME_TIMEOUT_SECONDS": "node_runtime_timeout_seconds",
     "RTSP_PROXY_RECONCILE_INTERVAL_SECONDS": "reconcile_interval_seconds",
+    "RTSP_PROXY_COLLECTOR_INTERVAL_SECONDS": "collector_interval_seconds",
     "RTSP_PROXY_CONFIRMATION_SECRET": "confirmation_secret",
     "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
     "RTSP_PROXY_NODE_MEDIAMTX_BINARY_SHA256": "node_mediamtx_binary_sha256",
@@ -73,6 +100,12 @@ ENV_TO_FIELD = {
 }
 
 LOGGER = logging.getLogger(__name__)
+
+_BACKGROUND_DATABASE_TIMEOUT_MS = 2_000
+_COLLECTOR_HELPER_TIMEOUT_SECONDS = 2.0
+_COLLECTOR_CYCLE_TIMEOUT_SECONDS = 8.0
+_COLLECTOR_JOIN_TIMEOUT_SECONDS = 20.0
+_NOTIFIER_JOIN_GRACE_SECONDS = 8.0
 
 
 class ConfigurationError(ValueError):
@@ -194,6 +227,20 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             ),
         )
     )
+    assert settings.database_url is not None
+    observability = (
+        PostgresObservabilityStore(
+            settings.database_url,
+            statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+        )
+        if store.schema_is_current()
+        else None
+    )
+
+    def close_runtime_stores() -> None:
+        if observability is not None:
+            observability.close()
+        store.close()
 
     return create_app(
         settings,
@@ -222,8 +269,10 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
                 new_grant_id=uuid4,
             )
         ),
+        fleet_snapshots=observability,
+        fleet_snapshot_max_age_seconds=settings.collector_interval_seconds * 3,
         startup=(None if node_runtime is None else recover_runtime_state),
-        shutdown=store.close,
+        shutdown=close_runtime_stores,
     )
 
 
@@ -239,7 +288,14 @@ def create_background_app(
         raise ConfigurationError("background_role_required")
     if settings.role is not expected_role:
         raise ConfigurationError("background_role_mismatch")
+    if expected_role is RuntimeRole.PROBE:
+        raise ConfigurationError("probe_role_not_implemented")
     store = _open_verified_store(settings)
+    if store is not None and expected_role in {
+        RuntimeRole.COLLECTOR,
+        RuntimeRole.WORKER,
+    }:
+        store.assert_schema_current()
     startup: Callable[[], None] | None = None
     shutdown: Callable[[], None] | None = None if store is None else store.close
     if (
@@ -297,11 +353,257 @@ def create_background_app(
 
         startup = start_reconciler
         shutdown = stop_reconciler
+    if (
+        store is not None
+        and expected_role is RuntimeRole.COLLECTOR
+        and settings.node_runtime_socket is not None
+    ):
+        collector_store = store
+        collector_database_timeout_ms = _BACKGROUND_DATABASE_TIMEOUT_MS
+        observability = PostgresObservabilityStore(
+            settings.database_url or "",
+            statement_timeout_ms=collector_database_timeout_ms,
+        )
+        node_runtime = UnixNodeRuntimeClient(
+            socket_path=settings.node_runtime_socket,
+            timeout_seconds=min(
+                _COLLECTOR_HELPER_TIMEOUT_SECONDS,
+                settings.node_runtime_timeout_seconds,
+            ),
+        )
+
+        class ReadOnlyRuntimeObserver:
+            def observe_node(self, node_id: UUID) -> Any:
+                node = collector_store.get_node(node_id)
+                if node is None:
+                    raise RuntimeError("node_not_found")
+                observation = node_runtime.execute(NodeRuntimeAction.OBSERVE, node)
+                return replace(
+                    node,
+                    runtime_state=observation.state,
+                    health=observation.health,
+                    applied_revision=observation.applied_revision,
+                    config_compatible=observation.config_compatible,
+                    management_fresh=observation.management_fresh,
+                    process_id=observation.process_id,
+                    process_start_ticks=observation.process_start_ticks,
+                    process_boot_id=observation.process_boot_id,
+                    observed_config_sha256=observation.config_sha256,
+                    observed_release_id=observation.release_id,
+                )
+        metrics = UnixNodeMetricSource(
+            media_nodes=UnixMediaNodeClientFactory(
+                socket_path=settings.node_runtime_socket,
+                timeout_seconds=min(
+                    _COLLECTOR_HELPER_TIMEOUT_SECONDS,
+                    settings.node_runtime_timeout_seconds,
+                ),
+            )
+        )
+        stop = threading.Event()
+        collector = FleetCollector(
+            nodes=store,
+            runtime=ReadOnlyRuntimeObserver(),
+            metrics=metrics,
+            observations=observability,
+            incidents=IncidentControl(store=observability),
+            max_nodes=settings.max_nodes,
+            external_port_capacity=len(
+                set(
+                    range(
+                        settings.node_port_range_start,
+                        settings.node_port_range_end + 1,
+                    )
+                ).difference(settings.node_port_reserved)
+            ),
+            cancelled=stop.is_set,
+            collection_interval_seconds=settings.collector_interval_seconds,
+            cycle_timeout_seconds=min(
+                settings.collector_interval_seconds,
+                _COLLECTOR_CYCLE_TIMEOUT_SECONDS,
+            ),
+        )
+        collector_thread: threading.Thread | None = None
+
+        def collector_loop() -> None:
+            while not stop.is_set():
+                try:
+                    collector.run_once()
+                except Exception:
+                    LOGGER.exception("fleet collector cycle failed")
+                stop.wait(settings.collector_interval_seconds)
+
+        def start_collector() -> None:
+            nonlocal collector_thread
+            collector_thread = threading.Thread(
+                target=collector_loop,
+                name="rtsp-proxy-collector",
+                daemon=False,
+            )
+            collector_thread.start()
+
+        def stop_collector() -> None:
+            stop.set()
+            try:
+                if collector_thread is not None:
+                    collector_thread.join(timeout=_COLLECTOR_JOIN_TIMEOUT_SECONDS)
+                    if collector_thread.is_alive():
+                        raise RuntimeError("collector_shutdown_timeout")
+            finally:
+                if collector_thread is None or not collector_thread.is_alive():
+                    try:
+                        collector.close()
+                    finally:
+                        try:
+                            observability.close()
+                        finally:
+                            store.close()
+
+        startup = start_collector
+        shutdown = stop_collector
+    if (
+        store is not None
+        and expected_role is RuntimeRole.WORKER
+        and settings.smtp_host is not None
+    ):
+        assert settings.database_url is not None
+        assert settings.smtp_username is not None
+        assert settings.smtp_password_file is not None
+        assert settings.smtp_from_address is not None
+        assert settings.smtp_to_address is not None
+        observability = PostgresObservabilityStore(
+            settings.database_url,
+            statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+        )
+        dispatcher = NotificationDispatcher(
+            store=observability,
+            transport=SmtpNotificationTransport(
+                host=settings.smtp_host,
+                port=settings.smtp_port,
+                username=settings.smtp_username,
+                password_file=settings.smtp_password_file,
+                ca_file=settings.smtp_ca_file,
+                from_address=settings.smtp_from_address,
+                to_address=settings.smtp_to_address,
+                starttls=settings.smtp_starttls,
+                timeout_seconds=settings.smtp_timeout_seconds,
+                trusted_password_owner_uid=os.geteuid(),
+            ),
+            max_attempts=settings.notification_max_attempts,
+            retry_delay=timedelta(seconds=settings.notification_retry_seconds),
+        )
+        stop = threading.Event()
+        notification_thread: threading.Thread | None = None
+
+        def notification_loop() -> None:
+            while not stop.is_set():
+                try:
+                    delivered = dispatcher.run_once()
+                except Exception:
+                    LOGGER.exception("notification delivery cycle failed")
+                    delivered = None
+                if delivered is None:
+                    stop.wait(1)
+
+        def start_notifications() -> None:
+            nonlocal notification_thread
+            notification_thread = threading.Thread(
+                target=notification_loop,
+                name="rtsp-proxy-notifications",
+                daemon=False,
+            )
+            notification_thread.start()
+
+        def stop_notifications() -> None:
+            stop.set()
+            try:
+                if notification_thread is not None:
+                    notification_thread.join(
+                        timeout=(
+                            settings.smtp_timeout_seconds
+                            + _NOTIFIER_JOIN_GRACE_SECONDS
+                        )
+                    )
+                    if notification_thread.is_alive():
+                        raise RuntimeError("notification_worker_shutdown_timeout")
+            finally:
+                if notification_thread is None or not notification_thread.is_alive():
+                    try:
+                        observability.close()
+                    finally:
+                        store.close()
+
+        startup = start_notifications
+        shutdown = stop_notifications
     return create_app(
         settings,
+        readiness=_background_readiness(
+            settings,
+            expected_role=expected_role,
+            store=store,
+        ),
         startup=startup,
         shutdown=shutdown,
     )
+
+
+def _background_readiness(
+    settings: Settings,
+    *,
+    expected_role: RuntimeRole,
+    store: PostgresNodeStore | None,
+) -> RoleReadinessProvider:
+    if store is None:
+        return RoleReadinessProvider({})
+
+    def database_ready() -> None:
+        store.assert_schema_compatible()
+
+    def media_helper_ready() -> None:
+        path = settings.node_runtime_socket
+        if path is None:
+            raise RuntimeError("node_runtime_socket_required")
+        UnixNodeRuntimeClient(
+            socket_path=path,
+            timeout_seconds=min(1, settings.node_runtime_timeout_seconds),
+        ).health()
+
+    checks: dict[str, Callable[[], None]] = {
+        "database": database_ready,
+        "schema": store.assert_schema_compatible,
+    }
+    if expected_role is RuntimeRole.WORKER:
+        assert settings.database_url is not None
+
+        def outbox_ready() -> None:
+            observability = PostgresObservabilityStore(
+                settings.database_url or "",
+                statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+            )
+            try:
+                observability.assert_notification_ready()
+            finally:
+                observability.close()
+
+        checks["outbox"] = outbox_ready
+    elif expected_role is RuntimeRole.RECONCILER:
+        checks["media_adapter"] = media_helper_ready
+    elif expected_role is RuntimeRole.COLLECTOR:
+        checks["media_metrics"] = media_helper_ready
+        assert settings.database_url is not None
+
+        def collector_store_ready() -> None:
+            observability = PostgresObservabilityStore(
+                settings.database_url or "",
+                statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+            )
+            try:
+                observability.assert_collector_ready()
+            finally:
+                observability.close()
+
+        checks["collector_store"] = collector_store_ready
+    return RoleReadinessProvider(checks)
 
 
 def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
@@ -314,7 +616,11 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
         statement_timeout_ms=(
             round(settings.auth_database_timeout_seconds * 1000)
             if settings.role is RuntimeRole.AUTH
-            else None
+            else (
+                _BACKGROUND_DATABASE_TIMEOUT_MS
+                if settings.role in {RuntimeRole.COLLECTOR, RuntimeRole.WORKER}
+                else None
+            )
         ),
     )
     try:

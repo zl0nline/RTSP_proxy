@@ -1588,6 +1588,53 @@ def test_root_helper_rejects_a_port_outside_its_allowlist_before_process_mutatio
     assert process.commands == []
 
 
+def test_read_only_helper_health_handshake_executes_no_node_operation(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    temporary = tempfile.TemporaryDirectory(prefix="rtsp-health-", dir="/tmp")
+    root = Path(temporary.name)
+    socket_path = root / "health.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    process = RecordingProcessController()
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=process,
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda _port: True,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12099,
+            api_port_start=13000,
+            api_port_end=13099,
+            metrics_port_start=14000,
+            metrics_port_end=14099,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+        read_only=True,
+    )
+
+    def answer() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            server.serve_connection(connection)
+
+    thread = Thread(target=answer)
+    thread.start()
+    UnixNodeRuntimeClient(socket_path=socket_path, timeout_seconds=1).health()
+    thread.join(timeout=1)
+    listener.close()
+    temporary.cleanup()
+
+    assert not thread.is_alive()
+    assert process.commands == []
+
+
 def test_root_helper_executes_a_valid_request_and_returns_bound_observation(
     tmp_path: Path,
 ) -> None:
@@ -1638,6 +1685,55 @@ def test_root_helper_executes_a_valid_request_and_returns_bound_observation(
     assert response["error"] is None
     assert response["observation"]["state"] == "running"
     assert response["observation"]["process_id"] == 1234
+
+
+def test_read_only_helper_rejects_process_mutation_before_execution(tmp_path: Path) -> None:
+    root = tmp_path / "nodes-read-only"
+    root.mkdir(mode=0o700)
+    process = RecordingProcessController()
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=process,
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda _port: False,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12099,
+            api_port_start=13000,
+            api_port_end=13099,
+            metrics_port_start=14000,
+            metrics_port_end=14099,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+        read_only=True,
+    )
+    client_socket, server_socket = socket.socketpair()
+    request = {
+        "schema_version": 1,
+        "action": "start",
+        "spec": {
+            "node_id": str(runtime_spec().node_id),
+            "external_port": runtime_spec().external_port,
+            "api_port": runtime_spec().api_port,
+            "metrics_port": runtime_spec().metrics_port,
+            "desired_revision": runtime_spec().desired_revision,
+            "release_id": runtime_spec().release_id,
+            "mediamtx_binary_sha256": runtime_spec().mediamtx_binary_sha256,
+        },
+        "config": None,
+    }
+    client_socket.sendall((json.dumps(request) + "\n").encode())
+
+    server.serve_connection(server_socket)
+
+    response = json.loads(client_socket.makefile("rb").readline())
+    client_socket.close()
+    server_socket.close()
+    assert response["error"] == "node_helper_read_only"
+    assert process.commands == []
 
 
 def test_root_helper_ignores_a_disconnected_response_peer(tmp_path: Path) -> None:

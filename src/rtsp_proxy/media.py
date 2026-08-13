@@ -54,6 +54,7 @@ class MediaMtxClient:
         self,
         *,
         api_url: str,
+        metrics_url: str | None = None,
         timeout_seconds: float,
         username: str | None = None,
         password: str | None = None,
@@ -61,6 +62,7 @@ class MediaMtxClient:
         if (username is None) != (password is None):
             raise ValueError("mediamtx_management_credentials_incomplete")
         self._api_url = api_url.rstrip("/")
+        self._metrics_url = None if metrics_url is None else metrics_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._authorization = (
             None
@@ -246,6 +248,29 @@ class MediaMtxClient:
             f"/v3/config/paths/delete/{path_segment}",
             not_found_is_none=True,
         )
+
+    def path_metrics(self, *, maximum_bytes: int = 1_048_576) -> bytes:
+        if self._metrics_url is None:
+            raise MediaNodeProtocolError("mediamtx_metrics_url_missing")
+        request = urllib.request.Request(
+            f"{self._metrics_url}/metrics?type=paths",
+            headers=(
+                {}
+                if self._authorization is None
+                else {"Authorization": self._authorization}
+            ),
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                content = bytes(response.read(maximum_bytes + 1))
+        except urllib.error.HTTPError as error:
+            raise MediaNodeRejected(f"mediamtx_metrics_http_{error.code}") from None
+        except (OSError, urllib.error.URLError) as error:
+            raise MediaNodeUnavailable("mediamtx_metrics_unavailable") from error
+        if len(content) > maximum_bytes:
+            raise MediaNodeProtocolError("mediamtx_metrics_too_large")
+        return content
 
     def _request(
         self,

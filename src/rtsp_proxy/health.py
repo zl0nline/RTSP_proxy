@@ -1,3 +1,4 @@
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -21,7 +22,7 @@ ROLE_DEPENDENCIES: dict[RuntimeRole, tuple[str, ...]] = {
     RuntimeRole.WORKER: ("database", "schema", "outbox"),
     RuntimeRole.RECONCILER: ("database", "schema", "media_adapter"),
     RuntimeRole.PROBE: ("database", "schema", "probe_runtime"),
-    RuntimeRole.COLLECTOR: ("database", "schema", "media_metrics"),
+    RuntimeRole.COLLECTOR: ("database", "schema", "media_metrics", "collector_store"),
 }
 
 
@@ -35,6 +36,32 @@ class MissingReadinessProvider:
             )
             for dependency in ROLE_DEPENDENCIES[role]
         )
+
+
+class RoleReadinessProvider:
+    """Run bounded role dependency probes without exposing exception details."""
+
+    def __init__(self, checks: Mapping[str, Callable[[], None]]) -> None:
+        self._checks = dict(checks)
+
+    async def check(self, role: RuntimeRole) -> tuple[DependencyResult, ...]:
+        results: list[DependencyResult] = []
+        for name in ROLE_DEPENDENCIES[role]:
+            check = self._checks.get(name)
+            if check is None:
+                results.append(
+                    DependencyResult(name=name, ready=False, reason="readiness_check_missing")
+                )
+                continue
+            try:
+                check()
+            except Exception:
+                results.append(
+                    DependencyResult(name=name, ready=False, reason=f"{name}_unavailable")
+                )
+            else:
+                results.append(DependencyResult(name=name, ready=True))
+        return tuple(results)
 
 
 def normalize_readiness_results(

@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     node_runtime_socket: Path | None = None
     node_runtime_timeout_seconds: float = Field(default=60, gt=1, le=60)
     reconcile_interval_seconds: float = Field(default=1, ge=0.1, le=60)
+    collector_interval_seconds: float = Field(default=5, ge=1, le=60)
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     node_release_id: str = Field(
         default="0.2.0",
@@ -88,6 +89,17 @@ class Settings(BaseSettings):
     auth_port: int = Field(default=8010, ge=1, le=65535)
     auth_database_timeout_seconds: float = Field(default=1, ge=0.1, le=5)
     access_pepper_file: Path | None = None
+    smtp_host: str | None = Field(default=None, min_length=1, max_length=253)
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str | None = Field(default=None, min_length=1, max_length=253)
+    smtp_password_file: Path | None = None
+    smtp_ca_file: Path | None = None
+    smtp_from_address: str | None = Field(default=None, min_length=3, max_length=320)
+    smtp_to_address: str | None = Field(default=None, min_length=3, max_length=320)
+    smtp_starttls: bool = True
+    smtp_timeout_seconds: float = Field(default=10, gt=0, le=30)
+    notification_max_attempts: int = Field(default=3, ge=1, le=10)
+    notification_retry_seconds: int = Field(default=60, ge=1, le=3600)
 
     @field_validator("node_port_reserved", mode="before")
     @classmethod
@@ -135,6 +147,40 @@ class Settings(BaseSettings):
                 raise ValueError("access_pepper_file_required")
             if self.database_url is None:
                 raise ValueError("database_url_required")
+        if self.role in {
+            RuntimeRole.WORKER,
+            RuntimeRole.RECONCILER,
+            RuntimeRole.PROBE,
+            RuntimeRole.COLLECTOR,
+        } and self.database_url is None:
+            raise ValueError("database_url_required")
+        if self.role in {
+            RuntimeRole.RECONCILER,
+            RuntimeRole.PROBE,
+            RuntimeRole.COLLECTOR,
+        } and self.node_runtime_socket is None:
+            raise ValueError("node_runtime_socket_required")
+        smtp_values = (
+            self.smtp_host,
+            self.smtp_username,
+            self.smtp_password_file,
+            self.smtp_from_address,
+            self.smtp_to_address,
+        )
+        if self.smtp_ca_file is not None and self.smtp_host is None:
+            raise ValueError("smtp_configuration_incomplete")
+        if any(value is not None for value in smtp_values):
+            if any(value is None for value in smtp_values):
+                raise ValueError("smtp_configuration_incomplete")
+            assert self.smtp_password_file is not None
+            if not self.smtp_password_file.is_absolute():
+                raise ValueError("smtp_password_file_must_be_absolute")
+            if not self.smtp_starttls:
+                raise ValueError("smtp_starttls_required")
+            if self.smtp_ca_file is not None and not self.smtp_ca_file.is_absolute():
+                raise ValueError("smtp_ca_file_must_be_absolute")
+        elif self.role is RuntimeRole.WORKER:
+            raise ValueError("smtp_configuration_required")
         if set(self.node_port_reserved) & (api | metrics):
             raise ValueError("node_management_port_reserved")
         available = external.difference(self.node_port_reserved)

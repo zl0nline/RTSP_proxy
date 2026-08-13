@@ -74,6 +74,8 @@ from rtsp_proxy.reconcile import (
 from rtsp_proxy.release import trusted_mediamtx_identity
 from rtsp_proxy.runtime import create_app_from_environment, create_background_app, run_web
 
+TRUSTED_MEDIAMTX_SHA256 = trusted_mediamtx_identity(platform.machine())[1].root
+
 
 def test_node_commands_fail_closed_when_the_control_store_is_not_configured() -> None:
     response = TestClient(create_app(Settings(role=RuntimeRole.WEB))).post(
@@ -1134,7 +1136,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_access_policies', 'camera_access_grants')"
             )
         )
-    assert revision == "0010_camera_access"
+    assert revision == "0011_observability"
     assert table_count == 6
 
 
@@ -1648,26 +1650,23 @@ def test_control_plane_refuses_to_start_on_an_older_database_revision(
         create_app_from_environment()
 
 
-def test_phase_e_bridge_accepts_future_additive_observability_schema(
+def test_new_control_plane_is_a_compatibility_bridge_for_previous_schema(
     postgres_database_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    upgrade_database(postgres_database_url)
-    engine = create_engine(postgres_database_url)
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "UPDATE alembic_version SET version_num = '0011_observability' "
-                "WHERE version_num = '0010_camera_access'"
-            )
-        )
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0010_camera_access")
     monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
     monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
 
     app = create_app_from_environment()
-
     with TestClient(app) as client:
         assert client.get("/health/live").status_code == 200
+        response = client.get("/api/v1/dashboard/snapshot")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "fleet_snapshot_unavailable"
 
 
 def test_schema_check_sanitizes_database_connection_failures() -> None:
@@ -1709,6 +1708,8 @@ def test_background_role_refuses_an_incompatible_database_revision(
             Settings(
                 role=RuntimeRole.RECONCILER,
                 database_url=postgres_database_url,
+                node_runtime_socket=Path("/run/missing.sock"),
+                node_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
             ),
             expected_role=RuntimeRole.RECONCILER,
         )

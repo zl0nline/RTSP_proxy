@@ -34,7 +34,9 @@ arbitrary path, unit name or command.
 ## Services
 
 - `rtsp-proxy-web.service` — management HTTPS/control application boundary.
-- `rtsp-proxy@worker|reconciler|probe|collector.service` — background roles.
+- `rtsp-proxy@reconciler|probe.service` — mutable background roles.
+- `rtsp-proxy-collector.service` — dedicated read-only fleet collector.
+- `rtsp-proxy-notifier.service` — dedicated SMTP incident dispatcher.
 - `rtsp-proxy-media@<node-id>.service` — one MediaMTX process per media node.
 
 Each media instance has:
@@ -50,6 +52,12 @@ Each media instance has:
 original single `mediamtx.service` and `mediamtx.yml.example` remain only as
 Phase 0 compatibility-lab artifacts; they are not a multi-node installer.
 
+Install `collector.env.example` as `/etc/rtsp-proxy/collector.env` and
+`notifier.env.example` as `/etc/rtsp-proxy/notifier.env`, replacing the database,
+artifact digest and SMTP endpoint values. The notifier password is deliberately
+absent from the env file; install it separately as the root-owned credential
+source consumed by `LoadCredential`.
+
 The web process never executes `systemctl`. It sends one strict JSON line to
 `/run/rtsp-proxy-node-runtime/control.sock`. The root helper validates the UUID,
 allowed external/API/metrics ranges, pinned release and binary SHA-256; it can
@@ -57,6 +65,41 @@ address only `rtsp-proxy-media@<uuid>.service`. Configure its identical policy
 in `/etc/rtsp-proxy/node-runtime.env` from `node-runtime.env.example`, then
 enable the socket and helper. API and metrics always bind loopback; the external
 ordinary `rtsp://` listener is TCP-only.
+
+The collector does not share that control socket. It runs as the dedicated
+`rtsp-proxy-collector` user and can reach only
+`/run/rtsp-proxy-node-metrics/metrics.sock`; its separate root helper is
+configured `READ_ONLY=true` and accepts only node `observe` plus MediaMTX
+`metrics`. Provision/start/stop/reconfigure and path CRUD fail closed on this
+socket even if the collector process is compromised.
+
+Create the two least-privilege PostgreSQL roles before enabling those units:
+
+```sh
+sudo -u postgres psql --dbname rtsp_proxy --set DBNAME=rtsp_proxy \
+  --file deploy/postgresql/rtsp_proxy_collector.sql
+sudo -u postgres psql --dbname rtsp_proxy --set DBNAME=rtsp_proxy \
+  --file deploy/postgresql/rtsp_proxy_notifier.sql
+```
+
+The collector can read only the non-secret node inventory and maintain fleet
+snapshots/incidents. The notifier can only claim and complete existing
+notification rows. Neither role can read camera source URLs/access grants nor
+mutate node or camera desired state. Configure their local passwords, peer or
+certificate authentication outside source control.
+
+SMTP delivery also has a dedicated `rtsp-proxy-notifier` identity. systemd
+copies the root-owned `/etc/rtsp-proxy/control-plane/smtp-password` into the
+service credential directory as a single-link owner-only file; the source
+secret is never exposed through an environment variable or to web/reconciler.
+STARTTLS with hostname and CA verification is mandatory, and one absolute
+deadline covers connect, EHLO, TLS, login and send.
+The collector uses two-second helper/database calls and an eight-second maximum
+collection cycle; its interruptible interval wait and 20-second join remain
+inside `TimeoutStopSec=30s`. Notifier database operations are capped at two
+seconds. With the supported 30-second SMTP deadline and eight-second join grace,
+shutdown remains inside `TimeoutStopSec=45s`; a locked PostgreSQL statement
+cannot leave either worker unbounded.
 
 The helper, not the web process, creates separate random Basic credentials for
 loopback management and the path-scoped `__rtsp_proxy_runtime_probe` reader,
@@ -153,10 +196,15 @@ RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_pro
 ```
 
 The runner upgrades to the packaged `head` and uses the same direct native
-PostgreSQL contract on amd64 and arm64. The release manifest and application
-are bound to that exact head; startup reads live `alembic_version` and fails
-closed on an older or newer revision. Backup/restore and rollback gates still
-apply; an older binary must never start against an unsupported newer schema.
+PostgreSQL contract on amd64 and arm64. Release `0.3.0` declares the additive
+rolling window `0010_camera_access..0011_observability`: first deploy the new
+web/reconciler while PostgreSQL remains on 0010, then apply 0011 and enable the
+collector/notifier. Dashboard snapshot is a typed 503 during the bridge, while
+collector/notifier refuse startup until 0011 exists. Retire the previous app
+only after both revisions have been exercised; a later contract release may
+remove 0010 support only after old processes are proved absent. Any schema
+outside the declared window fails closed; an older binary must never start
+against an unsupported newer schema.
 
 `0005_node_runtime` intentionally rejects an upgrade when legacy Phase-B
 `media_nodes` rows exist. Those rows lack trustworthy per-node management

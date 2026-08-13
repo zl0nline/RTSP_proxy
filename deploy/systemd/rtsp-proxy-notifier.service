@@ -1,0 +1,46 @@
+[Unit]
+Description=RTSP Proxy durable incident notification dispatcher
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=rtsp-proxy-notifier
+Group=rtsp-proxy-notifier
+Environment="RTSP_PROXY_ROLE=worker" "RTSP_PROXY_SMTP_PASSWORD_FILE=%d/smtp-password"
+EnvironmentFile=/etc/rtsp-proxy/notifier.env
+LoadCredential=smtp-password:/etc/rtsp-proxy/control-plane/smtp-password
+WorkingDirectory=/opt/rtsp-proxy/current
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=worker
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=45s
+UMask=0077
+
+RuntimeDirectory=rtsp-proxy-notifier
+RuntimeDirectoryMode=0700
+ReadWritePaths=/run/rtsp-proxy-notifier
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

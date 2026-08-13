@@ -1,0 +1,46 @@
+[Unit]
+Description=RTSP Proxy fleet metrics and incident collector
+Wants=network-online.target
+Requires=rtsp-proxy-node-metrics.socket
+After=network-online.target postgresql.service rtsp-proxy-node-metrics.socket
+
+[Service]
+Type=simple
+User=rtsp-proxy-collector
+Group=rtsp-proxy-collector
+Environment=RTSP_PROXY_ROLE=collector
+EnvironmentFile=/etc/rtsp-proxy/collector.env
+WorkingDirectory=/opt/rtsp-proxy/current
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=collector
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0077
+
+RuntimeDirectory=rtsp-proxy-collector
+RuntimeDirectoryMode=0750
+ReadWritePaths=/run/rtsp-proxy-collector
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

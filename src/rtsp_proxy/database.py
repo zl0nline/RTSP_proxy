@@ -481,8 +481,26 @@ class PostgresNodeStore:
                 )
         except SQLAlchemyError:
             raise DatabaseSchemaMismatch("database_schema_mismatch") from None
-        if revisions not in ((APPLICATION_SCHEMA,), ("0011_observability",)):
+        if revisions not in (("0010_camera_access",), (APPLICATION_SCHEMA,)):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
+
+    def assert_schema_current(self) -> None:
+        try:
+            with self._engine.connect() as connection:
+                revisions = tuple(
+                    connection.scalars(text("SELECT version_num FROM alembic_version"))
+                )
+        except SQLAlchemyError:
+            raise DatabaseSchemaMismatch("database_schema_mismatch") from None
+        if revisions != (APPLICATION_SCHEMA,):
+            raise DatabaseSchemaMismatch("database_schema_mismatch")
+
+    def schema_is_current(self) -> bool:
+        try:
+            self.assert_schema_current()
+        except DatabaseSchemaMismatch:
+            return False
+        return True
 
     @contextmanager
     def provisioning_guard(self) -> Iterator[None]:

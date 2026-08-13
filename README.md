@@ -13,8 +13,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   production hardware capacity/24h soak ещё не выполнены.
 > - Node registry/placement, isolated per-node Linux runtime, Phase-D
 >   administration and Phase-E access/security: **complete on native
->   amd64/arm64 CI**. Dashboard/notifications and production capacity evidence
->   remain pending.
+>   amd64/arm64 CI**.
+> - Phase-F observability foundation: **implemented locally, review/CI
+>   pending** — bounded fleet collector, persisted dashboard snapshot API and
+>   durable failure/recovery email dispatcher. Operator UI, RBAC/session/CSRF
+>   and browser workflows remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -281,9 +284,11 @@ policy, preflights every restored listener before writing desired state and
 preserves stable RUNNING/STOPPED/DRAINING/MAINTENANCE/FAILED intent. Transitional
 node states cannot be exported. It is not exposed over HTTP.
 
-Ещё не реализованы dashboard, notifications и complete operator workflows.
-Наличие load harness и зелёного Phase-E CI не означает готовый product или
-published capacity.
+Ещё не реализованы operator dashboard UI, RBAC/session/CSRF и complete browser
+workflows. Fleet snapshot API и durable notifications уже входят в Phase-F
+foundation, но до независимого review и native CI не считаются завершённой
+фазой. Наличие load harness и зелёного Phase-E CI не означает готовый product
+или published capacity.
 
 ## Локальная разработка
 

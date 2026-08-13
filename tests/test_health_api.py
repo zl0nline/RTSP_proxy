@@ -3,6 +3,7 @@ import os
 import platform
 import stat
 from pathlib import Path
+from time import sleep
 from types import SimpleNamespace
 
 import pytest
@@ -116,22 +117,17 @@ def test_ready_fails_closed_until_the_role_dependencies_are_wired() -> None:
         (RuntimeRole.WORKER, {"database", "schema", "outbox"}),
         (RuntimeRole.RECONCILER, {"database", "schema", "media_adapter"}),
         (RuntimeRole.PROBE, {"database", "schema", "probe_runtime"}),
-        (RuntimeRole.COLLECTOR, {"database", "schema", "media_metrics"}),
+        (
+            RuntimeRole.COLLECTOR,
+            {"database", "schema", "media_metrics", "collector_store"},
+        ),
     ],
 )
 def test_unwired_readiness_names_the_dependencies_required_by_each_role(
     role: RuntimeRole,
     required_checks: set[str],
 ) -> None:
-    settings = (
-        Settings(
-            role=role,
-            database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
-            access_pepper_file=Path("/run/credentials/access-peppers.json"),
-        )
-        if role is RuntimeRole.AUTH
-        else Settings(role=role)
-    )
+    settings = Settings.model_construct(role=role)
     response = TestClient(create_app(settings)).get("/health/ready")
 
     assert response.status_code == 503
@@ -287,6 +283,40 @@ def test_reserved_host_ports_cannot_remain_in_a_management_range() -> None:
         )
 
 
+def test_smtp_configuration_requires_complete_verified_starttls_paths(tmp_path: Path) -> None:
+    password = tmp_path / "smtp-password"
+    configured = {
+        "role": RuntimeRole.WORKER,
+        "database_url": "postgresql+psycopg://db.invalid/rtsp_proxy",
+        "smtp_host": "smtp.example.test",
+        "smtp_username": "mailer",
+        "smtp_password_file": password,
+        "smtp_from_address": "proxy@example.test",
+        "smtp_to_address": "operator@example.test",
+    }
+    with pytest.raises(ValidationError, match="smtp_configuration_incomplete"):
+        Settings(
+            role=RuntimeRole.WORKER,
+            database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+            smtp_ca_file=tmp_path / "ca.pem",
+        )
+    with pytest.raises(ValidationError, match="smtp_configuration_incomplete"):
+        Settings(
+            role=RuntimeRole.WORKER,
+            database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+            smtp_host="smtp.example.test",
+        )
+    with pytest.raises(ValidationError, match="smtp_starttls_required"):
+        Settings(**configured, smtp_starttls=False)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="smtp_password_file_must_be_absolute"):
+        Settings(**(configured | {"smtp_password_file": Path("relative")}))  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="smtp_ca_file_must_be_absolute"):
+        Settings(**configured, smtp_ca_file=Path("relative"))  # type: ignore[arg-type]
+
+    settings = Settings(**configured, smtp_ca_file=tmp_path / "ca.pem")  # type: ignore[arg-type]
+    assert settings.smtp_starttls
+
+
 def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity() -> None:
     with pytest.raises(ValidationError, match="node_release_identity_required"):
         Settings(
@@ -296,6 +326,7 @@ def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity()
     with pytest.raises(ValidationError, match="node_release_identity_untrusted"):
         Settings(
             role=RuntimeRole.RECONCILER,
+            database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
             node_runtime_socket=Path("/run/rtsp-proxy-node-runtime/control.sock"),
             node_mediamtx_binary_sha256="a" * 64,
         )
@@ -311,6 +342,7 @@ def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity()
 
     reconciler = Settings(
         role=RuntimeRole.RECONCILER,
+        database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
         node_runtime_socket=Path("/run/rtsp-proxy-node-runtime/control.sock"),
         node_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
     )
@@ -460,11 +492,8 @@ def _owned_by_root(value: os.stat_result, *, gid: int) -> object:
 
 
 def test_background_entrypoint_accepts_only_non_web_roles() -> None:
-    app = create_background_app(
-        Settings(role=RuntimeRole.WORKER),
-        expected_role=RuntimeRole.WORKER,
-    )
-    assert TestClient(app).get("/health/live").json()["role"] == "worker"
+    with pytest.raises(ValidationError, match="database_url_required"):
+        Settings(role=RuntimeRole.WORKER)
 
     with pytest.raises(ValueError, match="background_role_required"):
         create_background_app(
@@ -476,9 +505,39 @@ def test_background_entrypoint_accepts_only_non_web_roles() -> None:
 def test_background_entrypoint_fails_closed_when_config_changes_instance_role() -> None:
     with pytest.raises(ValueError, match="background_role_mismatch"):
         create_background_app(
-            Settings(role=RuntimeRole.PROBE),
+            Settings(
+                role=RuntimeRole.RECONCILER,
+                database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+                node_runtime_socket=Path("/run/missing.sock"),
+                node_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
+            ),
             expected_role=RuntimeRole.WORKER,
         )
+
+
+@pytest.mark.parametrize(
+    ("role", "values", "reason"),
+    [
+        (RuntimeRole.COLLECTOR, {}, "database_url_required"),
+        (
+            RuntimeRole.COLLECTOR,
+            {"database_url": "postgresql+psycopg://db/rtsp_proxy"},
+            "node_runtime_socket_required",
+        ),
+        (
+            RuntimeRole.WORKER,
+            {"database_url": "postgresql+psycopg://db/rtsp_proxy"},
+            "smtp_configuration_required",
+        ),
+    ],
+)
+def test_background_roles_fail_fast_when_required_dependencies_are_missing(
+    role: RuntimeRole,
+    values: dict[str, object],
+    reason: str,
+) -> None:
+    with pytest.raises(ValidationError, match=reason):
+        Settings.model_validate({"role": role, **values})
 
 
 def test_reconciler_background_role_starts_and_stops_its_bounded_loop(
@@ -502,3 +561,85 @@ def test_reconciler_background_role_starts_and_stops_its_bounded_loop(
 
     with TestClient(app) as client:
         assert client.get("/health/live").status_code == 200
+
+
+def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
+    postgres_database_url: str,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+    from rtsp_proxy.observability import PostgresObservabilityStore
+
+    upgrade_database(postgres_database_url)
+    app = create_background_app(
+        Settings(
+            role=RuntimeRole.COLLECTOR,
+            database_url=postgres_database_url,
+            node_runtime_socket=Path("/run/rtsp-proxy-node-metrics/metrics.sock"),
+            node_runtime_timeout_seconds=2,
+            node_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
+            collector_interval_seconds=1,
+        ),
+        expected_role=RuntimeRole.COLLECTOR,
+    )
+
+    observations = PostgresObservabilityStore(postgres_database_url)
+    try:
+        with TestClient(app) as client:
+            assert client.get("/health/live").json()["role"] == "collector"
+            snapshot = None
+            for _ in range(20):
+                snapshot = observations.current_snapshot()
+                if snapshot is not None:
+                    break
+                sleep(0.05)
+    finally:
+        observations.close()
+    assert snapshot is not None
+    assert snapshot.configured_nodes == 0
+
+
+def test_observability_roles_require_current_schema_after_bridge_deployment(
+    postgres_database_url: str,
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0010_camera_access")
+
+    with pytest.raises(RuntimeError, match="database_schema_mismatch"):
+        create_background_app(
+            Settings(
+                role=RuntimeRole.COLLECTOR,
+                database_url=postgres_database_url,
+                node_runtime_socket=Path("/run/missing.sock"),
+                node_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
+            ),
+            expected_role=RuntimeRole.COLLECTOR,
+        )
+
+
+def test_notification_background_role_starts_without_plaintext_secret_env(
+    postgres_database_url: str,
+    tmp_path: Path,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    app = create_background_app(
+        Settings(
+            role=RuntimeRole.WORKER,
+            database_url=postgres_database_url,
+            smtp_host="smtp.example.test",
+            smtp_username="mailer",
+            smtp_password_file=tmp_path / "systemd-credential-smtp-password",
+            smtp_from_address="proxy@example.test",
+            smtp_to_address="operator@example.test",
+            smtp_timeout_seconds=1,
+        ),
+        expected_role=RuntimeRole.WORKER,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/health/live").json()["role"] == "worker"

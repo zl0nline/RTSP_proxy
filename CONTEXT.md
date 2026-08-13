@@ -139,6 +139,9 @@ Administrative node state вне automatic placement/admission. Maintenance мо
 
 Один непрерывный outage media node. Incident создаёт одно failure email и после
 recovery одно confirmation email; repeated reminder отсутствует.
+SMTP submission использует durable claim token и at-most-once retry semantics:
+crash в неопределённом окне после relay acceptance становится terminal
+`ambiguous`, а не приводит к повторной отправке.
 
 ## Reconciler
 

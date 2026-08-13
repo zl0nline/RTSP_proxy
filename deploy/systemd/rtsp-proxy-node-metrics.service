@@ -1,0 +1,38 @@
+[Unit]
+Description=RTSP Proxy read-only media-node observation helper
+Requires=rtsp-proxy-node-metrics.socket rtsp-proxy-nftables.service
+After=rtsp-proxy-node-metrics.socket rtsp-proxy-nftables.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/rtsp-proxy/node-runtime.env
+Environment=RTSP_PROXY_NODE_HELPER_READ_ONLY=true
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-node-helper
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/rtsp-proxy/nodes /etc/rtsp-proxy/control-plane/access-peppers.json
+
+[Install]
+WantedBy=multi-user.target

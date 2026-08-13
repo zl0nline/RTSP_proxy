@@ -67,6 +67,52 @@ def test_background_roles_use_a_separate_systemd_template() -> None:
     assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env")
 
 
+def test_collector_has_a_dedicated_read_only_helper_boundary() -> None:
+    collector = read_unit("rtsp-proxy-collector.service")
+    metrics_helper = read_unit("rtsp-proxy-node-metrics.service")
+    metrics_socket = read_unit("rtsp-proxy-node-metrics.socket")["Socket"]
+    users = Path("deploy/sysusers.d/rtsp-proxy.conf").read_text(encoding="utf-8")
+
+    assert collector["Service"]["User"] == "rtsp-proxy-collector"
+    assert collector["Service"]["TimeoutStopSec"] == "30s"
+    assert collector["Service"]["Environment"] == "RTSP_PROXY_ROLE=collector"
+    assert metrics_socket["ListenStream"] == "/run/rtsp-proxy-node-metrics/metrics.sock"
+    assert metrics_socket["SocketGroup"] == "rtsp-proxy-collector"
+    assert metrics_socket["SocketMode"] == "0660"
+    assert metrics_helper["Service"]["Environment"] == (
+        "RTSP_PROXY_NODE_HELPER_READ_ONLY=true"
+    )
+    assert metrics_helper["Service"]["ReadOnlyPaths"] == (
+        "/etc/rtsp-proxy/nodes /etc/rtsp-proxy/control-plane/access-peppers.json"
+    )
+    assert "u rtsp-proxy-collector " in users
+
+
+def test_notifier_uses_a_dedicated_identity_and_systemd_credential() -> None:
+    notifier = read_unit("rtsp-proxy-notifier.service")["Service"]
+    users = Path("deploy/sysusers.d/rtsp-proxy.conf").read_text(encoding="utf-8")
+
+    assert notifier["User"] == "rtsp-proxy-notifier"
+    assert notifier["Environment"] == (
+        '"RTSP_PROXY_ROLE=worker" "RTSP_PROXY_SMTP_PASSWORD_FILE=%d/smtp-password"'
+    )
+    assert notifier["LoadCredential"] == (
+        "smtp-password:/etc/rtsp-proxy/control-plane/smtp-password"
+    )
+    assert notifier["EnvironmentFile"] == "/etc/rtsp-proxy/notifier.env"
+    assert notifier["TimeoutStopSec"] == "45s"
+    assert notifier["CapabilityBoundingSet"] == ""
+    assert "u rtsp-proxy-notifier " in users
+    notifier_environment = Path("deploy/notifier.env.example").read_text(encoding="utf-8")
+    assert "SMTP_PASSWORD" not in notifier_environment
+    collector_environment = Path("deploy/collector.env.example").read_text(encoding="utf-8")
+    assert "postgresql+psycopg://rtsp_proxy_collector@" in collector_environment
+    assert "postgresql+psycopg://rtsp_proxy_notifier@" in notifier_environment
+    assert "NODE_RUNTIME_SOCKET=/run/rtsp-proxy-node-metrics/metrics.sock" in (
+        collector_environment
+    )
+
+
 def test_media_auth_callback_is_a_dedicated_unprivileged_loopback_service() -> None:
     service = read_unit("rtsp-proxy-auth.service")["Service"]
     environment = Path("deploy/rtsp-proxy-auth.env.example").read_text(encoding="utf-8")

@@ -36,6 +36,7 @@ from rtsp_proxy.node_runtime import (
     UnixNodeSupervisorServer,
 )
 from rtsp_proxy.nodes import MediaNode, NodeHealth, NodeRuntimeAction, NodeState
+from rtsp_proxy.observability import NodeMetricObservation, NodeMetricSample, PathMetricCounters
 
 NODE_ID = UUID("00000000-0000-0000-0000-000000000001")
 PUBLIC_ID = PublicId.parse("a" * 26)
@@ -155,6 +156,60 @@ def test_node_aware_media_client_fails_before_io_for_an_unready_node(
             socket_path=tmp_path / "missing.sock",
             timeout_seconds=1,
         ).for_node(node)
+
+
+def test_node_metrics_round_trip_binds_generation_and_path_counters() -> None:
+    socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
+    server = unix_answer(
+        socket_path,
+        {
+            "schema_version": 1,
+            "ok": True,
+            "path": None,
+            "inventory": None,
+            "runtime": None,
+            "metrics": {
+                "active_sources": 1,
+                "occupied_streams": 1,
+                "received_bytes_total": 100,
+                "sent_bytes_total": 200,
+                "path_counters": [
+                    {
+                        "public_id": str(PUBLIC_ID),
+                        "received_bytes_total": 100,
+                        "sent_bytes_total": 200,
+                    }
+                ],
+                "process_id": 123,
+                "process_start_ticks": 456,
+                "process_boot_id": str(ready_node().process_boot_id),
+                "release_id": "v1.20.0",
+            },
+            "error": None,
+        },
+        {},
+    )
+
+    actual = UnixMediaNodeClientFactory(
+        socket_path=socket_path,
+        timeout_seconds=1,
+    ).for_node(ready_node()).node_metrics()
+
+    server.join(timeout=1)
+    socket_path.unlink(missing_ok=True)
+    assert actual == NodeMetricObservation(
+        sample=NodeMetricSample(
+            1,
+            1,
+            100,
+            200,
+            path_counters=(PathMetricCounters(str(PUBLIC_ID), 100, 200),),
+        ),
+        process_id=123,
+        process_start_ticks=456,
+        process_boot_id=ready_node().process_boot_id,  # type: ignore[arg-type]
+        release_id="v1.20.0",
+    )
 
 
 def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> None:
@@ -720,3 +775,61 @@ def test_media_request_deadline_expires_while_waiting_for_node_lock(
         "runtime": None,
         "error": "node_runtime_operation_timeout",
     }
+
+
+def test_read_only_helper_rejects_media_path_mutation_before_adapter_call(
+    tmp_path: Path,
+) -> None:
+    node = ready_node()
+    config_root = tmp_path / "nodes-read-only-media"
+    config_root.mkdir(mode=0o700)
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=config_root),
+            process=StableProcess(
+                NodeProcessSnapshot(
+                    active=False,
+                    pid=None,
+                    process_start_ticks=None,
+                    boot_id=None,
+                    executable_sha256=None,
+                )
+            ),
+            smoke=UnusedSmoke(),
+            port_is_bindable=lambda _port: True,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=node.external_port,
+            external_port_end=node.external_port,
+            api_port_start=node.api_port,
+            api_port_end=node.api_port,
+            metrics_port_start=node.metrics_port,
+            metrics_port_end=node.metrics_port,
+            release_id=node.release_id,
+            mediamtx_binary_sha256=node.mediamtx_binary_sha256,
+        ),
+        media=object(),  # type: ignore[arg-type]
+        read_only=True,
+    )
+    request = {
+        "schema_version": 1,
+        "request_type": "media_path",
+        "operation": "delete",
+        "spec": {
+            "node_id": str(node.id),
+            "external_port": node.external_port,
+            "api_port": node.api_port,
+            "metrics_port": node.metrics_port,
+            "desired_revision": node.desired_revision,
+            "release_id": node.release_id,
+            "mediamtx_binary_sha256": node.mediamtx_binary_sha256,
+        },
+        "path": {"name": str(PUBLIC_ID), "source_url": None, "max_readers": None},
+        "deadline_unix_ms": int(time.time() * 1000) + 1000,
+    }
+
+    result = server._serve_media_request(
+        (json.dumps(request, separators=(",", ":")) + "\n").encode()
+    )
+
+    assert result["error"] == "node_helper_read_only"

@@ -1,0 +1,13 @@
+[Unit]
+Description=RTSP Proxy read-only node observation socket
+
+[Socket]
+ListenStream=/run/rtsp-proxy-node-metrics/metrics.sock
+SocketUser=root
+SocketGroup=rtsp-proxy-collector
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

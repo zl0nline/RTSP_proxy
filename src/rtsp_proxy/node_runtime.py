@@ -45,6 +45,12 @@ from rtsp_proxy.nodes import (
     NodeState,
     validate_camera_source_url,
 )
+from rtsp_proxy.observability import (
+    NodeMetricObservation,
+    NodeMetricSample,
+    PathMetricCounters,
+    parse_mediamtx_path_metrics,
+)
 from rtsp_proxy.release import (
     ReleaseVerificationError,
     trusted_mediamtx_activation_identity,
@@ -269,6 +275,7 @@ class MediaPathOperation(StrEnum):
     PUT = "put"
     DELETE = "delete"
     RUNTIME = "runtime"
+    METRICS = "metrics"
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,7 +285,7 @@ class MediaPathCommand:
     path: MediaPathConfig | PublicId | None = None
 
     def __post_init__(self) -> None:
-        if self.operation is MediaPathOperation.INVENTORY:
+        if self.operation in {MediaPathOperation.INVENTORY, MediaPathOperation.METRICS}:
             if self.path is not None:
                 raise ValueError("node_media_path_not_allowed")
         elif self.operation is MediaPathOperation.PUT:
@@ -1548,8 +1555,8 @@ class _RuntimeRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: int
-    action: NodeRuntimeAction
-    spec: _RuntimeSpecPayload
+    action: NodeRuntimeAction | Literal["health"]
+    spec: _RuntimeSpecPayload | None
     config: _RuntimeConfigPayload | None
     deadline_unix_ms: int | None = Field(default=None, ge=1)
 
@@ -1602,6 +1609,28 @@ class _MediaRuntimePayload(BaseModel):
     reader_count: int = Field(ge=0)
 
 
+class _PathMetricPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    public_id: str = Field(min_length=26, max_length=26)
+    received_bytes_total: int = Field(ge=0)
+    sent_bytes_total: int = Field(ge=0)
+
+
+class _MediaMetricsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    active_sources: int = Field(ge=0, le=100)
+    occupied_streams: int = Field(ge=0, le=100)
+    received_bytes_total: int = Field(ge=0)
+    sent_bytes_total: int = Field(ge=0)
+    path_counters: list[_PathMetricPayload]
+    process_id: int = Field(ge=1)
+    process_start_ticks: int = Field(ge=1)
+    process_boot_id: UUID
+    release_id: str = Field(min_length=1, max_length=128)
+
+
 class _MediaResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -1610,6 +1639,7 @@ class _MediaResponsePayload(BaseModel):
     path: _MediaPathPayload | None
     inventory: _MediaInventoryPayload | None
     runtime: _MediaRuntimePayload | None = None
+    metrics: _MediaMetricsPayload | None = None
     error: str | None
 
 
@@ -1683,6 +1713,34 @@ class UnixNodeRuntimeClient:
             config_sha256=observation.config_sha256,
             release_id=observation.release_id,
         )
+
+    def health(self) -> None:
+        request = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "health",
+                    "spec": None,
+                    "config": None,
+                    "deadline_unix_ms": int(
+                        (time.time() + self._timeout_seconds / 2) * 1000
+                    ),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(self._timeout_seconds)
+                connection.connect(str(self._socket_path))
+                connection.sendall(request)
+                response = connection.makefile("rb").readline(_MAX_RUNTIME_MESSAGE_BYTES + 1)
+        except (OSError, TimeoutError) as error:
+            raise NodeSupervisorError("node_runtime_unavailable") from error
+        if response != b'{"error":null,"observation":null,"ok":true,"schema_version":1}\n':
+            raise NodeSupervisorError("node_runtime_response_invalid")
 
     @staticmethod
     def _encode_command(
@@ -1765,12 +1823,17 @@ class UnixMediaNodeClient:
             response.path is not None
             or response.inventory is not None
             or response.runtime is not None
+            or response.metrics is not None
         ):
             raise MediaNodeProtocolError("node_media_response_invalid")
 
     def get_path(self, name: PublicId) -> MediaPathConfig | None:
         response = self._request("get", name=name)
-        if response.inventory is not None or response.runtime is not None:
+        if (
+            response.inventory is not None
+            or response.runtime is not None
+            or response.metrics is not None
+        ):
             raise MediaNodeProtocolError("node_media_response_invalid")
         if response.path is None:
             return None
@@ -1796,6 +1859,7 @@ class UnixMediaNodeClient:
             response.path is not None
             or response.inventory is None
             or response.runtime is not None
+            or response.metrics is not None
         ):
             raise MediaNodeProtocolError("node_media_response_invalid")
         try:
@@ -1820,16 +1884,55 @@ class UnixMediaNodeClient:
             response.path is not None
             or response.inventory is not None
             or response.runtime is not None
+            or response.metrics is not None
         ):
             raise MediaNodeProtocolError("node_media_response_invalid")
 
     def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
         response = self._request("runtime", name=name)
-        if response.inventory is not None or response.path is not None:
+        if (
+            response.inventory is not None
+            or response.path is not None
+            or response.metrics is not None
+        ):
             raise MediaNodeProtocolError("node_media_response_invalid")
         if response.runtime is None:
             return None
         return response.runtime.ready, response.runtime.reader_count
+
+    def node_metrics(self) -> NodeMetricObservation:
+        response = self._request("metrics")
+        if (
+            response.inventory is not None
+            or response.path is not None
+            or response.runtime is not None
+            or response.metrics is None
+        ):
+            raise MediaNodeProtocolError("node_media_response_invalid")
+        try:
+            path_counters = tuple(
+                PathMetricCounters(
+                    public_id=item.public_id,
+                    received_bytes_total=item.received_bytes_total,
+                    sent_bytes_total=item.sent_bytes_total,
+                )
+                for item in response.metrics.path_counters
+            )
+        except ValueError:
+            raise MediaNodeProtocolError("node_media_response_invalid") from None
+        return NodeMetricObservation(
+            sample=NodeMetricSample(
+                active_sources=response.metrics.active_sources,
+                occupied_streams=response.metrics.occupied_streams,
+                received_bytes_total=response.metrics.received_bytes_total,
+                sent_bytes_total=response.metrics.sent_bytes_total,
+                path_counters=path_counters,
+            ),
+            process_id=response.metrics.process_id,
+            process_start_ticks=response.metrics.process_start_ticks,
+            process_boot_id=response.metrics.process_boot_id,
+            release_id=response.metrics.release_id,
+        )
 
     def _request(
         self,
@@ -1892,12 +1995,21 @@ class UnixMediaNodeClient:
                 or response.path is not None
                 or response.inventory is not None
                 or response.runtime is not None
+                or response.metrics is not None
             ):
                 raise MediaNodeUnavailable("node_media_response_invalid")
             raise MediaNodeUnavailable(response.error)
         if response.error is not None:
             raise MediaNodeUnavailable("node_media_response_invalid")
         return response
+
+
+class UnixNodeMetricSource:
+    def __init__(self, *, media_nodes: UnixMediaNodeClientFactory) -> None:
+        self._media_nodes = media_nodes
+
+    def scrape(self, node: MediaNode) -> NodeMetricObservation:
+        return self._media_nodes.for_node(node).node_metrics()
 
 
 def _runtime_spec_payload(node: MediaNode) -> dict[str, object]:
@@ -1965,7 +2077,13 @@ class RootMediaNodeAdapter:
         self,
         command: MediaPathCommand,
         deadline: NodeOperationDeadline | None = None,
-    ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | None:
+    ) -> (
+        MediaPathConfig
+        | MediaPathInventory
+        | tuple[bool, int]
+        | NodeMetricObservation
+        | None
+    ):
         if deadline is None:
             deadline = NodeOperationDeadline(
                 expires_monotonic=time.monotonic() + self._timeout_seconds
@@ -1986,6 +2104,7 @@ class RootMediaNodeAdapter:
             raise NodeSupervisorError("node_process_release_mismatch")
         client = MediaMtxClient(
             api_url=f"http://127.0.0.1:{command.spec.api_port}",
+            metrics_url=f"http://127.0.0.1:{command.spec.metrics_port}",
             timeout_seconds=deadline.remaining_seconds(maximum=self._timeout_seconds),
             username=credentials.username,
             password=credentials.password,
@@ -2002,15 +2121,30 @@ class RootMediaNodeAdapter:
         )
         if after != before:
             raise NodeSupervisorError("node_process_identity_changed")
+        if command.operation is MediaPathOperation.METRICS:
+            assert isinstance(result, NodeMetricSample)
+            assert before.pid is not None
+            assert before.process_start_ticks is not None
+            assert before.boot_id is not None
+            return NodeMetricObservation(
+                sample=result,
+                process_id=before.pid,
+                process_start_ticks=before.process_start_ticks,
+                process_boot_id=before.boot_id,
+                release_id=command.spec.release_id,
+            )
+        assert not isinstance(result, NodeMetricSample)
         return result
 
     @staticmethod
     def _execute_operation(
         client: MediaMtxClient,
         command: MediaPathCommand,
-    ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | None:
+    ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | NodeMetricSample | None:
         if command.operation is MediaPathOperation.INVENTORY:
             return client.inventory_paths()
+        if command.operation is MediaPathOperation.METRICS:
+            return parse_mediamtx_path_metrics(client.path_metrics())
         if command.operation is MediaPathOperation.PUT:
             assert isinstance(command.path, MediaPathConfig)
             client.put_path(command.path)
@@ -2084,6 +2218,7 @@ class UnixNodeSupervisorServer:
         operation_timeout_seconds: float = 55,
         cleanup_reserve_seconds: float = 25,
         max_workers: int = 16,
+        read_only: bool = False,
         wall_time: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -2102,15 +2237,30 @@ class UnixNodeSupervisorServer:
         self._operation_timeout_seconds = operation_timeout_seconds
         self._cleanup_reserve_seconds = cleanup_reserve_seconds
         self._max_workers = max_workers
+        self._read_only = read_only
         self._wall_time = wall_time
         self._monotonic = monotonic
         self._node_locks_guard = Lock()
         self._node_locks: dict[UUID, tuple[Lock, int]] = {}
 
     def serve_connection(self, connection: socket.socket) -> None:
+        payload: dict[str, object]
         try:
             connection.settimeout(self._request_timeout_seconds)
             request = connection.makefile("rb").readline(_MAX_RUNTIME_MESSAGE_BYTES + 1)
+            if self._is_health_request(request):
+                payload = {
+                    "schema_version": 1,
+                    "ok": True,
+                    "observation": None,
+                    "error": None,
+                }
+                encoded = (
+                    json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+                ).encode("utf-8")
+                with suppress(OSError, TimeoutError):
+                    connection.sendall(encoded)
+                return
             if self._is_media_request(request):
                 payload = self._serve_media_request(request)
                 encoded = (
@@ -2120,6 +2270,8 @@ class UnixNodeSupervisorServer:
                     connection.sendall(encoded)
                 return
             command, requested_deadline_unix_ms = self._decode_command(request)
+            if self._read_only and command.action is not NodeRuntimeAction.OBSERVE:
+                raise NodeSupervisorError("node_helper_read_only")
             self._policy.validate(command.spec)
             deadline = self._operation_deadline(requested_deadline_unix_ms)
             with self._node_lock(command.spec.node_id, deadline):
@@ -2146,6 +2298,8 @@ class UnixNodeSupervisorServer:
             if self._media is None:
                 raise NodeSupervisorError("node_media_unavailable")
             command, requested_deadline_unix_ms = self._decode_media_command(request)
+            if self._read_only and command.operation is not MediaPathOperation.METRICS:
+                raise NodeSupervisorError("node_helper_read_only")
             self._policy.validate(command.spec)
             deadline = self._operation_deadline(requested_deadline_unix_ms)
             with self._node_lock(command.spec.node_id, deadline):
@@ -2163,6 +2317,21 @@ class UnixNodeSupervisorServer:
         except (UnicodeError, json.JSONDecodeError):
             return False
         return isinstance(payload, dict) and payload.get("request_type") == "media_path"
+
+    @staticmethod
+    def _is_health_request(request: bytes) -> bool:
+        if not request or len(request) > _MAX_RUNTIME_MESSAGE_BYTES or not request.endswith(b"\n"):
+            return False
+        try:
+            payload = _RuntimeRequestPayload.model_validate_json(request)
+        except ValidationError:
+            return False
+        return (
+            payload.schema_version == 1
+            and payload.action == "health"
+            and payload.spec is None
+            and payload.config is None
+        )
 
     def serve_forever(self, listener: socket.socket) -> None:
         capacity = BoundedSemaphore(self._max_workers)
@@ -2226,6 +2395,10 @@ class UnixNodeSupervisorServer:
             raise NodeSupervisorError("node_runtime_request_invalid") from error
         if payload.schema_version != 1:
             raise NodeSupervisorError("node_runtime_request_invalid")
+        if payload.action == "health" or payload.spec is None:
+            raise NodeSupervisorError("node_runtime_request_invalid")
+        action = payload.action
+        assert isinstance(action, NodeRuntimeAction)
         try:
             spec = NodeRuntimeSpec(
                 node_id=payload.spec.node_id,
@@ -2245,7 +2418,7 @@ class UnixNodeSupervisorServer:
                 )
             )
             return (
-                NodeRuntimeCommand(action=payload.action, spec=spec, config=config),
+                NodeRuntimeCommand(action=action, spec=spec, config=config),
                 payload.deadline_unix_ms,
             )
         except ValueError as error:
@@ -2302,7 +2475,7 @@ class UnixNodeSupervisorServer:
 
     @staticmethod
     def _success_payload(observation: NodeRuntimeObservation) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": 1,
             "ok": True,
             "observation": {
@@ -2323,20 +2496,28 @@ class UnixNodeSupervisorServer:
             },
             "error": None,
         }
+        return payload
 
     @staticmethod
     def _error_payload(error: str) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": 1,
             "ok": False,
             "observation": None,
             "error": error,
         }
+        return payload
 
     @staticmethod
     def _media_success_payload(
         operation: MediaPathOperation,
-        result: MediaPathConfig | MediaPathInventory | tuple[bool, int] | None,
+        result: (
+            MediaPathConfig
+            | MediaPathInventory
+            | tuple[bool, int]
+            | NodeMetricObservation
+            | None
+        ),
     ) -> dict[str, object]:
         path = None
         inventory = None
@@ -2354,7 +2535,29 @@ class UnixNodeSupervisorServer:
             }
         if operation is MediaPathOperation.RUNTIME and isinstance(result, tuple):
             runtime = {"ready": result[0], "reader_count": result[1]}
-        return {
+        metrics = None
+        if operation is MediaPathOperation.METRICS and isinstance(
+            result, NodeMetricObservation
+        ):
+            metrics = {
+                "active_sources": result.sample.active_sources,
+                "occupied_streams": result.sample.occupied_streams,
+                "received_bytes_total": result.sample.received_bytes_total,
+                "sent_bytes_total": result.sample.sent_bytes_total,
+                "path_counters": [
+                    {
+                        "public_id": counter.public_id,
+                        "received_bytes_total": counter.received_bytes_total,
+                        "sent_bytes_total": counter.sent_bytes_total,
+                    }
+                    for counter in result.sample.path_counters
+                ],
+                "process_id": result.process_id,
+                "process_start_ticks": result.process_start_ticks,
+                "process_boot_id": str(result.process_boot_id),
+                "release_id": result.release_id,
+            }
+        payload: dict[str, object] = {
             "schema_version": 1,
             "ok": True,
             "path": path,
@@ -2362,6 +2565,9 @@ class UnixNodeSupervisorServer:
             "runtime": runtime,
             "error": None,
         }
+        if operation is MediaPathOperation.METRICS:
+            payload["metrics"] = metrics
+        return payload
 
     @staticmethod
     def _media_error_payload(error: str) -> dict[str, object]:
@@ -2409,6 +2615,7 @@ class NodeHelperSettings(BaseSettings):
     operation_timeout_seconds: float = Field(default=55, gt=0, le=55)
     cleanup_reserve_seconds: float = Field(default=25, ge=20, le=30)
     max_workers: int = Field(default=16, ge=1, le=64)
+    read_only: bool = False
     auth_callback_port: int | None = Field(default=None, ge=1, le=65535)
     auth_callback_pepper_file: Path | None = None
 
@@ -2548,6 +2755,7 @@ def run_node_runtime_helper() -> None:
         operation_timeout_seconds=settings.operation_timeout_seconds,
         cleanup_reserve_seconds=settings.cleanup_reserve_seconds,
         max_workers=settings.max_workers,
+        read_only=settings.read_only,
     ).serve_forever(listener)
 
 

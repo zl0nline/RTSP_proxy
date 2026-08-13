@@ -82,7 +82,7 @@ jobs:
           createdb --host 127.0.0.1 --port "$migration_port" --username postgres rtsp_proxy_migration_test
           RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
             .artifacts/clean-venv/bin/rtsp-proxy-migrate
-          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0010_camera_access"
+          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0011_observability"
 
       - name: Validate systemd units
         run: |
@@ -100,6 +100,9 @@ jobs:
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
           sudo touch /etc/rtsp-proxy/control-plane/access-peppers.json
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy-worker.env
+          sudo touch /etc/rtsp-proxy/collector.env
+          sudo touch /etc/rtsp-proxy/notifier.env
+          sudo touch /etc/rtsp-proxy/control-plane/smtp-password
           sudo touch /etc/rtsp-proxy/mediamtx/mediamtx.yml
           sudo touch /etc/rtsp-proxy/node-runtime.env
           systemd-analyze verify deploy/systemd/*

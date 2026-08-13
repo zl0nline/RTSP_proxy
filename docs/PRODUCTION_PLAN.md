@@ -319,6 +319,13 @@ message has its own stable dedupe key and bounded delivery retries. A recovery
 message identifies the incident and failure-delivery outcome; recurring outage
 reminders are forbidden.
 
+SMTP is an at-most-once submission boundary rather than a false exactly-once
+claim: every claim durably consumes one attempt and carries a lease token. If a
+worker dies after relay acceptance but before durable completion, the message
+becomes `FAILED_FINAL/notification_delivery_ambiguous` and is not submitted
+again. The stable Message-ID/dedupe key supports relay/operator correlation;
+the recovery message reports the terminal failure-notification outcome.
+
 ## 10. PostgreSQL model
 
 ### 10.1 Core entities
@@ -601,7 +608,8 @@ configuration default, not proof that any host can run 50 fully active nodes.
 - RSS slope <=1%/h, no FD/session/port leak;
 - clean profile proxy-added RTP loss = 0;
 - no interruption outside intended path/node;
-- incident/recovery exactly once;
+- one failure/recovery notification record per incident, with at-most-once SMTP
+  submission and explicit ambiguous terminal outcome;
 - raw evidence binds commit, binaries, config, hardware, clock and workload;
 - amd64/arm64 functional equality, capacity published per hardware profile.
 
@@ -918,12 +926,24 @@ green. The exact evidence boundary is recorded in
 
 ### Phase F — dashboard, metrics and notifications
 
-- node/camera pages and actions;
-- RBAC/CSRF/session/audit;
-- metrics collector and bounded queries;
-- incident outbox, failure email and recovery confirmation;
-- SMTP retry/dedupe;
-- browser E2E for confirmations and accessibility.
+Status: **IN PROGRESS**. The bounded collector, generation-bound per-path
+metrics, persisted fleet snapshot API, incident state machine and durable SMTP
+dispatcher are implemented locally and await independent review/native CI.
+No Phase-F completion claim is made yet.
+
+- [ ] node/camera pages and actions;
+- [ ] RBAC/CSRF/session/audit;
+- [x] metrics collector and bounded queries;
+- [x] incident outbox, failure email and recovery confirmation;
+- [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
+- [ ] browser E2E for confirmations and accessibility.
+
+Collector helper/DB operations and notification DB operations have hard
+deadlines. The collector shutdown budget remains below its 30-second systemd
+stop limit for every supported interval; SMTP plus DB completion remains below
+the notifier's 45-second stop limit for every supported SMTP timeout. Metrics
+are accepted only when one atomic helper response binds exact process
+PID/start/boot/release and the complete sorted per-path counter set.
 
 Exit: operator workflows complete without direct DB/systemctl/MediaMTX access.
 

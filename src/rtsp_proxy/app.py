@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Literal
@@ -56,6 +56,7 @@ from rtsp_proxy.nodes import (
     NodeRuntimeUnavailable,
     NodeState,
 )
+from rtsp_proxy.observability import SnapshotReader
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
     CameraMoveControl,
@@ -151,6 +152,43 @@ class NodeListResponse(BaseModel):
     items: list[NodeResponse]
     count: int
     max_nodes: int
+
+
+class NodeMetricResponse(BaseModel):
+    active_sources: int
+    occupied_streams: int
+    received_bytes_total: int
+    sent_bytes_total: int
+
+
+class FleetNodeResponse(BaseModel):
+    node_id: str
+    name: str
+    external_port: int
+    desired_state: str
+    runtime_state: str
+    health: str
+    registered_cameras: int
+    camera_capacity: int
+    desired_revision: int
+    applied_revision: int
+    scrape_status: str
+    scrape_reason: str | None
+    metrics: NodeMetricResponse | None
+    metric_observed_at: datetime | None
+    received_bitrate_bps: float | None
+    sent_bitrate_bps: float | None
+    counters_reset: bool
+
+
+class FleetSnapshotResponse(BaseModel):
+    generated_at: datetime
+    configured_nodes: int
+    max_nodes: int
+    registered_cameras: int
+    external_ports_used: int
+    external_ports_free: int
+    nodes: list[FleetNodeResponse]
 
 
 class CameraCreateRequest(BaseModel):
@@ -470,6 +508,9 @@ def create_app(
     camera_runtime_observer: CameraRuntimeObserver | None = None,
     access_policy_control: AccessPolicyControl | None = None,
     access_grant_control: AccessGrantControl | None = None,
+    fleet_snapshots: SnapshotReader | None = None,
+    fleet_snapshot_max_age_seconds: float = 30,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     startup: Callable[[], None] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -531,6 +572,66 @@ def create_app(
                     reason=result.reason,
                 )
                 for result in results
+            ],
+        )
+
+    @app.get("/api/v1/dashboard/snapshot", response_model=FleetSnapshotResponse)
+    def dashboard_snapshot() -> FleetSnapshotResponse:
+        if fleet_snapshots is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "fleet_snapshot_unavailable"},
+            )
+        snapshot = fleet_snapshots.current_snapshot()
+        if snapshot is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "fleet_snapshot_pending"},
+            )
+        if snapshot.generated_at < clock() - timedelta(
+            seconds=fleet_snapshot_max_age_seconds
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "fleet_snapshot_stale"},
+            )
+        return FleetSnapshotResponse(
+            generated_at=snapshot.generated_at,
+            configured_nodes=snapshot.configured_nodes,
+            max_nodes=snapshot.max_nodes,
+            registered_cameras=snapshot.registered_cameras,
+            external_ports_used=snapshot.external_ports_used,
+            external_ports_free=snapshot.external_ports_free,
+            nodes=[
+                FleetNodeResponse(
+                    node_id=str(node.node_id),
+                    name=node.name,
+                    external_port=node.external_port,
+                    desired_state=node.desired_state.value,
+                    runtime_state=node.runtime_state.value,
+                    health=node.health.value,
+                    registered_cameras=node.registered_cameras,
+                    camera_capacity=node.camera_capacity,
+                    desired_revision=node.desired_revision,
+                    applied_revision=node.applied_revision,
+                    scrape_status=node.scrape_status.value,
+                    scrape_reason=node.scrape_reason,
+                    metrics=(
+                        None
+                        if node.metrics is None
+                        else NodeMetricResponse(
+                            active_sources=node.metrics.active_sources,
+                            occupied_streams=node.metrics.occupied_streams,
+                            received_bytes_total=node.metrics.received_bytes_total,
+                            sent_bytes_total=node.metrics.sent_bytes_total,
+                        )
+                    ),
+                    metric_observed_at=node.metric_observed_at,
+                    received_bitrate_bps=node.received_bitrate_bps,
+                    sent_bitrate_bps=node.sent_bitrate_bps,
+                    counters_reset=node.counters_reset,
+                )
+                for node in snapshot.nodes
             ],
         )
 

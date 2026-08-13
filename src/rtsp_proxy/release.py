@@ -11,8 +11,8 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-APPLICATION_SCHEMA = "0010_camera_access"
-MAXIMUM_COMPATIBLE_SCHEMA = "0011_observability"
+APPLICATION_SCHEMA = "0011_observability"
+MINIMUM_APPLICATION_SCHEMA = "0010_camera_access"
 CONFIG_SCHEMA_VERSION = 1
 
 
@@ -40,6 +40,7 @@ class PythonArtifact(BaseModel):
 class MediaMtxArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    release_id: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
     version: str = Field(min_length=1)
     linux_arch: LinuxArch
     binary: str = Field(min_length=1)
@@ -66,7 +67,7 @@ class SchemaCompatibility(BaseModel):
 class ReleaseManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(ge=1, le=1)
+    schema_version: int = Field(ge=2, le=2)
     release_id: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
     git_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     python: PythonArtifact
@@ -185,12 +186,12 @@ def verify_release(
         raise ReleaseVerificationError("linux_arch_mismatch")
     trusted_version, trusted_digest = _trusted_mediamtx_identity(
         manifest.mediamtx.linux_arch,
-        manifest.release_id,
+        manifest.mediamtx.release_id,
     )
     try:
         trusted_mediamtx_activation_identity(
             manifest.mediamtx.linux_arch.value,
-            manifest.release_id,
+            manifest.mediamtx.release_id,
         )
     except ReleaseVerificationError as error:
         raise ReleaseVerificationError("untrusted_mediamtx_artifact") from error
@@ -202,8 +203,8 @@ def verify_release(
     if manifest.config_schema_version != CONFIG_SCHEMA_VERSION:
         raise ReleaseVerificationError("config_schema_mismatch")
     if (
-        manifest.schema_compatibility.minimum != APPLICATION_SCHEMA
-        or manifest.schema_compatibility.maximum != MAXIMUM_COMPATIBLE_SCHEMA
+        manifest.schema_compatibility.minimum != MINIMUM_APPLICATION_SCHEMA
+        or manifest.schema_compatibility.maximum != APPLICATION_SCHEMA
     ):
         raise ReleaseVerificationError("database_schema_mismatch")
 
