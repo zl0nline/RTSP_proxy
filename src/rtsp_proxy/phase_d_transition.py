@@ -20,6 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from rtsp_proxy.config import NodeRegistrationPolicy, RuntimeRole, Settings
 from rtsp_proxy.database import (
     audit_events,
+    camera_access_policies,
     camera_move_sagas,
     camera_placement_history,
     camera_placements,
@@ -340,6 +341,15 @@ def restore_transition(
                     )
                 )
                 connection.execute(
+                    insert(camera_access_policies).values(
+                        camera_id=camera.id,
+                        internet_cidrs=[],
+                        local_cidrs=[],
+                        revision=1,
+                        updated_at=func.clock_timestamp(),
+                    )
+                )
+                connection.execute(
                     insert(camera_placements).values(
                         camera_id=camera.id,
                         node_id=camera.node_id,
@@ -365,6 +375,19 @@ def restore_transition(
                         "node_id": str(camera.node_id),
                         "placement_generation": restored_generation,
                         "public_id": camera.public_id,
+                    },
+                )
+                _record_transition_event(
+                    connection,
+                    aggregate_type="camera_access_policy",
+                    aggregate_id=camera.id,
+                    aggregate_revision=1,
+                    event_type="camera.access_policy_created",
+                    payload={
+                        "camera_id": str(camera.id),
+                        "internet_cidrs": [],
+                        "local_cidrs": [],
+                        "revision": 1,
                     },
                 )
     except (SQLAlchemyError, ValueError, PhaseDTransitionError) as error:
@@ -561,6 +584,14 @@ def _already_restored(
             .where(cameras.c.state != CameraState.DELETED.value)
         ).mappings()
     )
+    access_policies = {
+        UUID(str(row["camera_id"])): (
+            tuple(str(value) for value in row["internet_cidrs"]),
+            tuple(str(value) for value in row["local_cidrs"]),
+            int(row["revision"]),
+        )
+        for row in connection.execute(select(camera_access_policies)).mappings()
+    }
     counts = Counter(camera.node_id for camera in manifest.cameras)
     expected_nodes = {
         node.id: (
@@ -622,6 +653,8 @@ def _already_restored(
             for row in restored_cameras
         }
         == expected_placements
+        and access_policies
+        == {camera.id: ((), (), 1) for camera in manifest.cameras}
     )
 
 

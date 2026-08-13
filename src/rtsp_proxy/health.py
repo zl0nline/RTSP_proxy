@@ -17,6 +17,7 @@ class ReadinessProvider(Protocol):
 
 ROLE_DEPENDENCIES: dict[RuntimeRole, tuple[str, ...]] = {
     RuntimeRole.WEB: ("database", "schema", "session_store"),
+    RuntimeRole.AUTH: ("database", "schema", "pepper"),
     RuntimeRole.WORKER: ("database", "schema", "outbox"),
     RuntimeRole.RECONCILER: ("database", "schema", "media_adapter"),
     RuntimeRole.PROBE: ("database", "schema", "probe_runtime"),

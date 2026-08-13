@@ -21,10 +21,12 @@ dependencies = [
 [project.scripts]
 rtsp-proxy-verify-release = "rtsp_proxy.cli:main"
 rtsp-proxy-web = "rtsp_proxy.runtime:run_web"
+rtsp-proxy-auth = "rtsp_proxy.runtime:run_auth"
 rtsp-proxy-role = "rtsp_proxy.runtime:run_background"
 rtsp-proxy-load = "rtsp_proxy.load_cli:main"
 rtsp-proxy-migrate = "rtsp_proxy.migrate:run_migrations"
 rtsp-proxy-node-helper = "rtsp_proxy.node_runtime:run_node_runtime_helper"
+rtsp-proxy-nft-reconcile = "rtsp_proxy.nft_reconcile:main"
 rtsp-proxy-phase-d-transition = "rtsp_proxy.phase_d_transition:main"
 
 [dependency-groups]

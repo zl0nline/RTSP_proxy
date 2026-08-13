@@ -10,15 +10,28 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
+from uuid import UUID
 
 import pytest
+import uvicorn
 
+from rtsp_proxy.access import (
+    AccessAuthorizer,
+    AccessGrant,
+    AccessPolicy,
+    AccessTarget,
+    PepperVerifier,
+)
+from rtsp_proxy.app import create_media_auth_app
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.load_evidence import REQUIRED_SUT_METRIC_FAMILIES, read_mediamtx_metrics
 from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
@@ -65,6 +78,26 @@ def stop_process(process: subprocess.Popen[str]) -> str:
     return output
 
 
+def authenticated_http_request(url: str) -> urllib.request.Request:
+    parts = urllib.parse.urlsplit(url)
+    request_url = url
+    headers: dict[str, str] = {}
+    if parts.username is not None:
+        hostname = parts.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        authority = hostname if parts.port is None else f"{hostname}:{parts.port}"
+        request_url = urllib.parse.urlunsplit(
+            (parts.scheme, authority, parts.path, parts.query, parts.fragment)
+        )
+        credentials = (
+            f"{urllib.parse.unquote(parts.username)}:"
+            f"{urllib.parse.unquote(parts.password or '')}"
+        )
+        headers["Authorization"] = "Basic " + b64encode(credentials.encode()).decode()
+    return urllib.request.Request(request_url, headers=headers)
+
+
 def wait_for_json(url: str, process: subprocess.Popen[str], *, ready_path: bool = False) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -72,7 +105,7 @@ def wait_for_json(url: str, process: subprocess.Popen[str], *, ready_path: bool 
             output, _ = process.communicate()
             pytest.fail(f"external contract process exited early:\n{output}")
         try:
-            with urllib.request.urlopen(url, timeout=1) as response:
+            with urllib.request.urlopen(authenticated_http_request(url), timeout=1) as response:
                 payload = json.load(response)
             if not ready_path or payload.get("ready") is True:
                 return
@@ -198,7 +231,7 @@ def put_lab_fanout_path(*, api_url: str, path: str, source_url: str) -> None:
 
 
 def metrics_lines(url: str) -> list[str]:
-    with urllib.request.urlopen(url, timeout=2) as response:
+    with urllib.request.urlopen(authenticated_http_request(url), timeout=2) as response:
         payload = response.read()
     assert isinstance(payload, bytes)
     return payload.decode("utf-8").splitlines()
@@ -293,14 +326,14 @@ def process_owned_udp_sockets(
     return frozenset(sockets)
 
 
-def assert_partial_rtsp_header_outlives_media_read_timeout(host: str, port: int) -> None:
+def assert_partial_rtsp_header_closes_at_media_read_timeout(host: str, port: int) -> None:
     started_at = time.monotonic()
     with socket.create_connection((host, port), timeout=2) as connection:
-        connection.settimeout(1.5)
+        connection.settimeout(2)
         connection.sendall(f"DESCRIBE rtsp://{host}:{port}/".encode())
-        with pytest.raises(TimeoutError):
-            connection.recv(4096)
+        assert connection.recv(4096) == b""
     assert time.monotonic() - started_at >= 1
+    assert time.monotonic() - started_at < 2
 
 
 class AuthCallbackServer(ThreadingHTTPServer):
@@ -350,6 +383,469 @@ class AuthCallbackHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+
+class NativeAccessStore:
+    def __init__(
+        self,
+        *,
+        target: AccessTarget,
+        grant: AccessGrant,
+    ) -> None:
+        self.target = target
+        self.grant = grant
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+
+    def get_access_target(
+        self,
+        *,
+        node_id: UUID,
+        public_id: PublicId,
+    ) -> AccessTarget | None:
+        with self._lock:
+            self.calls.append("target")
+            return self.target if (node_id, public_id) == (
+                self.target.node_id,
+                self.target.public_id,
+            ) else None
+
+    def get_access_grant(
+        self,
+        *,
+        camera_id: UUID,
+        username: str,
+    ) -> AccessGrant | None:
+        with self._lock:
+            self.calls.append("grant")
+            return self.grant if (camera_id, username) == (
+                self.grant.camera_id,
+                self.grant.username,
+            ) else None
+
+    def rehash_access_grant(
+        self,
+        grant_id: UUID,
+        *,
+        token_verifier: str,
+        pepper_key_id: str,
+        expected_revision: int,
+    ) -> bool:
+        with self._lock:
+            if self.grant.id != grant_id or self.grant.revision != expected_revision:
+                return False
+            self.grant = replace(
+                self.grant,
+                token_verifier=token_verifier,
+                pepper_key_id=pepper_key_id,
+                revision=expected_revision + 1,
+            )
+            return True
+
+    def mark_access_grant_used(self, grant_id: UUID) -> bool:
+        with self._lock:
+            if self.grant.id == grant_id:
+                self.grant = replace(self.grant, last_used_at=datetime.now(UTC))
+                return True
+            return False
+
+
+def start_native_auth_server(
+    *,
+    port: int,
+    authorizer: AccessAuthorizer,
+    callback_verifier: PepperVerifier,
+) -> tuple[uvicorn.Server, threading.Thread]:
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_media_auth_app(
+                authorizer=authorizer,
+                callback_verifier=callback_verifier,
+            ),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            access_log=False,
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health/live",
+                timeout=1,
+            ) as response:
+                if response.status == 200:
+                    return server, thread
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    server.should_exit = True
+    thread.join(timeout=2)
+    pytest.fail("native access callback did not become ready")
+
+
+@pytest.mark.parametrize(
+    ("encoder", "codec_name"),
+    (("libx264", "h264"), ("libx265", "hevc")),
+)
+def test_real_access_callback_acl_revoke_drain_and_single_reader_race(
+    tmp_path: Path,
+    encoder: str,
+    codec_name: str,
+) -> None:
+    assert MEDIA_MTX_BINARY is not None
+    assert FFMPEG_BINARY is not None
+    assert FFPROBE_BINARY is not None
+    (
+        origin_api_port,
+        origin_rtsp_port,
+        proxy_api_port,
+        proxy_metrics_port,
+        proxy_rtsp_port,
+        auth_port,
+    ) = unused_tcp_ports(6)
+    node_id = UUID("20000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    grant_id = UUID("30000000-0000-0000-0000-000000000003")
+    public_id = PublicId.parse("m" * 25 + "a")
+    secret = "N" * 43
+    now = datetime.now(UTC)
+    pepper = PepperVerifier(primary_key_id="native", keys={"native": b"p" * 32})
+    store = NativeAccessStore(
+        target=AccessTarget(
+            camera_id=camera_id,
+            node_id=node_id,
+            public_id=public_id,
+            enabled=True,
+            policy=AccessPolicy(
+                camera_id=camera_id,
+                revision=1,
+                internet_cidrs=("203.0.113.0/24",),
+            ),
+        ),
+        grant=AccessGrant(
+            id=grant_id,
+            camera_id=camera_id,
+            username=f"grant-{grant_id.hex}",
+            token_verifier=pepper.digest(secret),
+            pepper_key_id=pepper.primary_key_id,
+            not_before=now - timedelta(seconds=1),
+            expires_at=now + timedelta(hours=1),
+            revoked_at=None,
+            revision=1,
+        ),
+    )
+    origin_config = tmp_path / f"origin-{codec_name}.yml"
+    origin_config.write_text(
+        f"""
+logLevel: warn
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: api
+      - action: publish
+  - user: origin-reader
+    pass: origin-secret
+    permissions:
+      - action: read
+        path: fixture
+api: true
+apiAddress: 127.0.0.1:{origin_api_port}
+metrics: false
+pprof: false
+playback: false
+rtsp: true
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtspAddress: 127.0.0.1:{origin_rtsp_port}
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+paths:
+  fixture:
+    source: publisher
+""".lstrip(),
+        encoding="utf-8",
+    )
+    proxy_config = tmp_path / f"proxy-{codec_name}.yml"
+    callback_user, callback_password = pepper.callback_credentials(node_id)
+    proxy_config.write_text(
+        f"""
+logLevel: warn
+authMethod: http
+authInternalUsers:
+  - user: node-management
+    pass: node-management-secret
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: api
+      - action: metrics
+authHTTPAddress: http://{callback_user}:{callback_password}@127.0.0.1:{auth_port}/internal/v1/media-auth/{node_id}
+authHTTPExclude: []
+api: true
+apiAddress: 127.0.0.1:{proxy_api_port}
+metrics: true
+metricsAddress: 127.0.0.1:{proxy_metrics_port}
+pprof: false
+playback: false
+rtsp: true
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtspAddress: 127.0.0.1:{proxy_rtsp_port}
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+paths:
+  "~^[a-z2-7]{{25}}[aeimquy4]$": {{}}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    origin = start_process([MEDIA_MTX_BINARY, str(origin_config)])
+    publisher: subprocess.Popen[str] | None = None
+    proxy: subprocess.Popen[str] | None = None
+    established: subprocess.Popen[str] | None = None
+    auth_server: uvicorn.Server | None = None
+    auth_thread: threading.Thread | None = None
+    proxy_output = ""
+    try:
+        auth_server, auth_thread = start_native_auth_server(
+            port=auth_port,
+            authorizer=AccessAuthorizer(store=store, verifier=pepper),
+            callback_verifier=pepper,
+        )
+        wait_for_json(f"http://127.0.0.1:{origin_api_port}/v3/config/global/get", origin)
+        encoder_options = (
+            ["-preset", "ultrafast", "-tune", "zerolatency", "-g", "10"]
+            if encoder == "libx264"
+            else [
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "pools=1:frame-threads=1:keyint=10:min-keyint=10:scenecut=0",
+            ]
+        )
+        publisher = start_process(
+            [
+                FFMPEG_BINARY,
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-re",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=10",
+                "-an",
+                "-c:v",
+                encoder,
+                *encoder_options,
+                "-f",
+                "rtsp",
+                "-rtsp_transport",
+                "tcp",
+                f"rtsp://127.0.0.1:{origin_rtsp_port}/fixture",
+            ]
+        )
+        wait_for_json(
+            f"http://127.0.0.1:{origin_api_port}/v3/paths/get/fixture",
+            publisher,
+            ready_path=True,
+        )
+        proxy = start_process([MEDIA_MTX_BINARY, str(proxy_config)])
+        management_url = (
+            f"http://node-management:node-management-secret@127.0.0.1:{proxy_api_port}"
+        )
+        wait_for_json(f"{management_url}/v3/config/global/get", proxy)
+        with pytest.raises(urllib.error.HTTPError) as unauthenticated:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get",
+                timeout=2,
+            )
+        assert unauthenticated.value.code == 401
+        with pytest.raises(urllib.error.HTTPError) as bad_management:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get",
+                headers={"Authorization": "Basic " + b64encode(b"wrong:wrong").decode()},
+            )
+            urllib.request.urlopen(request, timeout=2)
+        assert bad_management.value.code == 401
+        media = MediaMtxClient(
+            api_url=f"http://127.0.0.1:{proxy_api_port}",
+            timeout_seconds=2,
+            username="node-management",
+            password="node-management-secret",
+        )
+        media.put_path(
+            MediaPathConfig(
+                name=public_id,
+                source_url=(
+                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/fixture"
+                ),
+            )
+        )
+        denied_acl = authenticated_describe_response(
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=str(public_id),
+            username=store.grant.username,
+            password=secret,
+        )
+        assert denied_acl.startswith(b"RTSP/1.0 401 Unauthorized")
+        assert store.calls[-1] == "target"
+        store.target = replace(
+            store.target,
+            policy=AccessPolicy(
+                camera_id=camera_id,
+                revision=2,
+                local_cidrs=("127.0.0.0/8",),
+            ),
+        )
+        valid = run_lab_ffprobe(
+            binary=FFPROBE_BINARY,
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=str(public_id),
+            username=store.grant.username,
+            password=secret,
+        )
+        assert valid.returncode == 0, valid.stderr
+        assert json.loads(valid.stdout)["streams"][0]["codec_name"] == codec_name
+
+        race_barrier = threading.Barrier(2)
+
+        def race_reader() -> subprocess.CompletedProcess[str]:
+            race_barrier.wait(timeout=5)
+            return run_lab_ffmpeg_reader(
+                binary=FFMPEG_BINARY,
+                host="127.0.0.1",
+                port=proxy_rtsp_port,
+                path=str(public_id),
+                username=store.grant.username,
+                password=secret,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            raced = [executor.submit(race_reader) for _ in range(2)]
+            results = [future.result() for future in raced]
+        assert sorted(result.returncode == 0 for result in results) == [False, True]
+        rejected = next(result for result in results if result.returncode != 0)
+        assert re.search(r"\b453\s*\(?Not Enough Bandwidth\)?", rejected.stderr)
+
+        established = start_process(
+            [
+                FFMPEG_BINARY,
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                (
+                    f"rtsp://{store.grant.username}:{secret}@127.0.0.1:"
+                    f"{proxy_rtsp_port}/{public_id}"
+                ),
+                "-map",
+                "0:v:0",
+                "-f",
+                "null",
+                "-",
+            ]
+        )
+        metrics_url = (
+            f"http://node-management:node-management-secret@127.0.0.1:"
+            f"{proxy_metrics_port}/metrics"
+        )
+        wait_for_reader(metrics_url, path_name=str(public_id))
+        before = metric_value(
+            metrics_lines(metrics_url),
+            "paths_outbound_bytes",
+            path_name=str(public_id),
+        )
+        store.grant = replace(store.grant, revoked_at=datetime.now(UTC), revision=2)
+        revoked = authenticated_describe_response(
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=str(public_id),
+            username=store.grant.username,
+            password=secret,
+        )
+        assert revoked.startswith(b"RTSP/1.0 401 Unauthorized")
+        after_revoke = wait_for_rtp_progress_from_metric(
+            established,
+            metrics_url,
+            str(public_id),
+            before,
+        )
+        store.grant = replace(store.grant, revoked_at=None, revision=3)
+        store.target = replace(store.target, enabled=False)
+        drained = authenticated_describe_response(
+            host="127.0.0.1",
+            port=proxy_rtsp_port,
+            path=str(public_id),
+            username=store.grant.username,
+            password=secret,
+        )
+        assert drained == revoked
+        wait_for_rtp_progress_from_metric(
+            established,
+            metrics_url,
+            str(public_id),
+            after_revoke,
+        )
+        auth_server.should_exit = True
+        auth_thread.join(timeout=5)
+        assert not auth_thread.is_alive()
+        auth_server = None
+        auth_thread = None
+        assert established.poll() is None
+        assert process_owned_udp_sockets(proxy) == frozenset()
+    finally:
+        if auth_server is not None:
+            auth_server.should_exit = True
+        if auth_thread is not None:
+            auth_thread.join(timeout=5)
+        if established is not None:
+            stop_process(established)
+        if proxy is not None:
+            proxy_output = stop_process(proxy)
+        for process in (publisher, origin):
+            if process is not None:
+                stop_process(process)
+    assert secret not in proxy_output
+
+
+def wait_for_rtp_progress_from_metric(
+    reader: subprocess.Popen[str],
+    metrics_url: str,
+    path_name: str,
+    before: float,
+) -> float:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if reader.poll() is not None:
+            output, _ = reader.communicate(timeout=1)
+            pytest.fail(f"established reader exited unexpectedly: {output}")
+        after = metric_value(
+            metrics_lines(metrics_url),
+            "paths_outbound_bytes",
+            path_name=path_name,
+        )
+        if after > before:
+            return after
+        time.sleep(0.1)
+    pytest.fail("established reader stopped making RTP progress")
 
 
 @pytest.mark.parametrize("auth_method", ["internal", "http"])
@@ -511,7 +1007,7 @@ paths: {{}}
             f"http://127.0.0.1:{timeout_api_port}/v3/config/global/get",
             timeout_proxy,
         )
-        assert_partial_rtsp_header_outlives_media_read_timeout("127.0.0.1", timeout_rtsp_port)
+        assert_partial_rtsp_header_closes_at_media_read_timeout("127.0.0.1", timeout_rtsp_port)
         stop_process(timeout_proxy)
         timeout_proxy = None
         publisher = start_process(

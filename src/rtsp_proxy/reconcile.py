@@ -318,6 +318,73 @@ class ConfirmationTokenService:
             expected_signature,
         )
 
+    def issue_node_reconfigure(
+        self,
+        *,
+        node_id: UUID,
+        external_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+        target_release_id: str,
+        target_mediamtx_binary_sha256: str,
+    ) -> str:
+        return self._sign(
+            self._node_reconfigure_payload(
+                node_id=node_id,
+                external_port=external_port,
+                desired_revision=desired_revision,
+                registered_cameras=registered_cameras,
+                blast_radius_sha256=blast_radius_sha256,
+                target_release_id=target_release_id,
+                target_mediamtx_binary_sha256=target_mediamtx_binary_sha256,
+                expires_at=int(self._wall_time()) + self._lifetime_seconds,
+            )
+        )
+
+    def verify_node_reconfigure(
+        self,
+        token: str,
+        *,
+        node_id: UUID,
+        external_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+        target_release_id: str,
+        target_mediamtx_binary_sha256: str,
+    ) -> bool:
+        if len(blast_radius_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in blast_radius_sha256
+        ):
+            return False
+        decoded_token = self._decode(token)
+        if decoded_token is None:
+            return False
+        payload, signature, decoded = decoded_token
+        expires_at = decoded.get("expires_at")
+        if (
+            not isinstance(expires_at, int)
+            or isinstance(expires_at, bool)
+            or expires_at < int(self._wall_time())
+        ):
+            return False
+        expected = self._node_reconfigure_payload(
+            node_id=node_id,
+            external_port=external_port,
+            desired_revision=desired_revision,
+            registered_cameras=registered_cameras,
+            blast_radius_sha256=blast_radius_sha256,
+            target_release_id=target_release_id,
+            target_mediamtx_binary_sha256=target_mediamtx_binary_sha256,
+            expires_at=expires_at,
+        )
+        expected_signature = hmac.new(self._secret, expected, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(payload, expected) and hmac.compare_digest(
+            signature,
+            expected_signature,
+        )
+
     def issue_camera_mutation(
         self,
         *,
@@ -413,6 +480,34 @@ class ConfirmationTokenService:
                 "old_port": old_port,
                 "operation": "node_port_change",
                 "registered_cameras": registered_cameras,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _node_reconfigure_payload(
+        *,
+        node_id: UUID,
+        external_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+        target_release_id: str,
+        target_mediamtx_binary_sha256: str,
+        expires_at: int,
+    ) -> bytes:
+        return json.dumps(
+            {
+                "blast_radius_sha256": blast_radius_sha256,
+                "desired_revision": desired_revision,
+                "expires_at": expires_at,
+                "external_port": external_port,
+                "node_id": str(node_id),
+                "operation": "node_reconfigure",
+                "registered_cameras": registered_cameras,
+                "target_release_id": target_release_id,
+                "target_mediamtx_binary_sha256": target_mediamtx_binary_sha256,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -1071,6 +1166,8 @@ class CameraReconciler:
             desired = self._store.list_node_cameras(node_id)
             active_moves = self._store.list_node_active_moves(node_id)
             inventory = client.inventory_paths()
+            if not inventory.no_oracle_matcher_present:
+                raise ReconcileRetry("camera_reconcile_reserved_path_missing")
             known_ids = {camera.public_id for camera in desired}.union(
                 move.public_id for move in active_moves
             )

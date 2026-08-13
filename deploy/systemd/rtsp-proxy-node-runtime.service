@@ -1,7 +1,8 @@
 [Unit]
 Description=RTSP Proxy privileged media-node runtime helper
-Requires=rtsp-proxy-node-runtime.socket
-After=rtsp-proxy-node-runtime.socket
+Requires=rtsp-proxy-node-runtime.socket rtsp-proxy-nftables.service
+Wants=rtsp-proxy-auth.service
+After=rtsp-proxy-node-runtime.socket rtsp-proxy-auth.service rtsp-proxy-nftables.service
 
 [Service]
 Type=simple
@@ -32,6 +33,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 ReadWritePaths=/etc/rtsp-proxy/nodes
+ReadOnlyPaths=/etc/rtsp-proxy/control-plane/access-peppers.json
 
 [Install]
 WantedBy=multi-user.target

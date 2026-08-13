@@ -11,6 +11,7 @@ from rtsp_proxy.release import (
     ReleaseVerificationError,
     Sha256,
     normalize_linux_arch,
+    trusted_mediamtx_activation_identity,
     verify_release,
 )
 
@@ -47,7 +48,7 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
     assert package_root.joinpath(
         "migrations",
         "versions",
-        "0009_camera_move_safety.py",
+        "0010_camera_access.py",
     ).is_file()
 
 
@@ -57,18 +58,18 @@ def sha256(payload: bytes) -> str:
 
 @pytest.fixture(autouse=True)
 def trust_test_mediamtx(monkeypatch: pytest.MonkeyPatch) -> None:
-    payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.1\\n'\n"
+    payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.2\\n'\n"
     monkeypatch.setattr(
         "rtsp_proxy.release._trusted_mediamtx_identity",
         lambda _architecture, _release_id: (
-            "v1.20.0-rtsp-proxy.1",
+            "v1.20.0-rtsp-proxy.2",
             Sha256.model_validate(sha256(payload)),
         ),
     )
 
 
 def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
-    mediamtx_payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.1\\n'\n"
+    mediamtx_payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.2\\n'\n"
     ffmpeg_payload = b"#!/bin/sh\nprintf 'ffmpeg version test build\\n'\n"
     ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version test build\\n'\n"
     artifacts = {
@@ -87,7 +88,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
 
     manifest = {
         "schema_version": 1,
-        "release_id": "0.1.0",
+        "release_id": "0.2.0",
         "git_commit": "a" * 40,
         "python": {
             "version": "3.12",
@@ -97,7 +98,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "wheel_sha256": sha256(wheel_payload),
         },
         "mediamtx": {
-            "version": "v1.20.0-rtsp-proxy.1",
+            "version": "v1.20.0-rtsp-proxy.2",
             "linux_arch": "amd64",
             "binary": "bin/mediamtx",
             "binary_sha256": sha256(mediamtx_payload),
@@ -110,8 +111,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
         "schema_compatibility": {
-            "minimum": "0009_camera_move_safety",
-            "maximum": "0009_camera_move_safety",
+            "minimum": "0010_camera_access",
+            "maximum": "0010_camera_access",
         },
         "config_schema_version": 1,
     }
@@ -125,7 +126,7 @@ def test_verified_release_exposes_only_validated_artifact_paths(tmp_path: Path) 
 
     release = verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
-    assert release.release_id == "0.1.0"
+    assert release.release_id == "0.2.0"
     assert release.wheel == tmp_path / "dist/rtsp_proxy-0.1.0-py3-none-any.whl"
     assert release.mediamtx_binary == tmp_path / "bin/mediamtx"
     assert release.ffmpeg_binary == tmp_path / "bin/ffmpeg"
@@ -143,6 +144,17 @@ def test_stock_or_self_declared_mediamtx_is_rejected_before_execution(tmp_path: 
 
     with pytest.raises(ReleaseVerificationError, match="untrusted_mediamtx_artifact"):
         verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
+
+
+def test_historical_release_is_trusted_for_provenance_but_not_activation() -> None:
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="mediamtx_release_activation_incompatible",
+    ):
+        trusted_mediamtx_activation_identity("amd64", "0.1.0")
+
+    version, _digest = trusted_mediamtx_activation_identity("amd64", "0.2.0")
+    assert version == "v1.20.0-rtsp-proxy.2"
 
 
 def test_tampered_artifact_is_rejected_with_a_stable_reason(tmp_path: Path) -> None:
@@ -187,7 +199,7 @@ def test_release_verifier_cli_is_usable_by_linux_installation_automation(
     exit_code = main(["--manifest", str(manifest_path)])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == "verified release 0.1.0\n"
+    assert capsys.readouterr().out == "verified release 0.2.0\n"
 
 
 def test_release_verifier_cli_fails_closed_on_tampering(
@@ -251,7 +263,7 @@ def test_cli_detects_the_native_linux_runtime(
     exit_code = main(["--manifest", str(manifest_path)])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == "verified release 0.1.0\n"
+    assert capsys.readouterr().out == "verified release 0.2.0\n"
 
 
 def test_cli_rejects_a_non_linux_activation_host(
@@ -305,7 +317,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert {manifest.release_id for manifest in manifests} == {"0.1.0"}
+    assert {manifest.release_id for manifest in manifests} == {"0.2.0"}
 
 
 def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:

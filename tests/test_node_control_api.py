@@ -1129,11 +1129,13 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
             text(
                 "SELECT count(*) FROM information_schema.tables "
                 "WHERE table_schema = 'public' "
-                "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
+                "AND table_name IN "
+                "('media_nodes', 'cameras', 'audit_events', 'outbox_messages', "
+                "'camera_access_policies', 'camera_access_grants')"
             )
         )
-    assert revision == "0009_camera_move_safety"
-    assert table_count == 4
+    assert revision == "0010_camera_access"
+    assert table_count == 6
 
 
 def test_camera_move_safety_migration_rejects_invalid_legacy_source_urls(
@@ -1444,7 +1446,7 @@ def test_phase_d_transition_round_trip_preserves_camera_uuid_and_public_rtsp_pat
             text("UPDATE cameras SET state='deleted', desired_revision=2, applied_revision=2")
         )
         connection.execute(text("DELETE FROM media_nodes"))
-    command.upgrade(migration, "0009_camera_move_safety")
+    command.upgrade(migration, "head")
     with engine.begin() as connection:
         database_name = str(connection.scalar(text("SELECT current_database()")))
         quoted_database = connection.dialect.identifier_preparer.quote(database_name)
@@ -1523,6 +1525,22 @@ def test_phase_d_transition_round_trip_preserves_camera_uuid_and_public_rtsp_pat
             text("SELECT count(*) FROM public_id_tombstones WHERE public_id=:public_id"),
             {"public_id": public_id},
         )
+        access_policy = connection.execute(
+            text(
+                "SELECT internet_cidrs, local_cidrs, revision "
+                "FROM camera_access_policies WHERE camera_id=:camera_id"
+            ),
+            {"camera_id": camera_id},
+        ).one()
+        access_policy_audit_count = connection.scalar(
+            text(
+                "SELECT count(*) FROM audit_events "
+                "WHERE aggregate_type='camera_access_policy' "
+                "AND aggregate_id=:camera_id "
+                "AND event_type='camera.access_policy_created'"
+            ),
+            {"camera_id": camera_id},
+        )
     assert row == (
         camera_id,
         public_id,
@@ -1538,8 +1556,26 @@ def test_phase_d_transition_round_trip_preserves_camera_uuid_and_public_rtsp_pat
         0,
     )
     assert tombstone_count == 1
+    assert access_policy == ([], [], 1)
+    assert access_policy_audit_count == 1
     assert f"rtsp://server:12000/{public_id}" == f"rtsp://server:12000/{row.public_id}"
     assert manifest.stat().st_mode & 0o777 == 0o600
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM camera_access_policies WHERE camera_id=:camera_id"),
+            {"camera_id": camera_id},
+        )
+    with pytest.raises(PhaseDTransitionError, match="transition_target_not_empty"):
+        restore_transition(
+            postgres_database_url,
+            manifest,
+            manifest_sha256=manifest_sha256,
+            release_id="0.1.0",
+            mediamtx_binary_sha256=digest.root,
+            node_policy=policy,
+            port_is_bindable=lambda _port: True,
+        )
 
     with engine.begin() as connection:
         connection.execute(
@@ -1700,7 +1736,7 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
             "external_port": 12000,
             "api_port": 20000,
             "metrics_port": 20100,
-            "release_id": "0.1.0",
+            "release_id": "0.2.0",
             "creation_mode": "operator",
             "camera_capacity": 100,
             "desired_revision": 1,
@@ -2318,7 +2354,7 @@ def test_node_create_can_complete_provision_start_and_persist_applied_revision()
     assert runtime.calls == [(NodeRuntimeAction.PROVISION_START, node_id)]
     persisted = control.list_nodes()[0]
     assert persisted.process_id == 3001
-    assert persisted.observed_release_id == "0.1.0"
+    assert persisted.observed_release_id == "0.2.0"
 
 
 def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
@@ -4183,6 +4219,239 @@ def test_drain_and_maintenance_exclude_placement_without_stopping_the_node() -> 
         )
 
 
+def test_reconfigure_requires_drain_and_exact_confirmation_then_preserves_endpoint() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+    )
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                node_port_range_start=12000,
+                node_port_range_end=12000,
+            ),
+            node_control=control,
+            camera_control=cameras,
+        )
+    )
+    created = client.post(
+        "/api/v1/nodes",
+        json={"name": "media-a", "external_port": 12000},
+    )
+    camera = cameras.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_id,
+    )
+
+    not_drained = client.post(f"/api/v1/nodes/{node_id}/reconfigure/preview")
+    assert not_drained.status_code == 409
+    assert not_drained.json()["detail"]["code"] == "node_not_draining"
+    assert client.post(f"/api/v1/nodes/{node_id}/drain").status_code == 200
+
+    missing_confirmation = client.post(
+        f"/api/v1/nodes/{node_id}/reconfigure",
+        json={},
+    )
+    preview = client.post(f"/api/v1/nodes/{node_id}/reconfigure/preview")
+    reconfigured = client.post(
+        f"/api/v1/nodes/{node_id}/reconfigure",
+        json={"confirmation_token": preview.json()["confirmation_token"]},
+    )
+    replay = client.post(
+        f"/api/v1/nodes/{node_id}/reconfigure",
+        json={"confirmation_token": preview.json()["confirmation_token"]},
+    )
+
+    assert created.status_code == 201
+    assert missing_confirmation.status_code == 409
+    assert missing_confirmation.json()["detail"]["code"] == (
+        "node_disruption_confirmation_required"
+    )
+    assert preview.status_code == 200
+    assert preview.json()["external_port"] == 12000
+    assert preview.json()["registered_cameras"] == 1
+    assert preview.json()["target_release_id"] == "0.2.0"
+    assert preview.json()["target_mediamtx_binary_sha256"] == "0" * 64
+    assert reconfigured.status_code == 200
+    assert reconfigured.json()["state"] == "draining"
+    assert reconfigured.json()["runtime_state"] == "running"
+    assert reconfigured.json()["external_port"] == 12000
+    assert reconfigured.json()["applied_revision"] == reconfigured.json()["desired_revision"]
+    assert cameras.list_cameras()[0] == camera
+    assert runtime.calls[-1] == (NodeRuntimeAction.RECONFIGURE_RESTART, node_id)
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["code"] == "node_disruption_confirmation_required"
+    resumed = client.post(f"/api/v1/nodes/{node_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["state"] == "running"
+
+
+def test_confirmed_reconfigure_upgrades_nonempty_node_release_atomically() -> None:
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        reconfigure_release_id="0.2.0",
+        reconfigure_mediamtx_binary_sha256="b" * 64,
+    )
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    created = control.register_node(
+        name="legacy-node",
+        port_range_start=12000,
+        port_range_end=12000,
+        max_nodes=1,
+        release_id="0.1.0",
+        mediamtx_binary_sha256="a" * 64,
+    )
+    camera = cameras.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_id,
+    )
+    control.set_administrative_state(node_id, NodeState.DRAINING)
+    preview = control.preview_reconfigure(node_id)
+
+    assert preview.target_release_id == "0.2.0"
+    assert preview.target_mediamtx_binary_sha256 == "b" * 64
+
+    upgraded = control.reconfigure_node(
+        node_id,
+        confirmation_token=preview.confirmation_token,
+    )
+
+    assert created.release_id == "0.1.0"
+    assert upgraded.release_id == "0.2.0"
+    assert upgraded.mediamtx_binary_sha256 == "b" * 64
+    assert upgraded.applied_revision == upgraded.desired_revision
+    assert cameras.list_cameras() == (camera,)
+    assert runtime.calls[-1] == (NodeRuntimeAction.RECONFIGURE_RESTART, node_id)
+
+
+def test_postgresql_confirmed_reconfigure_upgrades_nonempty_node_release(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    runtime = RecordingLifecycleRuntime()
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        node_runtime=runtime,
+        provision_on_create=True,
+        confirmations=node_confirmation_service(),
+        reconfigure_release_id="0.2.0",
+        reconfigure_mediamtx_binary_sha256="b" * 64,
+    )
+    control.register_node(
+        name="legacy-postgres-node",
+        port_range_start=12000,
+        port_range_end=12000,
+        max_nodes=1,
+        release_id="0.1.0",
+        mediamtx_binary_sha256="a" * 64,
+    )
+    CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    ).create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_id,
+    )
+    control.set_administrative_state(node_id, NodeState.DRAINING)
+    preview = control.preview_reconfigure(node_id)
+
+    upgraded = control.reconfigure_node(
+        node_id,
+        confirmation_token=preview.confirmation_token,
+    )
+
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        event = connection.execute(
+            text(
+                "SELECT payload->>'previous_release_id', payload->>'release_id', "
+                "payload->>'release_changed' FROM audit_events "
+                "WHERE aggregate_id=:node_id "
+                "AND event_type='media_node.reconfigure_requested'"
+            ),
+            {"node_id": node_id},
+        ).one()
+    engine.dispose()
+    store.close()
+
+    assert upgraded.release_id == "0.2.0"
+    assert upgraded.mediamtx_binary_sha256 == "b" * 64
+    assert upgraded.registered_cameras == 1
+    assert event == ("0.1.0", "0.2.0", "true")
+
+
+def test_failed_reconfigure_can_be_retried_only_while_node_remains_draining() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.DRAINING,
+                runtime_state=NodeState.FAILED,
+                desired_revision=2,
+                applied_revision=1,
+            ),
+        )
+    )
+    runtime = RecordingLifecycleRuntime()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+        confirmations=node_confirmation_service(),
+    )
+
+    preview = control.preview_reconfigure(node_id)
+    recovered = control.reconfigure_node(
+        node_id,
+        confirmation_token=preview.confirmation_token,
+    )
+
+    assert recovered.state is NodeState.DRAINING
+    assert recovered.runtime_state is NodeState.RUNNING
+    assert recovered.applied_revision == recovered.desired_revision == 3
+    assert runtime.calls == [(NodeRuntimeAction.RECONFIGURE_RESTART, node_id)]
+
+
 def test_node_administration_public_errors_are_typed() -> None:
     unknown_id = UUID("00000000-0000-0000-0000-000000000099")
     without_control = TestClient(create_app(Settings(role=RuntimeRole.WEB)))
@@ -4192,6 +4461,19 @@ def test_node_administration_public_errors_are_typed() -> None:
         without_control.post(
             f"/api/v1/nodes/{unknown_id}/port-change/preview",
             json={"new_port": 12000},
+        ).status_code
+        == 503
+    )
+    assert (
+        without_control.post(
+            f"/api/v1/nodes/{unknown_id}/reconfigure/preview",
+        ).status_code
+        == 503
+    )
+    assert (
+        without_control.post(
+            f"/api/v1/nodes/{unknown_id}/reconfigure",
+            json={"confirmation_token": "invalid"},
         ).status_code
         == 503
     )
@@ -4244,6 +4526,13 @@ def test_node_administration_public_errors_are_typed() -> None:
         f"/api/v1/nodes/{unknown_id}/port-change",
         json={"new_port": 12001, "confirmation_token": "invalid"},
     )
+    missing_reconfigure_preview = client.post(
+        f"/api/v1/nodes/{unknown_id}/reconfigure/preview"
+    )
+    missing_reconfigure = client.post(
+        f"/api/v1/nodes/{unknown_id}/reconfigure",
+        json={"confirmation_token": "invalid"},
+    )
     missing_delete = client.delete(f"/api/v1/nodes/{unknown_id}")
     invalid_transition = client.post(f"/api/v1/nodes/{node_id}/maintenance")
     out_of_range = client.post(
@@ -4260,6 +4549,8 @@ def test_node_administration_public_errors_are_typed() -> None:
     assert missing_resume.status_code == 404
     assert missing_preview.status_code == 404
     assert missing_change.status_code == 404
+    assert missing_reconfigure_preview.status_code == 404
+    assert missing_reconfigure.status_code == 404
     assert missing_delete.status_code == 404
     assert invalid_transition.status_code == 409
     assert invalid_transition.json()["detail"]["code"] == (
@@ -4387,6 +4678,83 @@ def test_node_administration_maps_busy_runtime_and_store_errors() -> None:
     response = client.delete(f"/api/v1/nodes/{node_id}")
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "node_delete_failed"
+
+
+def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.DRAINING,
+                runtime_state=NodeState.RUNNING,
+            ),
+        )
+    )
+
+    class ReconfigureControl(NodeControl):
+        preview_error: Exception | None = None
+        reconfigure_error: Exception | None = None
+
+        def preview_reconfigure(self, node_id: UUID) -> Any:
+            if self.preview_error is not None:
+                raise self.preview_error
+            return super().preview_reconfigure(node_id)
+
+        def reconfigure_node(
+            self,
+            node_id: UUID,
+            *,
+            confirmation_token: str | None,
+        ) -> MediaNode:
+            if self.reconfigure_error is not None:
+                raise self.reconfigure_error
+            return super().reconfigure_node(
+                node_id,
+                confirmation_token=confirmation_token,
+            )
+
+    control = ReconfigureControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        confirmations=node_confirmation_service(),
+    )
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
+    )
+
+    preview_cases: tuple[tuple[Exception, int], ...] = (
+        (NodeLifecycleBusy("node_lifecycle_busy"), 503),
+        (NodeRuntimeUnavailable("node_confirmation_unavailable"), 503),
+        (NodeLifecycleConflict("node_not_draining"), 409),
+    )
+    for error, expected_status in preview_cases:
+        control.preview_error = error
+        assert (
+            client.post(f"/api/v1/nodes/{node_id}/reconfigure/preview").status_code
+            == expected_status
+        )
+    control.preview_error = None
+    token = client.post(
+        f"/api/v1/nodes/{node_id}/reconfigure/preview"
+    ).json()["confirmation_token"]
+    reconfigure_cases: tuple[tuple[Exception, int], ...] = (
+        (NodeLifecycleBusy("node_lifecycle_busy"), 503),
+        (NodeRuntimeUnavailable("node_runtime_unavailable"), 503),
+        (NodeLifecycleConflict("node_operation_in_progress"), 409),
+        (NodeRuntimeFailed("node_runtime_operation_failed", node_id=node_id), 503),
+    )
+    for error, expected_status in reconfigure_cases:
+        control.reconfigure_error = error
+        response = client.post(
+            f"/api/v1/nodes/{node_id}/reconfigure",
+            json={"confirmation_token": token},
+        )
+        assert response.status_code == expected_status
 
 
 def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> None:
@@ -5423,6 +5791,14 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
         node_id=node_id,
     )
 
+    control.set_administrative_state(node_id, NodeState.DRAINING)
+    reconfigure_preview = control.preview_reconfigure(node_id)
+    reconfigured = control.reconfigure_node(
+        node_id,
+        confirmation_token=reconfigure_preview.confirmation_token,
+    )
+    control.set_administrative_state(node_id, NodeState.RUNNING)
+
     preview = control.preview_port_change(
         node_id,
         new_port=12001,
@@ -5451,6 +5827,11 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
         f"{camera.id}:{camera.placement_generation}".encode("ascii")
     ).hexdigest()
     assert changed.external_port == 12001
+    assert reconfigured.external_port == 12000
+    assert reconfigured.state is NodeState.DRAINING
+    assert reconfigured.applied_revision == reconfigured.desired_revision
+    assert reconfigure_preview.registered_cameras == 1
+    assert reconfigure_preview.blast_radius_sha256 == expected_blast_radius
     assert preview.registered_cameras == 1
     assert preview.blast_radius_sha256 == expected_blast_radius
     assert drained.state is NodeState.DRAINING
@@ -5472,8 +5853,17 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
             text("SELECT node_id FROM camera_placement_history WHERE camera_id = :camera_id"),
             {"camera_id": camera_id},
         )
+        reconfigure_events = connection.scalar(
+            text(
+                "SELECT count(*) FROM audit_events "
+                "WHERE aggregate_id = :node_id "
+                "AND event_type = 'media_node.reconfigure_requested'"
+            ),
+            {"node_id": node_id},
+        )
     assert saga == ("complete", 1, expected_blast_radius)
     assert historical_node == node_id
+    assert reconfigure_events == 1
     store.close()
 
 

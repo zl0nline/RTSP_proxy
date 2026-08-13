@@ -1,7 +1,8 @@
 [Unit]
 Description=RTSP Proxy bounded MediaMTX node %i
-Wants=network-online.target
-After=network-online.target
+Requires=rtsp-proxy-nftables.service
+Wants=network-online.target rtsp-proxy-auth.service
+After=network-online.target rtsp-proxy-auth.service rtsp-proxy-nftables.service
 
 [Service]
 Type=simple
@@ -44,6 +45,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 LimitNOFILE=131072
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target

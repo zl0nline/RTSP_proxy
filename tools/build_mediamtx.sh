@@ -68,7 +68,7 @@ git -C "$source_root" apply "$repo_root/$patch_path"
 (
     cd "$source_root"
     go generate ./...
-    go test -race ./internal/core ./internal/servers/rtsp
+    go test -race ./internal/auth ./internal/core ./internal/servers/rtsp
 )
 printf '%s\n' "$version" > "$source_root/internal/core/VERSION"
 

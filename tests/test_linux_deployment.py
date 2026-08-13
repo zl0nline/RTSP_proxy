@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from rtsp_proxy.release import ReleaseVerificationError, trusted_mediamtx_identity
+from rtsp_proxy.nft_reconcile import NftReconcileError, validate_owned_table
+from rtsp_proxy.release import trusted_mediamtx_identity
 
 
 class CaseSensitiveConfigParser(ConfigParser):
@@ -24,7 +25,7 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
     entries = Path("deploy/tmpfiles.d/rtsp-proxy.conf").read_text(encoding="utf-8").splitlines()
 
     assert "d /etc/rtsp-proxy 0755 root root -" in entries
-    assert "d /etc/rtsp-proxy/control-plane 0750 root rtsp-proxy -" in entries
+    assert "d /etc/rtsp-proxy/control-plane 0750 root rtsp-proxy-access -" in entries
     assert "d /etc/rtsp-proxy/mediamtx 0750 root mediamtx -" in entries
     assert "d /etc/rtsp-proxy/nodes 0700 root root -" in entries
 
@@ -33,9 +34,18 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
     assert web["Service"]["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy.env")
     assert media["Service"]["ExecStart"].endswith(" /etc/rtsp-proxy/mediamtx/mediamtx.yml")
 
+    users = Path("deploy/sysusers.d/rtsp-proxy.conf").read_text(encoding="utf-8")
+    assert "g rtsp-proxy-access - -" in users
+    assert "m rtsp-proxy rtsp-proxy-access" in users
+    assert "m rtsp-proxy-auth rtsp-proxy-access" in users
+
 
 def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
-    for name in ("rtsp-proxy-web.service", "rtsp-proxy@.service", "mediamtx.service"):
+    for name in (
+        "rtsp-proxy-web.service",
+        "rtsp-proxy@.service",
+        "mediamtx.service",
+    ):
         service = read_unit(name)["Service"]
         assert service["NoNewPrivileges"] == "yes"
         assert service["ProtectSystem"] == "strict"
@@ -57,8 +67,33 @@ def test_background_roles_use_a_separate_systemd_template() -> None:
     assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env")
 
 
+def test_media_auth_callback_is_a_dedicated_unprivileged_loopback_service() -> None:
+    service = read_unit("rtsp-proxy-auth.service")["Service"]
+    environment = Path("deploy/rtsp-proxy-auth.env.example").read_text(encoding="utf-8")
+
+    assert service["User"] == "rtsp-proxy-auth"
+    assert service["Group"] == "rtsp-proxy-auth"
+    assert service["Environment"] == "RTSP_PROXY_ROLE=auth"
+    assert service["EnvironmentFile"] == (
+        "/etc/rtsp-proxy/control-plane/rtsp-proxy-auth.env"
+    )
+    assert service["ExecStart"] == "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-auth"
+    assert service["NoNewPrivileges"] == "yes"
+    assert service["CapabilityBoundingSet"] == ""
+    assert service["ReadOnlyPaths"] == (
+        "/etc/rtsp-proxy/control-plane/access-peppers.json"
+    )
+    assert service["ReadWritePaths"] == "/run/rtsp-proxy-auth"
+    assert "StateDirectory" not in service
+    assert "LogsDirectory" not in service
+    assert "RTSP_PROXY_AUTH_HOST=127.0.0.1" in environment
+    assert "RTSP_PROXY_AUTH_PORT=8010" in environment
+    assert "RTSP_PROXY_ACCESS_PEPPER_FILE=/etc/rtsp-proxy/control-plane/" in environment
+
+
 def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
-    service = read_unit("rtsp-proxy-media@.service")["Service"]
+    unit = read_unit("rtsp-proxy-media@.service")
+    service = unit["Service"]
 
     assert service["DynamicUser"] == "yes"
     assert service["EnvironmentFile"] == "/etc/rtsp-proxy/nodes/%i/runtime.env"
@@ -81,10 +116,120 @@ def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
         "/etc/rtsp-proxy/nodes/%i/reader.json"
     )
     assert service["TimeoutStopSec"] == "15s"
+    assert service["LimitNOFILE"] == "131072"
+    assert service["TasksMax"] == "256"
+    assert "rtsp-proxy-auth.service" in unit["Unit"]["Wants"]
+    assert "rtsp-proxy-auth.service" in unit["Unit"]["After"]
+
+
+def test_nftables_policy_is_additive_bounded_and_scoped_to_node_ports() -> None:
+    policy = Path("deploy/nftables/rtsp-proxy.nft").read_text(encoding="utf-8")
+
+    assert 'comment "rtsp-proxy-owned:v1"' in policy
+    assert "destroy table inet rtsp_proxy" not in policy
+    assert "type filter hook input priority -5; policy accept;" in policy
+    assert "elements = { 10000-10999 }" in policy
+    assert policy.count("size 65536") == 4
+    assert "size 256" in policy
+    assert policy.count("ct count over 128") == 3
+    assert 'comment "rtsp-proxy per-node connection cap"' in policy
+    assert policy.count("limit rate over 100/second burst 200 packets") == 2
+    assert "flush ruleset" not in policy
+    assert "policy drop" not in policy
+
+    unit = read_unit("rtsp-proxy-nftables.service")
+    assert unit["Unit"]["Before"] == (
+        "network.target rtsp-proxy-node-runtime.service rtsp-proxy-media@.service"
+    )
+    assert unit["Service"]["ExecStart"] == (
+        "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-nft-reconcile"
+    )
+    assert unit["Service"]["CapabilityBoundingSet"] == "CAP_NET_ADMIN"
+
+
+def test_nftables_inventory_requires_exact_owned_schema() -> None:
+    entries: list[dict[str, object]] = [
+        {
+            "table": {
+                "family": "inet",
+                "name": "rtsp_proxy",
+                "comment": "rtsp-proxy-owned:v1",
+            }
+        }
+    ]
+    entries.extend(
+        {"set": {"family": "inet", "table": "rtsp_proxy", **contract}}
+        for contract in (
+            {"name": "node_ports", "type": "inet_service", "flags": ["interval"]},
+            {
+                "name": "syn_rate_v4",
+                "type": "ipv4_addr . inet_service",
+                "flags": ["dynamic", "timeout"],
+            },
+            {
+                "name": "syn_rate_v6",
+                "type": "ipv6_addr . inet_service",
+                "flags": ["dynamic", "timeout"],
+            },
+            {
+                "name": "connections_v4",
+                "type": "ipv4_addr . inet_service",
+                "flags": ["dynamic"],
+            },
+            {
+                "name": "connections_v6",
+                "type": "ipv6_addr . inet_service",
+                "flags": ["dynamic"],
+            },
+            {
+                "name": "node_connections",
+                "type": "inet_service",
+                "flags": ["dynamic"],
+            },
+        )
+    )
+    entries.append(
+        {
+            "chain": {
+                "family": "inet",
+                "table": "rtsp_proxy",
+                "name": "input",
+                "type": "filter",
+                "hook": "input",
+                "prio": -5,
+                "policy": "accept",
+            }
+        }
+    )
+    for comment in (
+        "rtsp-proxy per-node connection cap",
+        "rtsp-proxy per-ip-port connection cap",
+        "rtsp-proxy per-ip-port connection cap",
+        "rtsp-proxy per-ip-port SYN rate",
+        "rtsp-proxy per-ip-port SYN rate",
+    ):
+        entries.append(
+            {
+                "rule": {
+                    "family": "inet",
+                    "table": "rtsp_proxy",
+                    "comment": comment,
+                }
+            }
+        )
+    inventory: dict[str, object] = {"nftables": entries}
+
+    validate_owned_table(inventory)
+    table = entries[0]["table"]
+    assert isinstance(table, dict)
+    table["comment"] = "foreign"
+    with pytest.raises(NftReconcileError, match="nft_table_ownership_unproven"):
+        validate_owned_table(inventory)
 
 
 def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> None:
-    helper = read_unit("rtsp-proxy-node-runtime.service")["Service"]
+    helper_unit = read_unit("rtsp-proxy-node-runtime.service")
+    helper = helper_unit["Service"]
     runtime_socket = read_unit("rtsp-proxy-node-runtime.socket")["Socket"]
 
     assert helper["User"] == "root"
@@ -94,6 +239,10 @@ def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> 
     assert helper["NoNewPrivileges"] == "yes"
     assert helper["ProtectSystem"] == "strict"
     assert helper["CapabilityBoundingSet"] == ""
+    assert helper_unit["Unit"]["Requires"] == (
+        "rtsp-proxy-node-runtime.socket rtsp-proxy-nftables.service"
+    )
+    assert helper_unit["Unit"]["Wants"] == "rtsp-proxy-auth.service"
     assert runtime_socket["ListenStream"] == ("/run/rtsp-proxy-node-runtime/control.sock")
     assert runtime_socket["SocketUser"] == "root"
     assert runtime_socket["SocketGroup"] == "rtsp-proxy"
@@ -145,17 +294,16 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
 
     assert media["source_commit"] == "1b943637a4b5778bb929a7af7687b048fecaa03f"
     assert media["go_version"] == "go1.26.5"
-    assert media["version"] == "v1.20.0-rtsp-proxy.1"
+    assert media["version"] == "v1.20.0-rtsp-proxy.2"
     assert hashlib.sha256(patch_path.read_bytes()).hexdigest() == media["patch_sha256"]
-    assert trusted == {
-        "schema_version": 2,
-        "releases": {
-            "0.1.0": {
-                "version": media["version"],
-                "architectures": media["architectures"],
-            }
-        },
+    assert trusted["schema_version"] == 2
+    assert trusted["releases"]["0.2.0"] == {
+        "version": media["version"],
+        "activation_compatible": True,
+        "architectures": media["architectures"],
     }
+    assert trusted["releases"]["0.1.0"]["version"] == "v1.20.0-rtsp-proxy.1"
+    assert trusted["releases"]["0.1.0"]["activation_compatible"] is False
 
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert workflow.count("tools/build_mediamtx.sh") == 2
@@ -163,14 +311,19 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
     assert "Download, verify and stage MediaMTX" not in workflow
 
 
-def test_initial_patched_release_has_no_fabricated_previous_trust_entry() -> None:
-    _version, current = trusted_mediamtx_identity("amd64", "0.1.0")
+def test_current_and_previous_patched_releases_have_distinct_trust_entries() -> None:
+    previous_version, previous = trusted_mediamtx_identity("amd64", "0.1.0")
+    current_version, current = trusted_mediamtx_identity("amd64", "0.2.0")
 
-    assert current.root == (
+    assert previous_version == "v1.20.0-rtsp-proxy.1"
+    assert previous.root == (
         "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6"
     )
-    with pytest.raises(ReleaseVerificationError, match="trusted_artifact_catalog_invalid"):
-        trusted_mediamtx_identity("amd64", "0.0.9")
+    assert current_version == "v1.20.0-rtsp-proxy.2"
+    assert current.root == (
+        "9e6e61d4a33dd4283623c964dbf39cd8c84c807894f8db6edf97ee223c34b9d9"
+    )
+    assert current != previous
 
 
 def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
@@ -182,6 +335,9 @@ def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+    builder = Path("tools/build_mediamtx.sh").read_text(encoding="utf-8")
+    assert "go test -race ./internal/auth ./internal/core ./internal/servers/rtsp" in builder
 
 
 def test_load_fixture_builder_has_valid_bash_syntax() -> None:

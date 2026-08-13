@@ -64,6 +64,7 @@ class RecordingMediaNode(MediaNodeClient):
         self.deletes: list[PublicId] = []
         self.fail_put_after_apply = False
         self.runtime: dict[PublicId, tuple[bool, int] | None] = {}
+        self.no_oracle_matcher_present = True
 
     def put_path(self, path: MediaPathConfig) -> None:
         self.paths[path.name] = path
@@ -78,7 +79,7 @@ class RecordingMediaNode(MediaNodeClient):
     def inventory_paths(self) -> MediaPathInventory:
         return MediaPathInventory(
             camera_ids=tuple(sorted(self.paths, key=str)),
-            no_oracle_matcher_present=False,
+            no_oracle_matcher_present=self.no_oracle_matcher_present,
         )
 
     def delete_path(self, name: PublicId) -> None:
@@ -460,6 +461,87 @@ def test_node_port_confirmation_is_bound_to_blast_radius_and_expiry() -> None:
         desired_revision=3,
         registered_cameras=1,
         blast_radius_sha256=fingerprint,
+    )
+
+
+def test_node_reconfigure_confirmation_is_bound_to_exact_node_revision_and_placements() -> None:
+    wall_time = [1_700_000_000.0]
+    confirmations = ConfirmationTokenService(
+        secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+        lifetime_seconds=30,
+        wall_time=lambda: wall_time[0],
+    )
+    fingerprint = "b" * 64
+    token = confirmations.issue_node_reconfigure(
+        node_id=NODE_A,
+        external_port=12000,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+        target_release_id="0.2.0",
+        target_mediamtx_binary_sha256="a" * 64,
+    )
+
+    assert confirmations.verify_node_reconfigure(
+        token,
+        node_id=NODE_A,
+        external_port=12000,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+        target_release_id="0.2.0",
+        target_mediamtx_binary_sha256="a" * 64,
+    )
+    assert not confirmations.verify_node_reconfigure(
+        token,
+        node_id=NODE_A,
+        external_port=12001,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+        target_release_id="0.2.0",
+        target_mediamtx_binary_sha256="a" * 64,
+    )
+    assert not confirmations.verify_node_reconfigure(
+        token,
+        node_id=NODE_A,
+        external_port=12000,
+        desired_revision=4,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+        target_release_id="0.2.0",
+        target_mediamtx_binary_sha256="a" * 64,
+    )
+    assert not confirmations.verify_node_reconfigure(
+        token,
+        node_id=NODE_A,
+        external_port=12000,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+        target_release_id="0.2.1",
+        target_mediamtx_binary_sha256="c" * 64,
+    )
+    assert not confirmations.verify_node_reconfigure(
+        token,
+        node_id=NODE_A,
+        external_port=12000,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256="invalid",
+        target_release_id="0.2.0",
+        target_mediamtx_binary_sha256="a" * 64,
+    )
+    wall_time[0] += 31
+    assert not confirmations.verify_node_reconfigure(
+        token,
+        node_id=NODE_A,
+        external_port=12000,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256=fingerprint,
+        target_release_id="0.2.0",
+        target_mediamtx_binary_sha256="a" * 64,
     )
 
 
@@ -1184,6 +1266,20 @@ def test_reconcile_cycle_isolates_one_unavailable_node_and_continues() -> None:
     assert report.retryable_failures == 1
     assert report.reconciled_nodes == 1
     assert factory.requested == [NODE_A, NODE_B]
+
+
+def test_reconcile_fails_closed_when_reserved_no_oracle_matcher_is_missing() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+    factory.clients[NODE_A].no_oracle_matcher_present = False
+
+    with pytest.raises(ReconcileRetry, match="camera_reconcile_reserved_path_missing"):
+        CameraReconciler(store=store, media_nodes=factory).reconcile_node(NODE_A)
+
+    camera = store.get_camera(CAMERA_A)
+    assert camera is not None
+    assert camera.applied_revision == 0
+    assert factory.clients[NODE_A].puts == []
 
 
 def test_disabled_camera_remains_registered_but_its_path_is_removed() -> None:

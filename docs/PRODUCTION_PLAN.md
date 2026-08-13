@@ -472,7 +472,7 @@ simultaneous connects, ACL/auth and absence of media UDP sockets on amd64/arm64.
 
 Pinned upstream MediaMTX v1.20.0 does not natively produce both exact 453 and a
 race-safe non-disruptive admission fence. The product therefore builds
-`v1.20.0-rtsp-proxy.1` from exact commit
+`v1.20.0-rtsp-proxy.2` from exact commit
 `1b943637a4b5778bb929a7af7687b048fecaa03f` plus the reviewed SHA-256-bound
 patch in `patches/mediamtx-v1.20.0/`. The patch makes `maxReaders` a synchronous
 hot-only update, keeps an established session alive, and maps late SETUP to
@@ -745,12 +745,14 @@ Management and path-scoped runtime-reader credentials are different root-only
 secrets. The native isolation contract gates on first decodable AU and proves
 RTP packet progress after restart and stop of the other node. Startup recovery
 observes every node independently and converges persisted RUNNING/STOPPED
-intent after host reboot. Rolling activation drains/stops one node, performs a
-revision-fenced release transition, then starts/smokes it. From the second
-patched release onward, healthy old nodes stay manageable through a temporary
-previous-release catalog entry. Initial release `0.1.0` has no previous patched
-target and never treats stock v1.20.0 as rollback. Recovery is
-bounded-parallel; one slow node does not delay observation/convergence of every
+intent after host reboot. Empty-node rolling activation drains/stops one node,
+performs a revision-fenced release transition, then starts/smokes it. The
+Phase-E non-empty `.1 → .2` migration instead uses blast-radius-confirmed
+reconfigure and retains every camera/public path. `.1` is historical provenance,
+not rollback, because it lacks callback-compatible management auth. A future
+compatible previous-release entry must be independently proven before rollback
+is enabled; stock v1.20.0 is never rollback. Recovery is bounded-parallel; one
+slow node does not delay observation/convergence of every
 other node, and PostgreSQL advisory-lock connections are capped per replica.
 Recovery re-reads current desired state while holding the same-node lifecycle
 guard across observe, decision and convergence, so stale startup snapshots
@@ -799,8 +801,9 @@ legacy release digests in place is forbidden.
   desired revision and exact mutation digest;
 - [x] absolute helper deadlines, cancellation-aware PostgreSQL writer-lock
   waits and cooperative reconciler shutdown;
-- [x] versioned MediaMTX trust catalog with an optional separately verified
-  previous patched release; initial `0.1.0` honestly has no rollback target;
+- [x] versioned MediaMTX trust catalog with historical `.1` provenance and an
+  optional separately verified callback-compatible previous activation entry;
+  current `.2` has no rollback target;
 - [x] checksum-bound Phase-C→D export/restore preserving UUIDs/public paths,
   stable node intent, current host policy, synchronous durability and monotonic
   revision;
@@ -828,14 +831,77 @@ to receive RTP; CI runs it on amd64 and arm64.
 
 ### Phase E — access and one-reader contract
 
-- access policy schema/API/UI;
-- IPv4/IPv6 CIDR normalization;
-- ACL-before-password verifier;
-- downstream credential rotation/revoke;
-- integrate the Phase-D exact-453 admission primitive with ACL/auth/drain;
-- prove simultaneous reader admission remains race-safe;
-- no-oracle and connection abuse controls;
-- ordinary FFmpeg H.264/H.265 tests.
+- [x] access policy/grant schema and API (dashboard UI remains Phase F);
+- [x] IPv4/IPv6 CIDR normalization;
+- [x] ACL-before-password verifier;
+- [x] one-time URL-safe downstream credentials, versioned pepper,
+  explicit temporary/service kind, server-derived bootstrap creator/last-use
+  metadata, rotation/revoke
+  and no plaintext database/audit value;
+- [x] dedicated loopback callback with per-node HMAC Basic identity, exact
+  node/path binding, bounded body deadline and no positive decision cache;
+- [x] integrate the Phase-D exact-453 admission primitive with ACL/auth/drain;
+- [x] prove simultaneous reader admission remains race-safe;
+- [x] bounded callback/global, per-peer and per-grant admission plus uniform
+  malformed/oversized/overload denial, per-peer pending cap and a bounded
+  auth-only PostgreSQL statement/connect budget;
+- [x] dual-key pepper rotation with revision-fenced rehash-on-use;
+- [x] bounded redacted decision-event seam for internal audit/metrics;
+- [x] authenticated per-node API/metrics/runtime probe before callback fallback;
+- [x] idempotent least-privilege PostgreSQL auth-role grants and native denial
+  of control-plane camera mutation;
+- [x] drain + blast-radius-confirmed reconfigure/restart + resume workflow for
+  existing nodes, preserving their external port and registered cameras;
+- [x] Phase-D transition restore creates the required allow-all access-policy
+  row and normative event for every restored camera;
+- [x] ordinary FFmpeg H.264/H.265 contract tests;
+- [x] additive host/L4 per-node, per-peer and SYN connection controls for the
+  configured node-port range;
+- [ ] independent security/RTSP review and native amd64/arm64 CI.
+
+Status: **IN REVIEW**. Migration `0010_camera_access` creates normalized
+internet/local policy and revocable grant state. Media nodes call the exact
+loopback `/internal/v1/media-auth/<node-id>` route; unknown canonical paths use
+the reserved matcher and reach the same empty-401 path. Policy lookup checks
+camera placement plus RUNNING/non-maintenance node state, evaluates observed
+peer IP before reading a grant, and verifies a generated high-entropy token by
+constant-time HMAC-SHA-256. Creation explicitly chooses `temporary` or
+`service` and expiry; rotation also requires an explicit replacement lifetime,
+so there is no implicit unattended-client TTL. Until Phase F authenticates
+operators, creator is the server-derived `bootstrap-control-plane` principal,
+not caller input. The raw token is a one-time API response and is never stored
+or emitted to audit/outbox. Safe creator/last-use fields remain queryable;
+failed last-use persistence is visible at the auth service's loopback-only
+`/internal/v1/metrics` endpoint; its labels are limited to bounded
+reason/action/protocol/family classes.
+
+There is deliberately no positive/negative authorization cache, so new-session
+revoke, ACL and drain take effect on the next callback. Established sessions
+continue when the callback/DB is down or the grant is revoked; the patched
+MediaMTX owns occupancy and exact 453 atomically. A bounded callback in-flight
+gate, global request bucket, per-peer pending/rate gates and post-lookup
+per-camera/grant bucket fail closed without revealing denial reason. The
+generated node config pins `readTimeout: 10s`, and the pinned patch binds that
+value to the RTSP library idle/request deadline so an incomplete header cannot
+retain a socket past the bound. The additive nftables policy caps tracked
+connections at 128 per node and per peer/node pair and admits a 100/s,
+burst-200 SYN recovery wave per peer/node on IPv4 and IPv6. Its node-port
+interval must equal the configured range; native syntax/loading and RTSP
+behavior remain part of the Phase-E CI exit gate.
+
+Existing `.1` nodes must be drained after the helper is switched to the `.2`
+callback policy. The operator calls `POST /api/v1/nodes/<id>/reconfigure/preview`, verifies the
+returned exact port/camera-count/placement digest plus target release ID and
+binary SHA-256, and supplies that token to
+`POST /api/v1/nodes/<id>/reconfigure`; only then does the helper atomically render,
+restart and smoke the node. The desired state remains DRAINING until explicit
+`POST /api/v1/nodes/<id>/resume`. A failed attempt remains fail-closed and can be
+retried from DRAINING even when runtime is FAILED/STOPPED. Patched `.1` remains
+historical provenance but is not callback-compatible, so the first `.1 → .2`
+activation has no binary rollback target. Recovery retries `.2`; rollback stays
+NO-GO until a future callback-compatible previous release is catalogued and
+proven. It never installs allow-all/static users.
+Ordinary `rtsp://` interleaved TCP and the external port remain unchanged.
 
 Exit: security/RTSP review PASS and native amd64/arm64 contracts green.
 

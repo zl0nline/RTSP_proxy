@@ -18,7 +18,7 @@ fence.
 
 ## Decision
 
-Build `v1.20.0-rtsp-proxy.1` directly on Linux from upstream commit
+Build `v1.20.0-rtsp-proxy.2` directly on Linux from upstream commit
 `1b943637a4b5778bb929a7af7687b048fecaa03f` and
 `patches/mediamtx-v1.20.0/0001-hot-reader-limit-and-rtsp-453.patch`.
 
@@ -31,6 +31,8 @@ The patch:
 - preserves the established reader while `maxReaders` changes from `1` to
   `-1` and back;
 - maps reader-limit rejection to RTSP `453 Not Enough Bandwidth`.
+- checks node-internal API/metrics users before the external callback, so the
+  loopback management plane remains credentialed and node-scoped.
 
 The artifact catalog binds upstream commit, patch SHA-256, Go version, patched
 version string, and the resulting amd64/arm64 binary SHA-256 values. Release
@@ -59,8 +61,10 @@ Only catalog-verified binaries may be activated. The packaged trust catalog is
 versioned by deployment release ID and architecture. During an N→N+1 rollout it
 contains both the current N+1 identity and the previous N identity with their
 distinct binary digests; the helper validates each release ID against its own
-entry. Initial release `0.1.0` has no previous patched identity, so its previous
-pin stays unset and stock v1.20.0 is never used as a rollback target. Rollout
-starts with native contract nodes, then a drained pilot node. Once a catalogued
-previous patched release exists, rollback drains the affected node and activates
-it; rollback never falls back to stock v1.20.0 for reader-disruptive operations.
+entry. Release `0.2.0` catalogues the prior patched `0.1.0` identity and its
+distinct architecture-specific digests as historical provenance only. Since
+`.1` predates internal-user-before-callback behavior, it is not an activation
+or rollback target for Phase E. Rollout uses the blast-radius-confirmed
+non-empty `.1 → .2` reconfigure path. Binary rollback remains NO-GO until a
+future callback-compatible previous release is catalogued; stock v1.20.0 is
+never a fallback.

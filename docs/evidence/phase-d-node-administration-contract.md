@@ -20,8 +20,9 @@ Only then is the target opened and applied state committed. A five-minute
 deadline converts an incomplete pre-switch move to target cleanup, restores the
 source path, and records an abort reason.
 
-The fence is provided by the repository-owned MediaMTX build
-`v1.20.0-rtsp-proxy.1`: exact upstream commit plus a SHA-256-bound patch. Its
+The fence was first provided by repository-owned MediaMTX build
+`v1.20.0-rtsp-proxy.1`: exact upstream commit plus a SHA-256-bound patch. Phase E
+extends the same patch chain as `.2` to protect node management credentials. Its
 configuration acknowledgement waits until the running path has applied the new
 `maxReaders`; changing only this field does not recreate the path. The native
 amd64/arm64 contract keeps one reader receiving RTP through `1 → -1`, checks
@@ -54,10 +55,11 @@ writing, forces synchronous desired/audit/outbox durability and continues each
 node's normative revision. An operator-supplied legacy digest is never promoted
 to trusted identity. Stable desired lifecycle/admin state is restored exactly;
 transitional state blocks export and STOPPED/MAINTENANCE/FAILED is never
-promoted to RUNNING. The versioned catalog can carry separate current and
-previous patched identities, but initial release `0.1.0` contains only itself;
-it has no safe rollback target and never admits stock v1.20.0. A future N→N+1
-rollout must package both identities before enabling the previous pin.
+promoted to RUNNING. The versioned catalog carries current `0.2.0` and
+historical patched `0.1.0` identities and never admits stock v1.20.0. Phase E
+does not advertise `.1` as rollback because it lacks callback-compatible
+management auth. Every later N→N+1 rollout must package and prove a compatible
+previous identity before enabling its rollback pin.
 
 Local evidence: full unit/contract suite passes with native-only contracts
 skipped when Linux artifacts are unavailable. The published native Phase D

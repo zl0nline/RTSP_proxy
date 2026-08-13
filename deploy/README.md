@@ -120,7 +120,7 @@ release proof.
 `artifact-catalog.json` pins FFmpeg/ffprobe URLs and digests. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
 one SHA-256-bound local patch and Go `1.26.5`; resulting amd64/arm64 binary
-digests and the distinct `v1.20.0-rtsp-proxy.1` identity are pinned in the same
+digests and the distinct `v1.20.0-rtsp-proxy.2` identity are pinned in the same
 catalog. The patch makes `maxReaders` a synchronous non-disruptive hot update
 and maps a rejected late SETUP to RTSP 453. Example release manifests bind the
 resulting identity. Python wheel is platform-independent; native artifacts are
@@ -209,28 +209,135 @@ null endpoint snapshots when its deleted node no longer makes the old port
 reconstructible; all new and active moves require exact endpoint snapshots.
 
 Activation atomically switches `current`, reloads systemd and updates control
-roles. The packaged versioned trust catalog supports a current pin and, during
-a future rollout, one previous patched pin. Release `0.1.0` is the first patched
-release and intentionally has no previous entry: stock v1.20.0 is not a safe
-rollback target. Before an N→N+1 rollout, the new wheel must catalogue both N
-and N+1 with distinct architecture-specific digests; only then may the helper's
-three `PREVIOUS_*` values be set. Upgrade each node by draining it, stopping it, calling
-`PUT /api/v1/nodes/<uuid>/release` with the new release id/digest, and starting
-it again. The revision-fenced transition refuses a running, unconverged or
-non-empty node. Remove the previous pin only after every node is upgraded.
-When such a catalogued previous release exists, rollback uses the same
-stopped-node transition and validation/smoke path.
+roles. The packaged trust catalog records current `0.2.0` and historical
+patched `0.1.0` with distinct architecture-specific digests; stock v1.20.0 is
+never trusted. Phase-E `.1 → .2` uses the later documented drained,
+blast-radius-confirmed reconfigure because the ordinary release endpoint
+remains intentionally limited to empty stopped nodes. `.1` is not configured
+as `PREVIOUS_*`: it lacks callback-compatible management auth. Before a future
+N→N+1 rollout enables rollback, the new wheel must catalogue and prove both
+callback-compatible N and N+1 identities; only then may `PREVIOUS_*` be set.
 
 ## Security
+
+Install `/etc/rtsp-proxy/rtsp-proxy.nft` from
+`deploy/nftables/rtsp-proxy.nft` as a root-owned regular file, mode `0644`,
+change only the `node_ports` interval to the configured external node-port
+range, review it alongside the host's existing firewall, then enable and start
+`rtsp-proxy-nftables.service`. Never load the file directly. On every boot the
+serialized reconciler refuses a same-name table without the exact ownership
+marker, then atomically replaces absent or owned state from the full policy
+transaction. Consequently drift in ports, sizes, timeouts, expressions, caps
+or rates is repaired rather than accepted. Timeout-after-apply is retried as an
+owned atomic replacement; a partial owned post-state is removed and startup
+fails closed. The owned additive table keeps
+the host policy unchanged, limits both each node port and each source IP on that
+port to 128 tracked connections, and limits new SYN packets to 100/s with burst
+200 per source/port for both IPv4 and IPv6. The 128-session ceiling leaves
+bounded reconnect headroom above the product limit of 100 registered cameras
+and allows a single NVR/NAT address to read every camera on one node. Empty
+application ACLs still mean allow-all after this coarse abuse boundary. Monitor
+all three named rule comments/counters. Do not run `flush ruleset` and do not
+delete the table during normal operation. Stop media nodes first; explicit
+removal remains scoped to `nft delete table inet rtsp_proxy` after verifying
+the marker `rtsp-proxy-owned:v1`.
+
+The patched MediaMTX maps `readTimeout` to its idle request deadline. A partial
+first RTSP request is therefore closed at that bound, while established
+interleaved RTP/RTCP sessions retain their normal keepalive behavior.
 
 - dedicated control-plane users and per-instance systemd `DynamicUser`;
 - `NoNewPrivileges`, `ProtectSystem`, `ProtectHome`, `PrivateTmp`, bounded
   `ReadWritePaths`, address-family/syscall/capability restrictions;
-- node API/metrics/auth callback on loopback only and protected by a unique
-  per-node Basic credential;
+- node API/metrics and auth callback bind loopback only. The patched HTTP-auth
+  mode checks exact per-node internal credentials before the callback, so API,
+  metrics and the runtime probe remain authenticated rather than excluded;
+  the auth URL itself is scoped to the configured node UUID;
 - external listener ordinary RTSP/TCP only;
 - no Docker socket or container dependency;
 - secrets absent from argv, logs and world-readable config.
+
+Phase-E activation requires a root-owned regular
+`/etc/rtsp-proxy/control-plane/access-peppers.json`, mode `0640`, owner
+`root:rtsp-proxy-access`, with this bounded shape (one primary and at most one
+verify-only previous key; use at least 32 random bytes/key):
+
+```json
+{"primary_key_id":"2026-08","keys":{"2026-08":"<64-or-more-hex>"}}
+```
+
+Never put pepper bytes in an environment file. Run migration
+`0010_camera_access`, start `rtsp-proxy-auth.service`, and verify its loopback
+`/health/ready` before adding
+`RTSP_PROXY_NODE_HELPER_AUTH_CALLBACK_PORT=8010` to the privileged helper.
+Install the dedicated `rtsp-proxy-auth.env` from its example and grant that
+database role only the operations required by the callback:
+
+```sh
+sudo -u postgres psql --dbname rtsp_proxy --set DBNAME=rtsp_proxy \
+  --file deploy/postgresql/rtsp_proxy_auth.sql
+```
+
+The idempotent artifact creates `rtsp_proxy_auth` without broad database or
+schema privileges, grants exact callback reads plus `EXECUTE` on two constrained
+`SECURITY DEFINER` operations (last-use and revision-fenced rehash), and denies
+direct grant mutation, audit/outbox insertion, and all control-plane
+node/camera mutation. Configure its local password, peer or certificate auth
+separately according to the host PostgreSQL policy; never place it in this SQL
+artifact or source control.
+
+Pepper rotation is an explicit two-key operation:
+
+1. atomically replace the root-owned file with `{new primary, old verify-only}`;
+2. restart auth first, then restart the node-runtime helper so both processes
+   load the same primary; require auth `/health/ready` and a successful bounded
+   helper observation before continuing;
+3. smoke both a new-key grant
+   and one existing old-key grant (the latter rehashes on successful use);
+4. only then restart web so it can issue new-key grants; if either smoke fails,
+   atomically restore the old file, restart auth and helper, verify both, and
+   only then restart web;
+5. reconfigure one canary through the confirmed workflow, read back its
+   root-only generated config, and require the comment
+   `rtsp-proxy-auth-primary-key-id: <new-id>` plus a successful new RTSP read;
+   then reconfigure every remaining node so its callback Basic identity is
+   rendered from the new primary;
+6. keep the old key until every still-live grant has been rehashed, rotated,
+   revoked or expired and every node config has been reconfigured/smoked.
+   Verify that no database row references it before an atomic primary-only file
+   replacement and auth-then-helper-before-web restart. Removing the previous
+   key without restarting and verifying the helper is a fail-closed NO-GO.
+
+A suspected pepper compromise does not use the overlap flow: stop new grant
+issuance, install a fresh key, revoke and reissue every grant referencing the
+compromised key, notify affected operators, and retain the old key only as long
+as needed to complete the bounded revocation transaction. Raw tokens are never
+recovered or bulk rehashed.
+
+Restart the helper after changing its environment. Existing node configs are
+not silently rewritten. For every existing node:
+
+1. call `POST /api/v1/nodes/<uuid>/drain` and wait until the operator-approved
+   disruption window;
+2. call `POST /api/v1/nodes/<uuid>/reconfigure/preview` and verify the returned
+   external port, registered-camera count, placement fingerprint, target
+   release ID and target MediaMTX SHA-256;
+3. call `POST /api/v1/nodes/<uuid>/reconfigure` with
+   `{"confirmation_token":"<preview-token>"}`;
+4. require RUNNING runtime, matching desired/applied revisions and the same
+   external port, then call `POST /api/v1/nodes/<uuid>/resume`.
+
+The reconfigure/restart disconnects all streams of that node, but never any
+other node. A failed attempt leaves desired state DRAINING and is retriable
+from runtime FAILED/STOPPED with a fresh preview token. A generic restart does
+not rewrite a non-empty node and must not be used for this migration.
+New sessions fail closed while auth/DB is unavailable; established streams are
+not reauthorized. This initial Phase-E activation is a one-way `.1 → .2`
+transition: `.1` cannot preserve authenticated management under callback mode
+and is therefore not an activation/rollback target. A binary rollback is NO-GO
+until a future callback-compatible previous release is packaged and proven.
+Recovery retries `.2` with a fresh confirmation; it must never replace the
+callback with an allow-all rule.
 
 ## Production admission
 

@@ -4,7 +4,7 @@
 на независимые bounded nodes: каждая node — отдельный MediaMTX process/systemd
 instance, один внешний RTSP port и не более 100 зарегистрированных камер.
 
-> **Статус на 12 августа 2026**
+> **Статус на 13 августа 2026**
 >
 > - Bounded-node architecture: **согласована**, issues #1–#14 обновлены.
 > - Phase 0A MediaMTX/ordinary-RTSP compatibility: **complete** на native
@@ -13,7 +13,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   production hardware capacity/24h soak ещё не выполнены.
 > - Node registry/placement foundation, isolated per-node Linux runtime and
 >   Phase-D camera/node administration: **complete on native amd64/arm64 CI**.
->   Access, dashboard and production evidence remain in progress.
+>   Phase E access implementation is in review; dashboard and production
+>   evidence remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -88,7 +89,30 @@ source. API сохраняет и возвращает старый/новый p
 - Если policy активна, сначала проверяется напрямую наблюдаемый TCP peer IP,
   затем camera username/password.
 - Forwarded headers не используются для RTSP authorization.
-- MediaMTX API/metrics всех nodes доступны только loopback.
+- Downstream grants explicitly choose `temporary` or `service` and expiry;
+  there is no implicit one-hour service credential, including rotation. Until
+  Phase F authenticates operators, creator is the server-derived
+  `bootstrap-control-plane` principal and cannot be supplied by a caller. Raw
+  URL-safe secret is shown once, while PostgreSQL stores only a versioned-
+  pepper HMAC verifier plus safe creator/last-use metadata.
+- Pepper rotation loads the new primary plus bounded verify-only previous keys;
+  a successful use of an old-key grant atomically rehashes it under the primary
+  key with a revision-fenced audit/outbox event.
+- Rotation has bounded overlap; revoke/ACL/drain affects the next RTSP session
+  immediately because positive auth caching is absent. Established stream is
+  not disconnected by those non-disruptive policy changes.
+- New-session authorization is a loopback HTTP callback with a per-node HMAC
+  Basic identity bound to the exact node/path. A credential for node A cannot
+  call node B. Unknown path, bad IP/user/password, malformed/slow request, auth outage
+  and callback overload produce one no-oracle denial shape.
+- Auth work has bounded global concurrency/rate, per-peer pending/rate and
+  per-camera/grant rate gates plus a bounded PostgreSQL statement/connect
+  budget; these never disconnect an established stream.
+- A non-blocking typed decision sink keeps bounded reason/action/protocol/IP
+  family counters and a bounded safe audit handoff containing node/path/grant,
+  directly observed peer IP and reason; it never contains credentials.
+- MediaMTX API/metrics всех nodes доступны только loopback и сохраняют точные
+  per-node Basic credentials даже при внешнем HTTP auth callback.
 - Central dashboard/control API доступен из management LAN по HTTPS и RBAC.
 
 ## Failure behavior
@@ -182,7 +206,7 @@ review, fixes и native amd64/arm64 CI.
 - architecture/digest-aware release verifier;
 - direct-Linux systemd/sysusers/tmpfiles baseline;
 - typed MediaMTX adapter plus the reproducible
-  `v1.20.0-rtsp-proxy.1` source build pinned to upstream commit
+  `v1.20.0-rtsp-proxy.2` source build pinned to upstream commit
   `1b943637a4b5778bb929a7af7687b048fecaa03f`;
 - native ordinary RTSP/TCP H.264/H.265 compatibility contracts;
 - reproducible GStreamer load generator/readers;
@@ -204,10 +228,14 @@ startup convergence and automatic
 reserve→provision→smoke→place are in code. The two-node native contract proves
 that restart/stop of node A does not change node B process or its established
 ordinary RTSP/TCP session or packet progress. Restart is transactionally fenced
-against placement, and rolling activation supports a separately catalogued
-previous patched release while empty stopped nodes transition one at a time.
-The initial `0.1.0` patched release has no earlier safe rollback target; stock
-MediaMTX is never accepted as one. The native
+against placement; future rolling activation may use a separately catalogued
+callback-compatible previous release while empty stopped nodes transition one
+at a time.
+Release `0.2.0` keeps independently verified patched `0.1.0` only as historical
+trust provenance. It is not a Phase-E rollback target because it predates the
+authenticated callback-management patch; stock MediaMTX is never accepted.
+Rollback is NO-GO until a future callback-compatible release is catalogued as
+the previous activation target. The native
 test executes real systemd instances and proves process/listener/RTP isolation;
 its release identity and listener teardown checks remain fail closed while
 correctly accounting for exec transitions and completed TCP `TIME_WAIT` state.
@@ -228,10 +256,12 @@ drain/maintenance,
 blast-radius-confirmed port change with crash recovery, and empty-node deletion
 are implemented. A prepared port change freezes the exact camera placement set
 and reserves both ports; failed/restarted operations converge to the old port.
-Phase D now owns the binary admission primitive and proves exact one-reader
-RTSP `453` behavior without interrupting the established reader. Phase E will
-integrate that primitive with drain, internet/local ACL, credentials and the
-simultaneous-admission security contract.
+Phase D owns the binary admission primitive and proves exact one-reader RTSP
+`453` behavior without interrupting the established reader. Phase E integrates
+it with drain, internet/local ACL, generated credentials and a dedicated
+loopback authorization service. Its unit/PostgreSQL and local pinned
+MediaMTX+FFmpeg H.264/H.265 contracts are green; independent review and native
+amd64/arm64 CI are still required before Phase E is marked complete.
 
 [phase-d-ci]: https://github.com/zl0nline/RTSP_proxy/actions/runs/31658505374
 
@@ -246,8 +276,7 @@ policy, preflights every restored listener before writing desired state and
 preserves stable RUNNING/STOPPED/DRAINING/MAINTENANCE/FAILED intent. Transitional
 node states cannot be exported. It is not exposed over HTTP.
 
-Ещё не реализованы dashboard, full access policies,
-notifications и complete operations workflows.
+Ещё не реализованы dashboard, notifications и complete operations workflows.
 Наличие load harness не означает готовый product или published capacity.
 
 ## Локальная разработка

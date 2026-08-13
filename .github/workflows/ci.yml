@@ -82,7 +82,7 @@ jobs:
           createdb --host 127.0.0.1 --port "$migration_port" --username postgres rtsp_proxy_migration_test
           RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
             .artifacts/clean-venv/bin/rtsp-proxy-migrate
-          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0009_camera_move_safety"
+          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0010_camera_access"
 
       - name: Validate systemd units
         run: |
@@ -91,15 +91,34 @@ jobs:
           sudo install -d -m 0700 /etc/rtsp-proxy/nodes
           sudo install -d /var/lib/rtsp-proxy/nodes /var/log/rtsp-proxy/nodes
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-web
+          sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-auth
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-role
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-node-helper
+          sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-nft-reconcile
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/bin/mediamtx
           sudo ln -s releases/ci /opt/rtsp-proxy/current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
+          sudo touch /etc/rtsp-proxy/control-plane/access-peppers.json
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy-worker.env
           sudo touch /etc/rtsp-proxy/mediamtx/mediamtx.yml
           sudo touch /etc/rtsp-proxy/node-runtime.env
           systemd-analyze verify deploy/systemd/*
+
+      - name: Validate owned nftables policy
+        run: |
+          sudo apt-get install --yes --no-install-recommends nftables
+          sudo nft --check --file deploy/nftables/rtsp-proxy.nft
+          sudo install -d -m 0700 /run/rtsp-proxy-nftables
+          sudo install -d -m 0755 /etc/rtsp-proxy
+          sudo install -o root -g root -m 0644 \
+            deploy/nftables/rtsp-proxy.nft /etc/rtsp-proxy/rtsp-proxy.nft
+          sudo .venv/bin/rtsp-proxy-nft-reconcile \
+            --policy /etc/rtsp-proxy/rtsp-proxy.nft
+          sudo .venv/bin/rtsp-proxy-nft-reconcile \
+            --policy /etc/rtsp-proxy/rtsp-proxy.nft
+          sudo nft --json list table inet rtsp_proxy | \
+            jq --exit-status '.nftables[] | select(.table.comment == "rtsp-proxy-owned:v1")'
+          sudo nft delete table inet rtsp_proxy
 
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})

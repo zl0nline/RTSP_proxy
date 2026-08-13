@@ -1,5 +1,9 @@
+import json
+import os
 import platform
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +14,8 @@ from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.health import DependencyResult, ReadinessProvider
 from rtsp_proxy.release import trusted_mediamtx_identity
 from rtsp_proxy.runtime import (
+    ConfigurationError,
+    _load_access_verifier,
     create_app_from_environment,
     create_background_app,
     load_settings,
@@ -106,6 +112,7 @@ def test_ready_fails_closed_until_the_role_dependencies_are_wired() -> None:
     ("role", "required_checks"),
     [
         (RuntimeRole.WEB, {"database", "schema", "session_store"}),
+        (RuntimeRole.AUTH, {"database", "schema", "pepper"}),
         (RuntimeRole.WORKER, {"database", "schema", "outbox"}),
         (RuntimeRole.RECONCILER, {"database", "schema", "media_adapter"}),
         (RuntimeRole.PROBE, {"database", "schema", "probe_runtime"}),
@@ -116,7 +123,16 @@ def test_unwired_readiness_names_the_dependencies_required_by_each_role(
     role: RuntimeRole,
     required_checks: set[str],
 ) -> None:
-    response = TestClient(create_app(Settings(role=role))).get("/health/ready")
+    settings = (
+        Settings(
+            role=role,
+            database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+            access_pepper_file=Path("/run/credentials/access-peppers.json"),
+        )
+        if role is RuntimeRole.AUTH
+        else Settings(role=role)
+    )
+    response = TestClient(create_app(settings)).get("/health/ready")
 
     assert response.status_code == 503
     assert {check["name"] for check in response.json()["checks"]} == required_checks
@@ -291,7 +307,7 @@ def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity()
         confirmation_secret="test-confirmation-secret-that-is-at-least-43-bytes",
     )
 
-    assert settings.node_release_id == "0.1.0"
+    assert settings.node_release_id == "0.2.0"
 
     reconciler = Settings(
         role=RuntimeRole.RECONCILER,
@@ -329,6 +345,118 @@ def test_environment_overrides_a_validated_json_config_file(tmp_path: Path) -> N
     assert settings.role is RuntimeRole.WEB
     assert str(settings.http_host) == "127.0.0.3"
     assert settings.http_port == 8200
+
+
+def test_access_pepper_file_is_private_bounded_and_supports_key_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pepper_file = tmp_path / "access-peppers.json"
+    pepper_file.write_text(
+        json.dumps(
+            {
+                "primary_key_id": "new",
+                "keys": {"new": "11" * 32, "old": "22" * 32},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pepper_file.chmod(0o640)
+    real_fstat = __import__("os").fstat
+    monkeypatch.setattr(
+        "rtsp_proxy.access.os.fstat",
+        lambda descriptor: _owned_by_root(real_fstat(descriptor), gid=54321),
+    )
+    monkeypatch.setattr(
+        "rtsp_proxy.access.grp.getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=54321),
+    )
+    settings = Settings(
+        role=RuntimeRole.AUTH,
+        database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+        access_pepper_file=pepper_file,
+    )
+    loaded = _load_access_verifier(settings)
+    assert loaded.primary_key_id == "new"
+    assert loaded.verify(
+        "token",
+        expected=loaded.digest("token", key_id="old"),
+        key_id="old",
+    )
+
+    pepper_file.chmod(0o644)
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+
+    pepper_file.unlink()
+    pepper_file.write_text(
+        json.dumps({"primary_key_id": "new", "keys": {"new": "11" * 32}}),
+        encoding="utf-8",
+    )
+    pepper_file.chmod(0o640)
+    monkeypatch.setattr(
+        "rtsp_proxy.access.os.fstat",
+        lambda descriptor: _owned_by_root(real_fstat(descriptor), gid=99999),
+    )
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+    monkeypatch.setattr(
+        "rtsp_proxy.access.os.fstat",
+        lambda descriptor: _owned_by_root(real_fstat(descriptor), gid=54321),
+    )
+    pepper_file.chmod(0o640)
+    pepper_file.write_text("{}", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+    pepper_file.unlink()
+    pepper_file.write_bytes(b"x" * 4097)
+    pepper_file.chmod(0o640)
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+    pepper_file.unlink()
+    pepper_file.symlink_to(Path("/dev/null"))
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+
+
+def test_access_pepper_loader_rejects_non_regular_and_oversized_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pepper_file = tmp_path / "access-peppers.json"
+    pepper_file.mkdir(mode=0o700)
+    settings = Settings(
+        role=RuntimeRole.AUTH,
+        database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+        access_pepper_file=pepper_file,
+    )
+    assert stat.S_ISDIR(pepper_file.stat().st_mode)
+    real_fstat = __import__("os").fstat
+    monkeypatch.setattr(
+        "rtsp_proxy.access.os.fstat",
+        lambda descriptor: _owned_by_root(real_fstat(descriptor), gid=54321),
+    )
+    monkeypatch.setattr(
+        "rtsp_proxy.access.grp.getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=54321),
+    )
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+    pepper_file.rmdir()
+    pepper_file.write_bytes(b"x" * 4097)
+    pepper_file.chmod(0o640)
+    with pytest.raises(ConfigurationError, match="access_pepper_file_unsafe"):
+        _load_access_verifier(settings)
+
+
+def _owned_by_root(value: os.stat_result, *, gid: int) -> object:
+    return SimpleNamespace(
+        st_mode=value.st_mode,
+        st_nlink=value.st_nlink,
+        st_uid=0,
+        st_gid=gid,
+        st_size=value.st_size,
+    )
 
 
 def test_background_entrypoint_accepts_only_non_web_roles() -> None:

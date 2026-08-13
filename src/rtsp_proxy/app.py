@@ -1,18 +1,36 @@
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+from threading import BoundedSemaphore, Lock
+from time import monotonic
+from typing import Literal
 from uuid import UUID
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import RequestResponseEndpoint
 
+from rtsp_proxy.access import (
+    AccessAuthorizer,
+    AccessDecisionReason,
+    AccessDecisionTelemetry,
+    AccessGrantControl,
+    AccessPolicy,
+    AccessPolicyControl,
+    AuthorizeRequest,
+    IssuedAccessGrant,
+    PepperVerifier,
+)
 from rtsp_proxy.config import Settings
 from rtsp_proxy.health import (
     MissingReadinessProvider,
     ReadinessProvider,
     normalize_readiness_results,
 )
+from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.nodes import (
     CameraControl,
@@ -111,6 +129,21 @@ class NodePortChangePreviewResponse(BaseModel):
     desired_revision: int
     registered_cameras: int
     blast_radius_sha256: str
+    confirmation_token: str
+
+
+class NodeReconfigureRequest(BaseModel):
+    confirmation_token: str | None = Field(default=None, max_length=4096)
+
+
+class NodeReconfigurePreviewResponse(BaseModel):
+    node_id: str
+    external_port: int
+    desired_revision: int
+    registered_cameras: int
+    blast_radius_sha256: str
+    target_release_id: str
+    target_mediamtx_binary_sha256: str
     confirmation_token: str
 
 
@@ -222,6 +255,103 @@ class CameraRuntimeResponse(BaseModel):
     reader_limit_violated: bool
 
 
+class AccessPolicyUpdateRequest(BaseModel):
+    internet_cidrs: list[str] = Field(default_factory=list, max_length=128)
+    local_cidrs: list[str] = Field(default_factory=list, max_length=128)
+    expected_revision: int = Field(ge=1)
+
+
+class AccessPolicyResponse(BaseModel):
+    camera_id: str
+    internet_cidrs: list[str]
+    local_cidrs: list[str]
+    revision: int
+
+
+class AccessGrantCreateRequest(BaseModel):
+    kind: Literal["temporary", "service"]
+    lifetime_seconds: int = Field(ge=1, le=366 * 24 * 60 * 60)
+
+
+class AccessGrantRotateRequest(BaseModel):
+    overlap_seconds: int = Field(default=30, ge=0, le=24 * 60 * 60)
+    lifetime_seconds: int = Field(ge=1, le=366 * 24 * 60 * 60)
+
+
+class AccessGrantSecretResponse(BaseModel):
+    id: str
+    camera_id: str
+    username: str
+    password: str
+    not_before: datetime
+    expires_at: datetime
+    revision: int
+    kind: str
+    created_by: str
+    last_used_at: datetime | None
+
+
+class AccessGrantResponse(BaseModel):
+    id: str
+    camera_id: str
+    username: str
+    not_before: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    revision: int
+    kind: str
+    created_by: str
+    last_used_at: datetime | None
+
+
+class MediaAuthRequest(BaseModel):
+    user: str = Field(max_length=64)
+    password: str = Field(max_length=256)
+    action: str = Field(max_length=16)
+    path: str = Field(max_length=256)
+    protocol: str = Field(max_length=16)
+    ip: str = Field(max_length=64)
+
+
+class _MediaAuthAdmissionGate:
+    def __init__(self, *, max_inflight: int, rate_per_second: int, burst: int) -> None:
+        if min(max_inflight, rate_per_second, burst) < 1 or burst < rate_per_second:
+            raise ValueError("media_auth_admission_gate_invalid")
+        self._inflight = BoundedSemaphore(max_inflight)
+        self._lock = Lock()
+        self._rate_per_second = float(rate_per_second)
+        self._burst = float(burst)
+        self._tokens = float(burst)
+        self._updated = monotonic()
+
+    def enter(self) -> bool:
+        if not self._inflight.acquire(blocking=False):
+            return False
+        now = monotonic()
+        with self._lock:
+            elapsed = max(0.0, now - self._updated)
+            self._updated = now
+            self._tokens = min(
+                self._burst,
+                self._tokens + elapsed * self._rate_per_second,
+            )
+            if self._tokens < 1.0:
+                self._inflight.release()
+                return False
+            self._tokens -= 1.0
+        return True
+
+    def leave(self) -> None:
+        self._inflight.release()
+
+
+def _media_auth_denied() -> Response:
+    return Response(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def create_app(
     settings: Settings,
     readiness: ReadinessProvider | None = None,
@@ -230,6 +360,8 @@ def create_app(
     camera_mutation_control: CameraMutationControl | None = None,
     camera_move_control: CameraMoveControl | None = None,
     camera_runtime_observer: CameraRuntimeObserver | None = None,
+    access_policy_control: AccessPolicyControl | None = None,
+    access_grant_control: AccessGrantControl | None = None,
     startup: Callable[[], None] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -508,6 +640,92 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "node_not_empty"},
+            ) from None
+        except NodeRuntimeUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_runtime_unavailable"},
+            ) from None
+        except NodeRuntimeFailed as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": error.code, "node_id": str(error.node_id)},
+            ) from None
+        return _node_response(node)
+
+    @app.post(
+        "/api/v1/nodes/{node_id}/reconfigure/preview",
+        response_model=NodeReconfigurePreviewResponse,
+    )
+    def preview_node_reconfigure(node_id: UUID) -> NodeReconfigurePreviewResponse:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        try:
+            preview = node_control.preview_reconfigure(node_id)
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        except NodeRuntimeUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_confirmation_unavailable"},
+            ) from None
+        return NodeReconfigurePreviewResponse(
+            node_id=str(preview.node_id),
+            external_port=preview.external_port,
+            desired_revision=preview.desired_revision,
+            registered_cameras=preview.registered_cameras,
+            blast_radius_sha256=preview.blast_radius_sha256,
+            target_release_id=preview.target_release_id,
+            target_mediamtx_binary_sha256=(
+                preview.target_mediamtx_binary_sha256
+            ),
+            confirmation_token=preview.confirmation_token,
+        )
+
+    @app.post("/api/v1/nodes/{node_id}/reconfigure", response_model=NodeResponse)
+    def reconfigure_node(
+        node_id: UUID,
+        request: NodeReconfigureRequest,
+    ) -> NodeResponse:
+        if node_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_control_unavailable"},
+            )
+        try:
+            node = node_control.reconfigure_node(
+                node_id,
+                confirmation_token=request.confirmation_token,
+            )
+        except NodeNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "node_not_found"},
+            ) from None
+        except NodeLifecycleBusy:
+            raise _lifecycle_busy() from None
+        except NodeDisruptionConfirmationRequired:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "node_disruption_confirmation_required"},
+            ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
             ) from None
         except NodeRuntimeUnavailable:
             raise HTTPException(
@@ -1200,6 +1418,360 @@ def create_app(
         items = [_camera_response(camera) for camera in camera_control.list_cameras()]
         return CameraListResponse(items=items, count=len(items))
 
+    @app.get(
+        "/api/v1/cameras/{camera_id}/access-policy",
+        response_model=AccessPolicyResponse,
+    )
+    def get_access_policy(camera_id: UUID) -> AccessPolicyResponse:
+        if access_policy_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_control_unavailable"},
+            )
+        try:
+            return _access_policy_response(access_policy_control.get(camera_id))
+        except LookupError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+
+    @app.put(
+        "/api/v1/cameras/{camera_id}/access-policy",
+        response_model=AccessPolicyResponse,
+    )
+    def update_access_policy(
+        camera_id: UUID,
+        request: AccessPolicyUpdateRequest,
+    ) -> AccessPolicyResponse:
+        if access_policy_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_control_unavailable"},
+            )
+        try:
+            policy = access_policy_control.update(
+                camera_id,
+                internet_cidrs=request.internet_cidrs,
+                local_cidrs=request.local_cidrs,
+                expected_revision=request.expected_revision,
+            )
+        except LookupError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        except CameraLifecycleConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_policy_revision_conflict"},
+            ) from None
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": str(error)},
+            ) from None
+        return _access_policy_response(policy)
+
+    @app.post(
+        "/api/v1/cameras/{camera_id}/access-grants",
+        response_model=AccessGrantSecretResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_access_grant(
+        camera_id: UUID,
+        request: AccessGrantCreateRequest,
+        response: Response,
+    ) -> AccessGrantSecretResponse:
+        if access_grant_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_control_unavailable"},
+            )
+        try:
+            issued = access_grant_control.create(
+                camera_id=camera_id,
+                lifetime=timedelta(seconds=request.lifetime_seconds),
+                kind=request.kind,
+                created_by="bootstrap-control-plane",
+            )
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Location"] = f"/api/v1/access-grants/{issued.grant.id}"
+        return _issued_access_grant_response(issued)
+
+    @app.post(
+        "/api/v1/access-grants/{grant_id}/rotate",
+        response_model=AccessGrantSecretResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def rotate_access_grant(
+        grant_id: UUID,
+        request: AccessGrantRotateRequest,
+        response: Response,
+    ) -> AccessGrantSecretResponse:
+        if access_grant_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_control_unavailable"},
+            )
+        try:
+            issued = access_grant_control.rotate(
+                grant_id,
+                overlap=timedelta(seconds=request.overlap_seconds),
+                lifetime=timedelta(seconds=request.lifetime_seconds),
+            )
+        except LookupError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "access_grant_not_found"},
+            ) from None
+        except CameraLifecycleConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_grant_revision_conflict"},
+            ) from None
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Location"] = f"/api/v1/access-grants/{issued.grant.id}"
+        return _issued_access_grant_response(issued)
+
+    @app.delete(
+        "/api/v1/access-grants/{grant_id}",
+        response_model=AccessGrantResponse,
+    )
+    def revoke_access_grant(grant_id: UUID) -> AccessGrantResponse:
+        if access_grant_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_control_unavailable"},
+            )
+        try:
+            grant = access_grant_control.revoke(grant_id)
+        except LookupError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "access_grant_not_found"},
+            ) from None
+        except CameraLifecycleConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_grant_revision_conflict"},
+            ) from None
+        return AccessGrantResponse(
+            id=str(grant.id),
+            camera_id=str(grant.camera_id),
+            username=grant.username,
+            not_before=grant.not_before,
+            expires_at=grant.expires_at,
+            revoked_at=grant.revoked_at,
+            revision=grant.revision,
+            kind=grant.kind,
+            created_by=grant.created_by,
+            last_used_at=grant.last_used_at,
+        )
+
+    return app
+
+
+def create_media_auth_app(
+    *,
+    authorizer: AccessAuthorizer,
+    readiness: Callable[[], None] | None = None,
+    shutdown: Callable[[], None] | None = None,
+    callback_verifier: PepperVerifier | None = None,
+    telemetry: AccessDecisionTelemetry | None = None,
+    body_timeout_seconds: float = 1,
+    max_inflight: int = 128,
+    rate_per_second: int = 1000,
+    burst: int = 2000,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if shutdown is not None:
+                shutdown()
+
+    app = FastAPI(
+        title="RTSP Proxy Media Authorization",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+    if body_timeout_seconds <= 0 or body_timeout_seconds > 5:
+        raise ValueError("media_auth_body_timeout_invalid")
+    admission = _MediaAuthAdmissionGate(
+        max_inflight=max_inflight,
+        rate_per_second=rate_per_second,
+        burst=burst,
+    )
+
+    @app.middleware("http")
+    async def media_auth_admission(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if request.url.path in {
+            "/health/live",
+            "/health/ready",
+            "/internal/v1/metrics",
+        }:
+            return await call_next(request)
+        content_length = request.headers.get("content-length")
+        if content_length is None:
+            return _media_auth_denied()
+        try:
+            body_length = int(content_length)
+        except ValueError:
+            return _media_auth_denied()
+        if request.method != "POST" or body_length < 0 or body_length > 2048:
+            return _media_auth_denied()
+        prefix = "/internal/v1/media-auth/"
+        try:
+            node_id = UUID(request.url.path.removeprefix(prefix))
+        except ValueError:
+            return _media_auth_denied()
+        if (
+            not request.url.path.startswith(prefix)
+            or callback_verifier is None
+            or not callback_verifier.verify_callback_authorization(
+                node_id,
+                request.headers.get("authorization"),
+            )
+        ):
+            return _media_auth_denied()
+        if not admission.enter():
+            return _media_auth_denied()
+        try:
+            try:
+                with anyio.fail_after(body_timeout_seconds):
+                    body = await request.body()
+            except (TimeoutError, RuntimeError):
+                return _media_auth_denied()
+            if len(body) != body_length:
+                return _media_auth_denied()
+
+            async def receive() -> dict[str, object]:
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            bounded_request = Request(request.scope, receive)
+            try:
+                return await call_next(bounded_request)
+            except Exception:
+                return _media_auth_denied()
+        finally:
+            admission.leave()
+
+    @app.exception_handler(RequestValidationError)
+    async def media_auth_validation_denied(
+        _request: Request,
+        _error: RequestValidationError,
+    ) -> Response:
+        return _media_auth_denied()
+
+    @app.get("/health/live", include_in_schema=False)
+    def live() -> dict[str, str]:
+        return {"status": "ok", "role": "auth"}
+
+    @app.get("/health/ready", include_in_schema=False)
+    def ready(response: Response) -> dict[str, object]:
+        try:
+            if readiness is None:
+                raise RuntimeError("auth_readiness_provider_missing")
+            readiness()
+        except Exception:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {
+                "status": "not_ready",
+                "role": "auth",
+                "checks": [
+                    {"name": "database_schema", "status": "fail"},
+                    {"name": "pepper", "status": "pass"},
+                ],
+            }
+        return {
+            "status": "ready",
+            "role": "auth",
+            "checks": [
+                {"name": "database_schema", "status": "pass"},
+                {"name": "pepper", "status": "pass"},
+            ],
+        }
+
+    @app.get("/internal/v1/metrics", include_in_schema=False)
+    def internal_metrics() -> PlainTextResponse:
+        if telemetry is None:
+            return PlainTextResponse(
+                "rtsp_proxy_access_telemetry_available 0\n",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        snapshot = telemetry.snapshot()
+        lines = ["rtsp_proxy_access_telemetry_available 1"]
+        for (reason, allowed, action, protocol, peer_family), count in sorted(
+            snapshot.counters.items()
+        ):
+            labels = (
+                f'reason="{reason}",allowed="{str(allowed).lower()}",'
+                f'action="{action}",protocol="{protocol}",'
+                f'peer_family="{peer_family}"'
+            )
+            lines.append(f"rtsp_proxy_access_decisions_total{{{labels}}} {count}")
+        lines.extend(
+            (
+                "rtsp_proxy_access_audit_events_dropped_total "
+                f"{snapshot.dropped_audit}",
+                "rtsp_proxy_access_last_use_persistence_failures_total "
+                f"{snapshot.last_use_persistence_failures}",
+            )
+        )
+        return PlainTextResponse("\n".join(lines) + "\n")
+
+    @app.post(
+        "/internal/v1/media-auth/{node_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        include_in_schema=False,
+    )
+    def authorize_media(
+        node_id: UUID,
+        request: MediaAuthRequest,
+        http_request: Request,
+    ) -> Response:
+        if callback_verifier is None or not callback_verifier.verify_callback_authorization(
+            node_id,
+            http_request.headers.get("authorization"),
+        ):
+            return _media_auth_denied()
+        try:
+            public_id = PublicId.parse(request.path)
+            decision = authorizer.authorize(
+                AuthorizeRequest(
+                    node_id=node_id,
+                    public_id=public_id,
+                    peer_ip=request.ip,
+                    username=request.user,
+                    password=request.password,
+                    action=request.action,
+                    protocol=request.protocol,
+                )
+            )
+        except ValueError:
+            return _media_auth_denied()
+        if not decision.allowed:
+            assert decision.reason is not AccessDecisionReason.ALLOWED
+            return _media_auth_denied()
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT,
+            headers={"Cache-Control": "no-store"},
+        )
+
     return app
 
 
@@ -1285,4 +1857,28 @@ def _allowed_node_ports(settings: Settings) -> tuple[int, ...]:
         port
         for port in range(settings.node_port_range_start, settings.node_port_range_end + 1)
         if port not in reserved
+    )
+
+
+def _access_policy_response(policy: AccessPolicy) -> AccessPolicyResponse:
+    return AccessPolicyResponse(
+        camera_id=str(policy.camera_id),
+        internet_cidrs=list(policy.internet_cidrs),
+        local_cidrs=list(policy.local_cidrs),
+        revision=policy.revision,
+    )
+
+
+def _issued_access_grant_response(issued: IssuedAccessGrant) -> AccessGrantSecretResponse:
+    return AccessGrantSecretResponse(
+        id=str(issued.grant.id),
+        camera_id=str(issued.grant.camera_id),
+        username=issued.grant.username,
+        password=issued.secret,
+        not_before=issued.grant.not_before,
+        expires_at=issued.grant.expires_at,
+        revision=issued.grant.revision,
+        kind=issued.grant.kind,
+        created_by=issued.grant.created_by,
+        last_used_at=issued.grant.last_used_at,
     )

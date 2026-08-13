@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-APPLICATION_SCHEMA = "0009_camera_move_safety"
+APPLICATION_SCHEMA = "0010_camera_access"
 CONFIG_SCHEMA_VERSION = 1
 
 
@@ -117,9 +117,37 @@ def _trusted_mediamtx_identity(
         raise ReleaseVerificationError("trusted_artifact_catalog_invalid") from None
 
 
+def trusted_mediamtx_activation_identity(
+    machine: str,
+    release_id: str = "0.2.0",
+) -> tuple[str, Sha256]:
+    """Return an identity only when the packaged catalog permits activation."""
+
+    architecture = normalize_linux_arch(machine)
+    try:
+        resource = files("rtsp_proxy").joinpath("artifacts", "mediamtx.json")
+        payload = json.loads(resource.read_text(encoding="utf-8"))
+        release = payload["releases"][release_id]
+        if release.get("activation_compatible") is not True:
+            raise ReleaseVerificationError("mediamtx_release_activation_incompatible")
+    except ReleaseVerificationError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ):
+        raise ReleaseVerificationError("trusted_artifact_catalog_invalid") from None
+    return _trusted_mediamtx_identity(architecture, release_id)
+
+
 def trusted_mediamtx_identity(
     machine: str,
-    release_id: str = "0.1.0",
+    release_id: str = "0.2.0",
 ) -> tuple[str, Sha256]:
     """Return one release's packaged MediaMTX identity for a Linux architecture."""
 
@@ -158,6 +186,13 @@ def verify_release(
         manifest.mediamtx.linux_arch,
         manifest.release_id,
     )
+    try:
+        trusted_mediamtx_activation_identity(
+            manifest.mediamtx.linux_arch.value,
+            manifest.release_id,
+        )
+    except ReleaseVerificationError as error:
+        raise ReleaseVerificationError("untrusted_mediamtx_artifact") from error
     if (
         manifest.mediamtx.version != trusted_version
         or manifest.mediamtx.binary_sha256 != trusted_digest

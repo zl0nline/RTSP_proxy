@@ -37,8 +37,9 @@
   contract does not claim statistical timing equivalence;
 - four concurrent callbacks delayed past the one-second MediaMTX read deadline
   fail new sessions closed while the established reader continues progressing;
-- an incomplete RTSP header remains open past that one-second setting, proving
-  that `readTimeout` is not a sufficient slowloris/handshake control;
+- stock v1.20.0 leaves an incomplete RTSP header open past that one-second
+  setting; the Phase-E `.2` patch closes this inherited gap by binding the
+  RTSP library idle deadline to `readTimeout`;
 - registered configs, runtime path/source state, readers and RTSP sessions have
   distinct pinned API/metrics signals; the full emitted family/label schema is
   versioned and no `rtsps_*` family is emitted;
@@ -78,7 +79,9 @@ real-binary media contract jobs in
 
 - two-version FFmpeg/supervisor timeout and reconnect matrix;
 - isolated production probe execution (ADR 0004; health/security slices);
-- auth-layer/edge rate limiting and slow-client resource controls;
+- Phase-E additive host L4 controls and slow-client timeout are implemented;
+  their native amd64/arm64 loading/behavior evidence remains the Phase-E exit
+  gate;
 - statistically powered timing no-oracle evidence for revoked, wrong-password,
   unknown-user and unknown-path denials;
 - native VPN source-IP preservation; L4/NAT and cross-host callback remain

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -28,13 +29,14 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, CIDR, JSONB
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.sql.base import Executable
 from sqlalchemy.sql.selectable import Select
 
+from rtsp_proxy.access import AccessGrant, AccessPolicy, AccessTarget
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
     CameraLifecycleConflict,
@@ -171,6 +173,54 @@ public_id_tombstones = Table(
         server_default=text("clock_timestamp()"),
     ),
     CheckConstraint("public_id ~ '^[a-z2-7]{25}[aeimquy4]$'"),
+)
+
+camera_access_policies = Table(
+    "camera_access_policies",
+    metadata,
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column("internet_cidrs", ARRAY(CIDR()), nullable=False),
+    Column("local_cidrs", ARRAY(CIDR()), nullable=False),
+    Column("revision", BigInteger, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("revision >= 1"),
+    CheckConstraint("cardinality(internet_cidrs) <= 128"),
+    CheckConstraint("cardinality(local_cidrs) <= 128"),
+)
+
+camera_access_grants = Table(
+    "camera_access_grants",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("username", String(64), nullable=False, unique=True),
+    Column("token_verifier", String(64), nullable=False),
+    Column("pepper_key_id", String(64), nullable=False),
+    Column("not_before", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    Column("kind", String(16), nullable=False),
+    Column("created_by", String(128), nullable=False),
+    Column("last_used_at", DateTime(timezone=True), nullable=True),
+    Column("revision", BigInteger, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("username ~ '^grant-[0-9a-f]{32}$'"),
+    CheckConstraint("token_verifier ~ '^[0-9a-f]{64}$'"),
+    CheckConstraint("not_before < expires_at"),
+    CheckConstraint("revision >= 1"),
+    CheckConstraint("kind IN ('temporary', 'service')"),
+    CheckConstraint("length(created_by) BETWEEN 1 AND 128"),
 )
 
 camera_placements = Table(
@@ -380,16 +430,28 @@ class PostgresNodeStore:
         *,
         lifecycle_lock_pool_size: int = 4,
         lifecycle_lock_timeout_seconds: float = 5,
+        statement_timeout_ms: int | None = None,
     ) -> None:
         if lifecycle_lock_pool_size < 2 or lifecycle_lock_pool_size > 16:
             raise ValueError("node_lifecycle_lock_pool_size_invalid")
         if lifecycle_lock_timeout_seconds <= 0 or lifecycle_lock_timeout_seconds > 30:
             raise ValueError("node_lifecycle_lock_timeout_invalid")
+        if statement_timeout_ms is not None and not 100 <= statement_timeout_ms <= 5000:
+            raise ValueError("database_statement_timeout_invalid")
+        connect_args = (
+            {}
+            if statement_timeout_ms is None
+            else {
+                "connect_timeout": max(1, math.ceil(statement_timeout_ms / 1000)),
+                "options": f"-c statement_timeout={statement_timeout_ms}",
+            }
+        )
         self._engine = create_engine(
             database_url,
             pool_pre_ping=True,
             hide_parameters=True,
             pool_timeout=min(1.0, lifecycle_lock_timeout_seconds),
+            connect_args=connect_args,
         )
         self._lock_engine = create_engine(
             database_url,
@@ -398,6 +460,7 @@ class PostgresNodeStore:
             pool_size=lifecycle_lock_pool_size,
             max_overflow=0,
             pool_timeout=min(0.05, lifecycle_lock_timeout_seconds),
+            connect_args=connect_args,
         )
         self._provision_engine = create_engine(
             database_url,
@@ -406,6 +469,7 @@ class PostgresNodeStore:
             pool_size=1,
             max_overflow=0,
             pool_timeout=lifecycle_lock_timeout_seconds,
+            connect_args=connect_args,
         )
         self._lifecycle_lock_timeout_seconds = lifecycle_lock_timeout_seconds
 
@@ -1257,6 +1321,119 @@ class PostgresNodeStore:
                 aggregate_id=node_id,
                 event_type="media_node.restart_requested",
                 payload={"desired_revision": desired_revision},
+                aggregate_revision=desired_revision,
+            )
+            return _media_node(row)
+
+    def request_reconfigure(
+        self,
+        node_id: UUID,
+        *,
+        expected_revision: int,
+        expected_registered_cameras: int,
+        expected_blast_radius_sha256: str,
+        release_id: str | None = None,
+        mediamtx_binary_sha256: str | None = None,
+    ) -> MediaNode:
+        if (release_id is None) != (mediamtx_binary_sha256 is None):
+            raise ValueError("node_release_identity_incomplete")
+        if release_id is not None and mediamtx_binary_sha256 is not None:
+            if not release_id or len(release_id) > 128:
+                raise ValueError("node_release_id_invalid")
+            if len(mediamtx_binary_sha256) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in mediamtx_binary_sha256
+            ):
+                raise ValueError("node_binary_sha256_invalid")
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection)
+            current = (
+                connection.execute(
+                    select(media_nodes).where(media_nodes.c.id == node_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                raise NodeNotFound("node_not_found")
+            node = _media_node(current)
+            if node.state is not NodeState.DRAINING:
+                raise NodeLifecycleConflict("node_not_draining")
+            if node.runtime_state not in {
+                NodeState.RUNNING,
+                NodeState.STOPPED,
+                NodeState.FAILED,
+            }:
+                raise NodeLifecycleConflict("node_reconfigure_runtime_invalid")
+            if node.desired_revision != expected_revision:
+                raise NodeLifecycleConflict("node_revision_conflict")
+            self._require_no_active_node_move(connection, node_id)
+            if connection.scalar(
+                select(func.count())
+                .select_from(node_port_change_sagas)
+                .where(
+                    node_port_change_sagas.c.node_id == node_id,
+                    node_port_change_sagas.c.state == NodePortChangeState.PREPARED.value,
+                )
+            ):
+                raise NodeLifecycleConflict("node_operation_in_progress")
+            placements = tuple(
+                (_uuid(row["camera_id"]), int(row["generation"]))
+                for row in connection.execute(
+                    select(
+                        camera_placements.c.camera_id,
+                        camera_placements.c.generation,
+                    ).where(camera_placements.c.node_id == node_id)
+                ).mappings()
+            )
+            if (
+                node.registered_cameras != expected_registered_cameras
+                or len(placements) != expected_registered_cameras
+                or camera_placement_fingerprint(placements) != expected_blast_radius_sha256
+            ):
+                raise NodeLifecycleConflict("node_blast_radius_changed")
+            desired_revision = node.desired_revision + 1
+            release_changed = release_id is not None and (
+                node.release_id != release_id
+                or node.mediamtx_binary_sha256 != mediamtx_binary_sha256
+            )
+            row = (
+                connection.execute(
+                    update(media_nodes)
+                    .where(media_nodes.c.id == node_id)
+                    .values(
+                        release_id=node.release_id if release_id is None else release_id,
+                        mediamtx_binary_sha256=(
+                            node.mediamtx_binary_sha256
+                            if mediamtx_binary_sha256 is None
+                            else mediamtx_binary_sha256
+                        ),
+                        desired_revision=desired_revision,
+                        applied_revision=0 if release_changed else node.applied_revision,
+                        management_fresh=False,
+                        management_observed_at=None,
+                        config_compatible=False,
+                    )
+                    .returning(*media_nodes.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="media_node",
+                aggregate_id=node_id,
+                event_type="media_node.reconfigure_requested",
+                payload={
+                    "blast_radius_sha256": expected_blast_radius_sha256,
+                    "external_port": node.external_port,
+                    "registered_cameras": expected_registered_cameras,
+                    "desired_revision": desired_revision,
+                    "previous_release_id": node.release_id,
+                    "release_id": node.release_id if release_id is None else release_id,
+                    "release_changed": release_changed,
+                },
                 aggregate_revision=desired_revision,
             )
             return _media_node(row)
@@ -2347,6 +2524,15 @@ class PostgresNodeStore:
             )
         )
         connection.execute(
+            insert(camera_access_policies).values(
+                camera_id=camera_id,
+                internet_cidrs=[],
+                local_cidrs=[],
+                revision=1,
+                updated_at=func.clock_timestamp(),
+            )
+        )
+        connection.execute(
             insert(camera_placements).values(
                 camera_id=camera_id,
                 node_id=selected.id,
@@ -2382,6 +2568,19 @@ class PostgresNodeStore:
             },
             aggregate_revision=1,
         )
+        _record_normative_event(
+            connection,
+            aggregate_type="camera_access_policy",
+            aggregate_id=camera_id,
+            event_type="camera.access_policy_created",
+            payload={
+                "camera_id": str(camera_id),
+                "internet_cidrs": [],
+                "local_cidrs": [],
+                "revision": 1,
+            },
+            aggregate_revision=1,
+        )
         return CameraPlacement(
             id=camera_id,
             name=name,
@@ -2394,6 +2593,374 @@ class PostgresNodeStore:
             desired_revision=1,
             applied_revision=0,
         )
+
+    def get_access_policy(self, camera_id: UUID) -> AccessPolicy | None:
+        with self._engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(camera_access_policies).where(
+                        camera_access_policies.c.camera_id == camera_id
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return None if row is None else _access_policy(row)
+
+    def set_access_policy(
+        self,
+        policy: AccessPolicy,
+        *,
+        expected_revision: int,
+    ) -> AccessPolicy:
+        if policy.revision != expected_revision + 1:
+            raise ValueError("access_policy_revision_invalid")
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = (
+                connection.execute(
+                    select(camera_access_policies)
+                    .where(camera_access_policies.c.camera_id == policy.camera_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                raise CameraNotFound("camera_not_found")
+            if int(current["revision"]) != expected_revision:
+                raise CameraLifecycleConflict("access_policy_revision_conflict")
+            row = (
+                connection.execute(
+                    update(camera_access_policies)
+                    .where(camera_access_policies.c.camera_id == policy.camera_id)
+                    .values(
+                        internet_cidrs=list(policy.internet_cidrs),
+                        local_cidrs=list(policy.local_cidrs),
+                        revision=policy.revision,
+                        updated_at=func.clock_timestamp(),
+                    )
+                    .returning(*camera_access_policies.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera_access_policy",
+                aggregate_id=policy.camera_id,
+                event_type="camera.access_policy_changed",
+                payload={
+                    "camera_id": str(policy.camera_id),
+                    "internet_cidrs": list(policy.internet_cidrs),
+                    "local_cidrs": list(policy.local_cidrs),
+                    "revision": policy.revision,
+                },
+                aggregate_revision=policy.revision,
+            )
+            return _access_policy(row)
+
+    def get_access_target(
+        self,
+        *,
+        node_id: UUID,
+        public_id: PublicId,
+    ) -> AccessTarget | None:
+        with self._engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(
+                        cameras.c.id.label("camera_id"),
+                        cameras.c.state.label("camera_state"),
+                        camera_placements.c.node_id,
+                        media_nodes.c.state.label("node_state"),
+                        media_nodes.c.maintenance,
+                        cameras.c.public_id,
+                        camera_access_policies.c.internet_cidrs,
+                        camera_access_policies.c.local_cidrs,
+                        camera_access_policies.c.revision,
+                    )
+                    .select_from(
+                        cameras.join(
+                            camera_placements,
+                            camera_placements.c.camera_id == cameras.c.id,
+                        ).join(
+                            camera_access_policies,
+                            camera_access_policies.c.camera_id == cameras.c.id,
+                        ).join(
+                            media_nodes,
+                            media_nodes.c.id == camera_placements.c.node_id,
+                        )
+                    )
+                    .where(
+                        cameras.c.public_id == str(public_id),
+                        camera_placements.c.node_id == node_id,
+                        cameras.c.state != CameraState.DELETED.value,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            camera_id = _uuid(row["camera_id"])
+            return AccessTarget(
+                camera_id=camera_id,
+                node_id=_uuid(row["node_id"]),
+                public_id=PublicId.parse(str(row["public_id"])),
+                enabled=(
+                    str(row["camera_state"]) == CameraState.ENABLED.value
+                    and str(row["node_state"]) == NodeState.RUNNING.value
+                    and not bool(row["maintenance"])
+                ),
+                policy=AccessPolicy(
+                    camera_id=camera_id,
+                    revision=int(row["revision"]),
+                    internet_cidrs=tuple(str(value) for value in row["internet_cidrs"]),
+                    local_cidrs=tuple(str(value) for value in row["local_cidrs"]),
+                ),
+            )
+
+    def get_access_grant(
+        self,
+        *,
+        camera_id: UUID,
+        username: str,
+    ) -> AccessGrant | None:
+        with self._engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(camera_access_grants).where(
+                        camera_access_grants.c.camera_id == camera_id,
+                        camera_access_grants.c.username == username,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return None if row is None else _access_grant(row)
+
+    def get_access_grant_by_id(self, grant_id: UUID) -> AccessGrant | None:
+        with self._engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(camera_access_grants).where(camera_access_grants.c.id == grant_id)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return None if row is None else _access_grant(row)
+
+    def rehash_access_grant(
+        self,
+        grant_id: UUID,
+        *,
+        token_verifier: str,
+        pepper_key_id: str,
+        expected_revision: int,
+    ) -> bool:
+        if (
+            len(token_verifier) != 64
+            or any(character not in "0123456789abcdef" for character in token_verifier)
+            or not pepper_key_id
+            or len(pepper_key_id) > 64
+        ):
+            raise ValueError("access_grant_rehash_invalid")
+        with self._engine.begin() as connection:
+            return bool(
+                connection.scalar(
+                    select(
+                        func.rtsp_proxy_auth_rehash_grant(
+                            grant_id,
+                            token_verifier,
+                            pepper_key_id,
+                            expected_revision,
+                        )
+                    )
+                )
+            )
+
+    def mark_access_grant_used(self, grant_id: UUID) -> bool:
+        with self._engine.begin() as connection:
+            return bool(
+                connection.scalar(
+                    select(func.rtsp_proxy_auth_mark_grant_used(grant_id))
+                )
+            )
+
+    def create_access_grant(self, grant: AccessGrant) -> AccessGrant:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            if connection.scalar(
+                select(cameras.c.id).where(
+                    cameras.c.id == grant.camera_id,
+                    cameras.c.state != CameraState.DELETED.value,
+                )
+            ) is None:
+                raise CameraNotFound("camera_not_found")
+            row = (
+                connection.execute(
+                    insert(camera_access_grants)
+                    .values(
+                        id=grant.id,
+                        camera_id=grant.camera_id,
+                        username=grant.username,
+                        token_verifier=grant.token_verifier,
+                        pepper_key_id=grant.pepper_key_id,
+                        not_before=grant.not_before,
+                        expires_at=grant.expires_at,
+                        revoked_at=grant.revoked_at,
+                        kind=grant.kind,
+                        created_by=grant.created_by,
+                        last_used_at=grant.last_used_at,
+                        revision=grant.revision,
+                        created_at=func.clock_timestamp(),
+                    )
+                    .returning(*camera_access_grants.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera_access_grant",
+                aggregate_id=grant.id,
+                event_type="camera.access_grant_created",
+                payload=_access_grant_event_payload(grant),
+                aggregate_revision=grant.revision,
+            )
+            return _access_grant(row)
+
+    def revoke_access_grant(
+        self,
+        grant_id: UUID,
+        *,
+        revoked_at: datetime,
+        expected_revision: int,
+    ) -> AccessGrant:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = self._lock_access_grant(connection, grant_id)
+            if current.revision != expected_revision:
+                raise CameraLifecycleConflict("access_grant_revision_conflict")
+            if current.revoked_at is not None:
+                return current
+            updated = replace(
+                current,
+                revoked_at=revoked_at,
+                revision=expected_revision + 1,
+            )
+            row = (
+                connection.execute(
+                    update(camera_access_grants)
+                    .where(camera_access_grants.c.id == grant_id)
+                    .values(revoked_at=revoked_at, revision=updated.revision)
+                    .returning(*camera_access_grants.c)
+                )
+                .mappings()
+                .one()
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera_access_grant",
+                aggregate_id=grant_id,
+                event_type="camera.access_grant_revoked",
+                payload=_access_grant_event_payload(updated),
+                aggregate_revision=updated.revision,
+            )
+            return _access_grant(row)
+
+    def rotate_access_grant(
+        self,
+        grant_id: UUID,
+        *,
+        replacement: AccessGrant,
+        old_expires_at: datetime,
+        expected_revision: int,
+    ) -> tuple[AccessGrant, AccessGrant]:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            current = self._lock_access_grant(connection, grant_id)
+            if current.revision != expected_revision or current.revoked_at is not None:
+                raise CameraLifecycleConflict("access_grant_revision_conflict")
+            if replacement.camera_id != current.camera_id or old_expires_at > current.expires_at:
+                raise ValueError("access_grant_rotation_invalid")
+            previous = replace(
+                current,
+                expires_at=old_expires_at,
+                revision=expected_revision + 1,
+            )
+            connection.execute(
+                update(camera_access_grants)
+                .where(camera_access_grants.c.id == grant_id)
+                .values(expires_at=old_expires_at, revision=previous.revision)
+            )
+            persisted = self._insert_access_grant(connection, replacement)
+            _record_normative_event(
+                connection,
+                aggregate_type="camera_access_grant",
+                aggregate_id=grant_id,
+                event_type="camera.access_grant_rotation_started",
+                payload=_access_grant_event_payload(previous),
+                aggregate_revision=previous.revision,
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera_access_grant",
+                aggregate_id=persisted.id,
+                event_type="camera.access_grant_created",
+                payload={
+                    **_access_grant_event_payload(persisted),
+                    "rotates_grant_id": str(grant_id),
+                },
+                aggregate_revision=persisted.revision,
+            )
+            return previous, persisted
+
+    def _insert_access_grant(
+        self,
+        connection: Connection,
+        grant: AccessGrant,
+    ) -> AccessGrant:
+        row = (
+            connection.execute(
+                insert(camera_access_grants)
+                .values(
+                    id=grant.id,
+                    camera_id=grant.camera_id,
+                    username=grant.username,
+                    token_verifier=grant.token_verifier,
+                    pepper_key_id=grant.pepper_key_id,
+                    not_before=grant.not_before,
+                    expires_at=grant.expires_at,
+                    revoked_at=grant.revoked_at,
+                    kind=grant.kind,
+                    created_by=grant.created_by,
+                    last_used_at=grant.last_used_at,
+                    revision=grant.revision,
+                    created_at=func.clock_timestamp(),
+                )
+                .returning(*camera_access_grants.c)
+            )
+            .mappings()
+            .one()
+        )
+        return _access_grant(row)
+
+    @staticmethod
+    def _lock_access_grant(connection: Connection, grant_id: UUID) -> AccessGrant:
+        row = (
+            connection.execute(
+                select(camera_access_grants)
+                .where(camera_access_grants.c.id == grant_id)
+                .with_for_update()
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise LookupError("access_grant_not_found")
+        return _access_grant(row)
 
     def close(self) -> None:
         self._engine.dispose()
@@ -2458,6 +3025,49 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),
     )
+
+
+def _access_policy(row: RowMapping) -> AccessPolicy:
+    return AccessPolicy(
+        camera_id=_uuid(row["camera_id"]),
+        revision=int(row["revision"]),
+        internet_cidrs=tuple(str(value) for value in row["internet_cidrs"]),
+        local_cidrs=tuple(str(value) for value in row["local_cidrs"]),
+    )
+
+
+def _access_grant(row: RowMapping) -> AccessGrant:
+    return AccessGrant(
+        id=_uuid(row["id"]),
+        camera_id=_uuid(row["camera_id"]),
+        username=str(row["username"]),
+        token_verifier=str(row["token_verifier"]),
+        pepper_key_id=str(row["pepper_key_id"]),
+        not_before=row["not_before"],
+        expires_at=row["expires_at"],
+        revoked_at=row["revoked_at"],
+        revision=int(row["revision"]),
+        kind=str(row["kind"]),
+        created_by=str(row["created_by"]),
+        last_used_at=row["last_used_at"],
+    )
+
+
+def _access_grant_event_payload(grant: AccessGrant) -> dict[str, object]:
+    return {
+        "camera_id": str(grant.camera_id),
+        "username": grant.username,
+        "pepper_key_id": grant.pepper_key_id,
+        "not_before": grant.not_before.isoformat(),
+        "expires_at": grant.expires_at.isoformat(),
+        "revoked_at": None if grant.revoked_at is None else grant.revoked_at.isoformat(),
+        "revision": grant.revision,
+        "kind": grant.kind,
+        "created_by": grant.created_by,
+        "last_used_at": (
+            None if grant.last_used_at is None else grant.last_used_at.isoformat()
+        ),
+    }
 
 
 def _camera_move(row: RowMapping) -> CameraMove:

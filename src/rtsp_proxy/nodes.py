@@ -204,6 +204,18 @@ class NodePortChangePreview:
 
 
 @dataclass(frozen=True, slots=True)
+class NodeReconfigurePreview:
+    node_id: UUID
+    external_port: int
+    desired_revision: int
+    registered_cameras: int
+    blast_radius_sha256: str
+    target_release_id: str
+    target_mediamtx_binary_sha256: str
+    confirmation_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class CameraPlacement:
     id: UUID
     name: str
@@ -343,6 +355,31 @@ class NodeDisruptionConfirmations(Protocol):
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+    ) -> bool: ...
+
+    def issue_node_reconfigure(
+        self,
+        *,
+        node_id: UUID,
+        external_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+        target_release_id: str,
+        target_mediamtx_binary_sha256: str,
+    ) -> str: ...
+
+    def verify_node_reconfigure(
+        self,
+        token: str,
+        *,
+        node_id: UUID,
+        external_port: int,
+        desired_revision: int,
+        registered_cameras: int,
+        blast_radius_sha256: str,
+        target_release_id: str,
+        target_mediamtx_binary_sha256: str,
     ) -> bool: ...
 
 
@@ -806,6 +843,74 @@ class InMemoryNodeStore:
             if node.registered_cameras:
                 raise NodeNotEmpty("node_not_empty")
             updated = replace(node, desired_revision=node.desired_revision + 1)
+            self._nodes[self._nodes.index(node)] = updated
+            return updated
+
+    def request_reconfigure(
+        self,
+        node_id: UUID,
+        *,
+        expected_revision: int,
+        expected_registered_cameras: int,
+        expected_blast_radius_sha256: str,
+        release_id: str | None = None,
+        mediamtx_binary_sha256: str | None = None,
+    ) -> MediaNode:
+        if (release_id is None) != (mediamtx_binary_sha256 is None):
+            raise ValueError("node_release_identity_incomplete")
+        if release_id is not None and mediamtx_binary_sha256 is not None:
+            NodeRuntimeSpecLike.validate_release(release_id, mediamtx_binary_sha256)
+        with self._lock:
+            node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
+            if node is None:
+                raise NodeNotFound("node_not_found")
+            if node.state is not NodeState.DRAINING:
+                raise NodeLifecycleConflict("node_not_draining")
+            if node.runtime_state not in {
+                NodeState.RUNNING,
+                NodeState.STOPPED,
+                NodeState.FAILED,
+            }:
+                raise NodeLifecycleConflict("node_reconfigure_runtime_invalid")
+            if node.desired_revision != expected_revision:
+                raise NodeLifecycleConflict("node_revision_conflict")
+            if self.list_node_active_moves(node_id) or any(
+                change.node_id == node_id and change.state is NodePortChangeState.PREPARED
+                for change in self._port_changes
+            ):
+                raise NodeLifecycleConflict("node_operation_in_progress")
+            cameras = tuple(
+                camera
+                for camera in self._cameras
+                if camera.node_id == node_id and camera.state is not CameraState.DELETED
+            )
+            blast_radius_sha256 = camera_placement_fingerprint(
+                tuple((camera.id, camera.placement_generation) for camera in cameras)
+            )
+            if (
+                node.registered_cameras != expected_registered_cameras
+                or len(cameras) != expected_registered_cameras
+                or blast_radius_sha256 != expected_blast_radius_sha256
+            ):
+                raise NodeLifecycleConflict("node_blast_radius_changed")
+            release_changed = release_id is not None and (
+                node.release_id != release_id
+                or node.mediamtx_binary_sha256 != mediamtx_binary_sha256
+            )
+            updated = replace(
+                node,
+                release_id=node.release_id if release_id is None else release_id,
+                mediamtx_binary_sha256=(
+                    node.mediamtx_binary_sha256
+                    if mediamtx_binary_sha256 is None
+                    else mediamtx_binary_sha256
+                ),
+                desired_revision=node.desired_revision + 1,
+                applied_revision=0 if release_changed else node.applied_revision,
+                management_fresh=False,
+                management_observed_at=None,
+                config_compatible=False,
+            )
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
@@ -1372,6 +1477,8 @@ class NodeControl:
         confirmations: NodeDisruptionConfirmations | None = None,
         new_operation_id: NodeIdFactory = uuid4,
         sleep: Callable[[float], None] = time.sleep,
+        reconfigure_release_id: str | None = None,
+        reconfigure_mediamtx_binary_sha256: str | None = None,
     ) -> None:
         if recovery_workers < 1 or recovery_workers > 16:
             raise ValueError("node_recovery_workers_invalid")
@@ -1385,6 +1492,22 @@ class NodeControl:
         self._confirmations = confirmations
         self._new_operation_id = new_operation_id
         self._sleep = sleep
+        if (reconfigure_release_id is None) != (
+            reconfigure_mediamtx_binary_sha256 is None
+        ):
+            raise ValueError("node_release_identity_incomplete")
+        if (
+            reconfigure_release_id is not None
+            and reconfigure_mediamtx_binary_sha256 is not None
+        ):
+            NodeRuntimeSpecLike.validate_release(
+                reconfigure_release_id,
+                reconfigure_mediamtx_binary_sha256,
+            )
+        self._reconfigure_release_id = reconfigure_release_id
+        self._reconfigure_mediamtx_binary_sha256 = (
+            reconfigure_mediamtx_binary_sha256
+        )
 
     def register_node(
         self,
@@ -1502,6 +1625,96 @@ class NodeControl:
             self._require_node_and_runtime(node_id)
             desired = self._store.request_restart(node_id)
             return self._execute_runtime(desired, NodeRuntimeAction.RESTART)
+
+    def preview_reconfigure(self, node_id: UUID) -> NodeReconfigurePreview:
+        with self._store.lifecycle_guard(node_id):
+            node = self._require_node_and_runtime(node_id)
+            if node.state is not NodeState.DRAINING:
+                raise NodeLifecycleConflict("node_not_draining")
+            if node.runtime_state not in {
+                NodeState.RUNNING,
+                NodeState.STOPPED,
+                NodeState.FAILED,
+            }:
+                raise NodeLifecycleConflict("node_reconfigure_runtime_invalid")
+            if self._confirmations is None:
+                raise NodeRuntimeUnavailable("node_confirmation_unavailable")
+            blast_radius_sha256 = self._node_camera_fingerprint(node.id)
+            target_release_id = self._reconfigure_release_id or node.release_id
+            target_binary_sha256 = (
+                self._reconfigure_mediamtx_binary_sha256
+                or node.mediamtx_binary_sha256
+            )
+            token = self._confirmations.issue_node_reconfigure(
+                node_id=node.id,
+                external_port=node.external_port,
+                desired_revision=node.desired_revision,
+                registered_cameras=node.registered_cameras,
+                blast_radius_sha256=blast_radius_sha256,
+                target_release_id=target_release_id,
+                target_mediamtx_binary_sha256=target_binary_sha256,
+            )
+            return NodeReconfigurePreview(
+                node_id=node.id,
+                external_port=node.external_port,
+                desired_revision=node.desired_revision,
+                registered_cameras=node.registered_cameras,
+                blast_radius_sha256=blast_radius_sha256,
+                target_release_id=target_release_id,
+                target_mediamtx_binary_sha256=target_binary_sha256,
+                confirmation_token=token,
+            )
+
+    def reconfigure_node(
+        self,
+        node_id: UUID,
+        *,
+        confirmation_token: str | None,
+    ) -> MediaNode:
+        with self._store.lifecycle_guard(node_id):
+            current = self._require_node_and_runtime(node_id)
+            blast_radius_sha256 = self._node_camera_fingerprint(current.id)
+            target_release_id = self._reconfigure_release_id or current.release_id
+            target_binary_sha256 = (
+                self._reconfigure_mediamtx_binary_sha256
+                or current.mediamtx_binary_sha256
+            )
+            if (
+                self._confirmations is None
+                or confirmation_token is None
+                or not self._confirmations.verify_node_reconfigure(
+                    confirmation_token,
+                    node_id=current.id,
+                    external_port=current.external_port,
+                    desired_revision=current.desired_revision,
+                    registered_cameras=current.registered_cameras,
+                    blast_radius_sha256=blast_radius_sha256,
+                    target_release_id=target_release_id,
+                    target_mediamtx_binary_sha256=target_binary_sha256,
+                )
+            ):
+                raise NodeDisruptionConfirmationRequired(
+                    "node_disruption_confirmation_required"
+                )
+            if self._reconfigure_release_id is None:
+                desired = self._store.request_reconfigure(
+                    node_id,
+                    expected_revision=current.desired_revision,
+                    expected_registered_cameras=current.registered_cameras,
+                    expected_blast_radius_sha256=blast_radius_sha256,
+                )
+            else:
+                desired = self._store.request_reconfigure(
+                    node_id,
+                    expected_revision=current.desired_revision,
+                    expected_registered_cameras=current.registered_cameras,
+                    expected_blast_radius_sha256=blast_radius_sha256,
+                    release_id=self._reconfigure_release_id,
+                    mediamtx_binary_sha256=(
+                        self._reconfigure_mediamtx_binary_sha256
+                    ),
+                )
+            return self._execute_runtime(desired, NodeRuntimeAction.RECONFIGURE_RESTART)
 
     def set_administrative_state(
         self,
@@ -2094,6 +2307,17 @@ class NodeStore(Protocol):
     def request_stop(self, node_id: UUID) -> MediaNode: ...
 
     def request_restart(self, node_id: UUID) -> MediaNode: ...
+
+    def request_reconfigure(
+        self,
+        node_id: UUID,
+        *,
+        expected_revision: int,
+        expected_registered_cameras: int,
+        expected_blast_radius_sha256: str,
+        release_id: str | None = None,
+        mediamtx_binary_sha256: str | None = None,
+    ) -> MediaNode: ...
 
     def request_release(
         self,

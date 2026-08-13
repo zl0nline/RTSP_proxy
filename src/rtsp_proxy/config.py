@@ -10,11 +10,15 @@ from typing import Annotated, Any
 from pydantic import Field, IPvAnyAddress, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from rtsp_proxy.release import ReleaseVerificationError, trusted_mediamtx_identity
+from rtsp_proxy.release import (
+    ReleaseVerificationError,
+    trusted_mediamtx_activation_identity,
+)
 
 
 class RuntimeRole(StrEnum):
     WEB = "web"
+    AUTH = "auth"
     WORKER = "worker"
     RECONCILER = "reconciler"
     PROBE = "probe"
@@ -72,7 +76,7 @@ class Settings(BaseSettings):
     reconcile_interval_seconds: float = Field(default=1, ge=0.1, le=60)
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     node_release_id: str = Field(
-        default="0.1.0",
+        default="0.2.0",
         pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
     )
     node_mediamtx_binary_sha256: str = Field(
@@ -80,6 +84,10 @@ class Settings(BaseSettings):
         pattern=r"^[0-9a-f]{64}$",
     )
     database_url: str | None = None
+    auth_host: IPvAnyAddress = IPv4Address("127.0.0.1")
+    auth_port: int = Field(default=8010, ge=1, le=65535)
+    auth_database_timeout_seconds: float = Field(default=1, ge=0.1, le=5)
+    access_pepper_file: Path | None = None
 
     @field_validator("node_port_reserved", mode="before")
     @classmethod
@@ -116,6 +124,17 @@ class Settings(BaseSettings):
             raise ValueError("node_port_ranges_overlap")
         if any(self.http_port in configured for configured in (external, api, metrics)):
             raise ValueError("node_port_range_overlaps_control_port")
+        if not self.auth_host.is_loopback:
+            raise ValueError("auth_host_must_be_loopback")
+        if self.auth_port == self.http_port or any(
+            self.auth_port in configured for configured in (external, api, metrics)
+        ):
+            raise ValueError("auth_port_overlap")
+        if self.role is RuntimeRole.AUTH:
+            if self.access_pepper_file is None or not self.access_pepper_file.is_absolute():
+                raise ValueError("access_pepper_file_required")
+            if self.database_url is None:
+                raise ValueError("database_url_required")
         if set(self.node_port_reserved) & (api | metrics):
             raise ValueError("node_management_port_reserved")
         available = external.difference(self.node_port_reserved)
@@ -127,7 +146,7 @@ class Settings(BaseSettings):
             if self.node_mediamtx_binary_sha256 == "0" * 64:
                 raise ValueError("node_release_identity_required")
             try:
-                _version, trusted_digest = trusted_mediamtx_identity(
+                _version, trusted_digest = trusted_mediamtx_activation_identity(
                     platform.machine(),
                     self.node_release_id,
                 )

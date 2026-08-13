@@ -1,0 +1,67 @@
+#!/usr/sbin/nft -f
+
+# Owned additive table. Install and reconcile it only through
+# rtsp-proxy-nft-reconcile; direct replacement is intentionally unsupported.
+table inet rtsp_proxy {
+    comment "rtsp-proxy-owned:v1"
+    set node_ports {
+        type inet_service
+        flags interval
+        elements = { 10000-10999 }
+    }
+
+    set syn_rate_v4 {
+        type ipv4_addr . inet_service
+        flags dynamic,timeout
+        timeout 1m
+        size 65536
+    }
+
+    set syn_rate_v6 {
+        type ipv6_addr . inet_service
+        flags dynamic,timeout
+        timeout 1m
+        size 65536
+    }
+
+    set connections_v4 {
+        type ipv4_addr . inet_service
+        flags dynamic
+        size 65536
+    }
+
+    set connections_v6 {
+        type ipv6_addr . inet_service
+        flags dynamic
+        size 65536
+    }
+
+    set node_connections {
+        type inet_service
+        flags dynamic
+        size 256
+    }
+
+    chain input {
+        type filter hook input priority -5; policy accept;
+
+        tcp dport @node_ports ct state new \
+            add @node_connections { tcp dport ct count over 128 } \
+            counter drop comment "rtsp-proxy per-node connection cap"
+        tcp dport @node_ports ct state new meta nfproto ipv4 \
+            add @connections_v4 { ip saddr . tcp dport ct count over 128 } \
+            counter drop comment "rtsp-proxy per-ip-port connection cap"
+        tcp dport @node_ports ct state new meta nfproto ipv6 \
+            add @connections_v6 { ip6 saddr . tcp dport ct count over 128 } \
+            counter drop comment "rtsp-proxy per-ip-port connection cap"
+
+        tcp dport @node_ports tcp flags & (syn|ack) == syn meta nfproto ipv4 \
+            update @syn_rate_v4 { ip saddr . tcp dport \
+            limit rate over 100/second burst 200 packets } \
+            counter drop comment "rtsp-proxy per-ip-port SYN rate"
+        tcp dport @node_ports tcp flags & (syn|ack) == syn meta nfproto ipv6 \
+            update @syn_rate_v6 { ip6 saddr . tcp dport \
+            limit rate over 100/second burst 200 packets } \
+            counter drop comment "rtsp-proxy per-ip-port SYN rate"
+    }
+}

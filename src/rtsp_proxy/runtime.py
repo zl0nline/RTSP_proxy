@@ -12,7 +12,17 @@ from uuid import uuid4
 import uvicorn
 from fastapi import FastAPI
 
-from rtsp_proxy.app import create_app
+from rtsp_proxy.access import (
+    AccessAttemptLimiter,
+    AccessAuthorizer,
+    AccessDecisionTelemetry,
+    AccessGrantControl,
+    AccessPepperFileError,
+    AccessPolicyControl,
+    PepperVerifier,
+    load_pepper_verifier,
+)
+from rtsp_proxy.app import create_app, create_media_auth_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import generate_public_id
@@ -38,6 +48,10 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_ROLE": "role",
     "RTSP_PROXY_HTTP_HOST": "http_host",
     "RTSP_PROXY_HTTP_PORT": "http_port",
+    "RTSP_PROXY_AUTH_HOST": "auth_host",
+    "RTSP_PROXY_AUTH_PORT": "auth_port",
+    "RTSP_PROXY_AUTH_DATABASE_TIMEOUT_SECONDS": "auth_database_timeout_seconds",
+    "RTSP_PROXY_ACCESS_PEPPER_FILE": "access_pepper_file",
     "RTSP_PROXY_MAX_NODES": "max_nodes",
     "RTSP_PROXY_NODE_PORT_RANGE_START": "node_port_range_start",
     "RTSP_PROXY_NODE_PORT_RANGE_END": "node_port_range_end",
@@ -85,6 +99,8 @@ def create_app_from_environment() -> FastAPI:
 
 
 def _create_runtime_app(settings: Settings) -> FastAPI:
+    if settings.role is RuntimeRole.AUTH:
+        raise ConfigurationError("web_role_required")
     store = _open_verified_store(settings)
     if store is None:
         return create_app(settings)
@@ -112,6 +128,8 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
                 lifetime_seconds=30,
             )
         ),
+        reconfigure_release_id=settings.node_release_id,
+        reconfigure_mediamtx_binary_sha256=settings.node_mediamtx_binary_sha256,
     )
     provisioning_policy = NodeProvisioningPolicy(
         port_range_start=settings.node_port_range_start,
@@ -194,6 +212,16 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         camera_move_control=move_control,
         camera_mutation_control=mutation_control,
         camera_runtime_observer=camera_runtime,
+        access_policy_control=AccessPolicyControl(store=store),
+        access_grant_control=(
+            None
+            if settings.access_pepper_file is None
+            else AccessGrantControl(
+                store=store,
+                verifier=_load_access_verifier(settings),
+                new_grant_id=uuid4,
+            )
+        ),
         startup=(None if node_runtime is None else recover_runtime_state),
         shutdown=store.close,
     )
@@ -204,7 +232,10 @@ def create_background_app(
     *,
     expected_role: RuntimeRole,
 ) -> FastAPI:
-    if expected_role is RuntimeRole.WEB or settings.role is RuntimeRole.WEB:
+    if expected_role in {RuntimeRole.WEB, RuntimeRole.AUTH} or settings.role in {
+        RuntimeRole.WEB,
+        RuntimeRole.AUTH,
+    }:
         raise ConfigurationError("background_role_required")
     if settings.role is not expected_role:
         raise ConfigurationError("background_role_mismatch")
@@ -280,6 +311,11 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
         settings.database_url,
         lifecycle_lock_pool_size=settings.node_lifecycle_lock_pool_size,
         lifecycle_lock_timeout_seconds=settings.node_lifecycle_lock_timeout_seconds,
+        statement_timeout_ms=(
+            round(settings.auth_database_timeout_seconds * 1000)
+            if settings.role is RuntimeRole.AUTH
+            else None
+        ),
     )
     try:
         store.assert_schema_compatible()
@@ -300,6 +336,33 @@ def run_web() -> None:
     )
 
 
+def run_auth() -> None:
+    settings = load_settings()
+    if settings.role is not RuntimeRole.AUTH:
+        raise ConfigurationError("auth_role_required")
+    store = _open_verified_store(settings)
+    if store is None:
+        raise ConfigurationError("database_url_required")
+    verifier = _load_access_verifier(settings)
+    telemetry = AccessDecisionTelemetry()
+    uvicorn.run(
+        create_media_auth_app(
+            authorizer=AccessAuthorizer(
+                store=store,
+                verifier=verifier,
+                attempts=AccessAttemptLimiter(),
+                decision_sink=telemetry,
+            ),
+            callback_verifier=verifier,
+            telemetry=telemetry,
+            readiness=store.assert_schema_compatible,
+            shutdown=store.close,
+        ),
+        host=str(settings.auth_host),
+        port=settings.auth_port,
+    )
+
+
 def run_background(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="rtsp-proxy-role",
@@ -307,7 +370,11 @@ def run_background(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument(
         "--expected-role",
-        choices=[role.value for role in RuntimeRole if role is not RuntimeRole.WEB],
+        choices=[
+            role.value
+            for role in RuntimeRole
+            if role not in {RuntimeRole.WEB, RuntimeRole.AUTH}
+        ],
         required=True,
     )
     arguments = parser.parse_args(argv)
@@ -330,3 +397,13 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigurationError("invalid_config_file")
     return value
+
+
+def _load_access_verifier(settings: Settings) -> PepperVerifier:
+    path = settings.access_pepper_file
+    if path is None:
+        raise ConfigurationError("access_pepper_file_required")
+    try:
+        return load_pepper_verifier(path)
+    except AccessPepperFileError as error:
+        raise ConfigurationError("access_pepper_file_unsafe") from error
