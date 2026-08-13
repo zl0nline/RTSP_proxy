@@ -163,22 +163,22 @@ def test_nftables_inventory_requires_exact_owned_schema() -> None:
             {"name": "node_ports", "type": "inet_service", "flags": ["interval"]},
             {
                 "name": "syn_rate_v4",
-                "type": "ipv4_addr . inet_service",
+                "type": ["ipv4_addr", "inet_service"],
                 "flags": ["dynamic", "timeout"],
             },
             {
                 "name": "syn_rate_v6",
-                "type": "ipv6_addr . inet_service",
+                "type": ["ipv6_addr", "inet_service"],
                 "flags": ["dynamic", "timeout"],
             },
             {
                 "name": "connections_v4",
-                "type": "ipv4_addr . inet_service",
+                "type": ["ipv4_addr", "inet_service"],
                 "flags": ["dynamic"],
             },
             {
                 "name": "connections_v6",
-                "type": "ipv6_addr . inet_service",
+                "type": ["ipv6_addr", "inet_service"],
                 "flags": ["dynamic"],
             },
             {

@@ -15,10 +15,10 @@ from rtsp_proxy.nft_reconcile import NftReconcileError, reconcile_nftables
 def inventory(*, marker: str = "rtsp-proxy-owned:v1") -> dict[str, object]:
     sets = (
         ("node_ports", "inet_service", ["interval"]),
-        ("syn_rate_v4", "ipv4_addr . inet_service", ["dynamic", "timeout"]),
-        ("syn_rate_v6", "ipv6_addr . inet_service", ["dynamic", "timeout"]),
-        ("connections_v4", "ipv4_addr . inet_service", ["dynamic"]),
-        ("connections_v6", "ipv6_addr . inet_service", ["dynamic"]),
+        ("syn_rate_v4", ["ipv4_addr", "inet_service"], ["dynamic", "timeout"]),
+        ("syn_rate_v6", ["ipv6_addr", "inet_service"], ["dynamic", "timeout"]),
+        ("connections_v4", ["ipv4_addr", "inet_service"], ["dynamic"]),
+        ("connections_v6", ["ipv6_addr", "inet_service"], ["dynamic"]),
         ("node_connections", "inet_service", ["dynamic"]),
     )
     entries: list[dict[str, object]] = [

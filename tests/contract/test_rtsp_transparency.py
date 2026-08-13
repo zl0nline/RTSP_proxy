@@ -687,7 +687,11 @@ paths:
                 f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get",
                 headers={"Authorization": "Basic " + b64encode(b"wrong:wrong").decode()},
             )
-            urllib.request.urlopen(request, timeout=2)
+            # MediaMTX deliberately delays supplied invalid credentials by a
+            # random 0-4 seconds. Keep the native boundary above that bounded
+            # anti-bruteforce window while the manager regression proves that
+            # this management miss never reaches the external callback.
+            urllib.request.urlopen(request, timeout=6)
         assert bad_management.value.code == 401
         media = MediaMtxClient(
             api_url=f"http://127.0.0.1:{proxy_api_port}",

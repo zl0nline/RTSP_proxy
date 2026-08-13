@@ -87,10 +87,10 @@ def validate_owned_table(payload: object) -> None:
         raise NftReconcileError("nft_table_drift")
     expected_set_contract = {
         "node_ports": ("inet_service", {"interval"}),
-        "syn_rate_v4": ("ipv4_addr . inet_service", {"dynamic", "timeout"}),
-        "syn_rate_v6": ("ipv6_addr . inet_service", {"dynamic", "timeout"}),
-        "connections_v4": ("ipv4_addr . inet_service", {"dynamic"}),
-        "connections_v6": ("ipv6_addr . inet_service", {"dynamic"}),
+        "syn_rate_v4": (["ipv4_addr", "inet_service"], {"dynamic", "timeout"}),
+        "syn_rate_v6": (["ipv6_addr", "inet_service"], {"dynamic", "timeout"}),
+        "connections_v4": (["ipv4_addr", "inet_service"], {"dynamic"}),
+        "connections_v6": (["ipv6_addr", "inet_service"], {"dynamic"}),
         "node_connections": ("inet_service", {"dynamic"}),
     }
     for name, (expected_type, expected_flags) in expected_set_contract.items():
