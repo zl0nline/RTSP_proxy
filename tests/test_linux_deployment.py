@@ -1,6 +1,12 @@
+import hashlib
+import json
 import subprocess
 from configparser import ConfigParser
 from pathlib import Path
+
+import pytest
+
+from rtsp_proxy.release import ReleaseVerificationError, trusted_mediamtx_identity
 
 
 class CaseSensitiveConfigParser(ConfigParser):
@@ -127,6 +133,55 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
 
     assert "Verify native release manifest end to end" in workflow
     assert "uv run rtsp-proxy-verify-release --manifest" in workflow
+
+
+def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
+    catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
+    media = catalog["mediamtx"]
+    trusted = json.loads(
+        Path("src/rtsp_proxy/artifacts/mediamtx.json").read_text(encoding="utf-8")
+    )
+    patch_path = Path(media["patch"])
+
+    assert media["source_commit"] == "1b943637a4b5778bb929a7af7687b048fecaa03f"
+    assert media["go_version"] == "go1.26.5"
+    assert media["version"] == "v1.20.0-rtsp-proxy.1"
+    assert hashlib.sha256(patch_path.read_bytes()).hexdigest() == media["patch_sha256"]
+    assert trusted == {
+        "schema_version": 2,
+        "releases": {
+            "0.1.0": {
+                "version": media["version"],
+                "architectures": media["architectures"],
+            }
+        },
+    }
+
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert workflow.count("tools/build_mediamtx.sh") == 2
+    assert "Download and verify MediaMTX v1.20.0" not in workflow
+    assert "Download, verify and stage MediaMTX" not in workflow
+
+
+def test_initial_patched_release_has_no_fabricated_previous_trust_entry() -> None:
+    _version, current = trusted_mediamtx_identity("amd64", "0.1.0")
+
+    assert current.root == (
+        "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6"
+    )
+    with pytest.raises(ReleaseVerificationError, match="trusted_artifact_catalog_invalid"):
+        trusted_mediamtx_identity("amd64", "0.0.9")
+
+
+def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
+    result = subprocess.run(
+        ["sh", "-n", "tools/build_mediamtx.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_load_fixture_builder_has_valid_bash_syntax() -> None:

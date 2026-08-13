@@ -53,6 +53,11 @@ credentials никогда не раскрываются downstream consumer.
 Opaque immutable external path name camera. Public ID идентифицирует path, но
 не является credential.
 
+Phase-C→D offline transition сохраняет camera UUID и Public ID через private,
+checksum-bound export/restore; он также сохраняет stable desired lifecycle/admin
+state ноды и никогда не превращает STOPPED/MAINTENANCE/FAILED в RUNNING. Ручное
+пересоздание с новым Public ID запрещено.
+
 ## Placement
 
 Authoritative binding camera к ровно одной media node. Placement определяет
@@ -72,7 +77,11 @@ node отсутствует, orchestrator может создать новую �
 ## Camera move
 
 Audited change placement generation. Move может изменить внешний URL. Occupied
-ordinary move запрещён; forced move требует подтверждения и disconnect.
+ordinary move запрещён; forced move требует подтверждения текущего reader blast
+radius и disconnect. Source/target admission закрывается до повторной occupancy
+проверки; новый endpoint открывается только после удаления source. Saga bounded
+по времени, а API сохраняет exact old/new port и URL. Source update, disable и
+delete занятой camera требуют того же preview/confirmation.
 
 _Не называйте move failover: автоматического failover в текущем продукте нет._
 

@@ -11,9 +11,10 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   Linux amd64/arm64.
 > - Phase 0B reproducible load/netem harness: **functional foundation complete**;
 >   production hardware capacity/24h soak ещё не выполнены.
-> - Node registry/placement foundation and isolated per-node Linux runtime:
->   **complete**; camera reconciler, access, dashboard and production evidence
->   remain in progress.
+> - Node registry/placement foundation, isolated per-node Linux runtime and
+>   Phase-D camera/node administration: **implementation complete; native
+>   Phase-D CI confirmation pending**. Access, dashboard and production
+>   evidence remain in progress.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -71,8 +72,13 @@ node.
 затрагиваются.
 
 Unoccupied camera можно перемещать сразу. Occupied ordinary move запрещён;
-forced move требует подтверждения и disconnect. Move может изменить port/URL.
-Transparent redirect не обещается.
+forced move требует подтверждения текущего blast radius и disconnect. Move
+держит writer locks обеих nodes, сначала закрывает admission source/target,
+повторно проверяет reader, удаляет source и лишь затем открывает target. Saga
+имеет deadline и после pre-switch failure удаляет target и восстанавливает
+source. API сохраняет и возвращает старый/новый port и URL; transparent redirect
+не обещается. Source update, disable и delete активной camera используют такой
+же preview/confirmation contract.
 
 ## Access contract
 
@@ -152,7 +158,8 @@ nodes.
 3. **Linux runtime** — per-node config/systemd instance, lifecycle and health.
 4. **Media control** — node-aware reconciler, camera CRUD, drain, move, port
    change and delete-empty.
-5. **Access** — internet/local ACL, credentials, one-reader/RTSP 453.
+5. **Access** — internet/local ACL and credentials integrated with the
+   Phase-D one-reader/RTSP 453 admission primitive.
 6. **Dashboard/observability** — UI, RBAC, metrics aggregation and email
    incident/recovery.
 7. **Evidence/pilot** — per-node 100-camera and multi-node server matrix,
@@ -175,7 +182,9 @@ review, fixes и native amd64/arm64 CI.
 - release/startup schema gate bound to packaged Alembic head;
 - architecture/digest-aware release verifier;
 - direct-Linux systemd/sysusers/tmpfiles baseline;
-- typed MediaMTX v1.20.0 adapter;
+- typed MediaMTX adapter plus the reproducible
+  `v1.20.0-rtsp-proxy.1` source build pinned to upstream commit
+  `1b943637a4b5778bb929a7af7687b048fecaa03f`;
 - native ordinary RTSP/TCP H.264/H.265 compatibility contracts;
 - reproducible GStreamer load generator/readers;
 - tamper-evident resource/runtime/fixture evidence;
@@ -196,8 +205,10 @@ startup convergence and automatic
 reserve→provision→smoke→place are in code. The two-node native contract proves
 that restart/stop of node A does not change node B process or its established
 ordinary RTSP/TCP session or packet progress. Restart is transactionally fenced
-against placement, and rolling activation keeps current/previous verified
-release pins while empty stopped nodes transition one at a time. The native
+against placement, and rolling activation supports a separately catalogued
+previous patched release while empty stopped nodes transition one at a time.
+The initial `0.1.0` patched release has no earlier safe rollback target; stock
+MediaMTX is never accepted as one. The native
 test executes real systemd instances and proves process/listener/RTP isolation;
 its release identity and listener teardown checks remain fail closed while
 correctly accounting for exec transitions and completed TCP `TIME_WAIT` state.
@@ -211,15 +222,30 @@ release, поэтому переключение `/opt/rtsp-proxy/current` не 
 convergence другой: startup reconciliation выполняется bounded-параллельно,
 а PostgreSQL lifecycle locks имеют отдельный ограниченный pool и timeout.
 
-Phase D **code complete, review pending**: node-scoped reconciler and camera
-CRUD, occupancy observation, revision-fenced move saga, drain/maintenance,
+Phase D **implementation complete; native CI confirmation pending**:
+node-scoped reconciler and camera CRUD, occupancy-fenced/revision-fenced move
+saga with bounded abort cleanup, disruptive-camera confirmations,
+drain/maintenance,
 blast-radius-confirmed port change with crash recovery, and empty-node deletion
 are implemented. A prepared port change freezes the exact camera placement set
 and reserves both ports; failed/restarted operations converge to the old port.
-Phase E will add the admission half of drain plus internet/local ACL,
-credentials and exact one-reader RTSP `453` behavior.
+Phase D now owns the binary admission primitive and proves exact one-reader
+RTSP `453` behavior without interrupting the established reader. Phase E will
+integrate that primitive with drain, internet/local ACL, credentials and the
+simultaneous-admission security contract.
 
-Ещё не реализованы dashboard, one-reader admission, access policies,
+The Phase-C→D schema transition is intentionally offline and fail closed:
+`0009` rejects a non-empty legacy node registry because those rows cannot prove
+the patched non-disruptive admission behavior. The operator must export camera
+intent, drain/delete cameras, stop/remove nodes, back up PostgreSQL, migrate,
+activate the catalog-bound release, then run the private checksum-bound
+`rtsp-proxy-phase-d-transition restore`. The round trip preserves exact camera
+UUIDs and immutable `/<public_id>` paths, enforces the current host node/port
+policy, preflights every restored listener before writing desired state and
+preserves stable RUNNING/STOPPED/DRAINING/MAINTENANCE/FAILED intent. Transitional
+node states cannot be exported. It is not exposed over HTTP.
+
+Ещё не реализованы dashboard, full access policies,
 notifications и complete operations workflows.
 Наличие load harness не означает готовый product или published capacity.
 

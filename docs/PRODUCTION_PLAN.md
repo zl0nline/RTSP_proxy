@@ -414,9 +414,11 @@ node or interrupt B..N.
 VALIDATE
 -> PREPARE_TARGET
 -> VERIFY_TARGET
+-> CLOSE_TARGET_ADMISSION
+-> QUIESCE_AND_RECHECK_SOURCE
 -> SWITCH_PLACEMENT
--> DISABLE_SOURCE_PATH
--> CLEANUP_SOURCE
+-> DELETE_SOURCE_PATH
+-> ACTIVATE_TARGET
 -> COMPLETE
 ```
 
@@ -468,9 +470,14 @@ required platform config and registered path set are applied.
 Pinned native tests cover H.264/H.265, cold/warm, source offline/recovery,
 simultaneous connects, ACL/auth and absence of media UDP sockets on amd64/arm64.
 
-If MediaMTX cannot natively produce exact 453/race-safe single-reader behavior,
-the implementation requires an accepted admission/auth adapter at the node
-boundary; silently returning another code is not acceptable.
+Pinned upstream MediaMTX v1.20.0 does not natively produce both exact 453 and a
+race-safe non-disruptive admission fence. The product therefore builds
+`v1.20.0-rtsp-proxy.1` from exact commit
+`1b943637a4b5778bb929a7af7687b048fecaa03f` plus the reviewed SHA-256-bound
+patch in `patches/mediamtx-v1.20.0/`. The patch makes `maxReaders` a synchronous
+hot-only update, keeps an established session alive, and maps late SETUP to
+453. If this contract stops applying, another bounded admission mechanism must
+be accepted and proven; silently returning another code is not acceptable.
 
 ## 15. Access control and auth
 
@@ -724,8 +731,8 @@ Unix-socket command for an exact UUID; its absolute deadline leaves a reserved
 cleanup window, same-node requests serialize and different nodes use a bounded
 worker pool. The cleanup reserve exceeds the media unit stop timeout and keeps a
 separate final status/listener-proof budget. The root helper accepts only pinned
-port ranges/current-or-previous
-verified release identity and translates it to one systemd instance. Config is
+port ranges and current-or-optionally-previous catalogued patched release
+identity and translates it to one systemd instance. Config is
 installed with no-follow directory descriptors and fsync/rename. A healthy
 runtime observation binds PID, `/proc` start ticks, boot id, config SHA-256,
 release and desired revision. Automatic placement is serialized across
@@ -739,8 +746,10 @@ secrets. The native isolation contract gates on first decodable AU and proves
 RTP packet progress after restart and stop of the other node. Startup recovery
 observes every node independently and converges persisted RUNNING/STOPPED
 intent after host reboot. Rolling activation drains/stops one node, performs a
-revision-fenced release transition, then starts/smokes it; healthy old nodes stay
-manageable through the temporary previous-release allowlist. Recovery is
+revision-fenced release transition, then starts/smokes it. From the second
+patched release onward, healthy old nodes stay manageable through a temporary
+previous-release catalog entry. Initial release `0.1.0` has no previous patched
+target and never treats stock v1.20.0 as rollback. Recovery is
 bounded-parallel; one slow node does not delay observation/convergence of every
 other node, and PostgreSQL advisory-lock connections are capped per replica.
 Recovery re-reads current desired state while holding the same-node lifecycle
@@ -760,6 +769,20 @@ export camera intent, drain/remove old node rows, migrate, then recreate nodes
 through the Phase-C provision path. The migration never fabricates runtime
 identity or silently remaps ports.
 
+The Phase-C-to-Phase-D `0009_camera_move_safety` migration is likewise an
+offline, fail-closed boundary. It rejects a non-empty node registry because a
+legacy node cannot prove that it runs the patched, non-disruptive admission
+fence. Use the private canonical/checksum-bound export while still on `0008`,
+drain/delete cameras, stop/remove all node rows, back up PostgreSQL, migrate,
+activate the catalog-bound release, then run the transactional idempotent
+restore. It enforces the current max-node, port-range/reservation and listener
+availability policy before its synchronous desired/audit/outbox transaction,
+continues normative node revisions, preserves camera UUIDs, permanent
+tombstones, immutable `/<public_id>` paths and stable desired lifecycle/admin
+state. Transitional node state blocks export; restore never promotes a stopped,
+failed or maintenance node to running. It is not exposed over HTTP. Editing
+legacy release digests in place is forbidden.
+
 ### Phase D — camera reconciler and move
 
 - [x] node-aware MediaMTX client factory;
@@ -769,13 +792,27 @@ identity or silently remaps ports.
 - [x] drain/maintenance placement fencing; new-session admission follows in
   Phase E;
 - [x] move saga and forced confirmation;
+- [x] source/target writer guards, admission fence, current-reader recheck,
+  inaccessible prepared target and bounded abort/restore cleanup;
+- [x] persisted old/new move ports and URLs;
+- [x] source-update/disable/delete confirmation bound to current reader count,
+  desired revision and exact mutation digest;
+- [x] absolute helper deadlines, cancellation-aware PostgreSQL writer-lock
+  waits and cooperative reconciler shutdown;
+- [x] versioned MediaMTX trust catalog with an optional separately verified
+  previous patched release; initial `0.1.0` honestly has no rollback target;
+- [x] checksum-bound Phase-C→D export/restore preserving UUIDs/public paths,
+  stable node intent, current host policy, synchronous durability and monotonic
+  revision;
 - [x] port-change rollback/recovery and delete-empty;
 - [x] port-change confirmation bound to desired revision, camera count and
   exact `camera_id:placement_generation` SHA-256; the persisted saga rechecks
   that blast radius under the placement lock and fences camera mutations.
 
-Status: **code complete, review/native CI pending**. Ordinary camera CRUD never
-restarts a node. Port change is intentionally disruptive only to that node,
+Status: **implementation complete; native amd64/arm64 CI confirmation pending**.
+The review cycle found and closed the move occupancy TOCTOU, duplicate prepared
+target, missing writer guards, stale helper request and disruptive CRUD gaps.
+Ordinary camera CRUD never restarts a node. Port change is intentionally disruptive only to that node,
 retains its credentials, waits for the old listener to disappear, and commits
 the new endpoint only after runtime evidence. Crash recovery rolls an
 incomplete saga back to its old port. Delete stops the exact empty node,
@@ -783,7 +820,9 @@ verifies listener teardown and removes only its owned config directory before
 the registry row and port are released.
 
 Exit: contract tests prove CRUD isolation, crash convergence and exact blast
-radius.
+radius. The native systemd contract executes node-scoped CRUD, cross-node move,
+port change and empty-node delete while an unaffected RTSP/TCP reader continues
+to receive RTP; CI runs it on amd64 and arm64.
 
 ### Phase E — access and one-reader contract
 
@@ -791,7 +830,8 @@ radius.
 - IPv4/IPv6 CIDR normalization;
 - ACL-before-password verifier;
 - downstream credential rotation/revoke;
-- race-safe reader admission and exact RTSP 453;
+- integrate the Phase-D exact-453 admission primitive with ACL/auth/drain;
+- prove simultaneous reader admission remains race-safe;
 - no-oracle and connection abuse controls;
 - ordinary FFmpeg H.264/H.265 tests.
 

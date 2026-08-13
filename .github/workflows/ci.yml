@@ -82,7 +82,7 @@ jobs:
           createdb --host 127.0.0.1 --port "$migration_port" --username postgres rtsp_proxy_migration_test
           RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
             .artifacts/clean-venv/bin/rtsp-proxy-migrate
-          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0008_node_administration"
+          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0009_camera_move_safety"
 
       - name: Validate systemd units
         run: |
@@ -127,18 +127,16 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
-      - name: Download and verify MediaMTX v1.20.0 (${{ matrix.arch }})
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.26.5"
+          cache: false
+
+      - name: Build pinned patched MediaMTX (${{ matrix.arch }})
         run: |
-          archive_url=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].archive_url' deploy/artifact-catalog.json)
-          archive_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].archive_sha256' deploy/artifact-catalog.json)
-          binary_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].binary_sha256' deploy/artifact-catalog.json)
           mkdir -p .artifacts/mediamtx
-          curl --fail --location --silent --show-error \
-            --output .artifacts/mediamtx.tar.gz \
-            "$archive_url"
-          echo "$archive_sha256  .artifacts/mediamtx.tar.gz" | sha256sum --check
-          tar -xzf .artifacts/mediamtx.tar.gz -C .artifacts/mediamtx
-          echo "$binary_sha256  .artifacts/mediamtx/mediamtx" | sha256sum --check
+          tools/build_mediamtx.sh "${{ matrix.arch }}" .artifacts/mediamtx/mediamtx
 
       - name: Download and verify FFmpeg/ffprobe (${{ matrix.arch }})
         run: |
@@ -215,6 +213,12 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.26.5"
+          cache: false
+
       - name: Install native GStreamer build and runtime packages
         run: |
           sudo apt-get update
@@ -241,16 +245,11 @@ jobs:
           echo "$ffmpeg_sha256  .artifacts/ffmpeg/bin/ffmpeg" | sha256sum --check
           echo "$ffprobe_sha256  .artifacts/ffmpeg/bin/ffprobe" | sha256sum --check
 
-      - name: Download, verify and stage MediaMTX for node isolation (${{ matrix.arch }})
+      - name: Build and stage pinned patched MediaMTX (${{ matrix.arch }})
         run: |
-          archive_url=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].archive_url' deploy/artifact-catalog.json)
-          archive_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].archive_sha256' deploy/artifact-catalog.json)
           binary_sha256=$(jq --raw-output --arg arch "${{ matrix.arch }}" '.mediamtx.architectures[$arch].binary_sha256' deploy/artifact-catalog.json)
           mkdir -p .artifacts/mediamtx
-          curl --fail --location --silent --show-error --output .artifacts/mediamtx.tar.gz "$archive_url"
-          echo "$archive_sha256  .artifacts/mediamtx.tar.gz" | sha256sum --check
-          tar -xzf .artifacts/mediamtx.tar.gz -C .artifacts/mediamtx
-          echo "$binary_sha256  .artifacts/mediamtx/mediamtx" | sha256sum --check
+          tools/build_mediamtx.sh "${{ matrix.arch }}" .artifacts/mediamtx/mediamtx
           sudo install -d /opt/rtsp-proxy/releases/native-contract/bin
           sudo install -m 0755 .artifacts/mediamtx/mediamtx /opt/rtsp-proxy/releases/native-contract/bin/mediamtx
           echo "$binary_sha256  /opt/rtsp-proxy/releases/native-contract/bin/mediamtx" | sha256sum --check
@@ -286,7 +285,7 @@ jobs:
           FFPROBE_BINARY: .artifacts/ffmpeg/bin/ffprobe
         run: uv run pytest tests/contract/test_rtsp_pull_generator.py
 
-      - name: Verify two-node process and RTP session isolation
+      - name: Verify Phase D two-node administration and RTP isolation
         run: |
           sudo install -m 0644 deploy/systemd/rtsp-proxy-media@.service /etc/systemd/system/
           sudo systemctl daemon-reload

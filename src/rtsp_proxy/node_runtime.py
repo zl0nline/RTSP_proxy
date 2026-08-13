@@ -5,6 +5,7 @@ import errno
 import hashlib
 import json
 import os
+import platform
 import secrets
 import socket
 import stat
@@ -20,7 +21,7 @@ from enum import StrEnum
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import BoundedSemaphore, Lock
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -43,6 +44,7 @@ from rtsp_proxy.nodes import (
     NodeState,
     validate_camera_source_url,
 )
+from rtsp_proxy.release import ReleaseVerificationError, trusted_mediamtx_identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -1446,6 +1448,13 @@ class _MediaPathPayload(BaseModel):
 
     name: str
     source_url: str | None
+    max_readers: int | None = Field(default=None, ge=-1, le=1)
+
+    @model_validator(mode="after")
+    def validate_reader_limit(self) -> _MediaPathPayload:
+        if self.max_readers not in {None, -1, 1}:
+            raise ValueError("node_media_reader_limit_invalid")
+        return self
 
 
 class _MediaRequestPayload(BaseModel):
@@ -1456,6 +1465,7 @@ class _MediaRequestPayload(BaseModel):
     operation: MediaPathOperation
     spec: _RuntimeSpecPayload
     path: _MediaPathPayload | None
+    deadline_unix_ms: int = Field(ge=1)
 
 
 class _MediaInventoryPayload(BaseModel):
@@ -1596,7 +1606,8 @@ class UnixMediaNodeClientFactory:
 
     def for_node(self, node: MediaNode) -> UnixMediaNodeClient:
         if (
-            node.state is not NodeState.RUNNING
+            node.state
+            not in {NodeState.RUNNING, NodeState.DRAINING, NodeState.MAINTENANCE}
             or node.runtime_state is not NodeState.RUNNING
             or node.health is not NodeHealth.HEALTHY
             or not node.management_fresh
@@ -1624,7 +1635,12 @@ class UnixMediaNodeClient:
         self._node = node
 
     def put_path(self, path: MediaPathConfig) -> None:
-        response = self._request("put", name=path.name, source_url=path.source_url)
+        response = self._request(
+            "put",
+            name=path.name,
+            source_url=path.source_url,
+            max_readers=path.max_readers,
+        )
         if (
             response.path is not None
             or response.inventory is not None
@@ -1640,13 +1656,19 @@ class UnixMediaNodeClient:
             return None
         if response.path.source_url is None:
             raise MediaNodeProtocolError("node_media_response_invalid")
+        if response.path.max_readers not in {-1, 1}:
+            raise MediaNodeProtocolError("node_media_response_invalid")
         try:
             response_name = PublicId.parse(response.path.name)
         except InvalidPublicId:
             raise MediaNodeProtocolError("node_media_response_invalid") from None
         if response_name != name:
             raise MediaNodeProtocolError("node_media_response_invalid")
-        return MediaPathConfig(name=response_name, source_url=response.path.source_url)
+        return MediaPathConfig(
+            name=response_name,
+            source_url=response.path.source_url,
+            max_readers=response.path.max_readers,
+        )
 
     def inventory_paths(self) -> MediaPathInventory:
         response = self._request("inventory")
@@ -1695,7 +1717,12 @@ class UnixMediaNodeClient:
         *,
         name: PublicId | None = None,
         source_url: str | None = None,
+        max_readers: int | None = None,
     ) -> _MediaResponsePayload:
+        response_reserve = min(1.0, self._timeout_seconds / 2)
+        deadline_unix_ms = int(
+            (time.time() + self._timeout_seconds - response_reserve) * 1000
+        )
         payload = {
             "schema_version": 1,
             "request_type": "media_path",
@@ -1704,8 +1731,13 @@ class UnixMediaNodeClient:
             "path": (
                 None
                 if name is None
-                else {"name": str(name), "source_url": source_url}
+                else {
+                    "name": str(name),
+                    "source_url": source_url,
+                    "max_readers": max_readers,
+                }
             ),
+            "deadline_unix_ms": deadline_unix_ms,
         }
         encoded = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode(
             "utf-8"
@@ -1812,19 +1844,29 @@ class RootMediaNodeAdapter:
     def execute(
         self,
         command: MediaPathCommand,
+        deadline: NodeOperationDeadline | None = None,
     ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | None:
+        if deadline is None:
+            deadline = NodeOperationDeadline(
+                expires_monotonic=time.monotonic() + self._timeout_seconds
+            )
+        deadline.remaining_seconds()
         expected = self._config_store.expected(command.spec)
         if expected is None:
             raise NodeSupervisorError("node_config_not_applied")
         rendered, credentials = expected
         if self._config_store.digest(command.spec) != rendered.sha256:
             raise NodeSupervisorError("node_config_not_applied")
-        before = self._process.execute(NodeRuntimeAction.OBSERVE, command.spec)
+        before = self._process.execute(
+            NodeRuntimeAction.OBSERVE,
+            command.spec,
+            deadline,
+        )
         if not before.active or before.executable_sha256 != command.spec.mediamtx_binary_sha256:
             raise NodeSupervisorError("node_process_release_mismatch")
         client = MediaMtxClient(
             api_url=f"http://127.0.0.1:{command.spec.api_port}",
-            timeout_seconds=self._timeout_seconds,
+            timeout_seconds=deadline.remaining_seconds(maximum=self._timeout_seconds),
             username=credentials.username,
             password=credentials.password,
         )
@@ -1832,7 +1874,12 @@ class RootMediaNodeAdapter:
             result = self._execute_operation(client, command)
         except MediaNodeError:
             raise NodeSupervisorError("node_media_operation_failed") from None
-        after = self._process.execute(NodeRuntimeAction.OBSERVE, command.spec)
+        deadline.remaining_seconds()
+        after = self._process.execute(
+            NodeRuntimeAction.OBSERVE,
+            command.spec,
+            deadline,
+        )
         if after != before:
             raise NodeSupervisorError("node_process_identity_changed")
         return result
@@ -1864,10 +1911,12 @@ class _ScopedNodeLock:
         node_id: UUID,
         guard: Lock,
         locks: dict[UUID, tuple[Lock, int]],
+        deadline: NodeOperationDeadline,
     ) -> None:
         self._node_id = node_id
         self._guard = guard
         self._locks = locks
+        self._deadline = deadline
         self._lock: Lock | None = None
 
     def __enter__(self) -> None:
@@ -1875,18 +1924,31 @@ class _ScopedNodeLock:
             lock, references = self._locks.get(self._node_id, (Lock(), 0))
             self._locks[self._node_id] = (lock, references + 1)
             self._lock = lock
-        lock.acquire()
+        try:
+            remaining = self._deadline.remaining_seconds()
+            acquired = lock.acquire(timeout=remaining)
+        except Exception:
+            self._drop_reference(lock)
+            raise
+        if not acquired:
+            self._drop_reference(lock)
+            raise NodeSupervisorError("node_runtime_operation_timeout")
 
-    def __exit__(self, *exc_info: object) -> None:
-        assert self._lock is not None
-        self._lock.release()
+    def _drop_reference(self, lock: Lock) -> None:
         with self._guard:
-            lock, references = self._locks[self._node_id]
-            assert lock is self._lock and references > 0
+            current, references = self._locks[self._node_id]
+            assert current is lock and references > 0
             if references == 1:
                 del self._locks[self._node_id]
             else:
                 self._locks[self._node_id] = (lock, references - 1)
+        self._lock = None
+
+    def __exit__(self, *exc_info: object) -> None:
+        assert self._lock is not None
+        lock = self._lock
+        lock.release()
+        self._drop_reference(lock)
 
 
 class UnixNodeSupervisorServer:
@@ -1940,7 +2002,7 @@ class UnixNodeSupervisorServer:
             command, requested_deadline_unix_ms = self._decode_command(request)
             self._policy.validate(command.spec)
             deadline = self._operation_deadline(requested_deadline_unix_ms)
-            with self._node_lock(command.spec.node_id):
+            with self._node_lock(command.spec.node_id, deadline):
                 observation = self._supervisor.execute(
                     command,
                     deadline=deadline,
@@ -1963,10 +2025,11 @@ class UnixNodeSupervisorServer:
         try:
             if self._media is None:
                 raise NodeSupervisorError("node_media_unavailable")
-            command = self._decode_media_command(request)
+            command, requested_deadline_unix_ms = self._decode_media_command(request)
             self._policy.validate(command.spec)
-            with self._node_lock(command.spec.node_id):
-                result = self._media.execute(command)
+            deadline = self._operation_deadline(requested_deadline_unix_ms)
+            with self._node_lock(command.spec.node_id, deadline):
+                result = self._media.execute(command, deadline)
             return self._media_success_payload(command.operation, result)
         except NodeSupervisorError as error:
             return self._media_error_payload(str(error))
@@ -2004,11 +2067,16 @@ class UnixNodeSupervisorServer:
         finally:
             capacity.release()
 
-    def _node_lock(self, node_id: UUID) -> _ScopedNodeLock:
+    def _node_lock(
+        self,
+        node_id: UUID,
+        deadline: NodeOperationDeadline,
+    ) -> _ScopedNodeLock:
         return _ScopedNodeLock(
             node_id=node_id,
             guard=self._node_locks_guard,
             locks=self._node_locks,
+            deadline=deadline,
         )
 
     def _operation_deadline(
@@ -2064,7 +2132,7 @@ class UnixNodeSupervisorServer:
             raise NodeSupervisorError("node_runtime_request_invalid") from error
 
     @staticmethod
-    def _decode_media_command(request: bytes) -> MediaPathCommand:
+    def _decode_media_command(request: bytes) -> tuple[MediaPathCommand, int]:
         if not request or len(request) > _MAX_RUNTIME_MESSAGE_BYTES or not request.endswith(b"\n"):
             raise NodeSupervisorError("node_media_request_invalid")
         try:
@@ -2084,20 +2152,30 @@ class UnixNodeSupervisorServer:
             if payload.path is not None:
                 name = PublicId.parse(payload.path.name)
                 if payload.operation is MediaPathOperation.PUT:
-                    if payload.path.source_url is None:
+                    if (
+                        payload.path.source_url is None
+                        or payload.path.max_readers not in {-1, 1}
+                    ):
                         raise ValueError
                     path = MediaPathConfig(
                         name=name,
                         source_url=validate_camera_source_url(payload.path.source_url),
+                        max_readers=payload.path.max_readers,
                     )
                 else:
-                    if payload.path.source_url is not None:
+                    if (
+                        payload.path.source_url is not None
+                        or payload.path.max_readers is not None
+                    ):
                         raise ValueError
                     path = name
-            return MediaPathCommand(
-                operation=payload.operation,
-                spec=spec,
-                path=path,
+            return (
+                MediaPathCommand(
+                    operation=payload.operation,
+                    spec=spec,
+                    path=path,
+                ),
+                payload.deadline_unix_ms,
             )
         except (InvalidPublicId, ValidationError, ValueError) as error:
             raise NodeSupervisorError("node_media_request_invalid") from error
@@ -2144,7 +2222,11 @@ class UnixNodeSupervisorServer:
         inventory = None
         runtime = None
         if operation is MediaPathOperation.GET and isinstance(result, MediaPathConfig):
-            path = {"name": str(result.name), "source_url": result.source_url}
+            path = {
+                "name": str(result.name),
+                "source_url": result.source_url,
+                "max_readers": result.max_readers,
+            }
         if operation is MediaPathOperation.INVENTORY and isinstance(result, MediaPathInventory):
             inventory = {
                 "camera_ids": [str(value) for value in result.camera_ids],
@@ -2242,6 +2324,25 @@ class NodeHelperSettings(BaseSettings):
                 raise ValueError("node_helper_previous_release_duplicate")
         if self.cleanup_reserve_seconds >= self.operation_timeout_seconds:
             raise ValueError("node_runtime_cleanup_reserve_invalid")
+        try:
+            _version, trusted_digest = trusted_mediamtx_identity(
+                platform.machine(),
+                self.release_id,
+            )
+        except ReleaseVerificationError:
+            raise ValueError("node_release_identity_untrusted") from None
+        if self.mediamtx_binary_sha256 != trusted_digest.root:
+            raise ValueError("node_release_identity_untrusted")
+        if self.previous_mediamtx_binary_sha256 is not None:
+            try:
+                _previous_version, previous_trusted_digest = trusted_mediamtx_identity(
+                    platform.machine(),
+                    cast(str, self.previous_release_id),
+                )
+            except ReleaseVerificationError:
+                raise ValueError("node_previous_release_identity_untrusted") from None
+            if self.previous_mediamtx_binary_sha256 != previous_trusted_digest.root:
+                raise ValueError("node_previous_release_identity_untrusted")
         return self
 
     def policy(self) -> NodeRuntimePolicy:

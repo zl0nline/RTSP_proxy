@@ -1,18 +1,19 @@
 {
   "schema_version": 1,
   "mediamtx": {
-    "version": "v1.20.0",
+    "version": "v1.20.0-rtsp-proxy.1",
     "source_repository": "https://github.com/bluenviron/mediamtx",
+    "source_commit": "1b943637a4b5778bb929a7af7687b048fecaa03f",
+    "go_version": "go1.26.5",
+    "patch": "patches/mediamtx-v1.20.0/0001-hot-reader-limit-and-rtsp-453.patch",
+    "patch_sha256": "a86fe687875921337ba538d2c794dc0316207daa6632c46e2d5ce5f89afb36af",
+    "provenance": "reproducible source build from exact upstream commit plus reviewed local patch",
     "architectures": {
       "amd64": {
-        "archive_url": "https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_amd64.tar.gz",
-        "archive_sha256": "952d5f7d31d1b448ab4da4509550594c511d42636db9d7bb175d377f4ede81df",
-        "binary_sha256": "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336"
+        "binary_sha256": "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6"
       },
       "arm64": {
-        "archive_url": "https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_arm64.tar.gz",
-        "archive_sha256": "6aa3c03da7b6477f1e110c8e18e819cf9ef121e8981b52b8f8219982dae35f2f",
-        "binary_sha256": "2da379972ba86627632aa7e3f779c680ba04a5ee26ef2a20dc61cefcc24f73b8"
+        "binary_sha256": "3ed0ed9004792b1e3088b5b3cb8aff451293a88b0ee8366e16d8538c8b16bfe6"
       }
     }
   },

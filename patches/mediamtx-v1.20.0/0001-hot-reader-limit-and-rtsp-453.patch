@@ -1,0 +1,419 @@
+diff --git a/internal/core/core.go b/internal/core/core.go
+index b6be144..d8eedcc 100644
+--- a/internal/core/core.go
++++ b/internal/core/core.go
+@@ -105,6 +105,11 @@ var cli struct {
+ 	Upgrade      bool   `help:"upgrade executable to the latest version"`
+ }
+ 
++type coreAPIConfigSetReq struct {
++	conf *conf.Conf
++	done chan struct{}
++}
++
+ // Core is an instance of MediaMTX.
+ type Core struct {
+ 	ctx             context.Context
+@@ -131,7 +136,7 @@ type Core struct {
+ 	confWatcher     *confwatcher.ConfWatcher
+ 
+ 	// in
+-	chAPIConfigSet chan *conf.Conf
++	chAPIConfigSet chan coreAPIConfigSetReq
+ 
+ 	// out
+ 	done chan struct{}
+@@ -190,7 +195,7 @@ func New(args []string) (*Core, bool) {
+ 	p := &Core{
+ 		ctx:            ctx,
+ 		ctxCancel:      ctxCancel,
+-		chAPIConfigSet: make(chan *conf.Conf),
++		chAPIConfigSet: make(chan coreAPIConfigSetReq),
+ 		done:           make(chan struct{}),
+ 	}
+ 
+@@ -280,10 +285,11 @@ outer:
+ 				break outer
+ 			}
+ 
+-		case newConf := <-p.chAPIConfigSet:
++		case req := <-p.chAPIConfigSet:
+ 			p.Log(logger.Info, "reloading configuration (API request)")
+ 
+-			err := p.reloadConf(newConf, true)
++			err := p.reloadConf(req.conf, true)
++			close(req.done)
+ 			if err != nil {
+ 				p.Log(logger.Error, "%s", err)
+ 				break outer
+@@ -1167,8 +1173,15 @@ func (p *Core) reloadConf(newConf *conf.Conf, calledByAPI bool) error {
+ 
+ // APIConfigSet implements apiParent.
+ func (p *Core) APIConfigSet(conf *conf.Conf) {
++	done := make(chan struct{})
++	select {
++	case p.chAPIConfigSet <- coreAPIConfigSetReq{conf: conf, done: done}:
++	case <-p.ctx.Done():
++		return
++	}
++
+ 	select {
+-	case p.chAPIConfigSet <- conf:
++	case <-done:
+ 	case <-p.ctx.Done():
+ 	}
+ }
+diff --git a/internal/core/path.go b/internal/core/path.go
+index 1bba5f0..7daf4e8 100644
+--- a/internal/core/path.go
++++ b/internal/core/path.go
+@@ -69,6 +69,11 @@ type pathAPIPathsGetReq struct {
+ 	res  chan pathAPIPathsGetRes
+ }
+ 
++type pathReloadConfReq struct {
++	conf *conf.Path
++	done chan struct{}
++}
++
+ type pathAPIForwardDestListRes struct {
+ 	path *path
+ 	err  error
+@@ -136,7 +141,7 @@ type path struct {
+ 	onDemandPublisherCloseTimer    *time.Timer
+ 
+ 	// in
+-	chReloadConf              chan *conf.Path
++	chReloadConf              chan pathReloadConfReq
+ 	chStaticSourceSetReady    chan defs.PathSourceStaticSetReadyReq
+ 	chStaticSourceSetNotReady chan defs.PathSourceStaticSetNotReadyReq
+ 	chDescribe                chan defs.PathDescribeReq
+@@ -161,7 +166,7 @@ func (pa *path) initialize() {
+ 	pa.onDemandStaticSourceCloseTimer = emptyTimer()
+ 	pa.onDemandPublisherReadyTimer = emptyTimer()
+ 	pa.onDemandPublisherCloseTimer = emptyTimer()
+-	pa.chReloadConf = make(chan *conf.Path)
++	pa.chReloadConf = make(chan pathReloadConfReq)
+ 	pa.chStaticSourceSetReady = make(chan defs.PathSourceStaticSetReadyReq)
+ 	pa.chStaticSourceSetNotReady = make(chan defs.PathSourceStaticSetNotReadyReq)
+ 	pa.chDescribe = make(chan defs.PathDescribeReq)
+@@ -325,8 +330,9 @@ func (pa *path) runInner() error {
+ 		case <-pa.onDemandPublisherCloseTimer.C:
+ 			pa.doOnDemandPublisherCloseTimer()
+ 
+-		case newConf := <-pa.chReloadConf:
+-			pa.doReloadConf(newConf)
++		case req := <-pa.chReloadConf:
++			pa.doReloadConf(req.conf)
++			close(req.done)
+ 
+ 		case req := <-pa.chStaticSourceSetReady:
+ 			pa.doSourceStaticSetReady(req)
+@@ -1057,7 +1063,7 @@ func (pa *path) addReaderPost(req defs.PathAddReaderReq) {
+ 	}
+ 
+ 	if pa.conf.MaxReaders != 0 && len(pa.readers) >= pa.conf.MaxReaders {
+-		req.Res <- defs.PathAddReaderRes{Err: fmt.Errorf("maximum reader count reached")}
++		req.Res <- defs.PathAddReaderRes{Err: &defs.PathMaxReadersReachedError{PathName: pa.name}}
+ 		return
+ 	}
+ 
+@@ -1082,8 +1088,15 @@ func (pa *path) addReaderPost(req defs.PathAddReaderReq) {
+ 
+ // reloadConf is called by pathManager.
+ func (pa *path) reloadConf(newConf *conf.Path) {
++	done := make(chan struct{})
++	select {
++	case pa.chReloadConf <- pathReloadConfReq{conf: newConf, done: done}:
++	case <-pa.ctx.Done():
++		return
++	}
++
+ 	select {
+-	case pa.chReloadConf <- newConf:
++	case <-done:
+ 	case <-pa.ctx.Done():
+ 	}
+ }
+diff --git a/internal/core/path_manager.go b/internal/core/path_manager.go
+index b65259c..9529c65 100644
+--- a/internal/core/path_manager.go
++++ b/internal/core/path_manager.go
+@@ -21,6 +21,7 @@ import (
+ 
+ func pathConfCanBeUpdated(oldPathConf *conf.Path, newPathConf *conf.Path) bool {
+ 	clone := oldPathConf.Clone()
++	clone.MaxReaders = newPathConf.MaxReaders
+ 
+ 	clone.Name = newPathConf.Name
+ 	clone.Regexp = newPathConf.Regexp
+@@ -69,6 +70,11 @@ type pathManagerAuthManager interface {
+ 	Authenticate(req *auth.Request) (string, *auth.Error)
+ }
+ 
++type pathManagerReloadConfReq struct {
++	pathConfs map[string]*conf.Path
++	done      chan struct{}
++}
++
+ type pathManagerParent interface {
+ 	logger.Writer
+ }
+@@ -96,7 +102,7 @@ type pathManager struct {
+ 	paths     map[string]*path
+ 
+ 	// in
+-	chReloadConf         chan map[string]*conf.Path
++	chReloadConf         chan pathManagerReloadConfReq
+ 	chSetHLSServer       chan pathSetHLSServerReq
+ 	chRemovePath         chan *path
+ 	chClosePathIfIdle    chan *path
+@@ -118,7 +124,7 @@ func (pm *pathManager) initialize() {
+ 	pm.ctx = ctx
+ 	pm.ctxCancel = ctxCancel
+ 	pm.paths = make(map[string]*path)
+-	pm.chReloadConf = make(chan map[string]*conf.Path)
++	pm.chReloadConf = make(chan pathManagerReloadConfReq)
+ 	pm.chSetHLSServer = make(chan pathSetHLSServerReq)
+ 	pm.chRemovePath = make(chan *path)
+ 	pm.chClosePathIfIdle = make(chan *path)
+@@ -171,8 +177,8 @@ func (pm *pathManager) run() {
+ outer:
+ 	for {
+ 		select {
+-		case newPaths := <-pm.chReloadConf:
+-			pm.doReloadConf(newPaths)
++		case req := <-pm.chReloadConf:
++			pm.doReloadConf(req.pathConfs, req.done)
+ 
+ 		case req := <-pm.chSetHLSServer:
+ 			readyPaths := pm.doSetHLSServer(req.s)
+@@ -226,9 +232,17 @@ outer:
+ 	pm.ctxCancel()
+ }
+ 
+-func (pm *pathManager) doReloadConf(newPaths map[string]*conf.Path) {
++func (pm *pathManager) doReloadConf(newPaths map[string]*conf.Path, done chan struct{}) {
+ 	confsToRecreate := make(map[string]struct{})
+ 	confsToReload := make(map[string]struct{})
++	var reloads sync.WaitGroup
++	reload := func(pa *path, newConf *conf.Path) {
++		reloads.Add(1)
++		go func() {
++			defer reloads.Done()
++			pa.reloadConf(newConf)
++		}()
++	}
+ 
+ 	for confName, pathConf := range pm.pathConfs {
+ 		if newPath, ok := newPaths[confName]; ok {
+@@ -257,7 +271,7 @@ func (pm *pathManager) doReloadConf(newPaths map[string]*conf.Path) {
+ 			oldPathConf := pm.pathConfs[pa.confName]
+ 			if pathConfCanBeUpdated(oldPathConf, newPathConf) {
+ 				pa.confName = newPathConf.Name
+-				go pa.reloadConf(newPathConf)
++				reload(pa, newPathConf)
+ 				continue
+ 			}
+ 
+@@ -274,7 +288,7 @@ func (pm *pathManager) doReloadConf(newPaths map[string]*conf.Path) {
+ 
+ 		// path configuration has changed but can be hot reloaded: reload it
+ 		if _, ok := confsToReload[newPathConf.Name]; ok {
+-			go pa.reloadConf(newPathConf)
++			reload(pa, newPathConf)
+ 		}
+ 	}
+ 
+@@ -288,6 +302,11 @@ func (pm *pathManager) doReloadConf(newPaths map[string]*conf.Path) {
+ 			}
+ 		}
+ 	}
++
++	go func() {
++		reloads.Wait()
++		close(done)
++	}()
+ }
+ 
+ func (pm *pathManager) doClosePath(pa *path) {
+@@ -517,8 +536,15 @@ func (pm *pathManager) createPath(
+ 
+ // ReloadPathConfs is called by core.
+ func (pm *pathManager) ReloadPathConfs(pathConfs map[string]*conf.Path) {
++	done := make(chan struct{})
++	select {
++	case pm.chReloadConf <- pathManagerReloadConfReq{pathConfs: pathConfs, done: done}:
++	case <-pm.ctx.Done():
++		return
++	}
++
+ 	select {
+-	case pm.chReloadConf <- pathConfs:
++	case <-done:
+ 	case <-pm.ctx.Done():
+ 	}
+ }
+diff --git a/internal/core/path_test.go b/internal/core/path_test.go
+index dc414ad..82fc40c 100644
+--- a/internal/core/path_test.go
++++ b/internal/core/path_test.go
+@@ -800,6 +800,121 @@ func TestPathMaxReaders(t *testing.T) {
+ 	}
+ }
+ 
++func TestPathMaxReadersHotReloadKeepsEstablishedReader(t *testing.T) {
++	p, ok := newInstance(t, "api: yes\npaths:\n  all_others:\n    maxReaders: 1\n")
++	require.Equal(t, true, ok)
++	defer p.Close()
++
++	media := test.UniqueMediaH264()
++	source := gortsplib.Client{}
++	err := source.StartRecording(
++		"rtsp://localhost:8554/mystream",
++		&description.Session{Medias: []*description.Media{media}})
++	require.NoError(t, err)
++	defer source.Close()
++
++	u, err := base.ParseURL("rtsp://127.0.0.1:8554/mystream")
++	require.NoError(t, err)
++	reader := gortsplib.Client{Scheme: u.Scheme, Host: u.Host}
++	err = reader.Start()
++	require.NoError(t, err)
++	defer reader.Close()
++	desc, _, err := reader.Describe(u)
++	require.NoError(t, err)
++	err = reader.SetupAll(desc.BaseURL, desc.Medias)
++	require.NoError(t, err)
++	packetRecv := make(chan struct{}, 1)
++	reader.OnPacketRTP(desc.Medias[0], desc.Medias[0].Formats[0], func(_ *rtp.Packet) {
++		select {
++		case packetRecv <- struct{}{}:
++		default:
++		}
++	})
++	_, err = reader.Play(nil)
++	require.NoError(t, err)
++
++	tr := &http.Transport{}
++	defer tr.CloseIdleConnections()
++	httpRequest(t, &http.Client{Transport: tr}, http.MethodPatch,
++		"http://localhost:9997/v3/config/paths/patch/all_others",
++		map[string]any{"maxReaders": -1}, nil)
++
++	err = source.WritePacketRTP(media, &rtp.Packet{
++		Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: 1, Timestamp: 1, SSRC: 1},
++		Payload: []byte{5},
++	})
++	require.NoError(t, err)
++	select {
++	case <-packetRecv:
++	case <-time.After(5 * time.Second):
++		t.Fatal("established reader stopped receiving after maxReaders hot reload")
++	}
++
++	second := gortsplib.Client{Scheme: u.Scheme, Host: u.Host}
++	err = second.Start()
++	require.NoError(t, err)
++	defer second.Close()
++	desc2, _, err := second.Describe(u)
++	require.NoError(t, err)
++	err = second.SetupAll(desc2.BaseURL, desc2.Medias)
++	require.EqualError(t, err, "bad status code: 453 (Not Enough Bandwidth)")
++	second.Close()
++
++	httpRequest(t, &http.Client{Transport: tr}, http.MethodPatch,
++		"http://localhost:9997/v3/config/paths/patch/all_others",
++		map[string]any{"maxReaders": 1}, nil)
++	lateAfterOpen := gortsplib.Client{Scheme: u.Scheme, Host: u.Host}
++	err = lateAfterOpen.Start()
++	require.NoError(t, err)
++	defer lateAfterOpen.Close()
++	desc2, _, err = lateAfterOpen.Describe(u)
++	require.NoError(t, err)
++	err = lateAfterOpen.SetupAll(desc2.BaseURL, desc2.Medias)
++	require.EqualError(t, err, "bad status code: 453 (Not Enough Bandwidth)")
++
++	reader.Close()
++	third := gortsplib.Client{Scheme: u.Scheme, Host: u.Host}
++	err = third.Start()
++	require.NoError(t, err)
++	defer third.Close()
++	desc3, _, err := third.Describe(u)
++	require.NoError(t, err)
++	err = third.SetupAll(desc3.BaseURL, desc3.Medias)
++	require.NoError(t, err)
++}
++
++func TestPathMaxReadersHotReloadSourceChurnDoesNotDeadlock(t *testing.T) {
++	p, ok := newInstance(t, "api: yes\npaths:\n  all_others:\n    maxReaders: 1\n")
++	require.Equal(t, true, ok)
++	defer p.Close()
++
++	tr := &http.Transport{}
++	defer tr.CloseIdleConnections()
++	hc := &http.Client{Transport: tr, Timeout: 5 * time.Second}
++	for i := range 50 {
++		source := gortsplib.Client{}
++		media := test.UniqueMediaH264()
++		err := source.StartRecording(
++			"rtsp://localhost:8554/mystream",
++			&description.Session{Medias: []*description.Media{media}})
++		require.NoError(t, err)
++
++		closed := make(chan struct{})
++		go func() {
++			source.Close()
++			close(closed)
++		}()
++		httpRequest(t, hc, http.MethodPatch,
++			"http://localhost:9997/v3/config/paths/patch/all_others",
++			map[string]any{"maxReaders": []int{1, -1}[i%2]}, nil)
++		select {
++		case <-closed:
++		case <-time.After(5 * time.Second):
++			t.Fatal("maxReaders reload deadlocked with source ready/offline callback")
++		}
++	}
++}
++
+ func TestPathRecord(t *testing.T) {
+ 	dir := t.TempDir()
+ 
+diff --git a/internal/defs/path.go b/internal/defs/path.go
+index 6ffca69..201d5df 100644
+--- a/internal/defs/path.go
++++ b/internal/defs/path.go
+@@ -11,6 +11,15 @@ import (
+ 	"github.com/bluenviron/mediamtx/internal/stream"
+ )
+ 
++// PathMaxReadersReachedError is returned when path reader admission is full.
++type PathMaxReadersReachedError struct {
++	PathName string
++}
++
++func (e *PathMaxReadersReachedError) Error() string {
++	return "maximum reader count reached on path '" + e.PathName + "'"
++}
++
+ // PathNoStreamAvailableError is returned when no one is publishing.
+ type PathNoStreamAvailableError struct {
+ 	PathName string
+diff --git a/internal/servers/rtsp/session.go b/internal/servers/rtsp/session.go
+index ae3a675..9eedbf0 100644
+--- a/internal/servers/rtsp/session.go
++++ b/internal/servers/rtsp/session.go
+@@ -302,6 +302,12 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
+ 				}, nil, err
+ 			}
+ 
++			if _, ok := errors.AsType[*defs.PathMaxReadersReachedError](err); ok {
++				return &base.Response{
++					StatusCode: base.StatusNotEnoughBandwidth,
++				}, nil, err
++			}
++
+ 			return &base.Response{
+ 				StatusCode: base.StatusBadRequest,
+ 			}, nil, err

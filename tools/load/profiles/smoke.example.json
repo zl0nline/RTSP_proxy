@@ -7,8 +7,8 @@
     "gstreamer_build_id": "replace-with-dpkg-build-id",
     "gstreamer_version": "1.24.2",
     "load_reader_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "mediamtx_sha256": "25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336",
-    "mediamtx_version": "v1.20.0",
+    "mediamtx_sha256": "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6",
+    "mediamtx_version": "v1.20.0-rtsp-proxy.1",
     "pull_server_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "duration": {

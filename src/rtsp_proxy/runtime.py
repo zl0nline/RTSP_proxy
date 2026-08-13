@@ -26,9 +26,11 @@ from rtsp_proxy.nodes import (
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
     CameraMoveReconciler,
+    CameraMutationControl,
     CameraReconciler,
     CameraRuntimeObserver,
     ConfirmationTokenService,
+    ReconcileCancelled,
     ReconcileCoordinator,
 )
 
@@ -162,6 +164,18 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             new_move_id=uuid4,
         )
     )
+    mutation_control = (
+        None
+        if media_factory is None or settings.confirmation_secret is None
+        else CameraMutationControl(
+            store=store,
+            media_nodes=media_factory,
+            confirmations=ConfirmationTokenService(
+                secret=settings.confirmation_secret.encode("utf-8"),
+                lifetime_seconds=30,
+            ),
+        )
+    )
 
     return create_app(
         settings,
@@ -178,6 +192,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             ),
         ),
         camera_move_control=move_control,
+        camera_mutation_control=mutation_control,
         camera_runtime_observer=camera_runtime,
         startup=(None if node_runtime is None else recover_runtime_state),
         shutdown=store.close,
@@ -216,7 +231,9 @@ def create_background_app(
         def reconcile_loop() -> None:
             while not stop.is_set():
                 try:
-                    coordinator.run_once()
+                    coordinator.run_once(cancelled=stop.is_set)
+                except ReconcileCancelled:
+                    break
                 except Exception:
                     LOGGER.exception("camera reconcile cycle failed")
                 stop.wait(settings.reconcile_interval_seconds)
@@ -232,11 +249,20 @@ def create_background_app(
 
         def stop_reconciler() -> None:
             stop.set()
-            if thread is not None:
-                thread.join(timeout=settings.reconcile_interval_seconds + 10)
-                if thread.is_alive():
-                    raise RuntimeError("reconciler_shutdown_timeout")
-            store.close()
+            try:
+                if thread is not None:
+                    thread.join(
+                        timeout=max(
+                            settings.reconcile_interval_seconds,
+                            min(10, settings.node_runtime_timeout_seconds),
+                        )
+                        + 2
+                    )
+                    if thread.is_alive():
+                        raise RuntimeError("reconciler_shutdown_timeout")
+            finally:
+                if thread is None or not thread.is_alive():
+                    store.close()
 
         startup = start_reconciler
         shutdown = stop_reconciler

@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "releases": {
+    "0.1.0": {
+      "version": "v1.20.0-rtsp-proxy.1",
+      "architectures": {
+        "amd64": {
+          "binary_sha256": "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6"
+        },
+        "arm64": {
+          "binary_sha256": "3ed0ed9004792b1e3088b5b3cb8aff451293a88b0ee8366e16d8538c8b16bfe6"
+        }
+      }
+    }
+  }
+}

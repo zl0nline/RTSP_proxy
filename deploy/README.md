@@ -117,10 +117,14 @@ release proof.
 
 ## Artifact catalog and activation
 
-`artifact-catalog.json` pins MediaMTX, FFmpeg and ffprobe versions, URLs and
-architecture-specific SHA-256. Example release manifests show resulting
-identity. Python wheel is platform-independent; native artifacts are verified
-per architecture.
+`artifact-catalog.json` pins FFmpeg/ffprobe URLs and digests. MediaMTX is built
+directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
+one SHA-256-bound local patch and Go `1.26.5`; resulting amd64/arm64 binary
+digests and the distinct `v1.20.0-rtsp-proxy.1` identity are pinned in the same
+catalog. The patch makes `maxReaders` a synchronous non-disruptive hot update
+and maps a rejected late SETUP to RTSP 453. Example release manifests bind the
+resulting identity. Python wheel is platform-independent; native artifacts are
+verified per architecture.
 
 Before changing `current`, run from candidate environment:
 
@@ -159,14 +163,63 @@ node foreign keys from append-only placement/move history. Historical UUIDs
 remain immutable evidence after an empty stopped node is deleted; current
 placements still prevent deletion.
 
+`0009_camera_move_safety` adds a bounded abort/cleanup state machine, current
+reader blast-radius confirmation, persisted old/new RTSP ports and URLs, and a
+closed prepared-target state. It also introduces the repository-owned patched
+MediaMTX admission fence. The migration therefore refuses every non-empty
+Phase-C node registry: an old row cannot prove that changing `maxReaders` is
+non-disruptive. Stop control-plane writers and export an exact private manifest
+while the database is still on `0008`:
+
+```sh
+sudo systemd-run --quiet --wait --pipe --collect \
+  --uid=rtsp-proxy --gid=rtsp-proxy \
+  --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
+  /opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-phase-d-transition export \
+  --manifest /var/lib/rtsp-proxy/phase-d-transition.json
+```
+
+Record the printed SHA-256 separately. Drain/delete the cameras through the
+normal reconciler, stop/remove every node, and take a database backup. Apply
+`0009`, activate the catalog-bound release, then run:
+
+```sh
+sudo systemd-run --quiet --wait --pipe --collect \
+  --uid=rtsp-proxy --gid=rtsp-proxy \
+  --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
+  /opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-phase-d-transition restore \
+  --manifest /var/lib/rtsp-proxy/phase-d-transition.json \
+  --manifest-sha256 '<recorded-sha256>'
+```
+
+Restore reads the same control-plane environment as normal node registration.
+It rejects a manifest above current `max_nodes`, outside current external/API/
+metrics ranges, on a reserved external port, or when any listener is already in
+use. The checks happen under the restore locks before any synchronous desired/
+audit/outbox write; no node is started until the entire transaction commits.
+Restore is idempotent,
+validates tombstones, continues each node's normative revision and preserves
+exact camera UUIDs, node ports and immutable `/<public_id>` paths. It is a local
+maintenance command. Stable desired node state and maintenance intent are
+restored exactly; transitional PROVISIONING/STARTING/STOPPING/DELETING state
+blocks export, and a stopped/failed/maintenance node is never promoted to
+running by restore. The command is never an HTTP endpoint. Do not rewrite old digests or
+perform an in-place non-empty upgrade. Existing terminal history may retain
+null endpoint snapshots when its deleted node no longer makes the old port
+reconstructible; all new and active moves require exact endpoint snapshots.
+
 Activation atomically switches `current`, reloads systemd and updates control
-roles. The helper allowlist contains the verified current pin and, only during
-rollout, one verified previous pin, so old instances remain observable and
-stoppable. Upgrade each node by draining it, stopping it, calling
+roles. The packaged versioned trust catalog supports a current pin and, during
+a future rollout, one previous patched pin. Release `0.1.0` is the first patched
+release and intentionally has no previous entry: stock v1.20.0 is not a safe
+rollback target. Before an N→N+1 rollout, the new wheel must catalogue both N
+and N+1 with distinct architecture-specific digests; only then may the helper's
+three `PREVIOUS_*` values be set. Upgrade each node by draining it, stopping it, calling
 `PUT /api/v1/nodes/<uuid>/release` with the new release id/digest, and starting
 it again. The revision-fenced transition refuses a running, unconverged or
 non-empty node. Remove the previous pin only after every node is upgraded.
-Rollback uses the same stopped-node transition and validation/smoke path.
+When such a catalogued previous release exists, rollback uses the same
+stopped-node transition and validation/smoke path.
 
 ## Security
 

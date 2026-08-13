@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,7 @@ from rtsp_proxy.node_runtime import (
     MediaPathCommand,
     MediaPathOperation,
     NodeManagementCredentials,
+    NodeOperationDeadline,
     NodeProcessSnapshot,
     NodeRuntimePolicy,
     NodeRuntimeSpec,
@@ -100,6 +102,7 @@ def test_node_aware_media_client_uses_only_the_selected_node_identity() -> None:
             "path": {
                 "name": str(PUBLIC_ID),
                 "source_url": "rtsp://camera.invalid/main",
+                "max_readers": 1,
             },
             "inventory": None,
             "error": None,
@@ -122,6 +125,9 @@ def test_node_aware_media_client_uses_only_the_selected_node_identity() -> None:
         name=PUBLIC_ID,
         source_url="rtsp://camera.invalid/main",
     )
+    deadline_unix_ms = captured.pop("deadline_unix_ms")
+    assert isinstance(deadline_unix_ms, int)
+    assert deadline_unix_ms > int(time.time() * 1000)
     assert captured == {
         "schema_version": 1,
         "request_type": "media_path",
@@ -135,7 +141,7 @@ def test_node_aware_media_client_uses_only_the_selected_node_identity() -> None:
             "release_id": "v1.20.0",
             "mediamtx_binary_sha256": "a" * 64,
         },
-        "path": {"name": str(PUBLIC_ID), "source_url": None},
+        "path": {"name": str(PUBLIC_ID), "source_url": None, "max_readers": None},
     }
 
 
@@ -188,7 +194,11 @@ def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> No
             {
                 "schema_version": 1,
                 "ok": True,
-                "path": {"name": str(PUBLIC_ID), "source_url": "x"},
+                "path": {
+                    "name": str(PUBLIC_ID),
+                    "source_url": "x",
+                    "max_readers": 1,
+                },
                 "inventory": None,
                 "runtime": None,
                 "error": None,
@@ -212,7 +222,11 @@ def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> No
             {
                 "schema_version": 1,
                 "ok": True,
-                "path": {"name": str(PUBLIC_ID), "source_url": None},
+                "path": {
+                    "name": str(PUBLIC_ID),
+                    "source_url": None,
+                    "max_readers": None,
+                },
                 "inventory": None,
                 "runtime": None,
                 "error": None,
@@ -251,7 +265,11 @@ def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> No
             {
                 "schema_version": 1,
                 "ok": True,
-                "path": {"name": str(PUBLIC_ID), "source_url": "x"},
+                "path": {
+                    "name": str(PUBLIC_ID),
+                    "source_url": "x",
+                    "max_readers": 1,
+                },
                 "inventory": None,
                 "runtime": None,
                 "error": None,
@@ -361,6 +379,7 @@ class MediaApiHandler(BaseHTTPRequestHandler):
             "source": payload["source"],
             "sourceOnDemand": payload["sourceOnDemand"],
             "sourceOnDemandCloseAfter": payload["sourceOnDemandCloseAfter"],
+            "maxReaders": payload["maxReaders"],
         }
         self._respond(200, {"status": "ok"})
 
@@ -627,3 +646,77 @@ def test_root_media_adapter_validates_config_process_and_every_operation(
         fake,  # type: ignore[arg-type]
         MediaPathCommand(operation=MediaPathOperation.DELETE, spec=spec, path=PUBLIC_ID),
     )
+
+
+def test_media_request_deadline_expires_while_waiting_for_node_lock(
+    tmp_path: Path,
+) -> None:
+    node = ready_node()
+    config_root = tmp_path / "nodes"
+    config_root.mkdir(mode=0o700)
+    store = SecureNodeConfigStore(root=config_root)
+    snapshot = NodeProcessSnapshot(
+        active=True,
+        pid=123,
+        process_start_ticks=456,
+        boot_id=node.process_boot_id,
+        executable_sha256=node.mediamtx_binary_sha256,
+    )
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=store,
+            process=StableProcess(snapshot),
+            smoke=UnusedSmoke(),
+            port_is_bindable=lambda _port: False,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=node.external_port,
+            external_port_end=node.external_port,
+            api_port_start=node.api_port,
+            api_port_end=node.api_port,
+            metrics_port_start=node.metrics_port,
+            metrics_port_end=node.metrics_port,
+            release_id=node.release_id,
+            mediamtx_binary_sha256=node.mediamtx_binary_sha256,
+        ),
+        media=object(),  # type: ignore[arg-type]
+        operation_timeout_seconds=21,
+        cleanup_reserve_seconds=20,
+    )
+    held = server._node_lock(
+        node.id,
+        NodeOperationDeadline(expires_monotonic=time.monotonic() + 1),
+    )
+    request = {
+        "schema_version": 1,
+        "request_type": "media_path",
+        "operation": "get",
+        "spec": {
+            "node_id": str(node.id),
+            "external_port": node.external_port,
+            "api_port": node.api_port,
+            "metrics_port": node.metrics_port,
+            "desired_revision": node.desired_revision,
+            "release_id": node.release_id,
+            "mediamtx_binary_sha256": node.mediamtx_binary_sha256,
+        },
+        "path": {
+            "name": str(PUBLIC_ID),
+            "source_url": None,
+            "max_readers": None,
+        },
+        "deadline_unix_ms": int(time.time() * 1000) + 20,
+    }
+    with held:
+        result = server._serve_media_request(
+            (json.dumps(request, separators=(",", ":")) + "\n").encode()
+        )
+
+    assert result == {
+        "schema_version": 1,
+        "ok": False,
+        "path": None,
+        "inventory": None,
+        "runtime": None,
+        "error": "node_runtime_operation_timeout",
+    }

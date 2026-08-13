@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
@@ -39,6 +39,7 @@ from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
     CameraLifecycleConflict,
     CameraMove,
+    CameraMoveExpired,
     CameraMoveState,
     CameraNotFound,
     CameraPlacement,
@@ -67,6 +68,7 @@ from rtsp_proxy.nodes import (
     PlacementMode,
     PortBindable,
     PortChoice,
+    camera_move_is_terminal,
     camera_placement_fingerprint,
     is_node_eligible,
     select_port_with_bounded_recheck,
@@ -144,6 +146,15 @@ cameras = Table(
     Column("desired_revision", BigInteger, nullable=False),
     Column("applied_revision", BigInteger, nullable=False),
     CheckConstraint("public_id ~ '^[a-z2-7]{25}[aeimquy4]$'"),
+    CheckConstraint(
+        "octet_length(source_url) BETWEEN 1 AND 8192 "
+        "AND lower(source_url) LIKE 'rtsp://%/%' "
+        "AND length(split_part(source_url, '/', 3)) > 0 "
+        "AND position('@' IN split_part(source_url, '/', 3)) = 0 "
+        "AND position('?' IN source_url) = 0 "
+        "AND position('#' IN source_url) = 0",
+        name="ck_cameras_source_url",
+    ),
     CheckConstraint("state IN ('enabled', 'disabled', 'deleting', 'deleted')"),
     CheckConstraint("desired_revision >= 1"),
     CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
@@ -235,6 +246,12 @@ camera_move_sagas = Table(
     Column("target_generation", BigInteger, nullable=False),
     Column("desired_revision", BigInteger, nullable=False),
     Column("force", Boolean, nullable=False),
+    Column("confirmed_disconnect_readers", Integer, nullable=False),
+    Column("source_port", Integer, nullable=True),
+    Column("target_port", Integer, nullable=True),
+    Column("source_endpoint", String(512), nullable=True),
+    Column("target_endpoint", String(512), nullable=True),
+    Column("abort_reason", String(64), nullable=True),
     Column("state", String(32), nullable=False),
     Column(
         "created_at",
@@ -247,11 +264,23 @@ camera_move_sagas = Table(
         DateTime(timezone=True),
         nullable=True,
     ),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
     CheckConstraint("source_node_id <> target_node_id"),
     CheckConstraint("source_generation >= 1"),
     CheckConstraint("target_generation = source_generation + 1"),
     CheckConstraint("desired_revision >= 2"),
-    CheckConstraint("state IN ('prepare_target', 'cleanup_source', 'complete')"),
+    CheckConstraint("confirmed_disconnect_readers BETWEEN 0 AND 1"),
+    CheckConstraint("source_port IS NULL OR source_port BETWEEN 1 AND 65535"),
+    CheckConstraint("target_port IS NULL OR target_port BETWEEN 1 AND 65535"),
+    CheckConstraint(
+        "state IN ('complete', 'aborted') OR "
+        "(source_port IS NOT NULL AND target_port IS NOT NULL "
+        "AND source_endpoint IS NOT NULL AND target_endpoint IS NOT NULL)"
+    ),
+    CheckConstraint(
+        "state IN ('prepare_target', 'activate_target', 'cleanup_source', "
+        "'cleanup_target', 'complete', 'aborted')"
+    ),
 )
 
 node_port_change_sagas = Table(
@@ -360,6 +389,7 @@ class PostgresNodeStore:
             database_url,
             pool_pre_ping=True,
             hide_parameters=True,
+            pool_timeout=min(1.0, lifecycle_lock_timeout_seconds),
         )
         self._lock_engine = create_engine(
             database_url,
@@ -367,7 +397,7 @@ class PostgresNodeStore:
             hide_parameters=True,
             pool_size=lifecycle_lock_pool_size,
             max_overflow=0,
-            pool_timeout=lifecycle_lock_timeout_seconds,
+            pool_timeout=min(0.05, lifecycle_lock_timeout_seconds),
         )
         self._provision_engine = create_engine(
             database_url,
@@ -415,7 +445,7 @@ class PostgresNodeStore:
         """Serialize one node's external process mutation across web processes."""
 
         try:
-            with self._lock_engine.connect() as connection:
+            with self._lock_connection() as connection:
                 parameters = {"node_id": str(node_id), "seed": _NODE_REGISTRY_LOCK_KEY}
                 self._acquire_advisory_lock(
                     connection,
@@ -445,15 +475,41 @@ class PostgresNodeStore:
         connection: Connection,
         statement: Executable,
         parameters: Mapping[str, object],
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
     ) -> None:
         deadline = time.monotonic() + self._lifecycle_lock_timeout_seconds
         while True:
+            if cancelled():
+                raise NodeLifecycleBusy("node_lifecycle_busy")
             if connection.scalar(statement, parameters):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise NodeLifecycleBusy("node_lifecycle_busy")
             time.sleep(min(0.05, remaining))
+
+    @contextmanager
+    def _lock_connection(
+        self,
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> Iterator[Connection]:
+        deadline = time.monotonic() + self._lifecycle_lock_timeout_seconds
+        while True:
+            if cancelled():
+                raise NodeLifecycleBusy("node_lifecycle_busy")
+            try:
+                connection = self._lock_engine.connect()
+            except SQLAlchemyTimeoutError:
+                if time.monotonic() >= deadline:
+                    raise NodeLifecycleBusy("node_lifecycle_busy") from None
+                continue
+            try:
+                yield connection
+            finally:
+                connection.close()
+            return
 
     def register_automatically(
         self,
@@ -466,7 +522,7 @@ class PostgresNodeStore:
         new_node_id: NodeIdFactory,
         api_ports: Collection[int] = tuple(range(20000, 20100)),
         metrics_ports: Collection[int] = tuple(range(20100, 20200)),
-        release_id: str = "v1.20.0",
+        release_id: str = "0.1.0",
         mediamtx_binary_sha256: str = "0" * 64,
         creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
         is_port_bindable: PortBindable | None = None,
@@ -856,7 +912,9 @@ class PostgresNodeStore:
                         (camera_move_sagas.c.source_node_id == node_id)
                         | (camera_move_sagas.c.target_node_id == node_id)
                     ),
-                    camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                    camera_move_sagas.c.state.not_in(
+                        (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                    ),
                 )
             )
             if active or active_moves:
@@ -1047,7 +1105,9 @@ class PostgresNodeStore:
                         (camera_move_sagas.c.source_node_id == node_id)
                         | (camera_move_sagas.c.target_node_id == node_id)
                     ),
-                    camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                    camera_move_sagas.c.state.not_in(
+                        (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                    ),
                 )
             )
             active_port = connection.scalar(
@@ -1127,6 +1187,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            self._require_no_active_node_move(connection, node_id)
             if node.registered_cameras:
                 raise NodeNotEmpty("node_not_empty")
             if node.state is NodeState.STOPPED:
@@ -1174,6 +1235,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            self._require_no_active_node_move(connection, node_id)
             if node.state is not NodeState.RUNNING:
                 raise NodeLifecycleConflict("node_not_running")
             if node.registered_cameras:
@@ -1225,6 +1287,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            self._require_no_active_node_move(connection, node_id)
             if (
                 node.state is not NodeState.STOPPED
                 or node.runtime_state is not NodeState.STOPPED
@@ -1282,7 +1345,6 @@ class PostgresNodeStore:
         source_url = validate_camera_source_url(source_url)
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
-            self._lock_placements(connection)
             self._lock_placements(connection)
             selected = (
                 connection.execute(
@@ -1427,7 +1489,9 @@ class PostgresNodeStore:
                     (camera_move_sagas.c.source_node_id == node_id)
                     | (camera_move_sagas.c.target_node_id == node_id)
                 ),
-                camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                camera_move_sagas.c.state.not_in(
+                    (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                ),
             )
             .order_by(camera_move_sagas.c.id)
         )
@@ -1461,6 +1525,7 @@ class PostgresNodeStore:
         *,
         name: str,
         source_url: str,
+        expected_revision: int | None = None,
     ) -> CameraPlacement:
         source_url = validate_camera_source_url(source_url)
         with self._engine.begin() as connection:
@@ -1482,6 +1547,8 @@ class PostgresNodeStore:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
+            if expected_revision is not None and camera.desired_revision != expected_revision:
+                raise CameraLifecycleConflict("camera_revision_conflict")
             self._require_no_active_camera_move(connection, camera_id)
             self._require_no_active_port_change(connection, camera.node_id)
             if camera.name == name and camera.source_url == source_url:
@@ -1528,6 +1595,7 @@ class PostgresNodeStore:
         camera_id: UUID,
         *,
         enabled: bool,
+        expected_revision: int | None = None,
     ) -> CameraPlacement:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -1548,6 +1616,8 @@ class PostgresNodeStore:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
+            if expected_revision is not None and camera.desired_revision != expected_revision:
+                raise CameraLifecycleConflict("camera_revision_conflict")
             self._require_no_active_camera_move(connection, camera_id)
             self._require_no_active_port_change(connection, camera.node_id)
             target = CameraState.ENABLED if enabled else CameraState.DISABLED
@@ -1582,7 +1652,12 @@ class PostgresNodeStore:
                 desired_revision=desired_revision,
             )
 
-    def request_camera_delete(self, camera_id: UUID) -> CameraPlacement:
+    def request_camera_delete(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None = None,
+    ) -> CameraPlacement:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -1600,6 +1675,8 @@ class PostgresNodeStore:
             camera = _camera_placement(current)
             if camera.state is CameraState.DELETED:
                 raise CameraNotFound("camera_not_found")
+            if expected_revision is not None and camera.desired_revision != expected_revision:
+                raise CameraLifecycleConflict("camera_revision_conflict")
             if camera.state is CameraState.DELETING:
                 return camera
             self._require_no_active_camera_move(connection, camera_id)
@@ -1640,7 +1717,11 @@ class PostgresNodeStore:
         target_node_id: UUID,
         expected_revision: int,
         force: bool,
+        confirmed_disconnect_readers: int = 0,
+        timeout_seconds: int = 300,
     ) -> CameraMove:
+        if timeout_seconds < 1 or timeout_seconds > 3600:
+            raise ValueError("camera_move_timeout_invalid")
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -1677,6 +1758,7 @@ class PostgresNodeStore:
             database_now = connection.scalar(select(func.clock_timestamp()))
             if database_now is None or not is_node_eligible(target, now=database_now):
                 raise EligibleNodeMissing("manual_node_ineligible")
+            move_expires_at = database_now + timedelta(seconds=timeout_seconds)
             desired_revision = camera.desired_revision + 1
             connection.execute(
                 update(cameras)
@@ -1695,6 +1777,16 @@ class PostgresNodeStore:
                         target_generation=camera.placement_generation + 1,
                         desired_revision=desired_revision,
                         force=force,
+                        confirmed_disconnect_readers=confirmed_disconnect_readers,
+                        source_port=camera.node_port,
+                        target_port=target.external_port,
+                        source_endpoint=(
+                            f"rtsp://server:{camera.node_port}/{camera.public_id}"
+                        ),
+                        target_endpoint=(
+                            f"rtsp://server:{target.external_port}/{camera.public_id}"
+                        ),
+                        expires_at=move_expires_at,
                         state=CameraMoveState.PREPARE_TARGET.value,
                     )
                     .returning(*camera_move_sagas.c)
@@ -1742,16 +1834,25 @@ class PostgresNodeStore:
                 cameras.c.source_url,
             )
             .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
-            .where(camera_move_sagas.c.state != CameraMoveState.COMPLETE.value)
+            .where(
+                camera_move_sagas.c.state.not_in(
+                    (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                )
+            )
             .order_by(camera_move_sagas.c.created_at, camera_move_sagas.c.id)
         )
         with self._engine.connect() as connection:
             return tuple(_camera_move(row) for row in connection.execute(statement).mappings())
 
-    def switch_camera_move(self, move_id: UUID) -> CameraMove:
+    def switch_camera_move(
+        self,
+        move_id: UUID,
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> CameraMove:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
-            self._lock_placements(connection)
+            self._lock_placements(connection, cancelled=cancelled)
             move_row = (
                 connection.execute(
                     select(camera_move_sagas)
@@ -1792,6 +1893,8 @@ class PostgresNodeStore:
             database_now = connection.scalar(select(func.clock_timestamp()))
             if source is None or target is None:
                 raise CameraLifecycleConflict("camera_move_node_missing")
+            if database_now is None or move.expires_at <= database_now:
+                raise CameraMoveExpired("camera_move_expired")
             self._require_no_active_port_change(connection, source.id)
             self._require_no_active_port_change(connection, target.id)
             if (
@@ -1800,7 +1903,7 @@ class PostgresNodeStore:
                 or camera.desired_revision != move.desired_revision
             ):
                 raise CameraLifecycleConflict("camera_move_fenced")
-            if database_now is None or not is_node_eligible(target, now=database_now):
+            if not is_node_eligible(target, now=database_now):
                 raise EligibleNodeMissing("manual_node_ineligible")
             connection.execute(
                 update(camera_placements)
@@ -1833,11 +1936,6 @@ class PostgresNodeStore:
                 .where(media_nodes.c.id == target.id)
                 .values(registered_cameras=target.registered_cameras + 1)
             )
-            connection.execute(
-                update(cameras)
-                .where(cameras.c.id == camera.id)
-                .values(applied_revision=move.desired_revision)
-            )
             row = (
                 connection.execute(
                     update(camera_move_sagas)
@@ -1852,6 +1950,40 @@ class PostgresNodeStore:
                 .one()
             )
             return _camera_move_with_camera(row, camera)
+
+    def mark_camera_move_source_cleaned(self, move_id: UUID) -> CameraMove:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            row = (
+                connection.execute(
+                    select(
+                        camera_move_sagas,
+                        cameras.c.public_id,
+                        cameras.c.source_url,
+                    )
+                    .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
+                    .where(camera_move_sagas.c.id == move_id)
+                    .with_for_update(of=(camera_move_sagas, cameras))
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise CameraNotFound("camera_move_not_found")
+            current = _camera_move(row)
+            if current.state is CameraMoveState.ACTIVATE_TARGET:
+                return current
+            if current.state is not CameraMoveState.CLEANUP_SOURCE:
+                raise CameraLifecycleConflict("camera_move_not_switched")
+            connection.execute(
+                update(camera_move_sagas)
+                .where(
+                    camera_move_sagas.c.id == move_id,
+                    camera_move_sagas.c.state == CameraMoveState.CLEANUP_SOURCE.value,
+                )
+                .values(state=CameraMoveState.ACTIVATE_TARGET.value)
+            )
+            return replace(current, state=CameraMoveState.ACTIVATE_TARGET)
 
     def complete_camera_move(self, move_id: UUID) -> CameraMove:
         with self._engine.begin() as connection:
@@ -1875,13 +2007,18 @@ class PostgresNodeStore:
             current = _camera_move(row)
             if current.state is CameraMoveState.COMPLETE:
                 return current
-            if current.state is not CameraMoveState.CLEANUP_SOURCE:
+            if current.state is not CameraMoveState.ACTIVATE_TARGET:
                 raise CameraLifecycleConflict("camera_move_not_switched")
+            connection.execute(
+                update(cameras)
+                .where(cameras.c.id == current.camera_id)
+                .values(applied_revision=current.desired_revision)
+            )
             connection.execute(
                 update(camera_move_sagas)
                 .where(
                     camera_move_sagas.c.id == move_id,
-                    camera_move_sagas.c.state == CameraMoveState.CLEANUP_SOURCE.value,
+                    camera_move_sagas.c.state == CameraMoveState.ACTIVATE_TARGET.value,
                 )
                 .values(
                     state=CameraMoveState.COMPLETE.value,
@@ -1889,6 +2026,120 @@ class PostgresNodeStore:
                 )
             )
             return replace(current, state=CameraMoveState.COMPLETE)
+
+    def request_camera_move_abort(
+        self,
+        move_id: UUID,
+        *,
+        reason: str,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> CameraMove:
+        if not reason or len(reason) > 64:
+            raise ValueError("camera_move_abort_reason_invalid")
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            self._lock_placements(connection, cancelled=cancelled)
+            row = (
+                connection.execute(
+                    select(
+                        camera_move_sagas,
+                        cameras.c.public_id,
+                        cameras.c.source_url,
+                        cameras.c.desired_revision.label("camera_desired_revision"),
+                    )
+                    .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
+                    .where(camera_move_sagas.c.id == move_id)
+                    .with_for_update(of=(camera_move_sagas, cameras))
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise CameraNotFound("camera_move_not_found")
+            current = _camera_move(row)
+            if (
+                camera_move_is_terminal(current.state)
+                or current.state is CameraMoveState.CLEANUP_TARGET
+            ):
+                return current
+            if current.state is not CameraMoveState.PREPARE_TARGET:
+                raise CameraLifecycleConflict("camera_move_already_switched")
+            camera_revision = int(row["camera_desired_revision"])
+            abort_revision = camera_revision
+            if camera_revision == current.desired_revision:
+                abort_revision += 1
+                connection.execute(
+                    update(cameras)
+                    .where(cameras.c.id == current.camera_id)
+                    .values(desired_revision=abort_revision)
+                )
+            connection.execute(
+                update(camera_move_sagas)
+                .where(
+                    camera_move_sagas.c.id == move_id,
+                    camera_move_sagas.c.state == CameraMoveState.PREPARE_TARGET.value,
+                )
+                .values(
+                    state=CameraMoveState.CLEANUP_TARGET.value,
+                    abort_reason=reason,
+                )
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="camera",
+                aggregate_id=current.camera_id,
+                event_type="camera.move_abort_requested",
+                payload={
+                    "move_id": str(current.id),
+                    "reason": reason,
+                    "source_node_id": str(current.source_node_id),
+                    "target_node_id": str(current.target_node_id),
+                    "desired_revision": abort_revision,
+                },
+                aggregate_revision=abort_revision,
+            )
+            return replace(
+                current,
+                state=CameraMoveState.CLEANUP_TARGET,
+                abort_reason=reason,
+            )
+
+    def abort_camera_move(self, move_id: UUID) -> CameraMove:
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            row = (
+                connection.execute(
+                    select(
+                        camera_move_sagas,
+                        cameras.c.public_id,
+                        cameras.c.source_url,
+                    )
+                    .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
+                    .where(camera_move_sagas.c.id == move_id)
+                    .with_for_update(of=camera_move_sagas)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise CameraNotFound("camera_move_not_found")
+            current = _camera_move(row)
+            if current.state is CameraMoveState.ABORTED:
+                return current
+            if current.state is not CameraMoveState.CLEANUP_TARGET:
+                raise CameraLifecycleConflict("camera_move_abort_not_prepared")
+            connection.execute(
+                update(camera_move_sagas)
+                .where(
+                    camera_move_sagas.c.id == move_id,
+                    camera_move_sagas.c.state == CameraMoveState.CLEANUP_TARGET.value,
+                )
+                .values(
+                    state=CameraMoveState.ABORTED.value,
+                    completed_at=func.clock_timestamp(),
+                )
+            )
+            return replace(current, state=CameraMoveState.ABORTED)
 
     @staticmethod
     def _require_no_active_camera_move(
@@ -1900,11 +2151,31 @@ class PostgresNodeStore:
             .select_from(camera_move_sagas)
             .where(
                 camera_move_sagas.c.camera_id == camera_id,
-                camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                camera_move_sagas.c.state.not_in(
+                    (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                ),
             )
         )
         if active_move:
             raise CameraLifecycleConflict("camera_move_in_progress")
+
+    @staticmethod
+    def _require_no_active_node_move(connection: Connection, node_id: UUID) -> None:
+        active_move = connection.scalar(
+            select(func.count())
+            .select_from(camera_move_sagas)
+            .where(
+                (
+                    (camera_move_sagas.c.source_node_id == node_id)
+                    | (camera_move_sagas.c.target_node_id == node_id)
+                ),
+                camera_move_sagas.c.state.not_in(
+                    (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                ),
+            )
+        )
+        if active_move:
+            raise NodeLifecycleConflict("node_operation_in_progress")
 
     @staticmethod
     def _require_no_active_port_change(
@@ -1960,7 +2231,9 @@ class PostgresNodeStore:
                 .select_from(camera_move_sagas)
                 .where(
                     camera_move_sagas.c.camera_id == camera_id,
-                    camera_move_sagas.c.state != CameraMoveState.COMPLETE.value,
+                    camera_move_sagas.c.state.not_in(
+                        (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
+                    ),
                 )
             )
             if active_move:
@@ -2004,14 +2277,50 @@ class PostgresNodeStore:
             return result.rowcount == 1
 
     @contextmanager
-    def reconcile_guard(self, node_id: UUID) -> Iterator[None]:
-        with self.lifecycle_guard(node_id):
-            yield
+    def reconcile_guard(
+        self,
+        node_id: UUID,
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> Iterator[None]:
+        try:
+            with self._lock_connection(cancelled=cancelled) as connection:
+                parameters = {"node_id": str(node_id), "seed": _NODE_REGISTRY_LOCK_KEY}
+                self._acquire_advisory_lock(
+                    connection,
+                    text(
+                        "SELECT pg_try_advisory_lock("
+                        "hashtextextended(CAST(:node_id AS text), :seed))"
+                    ),
+                    parameters,
+                    cancelled=cancelled,
+                )
+                try:
+                    if self.get_node(node_id) is None:
+                        raise NodeNotFound("node_not_found")
+                    yield
+                finally:
+                    connection.execute(
+                        text(
+                            "SELECT pg_advisory_unlock("
+                            "hashtextextended(CAST(:node_id AS text), :seed))"
+                        ),
+                        parameters,
+                    )
+        except SQLAlchemyTimeoutError:
+            raise NodeLifecycleBusy("node_lifecycle_busy") from None
 
-    def _lock_placements(self, connection: Connection) -> None:
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(:key)"),
+    def _lock_placements(
+        self,
+        connection: Connection,
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> None:
+        self._acquire_advisory_lock(
+            connection,
+            text("SELECT pg_try_advisory_xact_lock(:key)"),
             {"key": _CAMERA_PLACEMENT_LOCK_KEY},
+            cancelled=cancelled,
         )
 
     def _insert_camera(
@@ -2163,6 +2472,17 @@ def _camera_move(row: RowMapping) -> CameraMove:
         target_generation=int(row["target_generation"]),
         desired_revision=int(row["desired_revision"]),
         force=bool(row["force"]),
+        confirmed_disconnect_readers=int(row["confirmed_disconnect_readers"]),
+        source_port=(None if row["source_port"] is None else int(row["source_port"])),
+        target_port=(None if row["target_port"] is None else int(row["target_port"])),
+        source_endpoint=(
+            None if row["source_endpoint"] is None else str(row["source_endpoint"])
+        ),
+        target_endpoint=(
+            None if row["target_endpoint"] is None else str(row["target_endpoint"])
+        ),
+        expires_at=row["expires_at"],
+        abort_reason=(None if row["abort_reason"] is None else str(row["abort_reason"])),
         state=CameraMoveState(str(row["state"])),
     )
 
@@ -2179,6 +2499,17 @@ def _camera_move_with_camera(row: RowMapping, camera: CameraPlacement) -> Camera
         target_generation=int(row["target_generation"]),
         desired_revision=int(row["desired_revision"]),
         force=bool(row["force"]),
+        confirmed_disconnect_readers=int(row["confirmed_disconnect_readers"]),
+        source_port=(None if row["source_port"] is None else int(row["source_port"])),
+        target_port=(None if row["target_port"] is None else int(row["target_port"])),
+        source_endpoint=(
+            None if row["source_endpoint"] is None else str(row["source_endpoint"])
+        ),
+        target_endpoint=(
+            None if row["target_endpoint"] is None else str(row["target_endpoint"])
+        ),
+        expires_at=row["expires_at"],
+        abort_reason=(None if row["abort_reason"] is None else str(row["abort_reason"])),
         state=CameraMoveState(str(row["state"])),
     )
 

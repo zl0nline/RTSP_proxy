@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import platform
+from dataclasses import dataclass
 from enum import StrEnum
 from ipaddress import IPv4Address
 from pathlib import Path
@@ -8,6 +10,8 @@ from typing import Annotated, Any
 from pydantic import Field, IPvAnyAddress, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from rtsp_proxy.release import ReleaseVerificationError, trusted_mediamtx_identity
+
 
 class RuntimeRole(StrEnum):
     WEB = "web"
@@ -15,6 +19,31 @@ class RuntimeRole(StrEnum):
     RECONCILER = "reconciler"
     PROBE = "probe"
     COLLECTOR = "collector"
+
+
+@dataclass(frozen=True, slots=True)
+class NodeRegistrationPolicy:
+    """Current host admission policy used by registration and offline restore."""
+
+    max_nodes: int
+    external_ports: range
+    api_ports: range
+    metrics_ports: range
+    reserved_ports: frozenset[int]
+
+    def __post_init__(self) -> None:
+        if self.max_nodes < 1 or self.max_nodes > 100:
+            raise ValueError("max_nodes_invalid")
+        if not self.external_ports or not self.api_ports or not self.metrics_ports:
+            raise ValueError("node_port_range_invalid")
+
+    def permits(self, *, external_port: int, api_port: int, metrics_port: int) -> bool:
+        return bool(
+            external_port in self.external_ports
+            and external_port not in self.reserved_ports
+            and api_port in self.api_ports
+            and metrics_port in self.metrics_ports
+        )
 
 
 class Settings(BaseSettings):
@@ -43,7 +72,7 @@ class Settings(BaseSettings):
     reconcile_interval_seconds: float = Field(default=1, ge=0.1, le=60)
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     node_release_id: str = Field(
-        default="v1.20.0",
+        default="0.1.0",
         pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
     )
     node_mediamtx_binary_sha256: str = Field(
@@ -97,6 +126,30 @@ class Settings(BaseSettings):
                 raise ValueError("node_runtime_socket_must_be_absolute")
             if self.node_mediamtx_binary_sha256 == "0" * 64:
                 raise ValueError("node_release_identity_required")
+            try:
+                _version, trusted_digest = trusted_mediamtx_identity(
+                    platform.machine(),
+                    self.node_release_id,
+                )
+            except ReleaseVerificationError:
+                raise ValueError("node_release_identity_untrusted") from None
+            if self.node_mediamtx_binary_sha256 != trusted_digest.root:
+                raise ValueError("node_release_identity_untrusted")
             if self.role is RuntimeRole.WEB and self.confirmation_secret is None:
                 raise ValueError("confirmation_secret_required")
         return self
+
+    def node_registration_policy(self) -> NodeRegistrationPolicy:
+        return NodeRegistrationPolicy(
+            max_nodes=self.max_nodes,
+            external_ports=range(self.node_port_range_start, self.node_port_range_end + 1),
+            api_ports=range(
+                self.node_api_port_range_start,
+                self.node_api_port_range_end + 1,
+            ),
+            metrics_ports=range(
+                self.node_metrics_port_range_start,
+                self.node_metrics_port_range_end + 1,
+            ),
+            reserved_ports=frozenset(self.node_port_reserved),
+        )

@@ -9,6 +9,7 @@ from rtsp_proxy.cli import main
 from rtsp_proxy.release import (
     ReleaseManifest,
     ReleaseVerificationError,
+    Sha256,
     normalize_linux_arch,
     verify_release,
 )
@@ -43,14 +44,31 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0008_node_administration.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0009_camera_move_safety.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+@pytest.fixture(autouse=True)
+def trust_test_mediamtx(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.1\\n'\n"
+    monkeypatch.setattr(
+        "rtsp_proxy.release._trusted_mediamtx_identity",
+        lambda _architecture, _release_id: (
+            "v1.20.0-rtsp-proxy.1",
+            Sha256.model_validate(sha256(payload)),
+        ),
+    )
+
+
 def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
-    mediamtx_payload = b"#!/bin/sh\nprintf 'v0.0.0-test\\n'\n"
+    mediamtx_payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.1\\n'\n"
     ffmpeg_payload = b"#!/bin/sh\nprintf 'ffmpeg version test build\\n'\n"
     ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version test build\\n'\n"
     artifacts = {
@@ -79,10 +97,10 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "wheel_sha256": sha256(wheel_payload),
         },
         "mediamtx": {
-            "version": "v0.0.0-test",
+            "version": "v1.20.0-rtsp-proxy.1",
             "linux_arch": "amd64",
             "binary": "bin/mediamtx",
-            "binary_sha256": sha256(artifacts["bin/mediamtx"]),
+            "binary_sha256": sha256(mediamtx_payload),
         },
         "ffmpeg": {
             "version": "test",
@@ -92,8 +110,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
         "schema_compatibility": {
-            "minimum": "0008_node_administration",
-            "maximum": "0008_node_administration",
+            "minimum": "0009_camera_move_safety",
+            "maximum": "0009_camera_move_safety",
         },
         "config_schema_version": 1,
     }
@@ -112,6 +130,19 @@ def test_verified_release_exposes_only_validated_artifact_paths(tmp_path: Path) 
     assert release.mediamtx_binary == tmp_path / "bin/mediamtx"
     assert release.ffmpeg_binary == tmp_path / "bin/ffmpeg"
     assert release.ffprobe_binary == tmp_path / "bin/ffprobe"
+
+
+def test_stock_or_self_declared_mediamtx_is_rejected_before_execution(tmp_path: Path) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["mediamtx"] |= {
+        "version": "v1.20.0",
+        "binary_sha256": sha256((tmp_path / "bin/mediamtx").read_bytes()),
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="untrusted_mediamtx_artifact"):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
 
 def test_tampered_artifact_is_rejected_with_a_stable_reason(tmp_path: Path) -> None:
@@ -274,7 +305,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert len({manifest.release_id for manifest in manifests}) == 2
+    assert {manifest.release_id for manifest in manifests} == {"0.1.0"}
 
 
 def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:

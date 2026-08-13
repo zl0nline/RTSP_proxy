@@ -26,3 +26,4 @@ Current records:
 | [0003](0003-per-node-http-auth-callback.md) | Proposed | Per-node loopback HTTP callback for RTSP access |
 | [0004](0004-isolated-probe-execution-boundary.md) | Proposed | Isolated source-probe process and egress boundary |
 | [0005](0005-bounded-media-nodes.md) | Accepted | Up to 100 cameras per MediaMTX node on one Linux server |
+| [0006](0006-patched-mediamtx-admission-fence.md) | Accepted | Non-disruptive reader fence and exact RTSP 453 |

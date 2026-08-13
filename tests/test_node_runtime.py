@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import json
 import os
+import platform
 import socket
 import tempfile
 import time
@@ -43,6 +44,9 @@ from rtsp_proxy.nodes import (
     NodeRuntimeObservation,
     NodeState,
 )
+from rtsp_proxy.release import Sha256, trusted_mediamtx_identity
+
+TRUSTED_MEDIAMTX_SHA256 = trusted_mediamtx_identity(platform.machine())[1].root
 
 
 def runtime_spec(*, node_suffix: int = 1) -> NodeRuntimeSpec:
@@ -1783,18 +1787,32 @@ def test_helper_settings_reject_overlap_and_non_absolute_privileged_paths() -> N
         helper_settings(api_port_start=12099)
     with pytest.raises(ValueError, match="node_helper_path_invalid"):
         helper_settings(config_root=Path("relative"))
+    with pytest.raises(ValueError, match="node_release_identity_untrusted"):
+        helper_settings(mediamtx_binary_sha256="a" * 64)
 
     settings = helper_settings()
-    assert settings.policy().release_id == "release-2026.08.12"
+    assert settings.policy().release_id == "0.1.0"
 
 
-def test_helper_policy_allows_current_and_previous_verified_releases() -> None:
+def test_helper_policy_allows_current_and_previous_verified_releases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_digest = "b" * 64
+
+    def trusted_identity(_machine: str, release_id: str = "0.1.0") -> tuple[str, Sha256]:
+        digest = TRUSTED_MEDIAMTX_SHA256 if release_id == "0.1.0" else previous_digest
+        return "v1.20.0-rtsp-proxy.1", Sha256.model_validate(digest)
+
+    monkeypatch.setattr(
+        "rtsp_proxy.node_runtime.trusted_mediamtx_identity",
+        trusted_identity,
+    )
     settings = helper_settings(
         previous_release_id="release-2026.08.11",
         previous_mediamtx_binary=Path(
             "/opt/rtsp-proxy/releases/release-2026.08.11/bin/mediamtx"
         ),
-        previous_mediamtx_binary_sha256="b" * 64,
+        previous_mediamtx_binary_sha256=previous_digest,
     )
     previous = NodeRuntimeSpec(
         node_id=runtime_spec().node_id,
@@ -1803,7 +1821,7 @@ def test_helper_policy_allows_current_and_previous_verified_releases() -> None:
         metrics_port=runtime_spec().metrics_port,
         desired_revision=3,
         release_id="release-2026.08.11",
-        mediamtx_binary_sha256="b" * 64,
+        mediamtx_binary_sha256=previous_digest,
     )
 
     settings.policy().validate(previous)
@@ -1863,11 +1881,11 @@ def test_helper_settings_require_a_complete_distinct_previous_release() -> None:
         helper_settings(previous_release_id="release-2026.08.11")
     with pytest.raises(ValueError, match="node_helper_previous_release_duplicate"):
         helper_settings(
-            previous_release_id="release-2026.08.12",
+            previous_release_id="0.1.0",
             previous_mediamtx_binary=Path(
                 "/opt/rtsp-proxy/releases/release-2026.08.11/bin/mediamtx"
             ),
-            previous_mediamtx_binary_sha256="b" * 64,
+            previous_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
         )
 
 
@@ -1967,6 +1985,43 @@ def test_root_helper_rejects_an_expired_client_deadline(tmp_path: Path) -> None:
         server._operation_deadline(1000)
 
 
+def test_root_helper_drops_lock_reference_when_deadline_expires_before_acquire(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nodes-expired-lock"
+    root.mkdir(mode=0o700)
+    server = UnixNodeSupervisorServer(
+        supervisor=LinuxNodeSupervisor(
+            config_store=SecureNodeConfigStore(root=root),
+            process=RecordingProcessController(),
+            smoke=HealthySmokeProbe(),
+            port_is_bindable=lambda port: True,
+        ),
+        policy=NodeRuntimePolicy(
+            external_port_start=12000,
+            external_port_end=12099,
+            api_port_start=13000,
+            api_port_end=13099,
+            metrics_port_start=14000,
+            metrics_port_end=14099,
+            release_id="release-2026.08.12",
+            mediamtx_binary_sha256="a" * 64,
+        ),
+    )
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    with (
+        pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"),
+        server._node_lock(
+            node_id,
+            NodeOperationDeadline(expires_monotonic=0, monotonic=lambda: 1),
+        ),
+    ):
+        pytest.fail("expired lock was entered")
+
+    assert server._node_locks == {}
+
+
 def test_runtime_client_rejects_invalid_constructor_boundaries(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="node_runtime_socket_must_be_absolute"):
         UnixNodeRuntimeClient(socket_path=Path("relative.sock"), timeout_seconds=1)
@@ -2062,8 +2117,8 @@ def helper_settings(
         "api_port_end": 13099,
         "metrics_port_start": 14000,
         "metrics_port_end": 14099,
-        "release_id": "release-2026.08.12",
-        "mediamtx_binary_sha256": "a" * 64,
+        "release_id": "0.1.0",
+        "mediamtx_binary_sha256": TRUSTED_MEDIAMTX_SHA256,
     }
     values.update(changes)
     return NodeHelperSettings(**values)  # type: ignore[arg-type]

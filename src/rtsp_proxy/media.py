@@ -18,6 +18,11 @@ SOURCE_ON_DEMAND_CLOSE_AFTER = "10s"
 class MediaPathConfig:
     name: PublicId
     source_url: str
+    max_readers: int = 1
+
+    def __post_init__(self) -> None:
+        if self.max_readers not in {-1, 1}:
+            raise ValueError("media_path_reader_limit_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +78,7 @@ class MediaMtxClient:
                 "sourceOnDemand": True,
                 "sourceOnDemandCloseAfter": SOURCE_ON_DEMAND_CLOSE_AFTER,
                 "rtspTransport": "tcp",
+                "maxReaders": path.max_readers,
             },
         )
 
@@ -91,12 +97,16 @@ class MediaMtxClient:
         source = response.get("source")
         source_on_demand = response.get("sourceOnDemand")
         source_on_demand_close_after = response.get("sourceOnDemandCloseAfter")
+        max_readers = response.get("maxReaders")
         response_name = response.get("name")
         if (
             not isinstance(response_name, str)
             or not isinstance(source, str)
             or not isinstance(source_on_demand, bool)
             or source_on_demand_close_after != SOURCE_ON_DEMAND_CLOSE_AFTER
+            or not isinstance(max_readers, int)
+            or isinstance(max_readers, bool)
+            or max_readers not in {-1, 1}
         ):
             raise MediaNodeProtocolError("mediamtx_invalid_path_response")
         if not source_on_demand:
@@ -110,6 +120,7 @@ class MediaMtxClient:
         return MediaPathConfig(
             name=parsed_name,
             source_url=source,
+            max_readers=max_readers,
         )
 
     def inventory_paths(self) -> MediaPathInventory:

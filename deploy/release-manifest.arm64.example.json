@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_id": "0.1.0-linux-arm64",
+  "release_id": "0.1.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",
@@ -10,10 +10,10 @@
     "wheel_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "mediamtx": {
-    "version": "v1.20.0",
+    "version": "v1.20.0-rtsp-proxy.1",
     "linux_arch": "arm64",
     "binary": "bin/mediamtx",
-    "binary_sha256": "2da379972ba86627632aa7e3f779c680ba04a5ee26ef2a20dc61cefcc24f73b8"
+    "binary_sha256": "3ed0ed9004792b1e3088b5b3cb8aff451293a88b0ee8366e16d8538c8b16bfe6"
   },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260810",
@@ -23,8 +23,8 @@
     "ffprobe_sha256": "974d21d84c3e8190223c9a5139298eb36e149506a48a1b82a83f5a6bc73933df"
   },
   "schema_compatibility": {
-    "minimum": "0008_node_administration",
-    "maximum": "0008_node_administration"
+    "minimum": "0009_camera_move_safety",
+    "maximum": "0009_camera_move_safety"
   },
   "config_schema_version": 1
 }

@@ -6,11 +6,12 @@ import os
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
+from importlib.resources import files
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-APPLICATION_SCHEMA = "0008_node_administration"
+APPLICATION_SCHEMA = "0009_camera_move_safety"
 CONFIG_SCHEMA_VERSION = 1
 
 
@@ -88,6 +89,43 @@ class ReleaseVerificationError(ValueError):
     """A release cannot be trusted or is incompatible with this runtime."""
 
 
+def _trusted_mediamtx_identity(
+    architecture: LinuxArch,
+    release_id: str,
+) -> tuple[str, Sha256]:
+    try:
+        resource = files("rtsp_proxy").joinpath("artifacts", "mediamtx.json")
+        payload = json.loads(resource.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 2:
+            raise ValueError
+        release = payload["releases"][release_id]
+        version = release["version"]
+        digest = release["architectures"][architecture.value]["binary_sha256"]
+        if not isinstance(version, str):
+            raise ValueError
+        return version, Sha256.model_validate(digest)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        ValidationError,
+    ):
+        raise ReleaseVerificationError("trusted_artifact_catalog_invalid") from None
+
+
+def trusted_mediamtx_identity(
+    machine: str,
+    release_id: str = "0.1.0",
+) -> tuple[str, Sha256]:
+    """Return one release's packaged MediaMTX identity for a Linux architecture."""
+
+    return _trusted_mediamtx_identity(normalize_linux_arch(machine), release_id)
+
+
 def normalize_linux_arch(machine: str) -> LinuxArch:
     canonical = machine.strip().lower()
     aliases = {
@@ -116,6 +154,15 @@ def verify_release(
         raise ReleaseVerificationError("python_version_mismatch")
     if manifest.mediamtx.linux_arch != expected_arch:
         raise ReleaseVerificationError("linux_arch_mismatch")
+    trusted_version, trusted_digest = _trusted_mediamtx_identity(
+        manifest.mediamtx.linux_arch,
+        manifest.release_id,
+    )
+    if (
+        manifest.mediamtx.version != trusted_version
+        or manifest.mediamtx.binary_sha256 != trusted_digest
+    ):
+        raise ReleaseVerificationError("untrusted_mediamtx_artifact")
     if manifest.config_schema_version != CONFIG_SCHEMA_VERSION:
         raise ReleaseVerificationError("config_schema_mismatch")
     if not (

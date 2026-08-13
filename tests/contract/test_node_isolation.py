@@ -11,10 +11,14 @@ import urllib.request
 from base64 import b64encode
 from contextlib import suppress
 from pathlib import Path
+from typing import cast
+from urllib.parse import quote
 from uuid import UUID
 
 import pytest
 
+from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.media import MediaMtxClient, MediaPathConfig
 from rtsp_proxy.node_runtime import (
     LinuxNodeSupervisor,
     MediaNodeSmokeProbe,
@@ -183,11 +187,12 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
     assert MEDIA_MTX_BINARY is not None
     assert RTSP_PULL_SERVER_BINARY is not None
     assert RTSP_LOAD_READER_BINARY is not None
+    assert FFMPEG_BINARY is not None
     binary = Path(MEDIA_MTX_BINARY).resolve(strict=True)
     config_root = Path("/etc/rtsp-proxy/nodes")
     config_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     config_root.chmod(0o700)
-    ports = unused_tcp_ports(6)
+    ports = unused_tcp_ports(7)
     binary_sha256 = sha256(binary)
     first = NodeRuntimeSpec(
         node_id=UUID("00000000-0000-0000-0000-000000000001"),
@@ -265,26 +270,21 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
         reader_identity = SecureNodeConfigStore(root=config_root).reader_credentials(second)
         assert credentials is not None
         assert reader_identity is not None
-        api_request = urllib.request.Request(
-            f"http://127.0.0.1:{second.api_port}/v3/config/paths/replace/"
-            "__rtsp_proxy_runtime_probe",
-            data=json.dumps(
-                {
-                    "source": f"rtsp://127.0.0.1:{source_port}/fixture-00000",
-                    "sourceOnDemand": True,
-                    "sourceOnDemandCloseAfter": "10s",
-                    "rtspTransport": "tcp",
-                }
-            ).encode(),
-            headers={
-                "Authorization": "Basic "
-                + b64encode(f"{credentials.username}:{credentials.password}".encode()).decode(),
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        second_media = MediaMtxClient(
+            api_url=f"http://127.0.0.1:{second.api_port}",
+            timeout_seconds=2,
+            username=credentials.username,
+            password=credentials.password,
         )
-        with urllib.request.urlopen(api_request, timeout=2):
-            pass
+        runtime_probe = cast(PublicId, "__rtsp_proxy_runtime_probe")
+        runtime_probe_source = f"rtsp://127.0.0.1:{source_port}/fixture-00000"
+        second_media.put_path(
+            MediaPathConfig(
+                name=runtime_probe,
+                source_url=runtime_probe_source,
+                max_readers=1,
+            )
+        )
         plan = tmp_path / "readers.tsv"
         plan.write_text("__rtsp_proxy_runtime_probe\t1\t0\t0\t0\n", encoding="utf-8")
         reader_credentials = tmp_path / "reader-credentials.txt"
@@ -310,7 +310,7 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
                 "--connect-rate",
                 "10",
                 "--hold-seconds",
-                "20",
+                "40",
                 "--evidence-grace-seconds",
                 "1",
                 "--events-file",
@@ -353,16 +353,156 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
         assert reader.poll() is None
         after_restart = wait_for_rtp_progress(second, credentials, before_restart)
 
-        supervisor.execute(NodeRuntimeCommand.for_node(NodeRuntimeAction.STOP, first))
-        second_after_stop = supervisor.execute(
+        first_credentials = SecureNodeConfigStore(root=config_root).credentials(first)
+        assert first_credentials is not None
+        first_media = MediaMtxClient(
+            api_url=f"http://127.0.0.1:{first.api_port}",
+            timeout_seconds=2,
+            username=first_credentials.username,
+            password=first_credentials.password,
+        )
+        second_media.put_path(
+            MediaPathConfig(
+                name=runtime_probe,
+                source_url=runtime_probe_source,
+                max_readers=-1,
+            )
+        )
+        after_fence = wait_for_rtp_progress(second, credentials, after_restart)
+        assert reader.poll() is None
+        denied = subprocess.run(
+            [
+                FFMPEG_BINARY,
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                (
+                    "rtsp://"
+                    f"{quote(reader_identity.username, safe='')}:"
+                    f"{quote(reader_identity.password, safe='')}@"
+                    f"127.0.0.1:{second.external_port}/__rtsp_proxy_runtime_probe"
+                ),
+                "-t",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert denied.returncode != 0
+        assert "453 Not Enough Bandwidth" in denied.stderr
+        second_media.put_path(
+            MediaPathConfig(
+                name=runtime_probe,
+                source_url=runtime_probe_source,
+                max_readers=1,
+            )
+        )
+        after_restore = wait_for_rtp_progress(second, credentials, after_fence)
+        assert reader.poll() is None
+        crud_path = MediaPathConfig(
+            name=PublicId.parse("c" * 25 + "a"),
+            source_url=f"rtsp://127.0.0.1:{source_port}/fixture-00000",
+        )
+        first_media.put_path(crud_path)
+        assert first_media.get_path(crud_path.name) == crud_path
+        first_media.delete_path(crud_path.name)
+        assert first_media.get_path(crud_path.name) is None
+        after_crud = wait_for_rtp_progress(second, credentials, after_restore)
+
+        moved_name = PublicId.parse("d" * 25 + "a")
+        moved_source = f"rtsp://127.0.0.1:{source_port}/fixture-00000"
+        first_media.put_path(MediaPathConfig(name=moved_name, source_url=moved_source))
+        second_media.put_path(
+            MediaPathConfig(name=moved_name, source_url=moved_source, max_readers=-1)
+        )
+        first_media.put_path(
+            MediaPathConfig(name=moved_name, source_url=moved_source, max_readers=-1)
+        )
+        assert first_media.path_runtime_status(moved_name) is None
+        first_media.delete_path(moved_name)
+        second_media.put_path(MediaPathConfig(name=moved_name, source_url=moved_source))
+        assert first_media.get_path(moved_name) is None
+        assert second_media.get_path(moved_name) == MediaPathConfig(
+            name=moved_name,
+            source_url=moved_source,
+        )
+        second_media.delete_path(moved_name)
+        after_move = wait_for_rtp_progress(second, credentials, after_crud)
+
+        reconfigured_first = NodeRuntimeSpec(
+            node_id=first.node_id,
+            external_port=ports[6],
+            api_port=first.api_port,
+            metrics_port=first.metrics_port,
+            desired_revision=2,
+            release_id=first.release_id,
+            mediamtx_binary_sha256=first.mediamtx_binary_sha256,
+        )
+        first_after_port_change = supervisor.execute(
+            NodeRuntimeCommand.for_node(
+                NodeRuntimeAction.RECONFIGURE_RESTART,
+                reconfigured_first,
+            )
+        )
+        assert first_after_port_change.process_id != first_restarted.process_id
+        assert _port_is_bindable(first.external_port)
+        assert not _port_is_bindable(reconfigured_first.external_port)
+        second_after_port_change = supervisor.execute(
             NodeRuntimeCommand.for_node(NodeRuntimeAction.OBSERVE, second)
         )
-        assert second_after_stop.process_id == second_started.process_id
-        wait_for_rtp_progress(second, credentials, after_restart)
+        assert second_after_port_change.process_id == second_started.process_id
+        after_port_change = wait_for_rtp_progress(second, credentials, after_move)
+
+        supervisor.execute(
+            NodeRuntimeCommand.for_node(NodeRuntimeAction.DELETE, reconfigured_first)
+        )
+        assert not (config_root / str(first.node_id)).exists()
+        second_after_delete = supervisor.execute(
+            NodeRuntimeCommand.for_node(NodeRuntimeAction.OBSERVE, second)
+        )
+        assert second_after_delete.process_id == second_started.process_id
+        wait_for_rtp_progress(second, credentials, after_port_change)
         assert reader.poll() is None
-        reader_output, _ = reader.communicate(timeout=25)
+        reader_output, _ = reader.communicate(timeout=45)
         assert reader.returncode == 0, reader_output
         assert "SUMMARY started=1 decodable=1 failed=0 transport=tcp" in reader_output
+        admitted = subprocess.run(
+            [
+                FFMPEG_BINARY,
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                (
+                    "rtsp://"
+                    f"{quote(reader_identity.username, safe='')}:"
+                    f"{quote(reader_identity.password, safe='')}@"
+                    f"127.0.0.1:{second.external_port}/__rtsp_proxy_runtime_probe"
+                ),
+                "-t",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert admitted.returncode == 0, admitted.stderr
     finally:
         if reader is not None and reader.poll() is None:
             reader.kill()

@@ -1,10 +1,12 @@
 import hashlib
+import platform
 import socket
 import time
 from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Barrier, Event, Lock
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -19,13 +21,15 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 from rtsp_proxy.app import create_app
-from rtsp_proxy.config import RuntimeRole, Settings
+from rtsp_proxy.config import NodeRegistrationPolicy, RuntimeRole, Settings
 from rtsp_proxy.database import DatabaseSchemaMismatch, PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId, generate_public_id
+from rtsp_proxy.media import MediaNodeUnavailable, MediaPathConfig, MediaPathInventory
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.nodes import (
     CameraControl,
     CameraLifecycleConflict,
+    CameraMoveExpired,
     CameraNotFound,
     EligibleNodeMissing,
     InMemoryNodeStore,
@@ -52,14 +56,22 @@ from rtsp_proxy.nodes import (
     camera_placement_fingerprint,
     tcp_port_is_bindable,
 )
+from rtsp_proxy.phase_d_transition import (
+    PhaseDTransitionError,
+    export_transition,
+    restore_transition,
+)
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
+    CameraMutationControl,
     CameraOccupied,
     CameraReaderInvariantViolation,
     CameraRuntimeObserver,
     ConfirmationTokenService,
     MoveConfirmationRequired,
+    ReconcileRetry,
 )
+from rtsp_proxy.release import trusted_mediamtx_identity
 from rtsp_proxy.runtime import create_app_from_environment, create_background_app, run_web
 
 
@@ -883,14 +895,22 @@ def test_camera_update_and_disable_are_revisioned_desired_state() -> None:
             ),
         )
     )
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    media = ApiRecordingMediaFactory(node_id)
+    mutations = CameraMutationControl(
+        store=store,
+        media_nodes=cast(Any, media),
+        confirmations=node_confirmation_service(),
+    )
     client = TestClient(
         create_app(
             Settings(role=RuntimeRole.WEB),
-            camera_control=CameraControl(
-                store=store,
-                new_camera_id=lambda: camera_id,
-                new_public_id=lambda: "a" * 26,
-            ),
+            camera_control=cameras,
+            camera_mutation_control=mutations,
         )
     )
     assert client.post(
@@ -1112,8 +1132,430 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "AND table_name IN ('media_nodes', 'cameras', 'audit_events', 'outbox_messages')"
             )
         )
-    assert revision == "0008_node_administration"
+    assert revision == "0009_camera_move_safety"
     assert table_count == 4
+
+
+def test_camera_move_safety_migration_rejects_invalid_legacy_source_urls(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0008_node_administration")
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO cameras "
+                "(id, name, source_url, public_id, state, desired_revision, applied_revision) "
+                "VALUES (:id, 'legacy', :source_url, :public_id, 'enabled', 1, 0)"
+            ),
+            {
+                "id": UUID("10000000-0000-0000-0000-000000000001"),
+                "source_url": "rtsp://camera.local/" + "x" * 8193,
+                "public_id": "a" * 26,
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="legacy_camera_source_url_invalid"):
+        command.upgrade(migration, "0009_camera_move_safety")
+
+
+def test_camera_move_safety_migration_rejects_a_legacy_node_registry(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0008_node_administration")
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO media_nodes "
+                "(id, name, external_port, api_port, metrics_port, state, runtime_state, "
+                "health, camera_capacity, registered_cameras, active_sources, maintenance, "
+                "management_fresh, config_compatible, release_id, mediamtx_binary_sha256, "
+                "desired_revision, applied_revision) "
+                "VALUES (:id, 'legacy', 12000, 13000, 14000, 'stopped', 'stopped', "
+                "'unknown', 100, 0, 0, false, false, false, 'v1.20.0', :digest, 1, 1)"
+            ),
+            {
+                "id": UUID("00000000-0000-0000-0000-000000000001"),
+                "digest": "a" * 64,
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="phase_d_requires_empty_media_node_registry"):
+        command.upgrade(migration, "0009_camera_move_safety")
+
+
+def test_camera_move_safety_migration_rejects_nonterminal_legacy_moves(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0008_node_administration")
+    engine = create_engine(postgres_database_url)
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    with engine.begin() as connection:
+        for node_id, name, port, api_port, metrics_port in (
+            (source_id, "source", 12000, 13000, 14000),
+            (target_id, "target", 12001, 13001, 14001),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO media_nodes "
+                    "(id, name, external_port, api_port, metrics_port, state, runtime_state, "
+                    "health, camera_capacity, registered_cameras, active_sources, maintenance, "
+                    "management_fresh, config_compatible, release_id, mediamtx_binary_sha256, "
+                    "desired_revision, applied_revision) "
+                    "VALUES (:id, :name, :port, :api_port, :metrics_port, 'running', 'running', "
+                    "'healthy', 100, 0, 0, false, true, true, 'v1.20.0', :digest, 1, 1)"
+                ),
+                {
+                    "id": node_id,
+                    "name": name,
+                    "port": port,
+                    "api_port": api_port,
+                    "metrics_port": metrics_port,
+                    "digest": "a" * 64,
+                },
+            )
+        connection.execute(
+            text(
+                "INSERT INTO cameras "
+                "(id, name, source_url, public_id, state, desired_revision, applied_revision) "
+                "VALUES (:id, 'legacy', 'rtsp://camera.local/main', :public_id, 'enabled', 2, 1)"
+            ),
+            {"id": camera_id, "public_id": "a" * 26},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO camera_move_sagas "
+                "(id, camera_id, source_node_id, target_node_id, source_generation, "
+                "target_generation, desired_revision, force, state) "
+                "VALUES (:id, :camera_id, :source, :target, 1, 2, 2, false, 'prepare_target')"
+            ),
+            {
+                "id": UUID("30000000-0000-0000-0000-000000000001"),
+                "camera_id": camera_id,
+                "source": source_id,
+                "target": target_id,
+            },
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy_nonterminal_camera_moves_require_manual_resolution",
+    ):
+        command.upgrade(migration, "0009_camera_move_safety")
+
+
+def test_camera_move_safety_migration_does_not_fabricate_terminal_endpoints(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0008_node_administration")
+    engine = create_engine(postgres_database_url)
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    move_id = UUID("30000000-0000-0000-0000-000000000001")
+    with engine.begin() as connection:
+        for node_id, name, port, api_port, metrics_port in (
+            (source_id, "source", 12000, 13000, 14000),
+            (target_id, "target", 12001, 13001, 14001),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO media_nodes "
+                    "(id, name, external_port, api_port, metrics_port, state, runtime_state, "
+                    "health, camera_capacity, registered_cameras, active_sources, maintenance, "
+                    "management_fresh, config_compatible, release_id, mediamtx_binary_sha256, "
+                    "desired_revision, applied_revision) "
+                    "VALUES (:id, :name, :port, :api_port, :metrics_port, 'running', 'running', "
+                    "'healthy', 100, 0, 0, false, true, true, 'legacy', :digest, 1, 1)"
+                ),
+                {
+                    "id": node_id,
+                    "name": name,
+                    "port": port,
+                    "api_port": api_port,
+                    "metrics_port": metrics_port,
+                    "digest": "a" * 64,
+                },
+            )
+        connection.execute(
+            text(
+                "INSERT INTO cameras "
+                "(id, name, source_url, public_id, state, desired_revision, applied_revision) "
+                "VALUES (:id, 'legacy', 'rtsp://camera.local/main', :public_id, 'enabled', 2, 2)"
+            ),
+            {"id": camera_id, "public_id": "a" * 26},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO camera_move_sagas "
+                "(id, camera_id, source_node_id, target_node_id, source_generation, "
+                "target_generation, desired_revision, force, state) "
+                "VALUES (:id, :camera_id, :source, :target, 1, 2, 2, false, 'complete')"
+            ),
+            {
+                "id": move_id,
+                "camera_id": camera_id,
+                "source": source_id,
+                "target": target_id,
+            },
+        )
+        connection.execute(text("DELETE FROM media_nodes"))
+
+    command.upgrade(migration, "0009_camera_move_safety")
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT source_port, target_port, source_endpoint, target_endpoint "
+                "FROM camera_move_sagas WHERE id = :id"
+            ),
+            {"id": move_id},
+        ).one()
+    assert tuple(row) == (None, None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("state", "maintenance", "reason"),
+    (
+        ("provisioning", False, "transition_node_state_invalid"),
+        ("running", True, "transition_node_maintenance_invalid"),
+    ),
+)
+def test_phase_d_transition_export_rejects_unsafe_node_intent_before_writing_manifest(
+    postgres_database_url: str,
+    tmp_path: Path,
+    state: str,
+    maintenance: bool,
+    reason: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0008_node_administration")
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO media_nodes "
+                "(id, name, external_port, api_port, metrics_port, state, runtime_state, "
+                "health, camera_capacity, registered_cameras, active_sources, maintenance, "
+                "management_fresh, config_compatible, release_id, mediamtx_binary_sha256, "
+                "creation_mode, desired_revision, applied_revision) "
+                "VALUES (:id, 'unsafe', 12000, 13000, 14000, :state, 'stopped', "
+                "'unknown', 100, 0, 0, :maintenance, false, false, 'phase-c', :digest, "
+                "'operator', 1, 0)"
+            ),
+            {
+                "id": UUID(int=1),
+                "state": state,
+                "maintenance": maintenance,
+                "digest": "a" * 64,
+            },
+        )
+    manifest = (tmp_path / "phase-d.json").resolve()
+
+    with pytest.raises(PhaseDTransitionError, match=reason):
+        export_transition(postgres_database_url, manifest)
+
+    assert not manifest.exists()
+
+
+def test_phase_d_transition_round_trip_preserves_camera_uuid_and_public_rtsp_path(
+    postgres_database_url: str,
+    tmp_path: Path,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0008_node_administration")
+    engine = create_engine(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    public_id = "a" * 26
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO media_nodes "
+                "(id, name, external_port, api_port, metrics_port, state, runtime_state, "
+                "health, camera_capacity, registered_cameras, active_sources, maintenance, "
+                "management_fresh, config_compatible, release_id, mediamtx_binary_sha256, "
+                "creation_mode, desired_revision, applied_revision) "
+                "VALUES (:id, 'media-a', 12000, 13000, 14000, 'maintenance', 'running', "
+                "'healthy', 100, 1, 1, true, true, true, 'phase-c', :digest, "
+                "'operator', 1, 1)"
+            ),
+            {"id": node_id, "digest": "a" * 64},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO cameras "
+                "(id, name, source_url, public_id, state, desired_revision, applied_revision) "
+                "VALUES (:id, 'entrance', 'rtsp://camera.local/main', :public_id, "
+                "'enabled', 1, 1)"
+            ),
+            {"id": camera_id, "public_id": public_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public_id_tombstones (public_id) VALUES (:public_id)"
+            ),
+            {"public_id": public_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO camera_placements "
+                "(camera_id, node_id, placement_mode, generation) "
+                "VALUES (:camera_id, :node_id, 'manual', 1)"
+            ),
+            {"camera_id": camera_id, "node_id": node_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO camera_placement_history "
+                "(camera_id, node_id, placement_mode, generation) "
+                "VALUES (:camera_id, :node_id, 'manual', 1)"
+            ),
+            {"camera_id": camera_id, "node_id": node_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO audit_events "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'media_node', :node_id, 'media_node.legacy', 7, '{}'::jsonb)"
+            ),
+            {"id": UUID(int=7), "node_id": node_id},
+        )
+
+    manifest = (tmp_path / "transition" / "phase-d.json").resolve()
+    manifest_sha256 = export_transition(postgres_database_url, manifest)
+
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM camera_placements"))
+        connection.execute(
+            text("UPDATE cameras SET state='deleted', desired_revision=2, applied_revision=2")
+        )
+        connection.execute(text("DELETE FROM media_nodes"))
+    command.upgrade(migration, "0009_camera_move_safety")
+    with engine.begin() as connection:
+        database_name = str(connection.scalar(text("SELECT current_database()")))
+        quoted_database = connection.dialect.identifier_preparer.quote(database_name)
+        connection.execute(
+            text(f"ALTER DATABASE {quoted_database} SET synchronous_commit = off")
+        )
+        connection.execute(
+            text(
+                "CREATE FUNCTION require_sync_transition() RETURNS trigger AS $$ "
+                "BEGIN IF current_setting('synchronous_commit') <> 'on' THEN "
+                "RAISE EXCEPTION 'transition must be synchronous'; END IF; RETURN NEW; END; "
+                "$$ LANGUAGE plpgsql"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TRIGGER require_sync_transition BEFORE INSERT ON audit_events "
+                "FOR EACH ROW EXECUTE FUNCTION require_sync_transition()"
+            )
+        )
+    _version, digest = trusted_mediamtx_identity(platform.machine(), "0.1.0")
+    policy = NodeRegistrationPolicy(
+        max_nodes=50,
+        external_ports=range(12000, 12001),
+        api_ports=range(13000, 13001),
+        metrics_ports=range(14000, 14001),
+        reserved_ports=frozenset(),
+    )
+
+    with pytest.raises(PhaseDTransitionError, match="transition_node_port_in_use"):
+        restore_transition(
+            postgres_database_url,
+            manifest,
+            manifest_sha256=manifest_sha256,
+            release_id="0.1.0",
+            mediamtx_binary_sha256=digest.root,
+            node_policy=policy,
+            port_is_bindable=lambda _port: False,
+        )
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM media_nodes")) == 0
+
+    restore_transition(
+        postgres_database_url,
+        manifest,
+        manifest_sha256=manifest_sha256,
+        release_id="0.1.0",
+        mediamtx_binary_sha256=digest.root,
+        node_policy=policy,
+        port_is_bindable=lambda _port: True,
+    )
+    restore_transition(
+        postgres_database_url,
+        manifest,
+        manifest_sha256=manifest_sha256,
+        release_id="0.1.0",
+        mediamtx_binary_sha256=digest.root,
+        node_policy=policy,
+        port_is_bindable=lambda _port: True,
+    )
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT cameras.id, cameras.public_id, cameras.state, "
+                "camera_placements.node_id, camera_placements.generation, "
+                "media_nodes.external_port, media_nodes.release_id, "
+                "media_nodes.state, media_nodes.runtime_state, "
+                "media_nodes.maintenance, media_nodes.desired_revision, "
+                "media_nodes.applied_revision "
+                "FROM cameras JOIN camera_placements ON camera_placements.camera_id=cameras.id "
+                "JOIN media_nodes ON media_nodes.id=camera_placements.node_id"
+            )
+        ).one()
+        tombstone_count = connection.scalar(
+            text("SELECT count(*) FROM public_id_tombstones WHERE public_id=:public_id"),
+            {"public_id": public_id},
+        )
+    assert row == (
+        camera_id,
+        public_id,
+        "enabled",
+        node_id,
+        2,
+        12000,
+        "0.1.0",
+        "maintenance",
+        "provisioning",
+        True,
+        8,
+        0,
+    )
+    assert tombstone_count == 1
+    assert f"rtsp://server:12000/{public_id}" == f"rtsp://server:12000/{row.public_id}"
+    assert manifest.stat().st_mode & 0o777 == 0o600
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE cameras SET name='unexpected' WHERE id=:camera_id"),
+            {"camera_id": camera_id},
+        )
+    with pytest.raises(PhaseDTransitionError, match="transition_target_not_empty"):
+        restore_transition(
+            postgres_database_url,
+            manifest,
+            manifest_sha256=manifest_sha256,
+            release_id="0.1.0",
+            mediamtx_binary_sha256=digest.root,
+            node_policy=policy,
+            port_is_bindable=lambda _port: True,
+        )
 
 
 def test_management_freshness_migration_fails_closed_until_a_new_observation(
@@ -1258,7 +1700,7 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
             "external_port": 12000,
             "api_port": 20000,
             "metrics_port": 20100,
-            "release_id": "v1.20.0",
+            "release_id": "0.1.0",
             "creation_mode": "operator",
             "camera_capacity": 100,
             "desired_revision": 1,
@@ -1434,7 +1876,7 @@ def test_database_constraint_errors_never_render_camera_source_credentials(
             process_start_ticks=2001,
             process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
             config_sha256="b" * 64,
-            release_id="v1.20.0",
+            release_id="0.1.0",
         ),
     )
     duplicate_public_id = "a" * 26
@@ -1484,7 +1926,7 @@ def test_postgresql_adapter_rejects_credentialed_source_urls_if_called_directly(
             process_start_ticks=2001,
             process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
             config_sha256="b" * 64,
-            release_id="v1.20.0",
+            release_id="0.1.0",
         ),
     )
 
@@ -1493,6 +1935,52 @@ def test_postgresql_adapter_rejects_credentialed_source_urls_if_called_directly(
             camera_id=UUID("10000000-0000-0000-0000-000000000001"),
             name="secret",
             source_url="rtsp://operator:never-store-this@camera.local/main",
+            public_id=PublicId.parse("a" * 26),
+            node_id=node_id,
+        )
+
+    assert store.list_cameras() == ()
+
+
+@pytest.mark.parametrize(
+    ("source_url", "reason"),
+    (
+        ("rtsp://camera.local/" + ("é" * 4090), "camera_source_url_too_long"),
+        ("rtsp://camera.local:bad/main", "camera_source_url_invalid"),
+        ("http://camera.local/main", "camera_source_url_invalid"),
+        ("rtsp://camera.local/main?token=secret", "camera_source_secret_reference_required"),
+    ),
+)
+def test_camera_source_validation_fails_before_persistence(
+    source_url: str,
+    reason: str,
+) -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                runtime_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+
+    with pytest.raises(InvalidCameraSource, match=reason):
+        store.place_camera_manually(
+            camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+            name="invalid",
+            source_url=source_url,
             public_id=PublicId.parse("a" * 26),
             node_id=node_id,
         )
@@ -1830,7 +2318,7 @@ def test_node_create_can_complete_provision_start_and_persist_applied_revision()
     assert runtime.calls == [(NodeRuntimeAction.PROVISION_START, node_id)]
     persisted = control.list_nodes()[0]
     assert persisted.process_id == 3001
-    assert persisted.observed_release_id == "v1.20.0"
+    assert persisted.observed_release_id == "0.1.0"
 
 
 def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
@@ -1932,6 +2420,50 @@ def test_operator_updates_release_only_after_empty_stopped_convergence() -> None
     assert persisted.config_compatible is False
 
 
+@pytest.mark.parametrize("operation", ("stop", "restart", "release"))
+def test_node_operations_expose_an_active_camera_move_conflict(operation: str) -> None:
+    class ActiveMoveStore(InMemoryNodeStore):
+        def request_stop(self, node_id: UUID) -> MediaNode:
+            raise NodeLifecycleConflict("node_operation_in_progress")
+
+        def request_restart(self, node_id: UUID) -> MediaNode:
+            raise NodeLifecycleConflict("node_operation_in_progress")
+
+        def request_release(
+            self,
+            node_id: UUID,
+            *,
+            release_id: str,
+            mediamtx_binary_sha256: str,
+        ) -> MediaNode:
+            raise NodeLifecycleConflict("node_operation_in_progress")
+
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    control = NodeControl(
+        store=ActiveMoveStore(nodes=(MediaNode(id=node_id, name="media-a", external_port=12000),)),
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+    )
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        node_release_id="release-2",
+        node_mediamtx_binary_sha256="b" * 64,
+    )
+    client = TestClient(create_app(settings, node_control=control))
+
+    if operation == "release":
+        response = client.put(
+            f"/api/v1/nodes/{node_id}/release",
+            json={"release_id": "release-2", "mediamtx_binary_sha256": "b" * 64},
+        )
+    else:
+        response = client.post(f"/api/v1/nodes/{node_id}/{operation}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "node_operation_in_progress"
+
+
 class FailingNodeRuntime(NodeRuntime):
     def execute(
         self,
@@ -1986,7 +2518,7 @@ def automatic_policy(*, max_nodes: int = 50) -> NodeProvisioningPolicy:
         reserved_ports=(),
         api_ports=tuple(range(13000, 13010)),
         metrics_ports=tuple(range(14000, 14010)),
-        release_id="v1.20.0",
+        release_id="0.1.0",
         mediamtx_binary_sha256="0" * 64,
     )
 
@@ -3247,6 +3779,231 @@ def test_postgresql_lifecycle_guard_times_out_same_node_contention(
         assert executor.submit(contend).result(timeout=1) == "bounded"
 
 
+def test_postgresql_reconcile_guard_honors_shutdown_cancellation(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(
+        postgres_database_url,
+        lifecycle_lock_pool_size=2,
+        lifecycle_lock_timeout_seconds=30,
+    )
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+    cancelled = Event()
+
+    def contend() -> str:
+        with store.reconcile_guard(node.id, cancelled=cancelled.is_set):
+            pytest.fail("cancelled reconcile guard was acquired")
+        return "unreachable"
+
+    with store.lifecycle_guard(node.id), ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(contend)
+        time.sleep(0.1)
+        cancelled.set()
+        with pytest.raises(NodeLifecycleBusy, match="node_lifecycle_busy"):
+            future.result(timeout=1)
+
+
+def test_in_memory_move_deadline_is_rechecked_at_the_atomic_switch() -> None:
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    now = datetime.now(UTC)
+    current_time = [now]
+    store = InMemoryNodeStore(
+        nodes=tuple(
+            MediaNode(
+                id=node_id,
+                name=name,
+                external_port=port,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            )
+            for node_id, name, port in (
+                (source_id, "source", 12000),
+                (target_id, "target", 12001),
+            )
+        ),
+        clock=lambda: current_time[0],
+    )
+    store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=source_id,
+    )
+    move = store.create_camera_move(
+        move_id=UUID("30000000-0000-0000-0000-000000000001"),
+        camera_id=camera_id,
+        target_node_id=target_id,
+        expected_revision=1,
+        force=False,
+        timeout_seconds=1,
+    )
+    current_time[0] += timedelta(seconds=2)
+
+    with pytest.raises(CameraMoveExpired, match="camera_move_expired"):
+        store.switch_camera_move(move.id)
+
+    camera = store.get_camera(camera_id)
+    assert camera is not None
+    assert camera.node_id == source_id
+    assert store.get_node(source_id).registered_cameras == 1  # type: ignore[union-attr]
+    assert store.get_node(target_id).registered_cameras == 0  # type: ignore[union-attr]
+
+
+def test_postgresql_move_deadline_is_rechecked_in_the_switch_transaction(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    for node_id, name, port in (
+        (source_id, "source", 12000),
+        (target_id, "target", 12001),
+    ):
+        def allocate_node_id(selected: UUID = node_id) -> UUID:
+            return selected
+
+        node = store.register_automatically(
+            name=name,
+            allowed_ports=(12000, 12001),
+            max_nodes=2,
+            preferred_port=port,
+            choose_port=lambda available: available[0],
+            new_node_id=allocate_node_id,
+            api_ports=(13000, 13001),
+            metrics_ports=(14000, 14001),
+        )
+        node = store.request_desired_state(node.id, NodeState.RUNNING)
+        store.apply_runtime_observation(
+            node.id,
+            runtime_observation_for(node.id, revision=node.desired_revision),
+        )
+    camera = store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=source_id,
+    )
+    move = store.create_camera_move(
+        move_id=UUID("30000000-0000-0000-0000-000000000001"),
+        camera_id=camera.id,
+        target_node_id=target_id,
+        expected_revision=camera.desired_revision,
+        force=False,
+        timeout_seconds=300,
+    )
+
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE camera_move_sagas "
+                "SET expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE id = :move_id"
+            ),
+            {"move_id": move.id},
+        )
+
+    with pytest.raises(CameraMoveExpired, match="camera_move_expired"):
+        store.switch_camera_move(move.id)
+
+    unchanged = store.get_camera(camera.id)
+    assert unchanged is not None
+    assert unchanged.node_id == source_id
+    assert store.get_node(source_id).registered_cameras == 1  # type: ignore[union-attr]
+    assert store.get_node(target_id).registered_cameras == 0  # type: ignore[union-attr]
+    store.close()
+
+
+def test_postgresql_move_switch_honors_shutdown_while_placement_lock_is_held(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url, lifecycle_lock_timeout_seconds=30)
+    source_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    for node_id, name, port in (
+        (source_id, "source", 12000),
+        (target_id, "target", 12001),
+    ):
+        def allocate_node_id(selected: UUID = node_id) -> UUID:
+            return selected
+
+        node = store.register_automatically(
+            name=name,
+            allowed_ports=(12000, 12001),
+            max_nodes=2,
+            preferred_port=port,
+            choose_port=lambda available: available[0],
+            new_node_id=allocate_node_id,
+            api_ports=(13000, 13001),
+            metrics_ports=(14000, 14001),
+        )
+        node = store.request_desired_state(node.id, NodeState.RUNNING)
+        store.apply_runtime_observation(
+            node.id,
+            runtime_observation_for(node.id, revision=node.desired_revision),
+        )
+    camera = store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("a" * 26),
+        node_id=source_id,
+    )
+    move = store.create_camera_move(
+        move_id=UUID("30000000-0000-0000-0000-000000000001"),
+        camera_id=camera.id,
+        target_node_id=target_id,
+        expected_revision=camera.desired_revision,
+        force=False,
+    )
+    cancelled = Event()
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as blocker, ThreadPoolExecutor(max_workers=1) as executor:
+        blocker.execute(
+            text("SELECT pg_advisory_lock(:key)"),
+            {"key": 0x43414D504C414345},
+        )
+        try:
+            future = executor.submit(
+                lambda: store.switch_camera_move(move.id, cancelled=cancelled.is_set)
+            )
+            time.sleep(0.1)
+            cancelled.set()
+            with pytest.raises(NodeLifecycleBusy, match="node_lifecycle_busy"):
+                future.result(timeout=1)
+        finally:
+            blocker.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": 0x43414D504C414345},
+            )
+    engine.dispose()
+    store.close()
+
+
 @pytest.mark.parametrize(
     "changes",
     (
@@ -3832,6 +4589,7 @@ def test_port_change_confirmation_binds_exact_camera_placements_not_only_count()
         force=False,
     )
     store.switch_camera_move(first_move.id)
+    store.mark_camera_move_source_cleaned(first_move.id)
     store.complete_camera_move(first_move.id)
     second_move = store.create_camera_move(
         move_id=UUID("30000000-0000-0000-0000-000000000002"),
@@ -3841,6 +4599,7 @@ def test_port_change_confirmation_binds_exact_camera_placements_not_only_count()
         force=False,
     )
     store.switch_camera_move(second_move.id)
+    store.mark_camera_move_source_cleaned(second_move.id)
     store.complete_camera_move(second_move.id)
 
     with pytest.raises(NodeDisruptionConfirmationRequired):
@@ -4535,7 +5294,7 @@ def runtime_observation_for(node_id: UUID, *, revision: int) -> NodeRuntimeObser
         process_start_ticks=1000,
         process_boot_id=UUID("20000000-0000-0000-0000-000000000001"),
         config_sha256="b" * 64,
-        release_id="v1.20.0",
+        release_id="0.1.0",
     )
 
 
@@ -4815,7 +5574,7 @@ def test_postgresql_node_administration_rejects_stale_or_conflicting_operations(
             config_compatible=True,
             applied_revision=stopped.desired_revision,
             config_sha256="b" * 64,
-            release_id="v1.20.0",
+            release_id="0.1.0",
         ),
     )
     deleting = store.request_node_delete(node_id)
@@ -4932,9 +5691,10 @@ def test_camera_and_move_routes_cover_success_and_typed_failures() -> None:
         source_url="rtsp://camera.local/main",
         node_id=node_a,
     )
+    media = ApiRecordingMediaFactory(node_a, node_b)
     observer = CameraRuntimeObserver(
         store=store,
-        media_nodes=cast(Any, ApiRecordingMediaFactory(node_a, node_b)),
+        media_nodes=cast(Any, media),
     )
     moves = CameraMoveControl(
         store=store,
@@ -4946,6 +5706,11 @@ def test_camera_and_move_routes_cover_success_and_typed_failures() -> None:
         create_app(
             Settings(role=RuntimeRole.WEB),
             camera_control=cameras,
+            camera_mutation_control=CameraMutationControl(
+                store=store,
+                media_nodes=cast(Any, media),
+                confirmations=node_confirmation_service(),
+            ),
             camera_runtime_observer=observer,
             camera_move_control=moves,
         )
@@ -4984,21 +5749,25 @@ def test_camera_and_move_routes_cover_success_and_typed_failures() -> None:
 class ApiRecordingMediaNode:
     def __init__(self) -> None:
         self.runtime: dict[PublicId, tuple[bool, int] | None] = {}
+        self.paths: dict[PublicId, MediaPathConfig] = {}
 
     def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
         return self.runtime.get(name, (False, 0))
 
-    def put_path(self, path: object) -> None:
-        raise AssertionError("unused")
+    def put_path(self, path: MediaPathConfig) -> None:
+        self.paths[path.name] = path
 
-    def get_path(self, name: PublicId) -> None:
-        raise AssertionError("unused")
+    def get_path(self, name: PublicId) -> MediaPathConfig | None:
+        return self.paths.get(name)
 
-    def inventory_paths(self) -> object:
-        raise AssertionError("unused")
+    def inventory_paths(self) -> MediaPathInventory:
+        return MediaPathInventory(
+            camera_ids=tuple(sorted(self.paths, key=str)),
+            no_oracle_matcher_present=False,
+        )
 
     def delete_path(self, name: PublicId) -> None:
-        raise AssertionError("unused")
+        self.paths.pop(name, None)
 
 
 class ApiRecordingMediaFactory:
@@ -5007,6 +5776,135 @@ class ApiRecordingMediaFactory:
 
     def for_node(self, node: MediaNode) -> ApiRecordingMediaNode:
         return self.clients[node.id]
+
+
+def test_disruptive_camera_routes_preview_and_confirm_exact_current_reader() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    node = MediaNode(
+        id=node_id,
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        management_observed_at=datetime.now(UTC),
+        config_compatible=True,
+        desired_revision=1,
+        applied_revision=1,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a" * 26,
+    )
+    camera = cameras.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=node_id,
+    )
+    media = ApiRecordingMediaFactory(node_id)
+    media.clients[node_id].paths[camera.public_id] = MediaPathConfig(
+        name=camera.public_id,
+        source_url=camera.source_url,
+    )
+    media.clients[node_id].runtime[camera.public_id] = (True, 1)
+    mutations = CameraMutationControl(
+        store=store,
+        media_nodes=cast(Any, media),
+        confirmations=node_confirmation_service(),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=cameras,
+            camera_mutation_control=mutations,
+        )
+    )
+
+    media.clients[node_id].runtime[camera.public_id] = (True, 2)
+    assert client.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={"operation": "disable"},
+    ).status_code == 409
+    media.clients[node_id].runtime[camera.public_id] = (True, 1)
+    assert client.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={"operation": "update_source"},
+    ).status_code == 422
+    preview = client.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={"operation": "disable"},
+    )
+    assert preview.status_code == 200
+    assert preview.json()["disconnect_readers"] == 1
+    assert client.post(f"/api/v1/cameras/{camera_id}/disable").status_code == 409
+    disabled = client.post(
+        f"/api/v1/cameras/{camera_id}/disable",
+        json={"confirmation_token": preview.json()["confirmation_token"]},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["state"] == "disabled"
+
+    assert client.post(f"/api/v1/cameras/{camera_id}/enable").status_code == 200
+    update_preview = client.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={
+            "operation": "update_source",
+            "name": "entrance-new",
+            "source_url": "rtsp://camera.local/sub",
+        },
+    ).json()
+    assert client.put(
+        f"/api/v1/cameras/{camera_id}",
+        json={"name": "entrance-new", "source_url": "rtsp://camera.local/sub"},
+    ).status_code == 409
+    updated = client.put(
+        f"/api/v1/cameras/{camera_id}",
+        json={
+            "name": "entrance-new",
+            "source_url": "rtsp://camera.local/sub",
+            "confirmation_token": update_preview["confirmation_token"],
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "entrance-new"
+
+    delete_preview = client.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={"operation": "delete"},
+    ).json()
+    assert client.delete(f"/api/v1/cameras/{camera_id}").status_code == 409
+    deleting = client.request(
+        "DELETE",
+        f"/api/v1/cameras/{camera_id}",
+        json={"confirmation_token": delete_preview["confirmation_token"]},
+    )
+    assert deleting.status_code == 202
+    assert deleting.json()["state"] == "deleting"
+
+
+def test_camera_mutation_preview_maps_missing_camera_and_reader_violation() -> None:
+    class ErrorMutations:
+        error: Exception = CameraNotFound("camera_not_found")
+
+        def preview(self, *args: object, **kwargs: object) -> object:
+            raise self.error
+
+    mutations = ErrorMutations()
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_mutation_control=cast(CameraMutationControl, mutations),
+        )
+    )
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    endpoint = f"/api/v1/cameras/{camera_id}/mutations/preview"
+    assert client.post(endpoint, json={"operation": "disable"}).status_code == 404
+    mutations.error = CameraReaderInvariantViolation("camera_reader_limit_violated")
+    assert client.post(endpoint, json={"operation": "disable"}).status_code == 409
 
 
 def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> None:
@@ -5030,6 +5928,33 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
         json={"target_node_id": str(node_id)},
     ).status_code == 503
     assert missing.get(f"/api/v1/camera-moves/{move_id}").status_code == 503
+
+    store_without_runtime = InMemoryNodeStore()
+    camera_control_without_runtime = CameraControl(
+        store=store_without_runtime,
+        new_camera_id=uuid4,
+        new_public_id=lambda: "a" * 26,
+    )
+    without_runtime = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=camera_control_without_runtime,
+        )
+    )
+    update_without_runtime = without_runtime.put(
+        f"/api/v1/cameras/{camera_id}",
+        json={"name": "x", "source_url": "rtsp://camera.local/main"},
+    )
+    assert update_without_runtime.status_code == 503
+    assert update_without_runtime.json()["detail"]["code"] == (
+        "camera_mutation_confirmation_unavailable"
+    )
+    assert without_runtime.post(f"/api/v1/cameras/{camera_id}/disable").status_code == 503
+    assert without_runtime.delete(f"/api/v1/cameras/{camera_id}").status_code == 503
+    assert without_runtime.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={"operation": "disable"},
+    ).status_code == 503
 
     class ErrorCameraControl(CameraControl):
         error: Exception = CameraNotFound("camera_not_found")
@@ -5059,6 +5984,33 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
         def observe(self, requested_camera_id: UUID) -> Any:
             raise CameraNotFound("camera_not_found")
 
+    class ErrorMutations:
+        def update(
+            self,
+            camera_id: UUID,
+            *,
+            name: str,
+            source_url: str,
+            confirmation_token: str | None,
+        ) -> Any:
+            return cameras.update_camera(camera_id, name=name, source_url=source_url)
+
+        def disable(
+            self,
+            camera_id: UUID,
+            *,
+            confirmation_token: str | None,
+        ) -> Any:
+            return cameras.set_camera_enabled(camera_id, enabled=False)
+
+        def delete(
+            self,
+            camera_id: UUID,
+            *,
+            confirmation_token: str | None,
+        ) -> Any:
+            return cameras.delete_camera(camera_id)
+
     cameras = ErrorCameraControl(
         store=InMemoryNodeStore(),
         new_camera_id=uuid4,
@@ -5069,6 +6021,7 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
         create_app(
             Settings(role=RuntimeRole.WEB),
             camera_control=cameras,
+            camera_mutation_control=cast(CameraMutationControl, ErrorMutations()),
             camera_runtime_observer=cast(CameraRuntimeObserver, ErrorRuntimeObserver()),
             camera_move_control=cast(CameraMoveControl, moves),
         )
@@ -5115,3 +6068,40 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
         assert client.post(
             f"/api/v1/cameras/{camera_id}/moves", json=preview_request
         ).status_code == expected
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        NodeLifecycleBusy("node_lifecycle_busy"),
+        ReconcileRetry("camera_runtime_node_missing"),
+        MediaNodeUnavailable("mediamtx_unavailable"),
+    ),
+)
+def test_camera_routes_sanitize_retryable_runtime_failures(error: Exception) -> None:
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+
+    class FailingMutations:
+        def update(self, *args: object, **kwargs: object) -> Any:
+            raise error
+
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=cast(CameraControl, object()),
+            camera_mutation_control=cast(CameraMutationControl, FailingMutations()),
+        )
+    )
+
+    response = client.put(
+        f"/api/v1/cameras/{camera_id}",
+        json={"name": "x", "source_url": "rtsp://camera.local/main"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.json()["detail"]["code"] in {
+        "node_lifecycle_busy",
+        "camera_runtime_retry",
+    }
+    assert "mediamtx" not in response.text

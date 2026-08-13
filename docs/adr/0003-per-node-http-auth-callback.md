@@ -29,8 +29,11 @@ Authorization order in the callback:
 1. validate target node/path generation;
 2. evaluate `internet`/`local` CIDRs against directly observed peer IP;
 3. verify downstream username/password;
-4. enforce drain/maintenance admission;
-5. atomically admit one reader or return the contract mapped to RTSP 453.
+4. enforce drain/maintenance admission.
+
+After successful authentication, the accepted patched-MediaMTX admission fence
+from ADR 0006 atomically admits one reader or returns exact RTSP 453. Occupancy
+is not maintained in the callback or database.
 
 MediaMTX remains the RTSP server; consumer sees only ordinary `rtsp://` and
 Basic Auth. API/metrics callback exclusions are exact loopback management
@@ -46,11 +49,10 @@ control outage; new sessions fail closed.
 
 ## Consequences
 
-Every media node depends on local control-plane admission for new sessions but
-keeps media bytes outside Python. Failure remains scoped to new admission; no
-automatic cross-node failover is introduced. If pinned MediaMTX cannot preserve
-exact IP ordering or RTSP 453 semantics through HTTP auth, another bounded
-admission mechanism requires a new ADR.
+Every media node depends on local control-plane authorization for new sessions
+but keeps media bytes and the one-reader race outside Python. Failure remains
+scoped to new admission; no automatic cross-node failover is introduced. Exact
+453 semantics and non-disruptive admission are owned by ADR 0006.
 
 ## Alternatives
 

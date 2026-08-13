@@ -1,4 +1,4 @@
-# MediaMTX v1.20.0 Phase 0 baseline. Paths and external grants are intentionally
+# MediaMTX v1.20.0-rtsp-proxy.1 baseline. Paths and external grants are intentionally
 # absent until the adapter/auth contract is proven and configured.
 
 logLevel: info

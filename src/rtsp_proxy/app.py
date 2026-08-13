@@ -1,8 +1,10 @@
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from rtsp_proxy.config import Settings
@@ -11,6 +13,7 @@ from rtsp_proxy.health import (
     ReadinessProvider,
     normalize_readiness_results,
 )
+from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.nodes import (
     CameraControl,
     CameraLifecycleConflict,
@@ -36,11 +39,15 @@ from rtsp_proxy.nodes import (
     NodeState,
 )
 from rtsp_proxy.reconcile import (
+    CameraDisruptionConfirmationRequired,
     CameraMoveControl,
+    CameraMutationControl,
+    CameraMutationOperation,
     CameraOccupied,
     CameraReaderInvariantViolation,
     CameraRuntimeObserver,
     MoveConfirmationRequired,
+    ReconcileRetry,
 )
 
 
@@ -122,6 +129,27 @@ class CameraCreateRequest(BaseModel):
 class CameraUpdateRequest(BaseModel):
     name: str
     source_url: str
+    confirmation_token: str | None = Field(default=None, max_length=4096)
+
+
+class CameraDisruptionRequest(BaseModel):
+    confirmation_token: str | None = Field(default=None, max_length=4096)
+
+
+class CameraMutationPreviewRequest(BaseModel):
+    operation: CameraMutationOperation
+    name: str | None = None
+    source_url: str | None = None
+
+
+class CameraMutationPreviewResponse(BaseModel):
+    camera_id: str
+    operation: CameraMutationOperation
+    desired_revision: int
+    occupied: bool
+    disconnect_readers: int
+    mutation_sha256: str
+    confirmation_token: str | None
 
 
 class CameraResponse(BaseModel):
@@ -160,6 +188,10 @@ class CameraMovePreviewResponse(BaseModel):
     occupied: bool
     disconnect_readers: int
     confirmation_token: str | None
+    source_port: int
+    target_port: int
+    source_endpoint: str
+    target_endpoint: str
 
 
 class CameraMoveResponse(BaseModel):
@@ -171,6 +203,13 @@ class CameraMoveResponse(BaseModel):
     target_generation: int
     desired_revision: int
     force: bool
+    confirmed_disconnect_readers: int
+    source_port: int | None
+    target_port: int | None
+    source_endpoint: str | None
+    target_endpoint: str | None
+    expires_at: datetime
+    abort_reason: str | None
     state: str
 
 
@@ -188,6 +227,7 @@ def create_app(
     readiness: ReadinessProvider | None = None,
     node_control: NodeControl | None = None,
     camera_control: CameraControl | None = None,
+    camera_mutation_control: CameraMutationControl | None = None,
     camera_move_control: CameraMoveControl | None = None,
     camera_runtime_observer: CameraRuntimeObserver | None = None,
     startup: Callable[[], None] | None = None,
@@ -205,6 +245,27 @@ def create_app(
 
     app = FastAPI(title="RTSP Proxy Control Plane", lifespan=lifespan)
     readiness_provider = readiness or MissingReadinessProvider()
+
+    @app.exception_handler(NodeLifecycleBusy)
+    async def node_lifecycle_busy_handler(
+        _request: Request,
+        _error: NodeLifecycleBusy,
+    ) -> JSONResponse:
+        return _retryable_service_response("node_lifecycle_busy")
+
+    @app.exception_handler(ReconcileRetry)
+    async def reconcile_retry_handler(
+        _request: Request,
+        _error: ReconcileRetry,
+    ) -> JSONResponse:
+        return _retryable_service_response("camera_runtime_retry")
+
+    @app.exception_handler(MediaNodeError)
+    async def media_node_error_handler(
+        _request: Request,
+        _error: MediaNodeError,
+    ) -> JSONResponse:
+        return _retryable_service_response("camera_runtime_retry")
 
     @app.get("/health/live", response_model=LiveStatus)
     async def live() -> LiveStatus:
@@ -405,6 +466,11 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "node_not_empty"},
             ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
         except NodeRuntimeUnavailable:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -433,10 +499,10 @@ def create_app(
             ) from None
         except NodeLifecycleBusy:
             raise _lifecycle_busy() from None
-        except NodeLifecycleConflict:
+        except NodeLifecycleConflict as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "node_not_running"},
+                detail={"code": str(error)},
             ) from None
         except NodeNotEmpty:
             raise HTTPException(
@@ -518,6 +584,11 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "node_release_transition_requires_stopped_empty"},
+            ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
             ) from None
         return _node_response(node)
 
@@ -777,10 +848,10 @@ def create_app(
             ) from None
         except NodeLifecycleBusy:
             raise _lifecycle_busy() from None
-        except InvalidCameraSource:
+        except InvalidCameraSource as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": "camera_source_secret_reference_required"},
+                detail={"code": str(error)},
             ) from None
         except CameraLifecycleConflict as error:
             raise HTTPException(
@@ -791,12 +862,18 @@ def create_app(
 
     @app.put("/api/v1/cameras/{camera_id}", response_model=CameraResponse)
     def update_camera(camera_id: UUID, request: CameraUpdateRequest) -> CameraResponse:
-        control = _require_camera_control(camera_control)
+        _require_camera_control(camera_control)
+        if camera_mutation_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_mutation_confirmation_unavailable"},
+            )
         try:
-            camera = control.update_camera(
+            camera = camera_mutation_control.update(
                 camera_id,
                 name=request.name,
                 source_url=request.source_url,
+                confirmation_token=request.confirmation_token,
             )
         except CameraNotFound:
             raise HTTPException(
@@ -808,17 +885,39 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": str(error)},
             ) from None
-        except InvalidCameraSource:
+        except InvalidCameraSource as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": "camera_source_secret_reference_required"},
+                detail={"code": str(error)},
+            ) from None
+        except CameraDisruptionConfirmationRequired:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_disruption_confirmation_required"},
             ) from None
         return _camera_response(camera)
 
-    def set_camera_enabled(camera_id: UUID, *, enabled: bool) -> CameraResponse:
+    def set_camera_enabled(
+        camera_id: UUID,
+        *,
+        enabled: bool,
+        confirmation_token: str | None = None,
+    ) -> CameraResponse:
         control = _require_camera_control(camera_control)
+        if not enabled and camera_mutation_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_mutation_confirmation_unavailable"},
+            )
         try:
-            camera = control.set_camera_enabled(camera_id, enabled=enabled)
+            if enabled:
+                camera = control.set_camera_enabled(camera_id, enabled=True)
+            else:
+                assert camera_mutation_control is not None
+                camera = camera_mutation_control.disable(
+                    camera_id,
+                    confirmation_token=confirmation_token,
+                )
         except CameraNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -828,6 +927,11 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": str(error)},
+            ) from None
+        except CameraDisruptionConfirmationRequired:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_disruption_confirmation_required"},
             ) from None
         return _camera_response(camera)
 
@@ -836,18 +940,40 @@ def create_app(
         return set_camera_enabled(camera_id, enabled=True)
 
     @app.post("/api/v1/cameras/{camera_id}/disable", response_model=CameraResponse)
-    def disable_camera(camera_id: UUID) -> CameraResponse:
-        return set_camera_enabled(camera_id, enabled=False)
+    def disable_camera(
+        camera_id: UUID,
+        request: CameraDisruptionRequest | None = None,
+    ) -> CameraResponse:
+        return set_camera_enabled(
+            camera_id,
+            enabled=False,
+            confirmation_token=(None if request is None else request.confirmation_token),
+        )
 
     @app.delete(
         "/api/v1/cameras/{camera_id}",
         response_model=CameraResponse,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    def delete_camera(camera_id: UUID) -> CameraResponse:
-        control = _require_camera_control(camera_control)
+    def delete_camera(
+        camera_id: UUID,
+        request: CameraDisruptionRequest | None = None,
+    ) -> CameraResponse:
+        _require_camera_control(camera_control)
+        if camera_mutation_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_mutation_confirmation_unavailable"},
+            )
         try:
-            return _camera_response(control.delete_camera(camera_id))
+            return _camera_response(
+                camera_mutation_control.delete(
+                    camera_id,
+                    confirmation_token=(
+                        None if request is None else request.confirmation_token
+                    ),
+                )
+            )
         except CameraNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -858,6 +984,58 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": str(error)},
             ) from None
+        except CameraDisruptionConfirmationRequired:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_disruption_confirmation_required"},
+            ) from None
+
+    @app.post(
+        "/api/v1/cameras/{camera_id}/mutations/preview",
+        response_model=CameraMutationPreviewResponse,
+    )
+    def preview_camera_mutation(
+        camera_id: UUID,
+        request: CameraMutationPreviewRequest,
+    ) -> CameraMutationPreviewResponse:
+        if camera_mutation_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_mutation_confirmation_unavailable"},
+            )
+        if request.operation is CameraMutationOperation.UPDATE_SOURCE and (
+            request.name is None or request.source_url is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "camera_mutation_payload_required"},
+            )
+        try:
+            preview = camera_mutation_control.preview(
+                camera_id,
+                operation=request.operation,
+                name=request.name,
+                source_url=request.source_url,
+            )
+        except CameraNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "camera_not_found"},
+            ) from None
+        except CameraReaderInvariantViolation:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "camera_reader_limit_violated"},
+            ) from None
+        return CameraMutationPreviewResponse(
+            camera_id=str(preview.camera_id),
+            operation=preview.operation,
+            desired_revision=preview.desired_revision,
+            occupied=preview.occupied,
+            disconnect_readers=preview.disconnect_readers,
+            mutation_sha256=preview.mutation_sha256,
+            confirmation_token=preview.confirmation_token,
+        )
 
     @app.get(
         "/api/v1/cameras/{camera_id}/runtime",
@@ -935,6 +1113,10 @@ def create_app(
             occupied=preview.occupied,
             disconnect_readers=preview.disconnect_readers,
             confirmation_token=preview.confirmation_token,
+            source_port=preview.source_port,
+            target_port=preview.target_port,
+            source_endpoint=preview.source_endpoint,
+            target_endpoint=preview.target_endpoint,
         )
 
     @app.post(
@@ -1040,6 +1222,14 @@ def _node_response(node: object) -> NodeResponse:
     )
 
 
+def _retryable_service_response(code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": {"code": code}},
+        headers={"Retry-After": "1"},
+    )
+
+
 def _camera_response(camera: object) -> CameraResponse:
     from rtsp_proxy.nodes import CameraPlacement, CameraState
 
@@ -1078,6 +1268,13 @@ def _camera_move_response(move: CameraMove) -> CameraMoveResponse:
         target_generation=move.target_generation,
         desired_revision=move.desired_revision,
         force=move.force,
+        confirmed_disconnect_readers=move.confirmed_disconnect_readers,
+        source_port=move.source_port,
+        target_port=move.target_port,
+        source_endpoint=move.source_endpoint,
+        target_endpoint=move.target_endpoint,
+        expires_at=move.expires_at,
+        abort_reason=move.abort_reason,
         state=move.state.value,
     )
 

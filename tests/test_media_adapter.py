@@ -73,6 +73,7 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
             "source": payload["source"],
             "sourceOnDemand": payload["sourceOnDemand"],
             "sourceOnDemandCloseAfter": payload["sourceOnDemandCloseAfter"],
+            "maxReaders": payload["maxReaders"],
         }
         if name in self.ready_on_put:
             self.ready_paths.add(name)
@@ -133,6 +134,7 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
                         "source": "rtsp://camera.invalid/main",
                         "sourceOnDemand": True,
                         "sourceOnDemandCloseAfter": "10s",
+                        "maxReaders": 1,
                     }
                 ).encode("utf-8"),
             )
@@ -146,6 +148,7 @@ class MediaMtxFixtureHandler(BaseHTTPRequestHandler):
                         "source": "rtsp://camera.invalid/main",
                         "sourceOnDemand": False,
                         "sourceOnDemandCloseAfter": "10s",
+                        "maxReaders": 1,
                     }
                 ).encode("utf-8"),
             )
