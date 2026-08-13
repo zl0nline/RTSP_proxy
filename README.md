@@ -11,10 +11,10 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   Linux amd64/arm64.
 > - Phase 0B reproducible load/netem harness: **functional foundation complete**;
 >   production hardware capacity/24h soak ещё не выполнены.
-> - Node registry/placement foundation, isolated per-node Linux runtime and
->   Phase-D camera/node administration: **complete on native amd64/arm64 CI**.
->   Phase E access implementation is in review; dashboard and production
->   evidence remain pending.
+> - Node registry/placement, isolated per-node Linux runtime, Phase-D
+>   administration and Phase-E access/security: **complete on native
+>   amd64/arm64 CI**. Dashboard/notifications and production capacity evidence
+>   remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -257,13 +257,18 @@ blast-radius-confirmed port change with crash recovery, and empty-node deletion
 are implemented. A prepared port change freezes the exact camera placement set
 and reserves both ports; failed/restarted operations converge to the old port.
 Phase D owns the binary admission primitive and proves exact one-reader RTSP
-`453` behavior without interrupting the established reader. Phase E integrates
-it with drain, internet/local ACL, generated credentials and a dedicated
-loopback authorization service. Its unit/PostgreSQL and local pinned
-MediaMTX+FFmpeg H.264/H.265 contracts are green; independent review and native
-amd64/arm64 CI are still required before Phase E is marked complete.
+`453` behavior without interrupting the established reader.
+
+Phase E **complete** ([native amd64/arm64 CI evidence][phase-e-ci]): it
+integrates that primitive with drain, two-level CIDR ACL, generated revocable
+credentials and a dedicated node-authenticated loopback authorization service.
+All six CI jobs passed on both architectures, including PostgreSQL migrations,
+owned nftables read-back, patched MediaMTX management isolation, H.264/H.265
+ACL/revoke/single-reader behavior and ordinary RTSP/TCP node isolation. This is
+functional security evidence, not a production capacity result.
 
 [phase-d-ci]: https://github.com/zl0nline/RTSP_proxy/actions/runs/31658505374
+[phase-e-ci]: https://github.com/zl0nline/RTSP_proxy/actions/runs/31689056322
 
 The Phase-C→D schema transition is intentionally offline and fail closed:
 `0009` rejects a non-empty legacy node registry because those rows cannot prove
@@ -276,8 +281,9 @@ policy, preflights every restored listener before writing desired state and
 preserves stable RUNNING/STOPPED/DRAINING/MAINTENANCE/FAILED intent. Transitional
 node states cannot be exported. It is not exposed over HTTP.
 
-Ещё не реализованы dashboard, notifications и complete operations workflows.
-Наличие load harness не означает готовый product или published capacity.
+Ещё не реализованы dashboard, notifications и complete operator workflows.
+Наличие load harness и зелёного Phase-E CI не означает готовый product или
+published capacity.
 
 ## Локальная разработка
 

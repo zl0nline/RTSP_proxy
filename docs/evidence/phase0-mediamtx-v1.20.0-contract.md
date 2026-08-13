@@ -79,9 +79,9 @@ real-binary media contract jobs in
 
 - two-version FFmpeg/supervisor timeout and reconnect matrix;
 - isolated production probe execution (ADR 0004; health/security slices);
-- Phase-E additive host L4 controls and slow-client timeout are implemented;
-  their native amd64/arm64 loading/behavior evidence remains the Phase-E exit
-  gate;
+- Phase-E additive host L4 controls and slow-client timeout are implemented and
+  their native amd64/arm64 loading/behavior evidence passed in
+  [CI run 31689056322](https://github.com/zl0nline/RTSP_proxy/actions/runs/31689056322);
 - statistically powered timing no-oracle evidence for revoked, wrong-password,
   unknown-user and unknown-path denials;
 - native VPN source-IP preservation; L4/NAT and cross-host callback remain

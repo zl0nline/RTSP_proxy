@@ -1,6 +1,6 @@
 # Production-план RTSP Proxy
 
-> Актуализировано 12 августа 2026 года по owner consensus и текущим телам
+> Актуализировано 13 августа 2026 года по owner consensus и текущим телам
 > [issues #1–#14](https://github.com/zl0nline/RTSP_proxy/issues).
 >
 > **ARCHITECTURE: BOUNDED MEDIA NODES · IMPLEMENTATION: IN PROGRESS ·
@@ -857,9 +857,18 @@ to receive RTP; CI runs it on amd64 and arm64.
 - [x] ordinary FFmpeg H.264/H.265 contract tests;
 - [x] additive host/L4 per-node, per-peer and SYN connection controls for the
   configured node-port range;
-- [ ] independent security/RTSP review and native amd64/arm64 CI.
+- [x] independent security/RTSP review and native amd64/arm64 CI.
 
-Status: **IN REVIEW**. Migration `0010_camera_access` creates normalized
+Status: **complete**. Independent Spec and Standards reviews are PASS. All six
+jobs in the
+[native amd64/arm64 Phase-E CI run](https://github.com/zl0nline/RTSP_proxy/actions/runs/31689056322)
+passed at commit `0ffdffbfd7030ed1a8bf85a1a921af0033ddc61a`, including real
+PostgreSQL migration, owned nftables reconciliation, patched MediaMTX,
+H.264/H.265 auth/ACL/revoke/single-reader behavior and systemd node isolation.
+This closes the functional access/security phase only; Phase F dashboard/email
+and Phase G hardware capacity/soak remain Production NO-GO gates.
+
+Migration `0010_camera_access` creates normalized
 internet/local policy and revocable grant state. Media nodes call the exact
 loopback `/internal/v1/media-auth/<node-id>` route; unknown canonical paths use
 the reserved matcher and reach the same empty-401 path. Policy lookup checks
@@ -903,7 +912,9 @@ NO-GO until a future callback-compatible previous release is catalogued and
 proven. It never installs allow-all/static users.
 Ordinary `rtsp://` interleaved TCP and the external port remain unchanged.
 
-Exit: security/RTSP review PASS and native amd64/arm64 contracts green.
+Exit: **met** — security/RTSP review PASS and native amd64/arm64 contracts
+green. The exact evidence boundary is recorded in
+[`docs/evidence/phase-e-access-security-contract.md`](evidence/phase-e-access-security-contract.md).
 
 ### Phase F — dashboard, metrics and notifications
 

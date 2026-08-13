@@ -66,4 +66,5 @@ skipped when Linux artifacts are unavailable. The published native Phase D
 systemd test passes on both amd64 and arm64 and performs targeted CRUD, a
 cross-node move, port change and empty-node delete while a reader on the
 unaffected node demonstrates continuing RTP progress. Production admission
-still waits for Phase E/G security and capacity evidence.
+still waits for Phase F operator/dashboard/notification work and Phase G
+capacity evidence; Phase E functional access/security evidence is complete.
