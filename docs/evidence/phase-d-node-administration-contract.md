@@ -1,7 +1,8 @@
 # Phase D node administration contract
 
 - Last reviewed: 2026-08-13
-- Status: implementation complete; native CI confirmation pending
+- Status: complete; native amd64/arm64 CI green
+- CI: https://github.com/zl0nline/RTSP_proxy/actions/runs/31658505374
 - Architectures: Linux amd64 and arm64, identical contract
 
 Phase D implements bounded camera reconciliation and administration for the
@@ -59,8 +60,8 @@ it has no safe rollback target and never admits stock v1.20.0. A future N→N+1
 rollout must package both identities before enabling the previous pin.
 
 Local evidence: full unit/contract suite passes with native-only contracts
-skipped when Linux artifacts are unavailable. CI's Phase D systemd test performs
-targeted CRUD, a cross-node move, port change and empty-node delete while a
-reader on the unaffected node demonstrates continuing RTP progress. Production
-admission still waits for the published green amd64/arm64 CI run and later
-Phase E/G security and capacity evidence.
+skipped when Linux artifacts are unavailable. The published native Phase D
+systemd test passes on both amd64 and arm64 and performs targeted CRUD, a
+cross-node move, port change and empty-node delete while a reader on the
+unaffected node demonstrates continuing RTP progress. Production admission
+still waits for Phase E/G security and capacity evidence.

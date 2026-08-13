@@ -809,7 +809,9 @@ legacy release digests in place is forbidden.
   exact `camera_id:placement_generation` SHA-256; the persisted saga rechecks
   that blast radius under the placement lock and fences camera mutations.
 
-Status: **implementation complete; native amd64/arm64 CI confirmation pending**.
+Status: **complete**. All six jobs in the
+[native amd64/arm64 Phase-D CI run](https://github.com/zl0nline/RTSP_proxy/actions/runs/31658505374)
+passed, including the real systemd two-node/RTP-isolation contract.
 The review cycle found and closed the move occupancy TOCTOU, duplicate prepared
 target, missing writer guards, stale helper request and disruptive CRUD gaps.
 Ordinary camera CRUD never restarts a node. Port change is intentionally disruptive only to that node,

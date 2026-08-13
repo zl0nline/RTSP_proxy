@@ -12,9 +12,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 > - Phase 0B reproducible load/netem harness: **functional foundation complete**;
 >   production hardware capacity/24h soak ещё не выполнены.
 > - Node registry/placement foundation, isolated per-node Linux runtime and
->   Phase-D camera/node administration: **implementation complete; native
->   Phase-D CI confirmation pending**. Access, dashboard and production
->   evidence remain in progress.
+>   Phase-D camera/node administration: **complete on native amd64/arm64 CI**.
+>   Access, dashboard and production evidence remain in progress.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -222,7 +221,7 @@ release, поэтому переключение `/opt/rtsp-proxy/current` не 
 convergence другой: startup reconciliation выполняется bounded-параллельно,
 а PostgreSQL lifecycle locks имеют отдельный ограниченный pool и timeout.
 
-Phase D **implementation complete; native CI confirmation pending**:
+Phase D **complete** ([native amd64/arm64 CI evidence][phase-d-ci]):
 node-scoped reconciler and camera CRUD, occupancy-fenced/revision-fenced move
 saga with bounded abort cleanup, disruptive-camera confirmations,
 drain/maintenance,
@@ -233,6 +232,8 @@ Phase D now owns the binary admission primitive and proves exact one-reader
 RTSP `453` behavior without interrupting the established reader. Phase E will
 integrate that primitive with drain, internet/local ACL, credentials and the
 simultaneous-admission security contract.
+
+[phase-d-ci]: https://github.com/zl0nline/RTSP_proxy/actions/runs/31658505374
 
 The Phase-C→D schema transition is intentionally offline and fail closed:
 `0009` rejects a non-empty legacy node registry because those rows cannot prove
