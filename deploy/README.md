@@ -184,14 +184,13 @@ Verifier reads actual Linux architecture, validates artifact paths/digests and
 version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
 activation.
 
-Release `0.2.0` is the compatibility bridge for the next additive migration;
-MediaMTX release `0.2.1` is its race-safe native successor and is the default
-node target. The application manifest remains `0.3.0`. The bridge
-its manifest and startup gate accept both `0010_camera_access` and
-`0011_observability`, while its own migration head remains 0010. Deploy and
-smoke this bridge on every control-plane process before any host advances the
-database to 0011. This ordering is what makes the subsequent N/N-1 rolling
-window executable rather than merely declarative.
+MediaMTX release `0.2.1` is the race-safe native node target; the operator
+session slice does not change it. Application release `0.4.0` is the additive
+schema bridge: its manifest and startup gate accept both
+`0011_observability` and `0012_operator_sessions`, while release `0.3.0`
+remains on 0011. Deploy and smoke 0.4.0 on every control-plane process before
+the database advances to 0012. This ordering makes the N/N-1 window executable
+rather than merely declarative.
 
 Before starting a control-plane release, apply the migrations packaged inside
 that exact wheel environment:
@@ -202,15 +201,14 @@ RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_pro
 ```
 
 The runner upgrades to the packaged `head` and uses the same direct native
-PostgreSQL contract on amd64 and arm64. Release `0.3.0` declares the additive
-rolling window `0010_camera_access..0011_observability`: first deploy the new
-web/reconciler while PostgreSQL remains on 0010, then apply 0011 and enable the
-collector/notifier. Dashboard snapshot is a typed 503 during the bridge, while
-collector/notifier refuse startup until 0011 exists. Retire the previous app
-only after both revisions have been exercised; a later contract release may
-remove 0010 support only after old processes are proved absent. Any schema
-outside the declared window fails closed; an older binary must never start
-against an unsupported newer schema.
+PostgreSQL contract on amd64 and arm64. Release `0.4.0` declares the additive
+rolling window `0011_observability..0012_operator_sessions`: first deploy the
+new web/reconciler while PostgreSQL remains on 0011, then apply 0012. Operator
+authentication remains disabled until OIDC and break-glass readiness are both
+proven; the session tables alone do not protect the API. Retire 0.3.0 only after
+all processes run 0.4.0 and the new revision is exercised. Any schema outside
+the declared window fails closed; an older binary must never start against an
+unsupported newer schema.
 
 `0005_node_runtime` intentionally rejects an upgrade when legacy Phase-B
 `media_nodes` rows exist. Those rows lack trustworthy per-node management

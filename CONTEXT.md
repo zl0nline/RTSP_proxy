@@ -16,6 +16,13 @@ runtime внутри server._
 Dashboard/API, workers, reconciler, collector и PostgreSQL-состояние, которые
 управляют media plane, но не передают RTP.
 
+## Operator session
+
+Revocable server-side browser session backed by PostgreSQL. The browser cookie
+contains only an opaque identifier; authorization comes from the current
+operator account, role, scope and `authz_version`. A stale or unavailable
+authoritative record fails closed and does not affect established media.
+
 ## Media node
 
 Один независимо управляемый MediaMTX process/systemd instance с собственными

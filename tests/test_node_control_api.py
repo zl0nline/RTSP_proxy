@@ -1136,7 +1136,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_access_policies', 'camera_access_grants')"
             )
         )
-    assert revision == "0011_observability"
+    assert revision == "0012_operator_sessions"
     assert table_count == 6
 
 
@@ -1656,7 +1656,7 @@ def test_new_control_plane_is_a_compatibility_bridge_for_previous_schema(
 ) -> None:
     migration = Config("alembic.ini")
     migration.set_main_option("sqlalchemy.url", postgres_database_url)
-    command.upgrade(migration, "0010_camera_access")
+    command.upgrade(migration, "0011_observability")
     monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
     monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
 

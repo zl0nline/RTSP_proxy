@@ -55,6 +55,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0011_observability.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0012_operator_sessions.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -93,7 +98,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
 
     manifest = {
         "schema_version": 2,
-        "release_id": "0.3.0",
+        "release_id": "0.4.0",
         "git_commit": "a" * 40,
         "python": {
             "version": "3.12",
@@ -117,8 +122,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "ffprobe_sha256": sha256(ffprobe_payload),
         },
         "schema_compatibility": {
-            "minimum": "0010_camera_access",
-            "maximum": "0011_observability",
+            "minimum": "0011_observability",
+            "maximum": "0012_operator_sessions",
         },
         "config_schema_version": 1,
     }
@@ -132,7 +137,7 @@ def test_verified_release_exposes_only_validated_artifact_paths(tmp_path: Path) 
 
     release = verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
-    assert release.release_id == "0.3.0"
+    assert release.release_id == "0.4.0"
     assert release.wheel == tmp_path / "dist/rtsp_proxy-0.1.0-py3-none-any.whl"
     assert release.mediamtx_binary == tmp_path / "bin/mediamtx"
     assert release.ffmpeg_binary == tmp_path / "bin/ffmpeg"
@@ -205,7 +210,7 @@ def test_release_verifier_cli_is_usable_by_linux_installation_automation(
     exit_code = main(["--manifest", str(manifest_path)])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == "verified release 0.3.0\n"
+    assert capsys.readouterr().out == "verified release 0.4.0\n"
 
 
 def test_release_verifier_cli_fails_closed_on_tampering(
@@ -269,7 +274,7 @@ def test_cli_detects_the_native_linux_runtime(
     exit_code = main(["--manifest", str(manifest_path)])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == "verified release 0.3.0\n"
+    assert capsys.readouterr().out == "verified release 0.4.0\n"
 
 
 def test_cli_rejects_a_non_linux_activation_host(
@@ -323,7 +328,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert {manifest.release_id for manifest in manifests} == {"0.3.0"}
+    assert {manifest.release_id for manifest in manifests} == {"0.4.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
 
 

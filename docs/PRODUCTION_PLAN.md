@@ -934,12 +934,14 @@ green. The exact evidence boundary is recorded in
 ### Phase F — dashboard, metrics and notifications
 
 Status: **IN PROGRESS**. The bounded collector, generation-bound per-path
-metrics, persisted fleet snapshot API, incident state machine and durable SMTP
-dispatcher are implemented locally and await independent review/native CI.
-No Phase-F completion claim is made yet.
+metrics, persisted fleet snapshot API, incident state machine, durable SMTP
+dispatcher, digest-only PostgreSQL operator sessions, authoritative
+`authz_version` fencing and CSRF/RBAC HTTP boundary are implemented locally and
+await independent review/native CI. OIDC/break-glass activation and browser UI
+remain pending. No Phase-F completion claim is made yet.
 
 - [ ] node/camera pages and actions;
-- [ ] RBAC/CSRF/session/audit;
+- [~] RBAC/CSRF/session foundation (OIDC/break-glass and security audit pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

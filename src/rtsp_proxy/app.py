@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
@@ -57,6 +57,14 @@ from rtsp_proxy.nodes import (
     NodeState,
 )
 from rtsp_proxy.observability import SnapshotReader
+from rtsp_proxy.operator_access import (
+    OperatorAuthenticationRequired,
+    OperatorAuthorizationDenied,
+    OperatorPermission,
+    OperatorPrincipal,
+    OperatorSessionControl,
+    OperatorSessionUnavailable,
+)
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
     CameraMoveControl,
@@ -189,6 +197,16 @@ class FleetSnapshotResponse(BaseModel):
     external_ports_used: int
     external_ports_free: int
     nodes: list[FleetNodeResponse]
+
+
+class OperatorSessionResponse(BaseModel):
+    account_id: str
+    subject: str
+    display_name: str
+    roles: list[str]
+    scopes: list[str]
+    authz_version: int
+    mfa_verified_at: datetime | None
 
 
 class CameraCreateRequest(BaseModel):
@@ -509,6 +527,7 @@ def create_app(
     access_policy_control: AccessPolicyControl | None = None,
     access_grant_control: AccessGrantControl | None = None,
     fleet_snapshots: SnapshotReader | None = None,
+    operator_sessions: OperatorSessionControl | None = None,
     fleet_snapshot_max_age_seconds: float = 30,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     startup: Callable[[], None] | None = None,
@@ -527,12 +546,69 @@ def create_app(
     app = FastAPI(title="RTSP Proxy Control Plane", lifespan=lifespan)
     readiness_provider = readiness or MissingReadinessProvider()
 
+    if operator_sessions is not None:
+
+        @app.middleware("http")
+        async def operator_access_boundary(
+            request: Request,
+            call_next: Callable[[Request], Awaitable[Response]],
+        ) -> Response:
+            if not request.url.path.startswith("/api/v1/"):
+                result = await call_next(request)
+                assert isinstance(result, Response)
+                return result
+            session_token = request.cookies.get("__Host-rtsp_proxy_session", "")
+            require_csrf = request.method not in {"GET", "HEAD", "OPTIONS"}
+            permission = _operator_permission_for_request(request)
+            try:
+                principal = await anyio.to_thread.run_sync(
+                    lambda: operator_sessions.authenticate(
+                        session_token=session_token,
+                        permission=permission,
+                        csrf_token=request.headers.get("X-CSRF-Token"),
+                        require_csrf=require_csrf,
+                    ),
+                    abandon_on_cancel=True,
+                )
+            except OperatorAuthenticationRequired:
+                return _operator_error_response(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "operator_authentication_required",
+                )
+            except OperatorAuthorizationDenied:
+                return _operator_error_response(
+                    status.HTTP_403_FORBIDDEN,
+                    "operator_permission_denied",
+                )
+            except OperatorSessionUnavailable:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"detail": {"code": "operator_session_unavailable"}},
+                    headers={"Cache-Control": "no-store", "Retry-After": "1"},
+                )
+            request.state.operator_principal = principal
+            result = await call_next(request)
+            assert isinstance(result, Response)
+            result.headers["Cache-Control"] = "no-store"
+            return result
+
     @app.exception_handler(NodeLifecycleBusy)
     async def node_lifecycle_busy_handler(
         _request: Request,
         _error: NodeLifecycleBusy,
     ) -> JSONResponse:
         return _retryable_service_response("node_lifecycle_busy")
+
+    @app.exception_handler(OperatorSessionUnavailable)
+    async def operator_session_unavailable_handler(
+        _request: Request,
+        _error: OperatorSessionUnavailable,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": {"code": "operator_session_unavailable"}},
+            headers={"Cache-Control": "no-store", "Retry-After": "1"},
+        )
 
     @app.exception_handler(ReconcileRetry)
     async def reconcile_retry_handler(
@@ -633,6 +709,32 @@ def create_app(
                 )
                 for node in snapshot.nodes
             ],
+        )
+
+    @app.get("/api/v1/operator/session", response_model=OperatorSessionResponse)
+    def operator_session(request: Request) -> OperatorSessionResponse:
+        principal = _operator_principal(request)
+        return OperatorSessionResponse(
+            account_id=str(principal.account_id),
+            subject=principal.subject,
+            display_name=principal.display_name,
+            roles=sorted(role.value for role in principal.roles),
+            scopes=sorted(principal.scopes),
+            authz_version=principal.authz_version,
+            mfa_verified_at=principal.mfa_verified_at,
+        )
+
+    @app.delete("/api/v1/operator/session", status_code=status.HTTP_204_NO_CONTENT)
+    def operator_logout(request: Request, response: Response) -> None:
+        assert operator_sessions is not None
+        token = request.cookies.get("__Host-rtsp_proxy_session", "")
+        operator_sessions.revoke(token)
+        response.delete_cookie(
+            "__Host-rtsp_proxy_session",
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="strict",
         )
 
     @app.post("/api/v1/nodes", response_model=NodeResponse, status_code=201)
@@ -1960,6 +2062,52 @@ def _retryable_service_response(code: str) -> JSONResponse:
         content={"detail": {"code": code}},
         headers={"Retry-After": "1"},
     )
+
+
+def _operator_permission_for_request(request: Request) -> OperatorPermission:
+    path = request.url.path
+    if request.url.path in {
+        "/api/v1/operator/session",
+        "/api/v1/dashboard/snapshot",
+    }:
+        return OperatorPermission.DASHBOARD_READ
+    if path.endswith("/access-policy"):
+        return (
+            OperatorPermission.CONTROL_READ
+            if request.method in {"GET", "HEAD", "OPTIONS"}
+            else OperatorPermission.ACCESS_ADMIN
+        )
+    if "/access-grants" in path:
+        return (
+            OperatorPermission.SECRET_ISSUE
+            if request.method == "POST"
+            else OperatorPermission.ACCESS_ADMIN
+        )
+    if path.startswith("/api/v1/operators"):
+        return OperatorPermission.OPERATOR_ADMIN
+    if path.startswith("/api/v1/audit"):
+        return OperatorPermission.AUDIT_READ
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return OperatorPermission.CONTROL_READ
+    return OperatorPermission.CONTROL_MUTATE
+
+
+def _operator_error_response(status_code: int, code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": {"code": code}},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _operator_principal(request: Request) -> OperatorPrincipal:
+    principal = getattr(request.state, "operator_principal", None)
+    if not isinstance(principal, OperatorPrincipal):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "operator_authentication_required"},
+        )
+    return principal
 
 
 def _camera_response(camera: object) -> CameraResponse:

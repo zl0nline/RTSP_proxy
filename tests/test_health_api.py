@@ -606,7 +606,7 @@ def test_observability_roles_require_current_schema_after_bridge_deployment(
 
     migration = Config("alembic.ini")
     migration.set_main_option("sqlalchemy.url", postgres_database_url)
-    command.upgrade(migration, "0010_camera_access")
+    command.upgrade(migration, "0011_observability")
 
     with pytest.raises(RuntimeError, match="database_schema_mismatch"):
         create_background_app(

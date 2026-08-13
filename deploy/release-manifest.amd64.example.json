@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "release_id": "0.3.0",
+  "release_id": "0.4.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",
@@ -24,8 +24,8 @@
     "ffprobe_sha256": "0f7a6c43858e8123f09b2f2236e7084165d76642e618d8d0ec9304cff3135d95"
   },
   "schema_compatibility": {
-    "minimum": "0010_camera_access",
-    "maximum": "0011_observability"
+    "minimum": "0011_observability",
+    "maximum": "0012_operator_sessions"
   },
   "config_schema_version": 1
 }

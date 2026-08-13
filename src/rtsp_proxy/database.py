@@ -481,7 +481,7 @@ class PostgresNodeStore:
                 )
         except SQLAlchemyError:
             raise DatabaseSchemaMismatch("database_schema_mismatch") from None
-        if revisions not in (("0010_camera_access",), (APPLICATION_SCHEMA,)):
+        if revisions not in (("0011_observability",), (APPLICATION_SCHEMA,)):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     def assert_schema_current(self) -> None:
