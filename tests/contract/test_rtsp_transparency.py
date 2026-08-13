@@ -26,6 +26,7 @@ import uvicorn
 
 from rtsp_proxy.access import (
     AccessAuthorizer,
+    AccessDecisionTelemetry,
     AccessGrant,
     AccessPolicy,
     AccessTarget,
@@ -455,12 +456,14 @@ def start_native_auth_server(
     port: int,
     authorizer: AccessAuthorizer,
     callback_verifier: PepperVerifier,
+    telemetry: AccessDecisionTelemetry | None = None,
 ) -> tuple[uvicorn.Server, threading.Thread]:
     server = uvicorn.Server(
         uvicorn.Config(
             create_media_auth_app(
                 authorizer=authorizer,
                 callback_verifier=callback_verifier,
+                telemetry=telemetry,
             ),
             host="127.0.0.1",
             port=port,
@@ -538,6 +541,7 @@ def test_real_access_callback_acl_revoke_drain_and_single_reader_race(
             revision=1,
         ),
     )
+    telemetry = AccessDecisionTelemetry()
     origin_config = tmp_path / f"origin-{codec_name}.yml"
     origin_config.write_text(
         f"""
@@ -620,8 +624,13 @@ paths:
     try:
         auth_server, auth_thread = start_native_auth_server(
             port=auth_port,
-            authorizer=AccessAuthorizer(store=store, verifier=pepper),
+            authorizer=AccessAuthorizer(
+                store=store,
+                verifier=pepper,
+                decision_sink=telemetry,
+            ),
             callback_verifier=pepper,
+            telemetry=telemetry,
         )
         wait_for_json(f"http://127.0.0.1:{origin_api_port}/v3/config/global/get", origin)
         encoder_options = (
@@ -721,6 +730,15 @@ paths:
         )
         assert valid.returncode == 0, valid.stderr
         assert json.loads(valid.stdout)["streams"][0]["codec_name"] == codec_name
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{auth_port}/internal/v1/metrics",
+            timeout=2,
+        ) as response:
+            auth_metrics = response.read().decode("utf-8")
+        assert (
+            'reason="allowed",allowed="true",action="read",protocol="rtsp",'
+            'peer_family="ipv4"'
+        ) in auth_metrics
 
         race_barrier = threading.Barrier(2)
 
@@ -949,9 +967,7 @@ paths: {{}}
             "authMethod: internal",
             "authMethod: http\n"
             f"authHTTPAddress: http://127.0.0.1:{auth_port}/auth\n"
-            "authHTTPExclude:\n"
-            "  - action: api\n"
-            "  - action: metrics",
+            "authHTTPExclude: []",
         ).replace("paths: {}", 'paths:\n  "~^[a-z2-7]{25}[aeimquy4]$": {}')
     proxy_config = tmp_path / "proxy.yml"
     proxy_config.write_text(
@@ -1045,15 +1061,19 @@ paths: {{}}
         )
 
         proxy = start_process([MEDIA_MTX_BINARY, str(proxy_config)])
-        wait_for_json(
-            f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get",
-            proxy,
+        proxy_management_url = (
+            f"http://any@127.0.0.1:{proxy_api_port}/v3/config/global/get"
+            if auth_method == "http"
+            else f"http://127.0.0.1:{proxy_api_port}/v3/config/global/get"
         )
+        wait_for_json(proxy_management_url, proxy)
         udp_socket_baseline = process_owned_udp_sockets(proxy)
         assert not udp_socket_baseline
         client = MediaMtxClient(
             api_url=f"http://127.0.0.1:{proxy_api_port}",
             timeout_seconds=2,
+            username="any" if auth_method == "http" else None,
+            password="" if auth_method == "http" else None,
         )
         client.put_path(
             MediaPathConfig(

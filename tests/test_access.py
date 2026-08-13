@@ -1317,6 +1317,109 @@ def test_media_auth_body_timeout_is_bounded_before_admission() -> None:
     assert response_started[0]["status"] == 401
 
 
+@pytest.mark.parametrize(
+    ("headers", "path"),
+    (
+        ([(b"content-length", b"1")], "/wrong-route"),
+        ([(b"content-length", b"invalid")], f"/internal/v1/media-auth/{NODE_ID}"),
+        (
+            [(b"content-length", b"1"), (b"content-length", b"1")],
+            f"/internal/v1/media-auth/{NODE_ID}",
+        ),
+    ),
+)
+def test_media_auth_raw_middleware_rejects_ambiguous_request_metadata(
+    headers: list[tuple[bytes, bytes]],
+    path: str,
+) -> None:
+    import asyncio
+
+    app = create_media_auth_app(
+        authorizer=AccessAuthorizer(
+            store=RecordingAccessStore(policy=policy(), grant=grant_for()),
+            verifier=verifier(),
+        ),
+        callback_verifier=verifier(),
+    )
+    response_started: list[dict[str, object]] = []
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "root_path": "",
+        "server": ("127.0.0.1", 8010),
+        "client": ("127.0.0.1", 30000),
+        "headers": [
+            *headers,
+            (b"authorization", callback_headers()["authorization"].encode("ascii")),
+        ],
+    }
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"{", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        response_started.append(message)
+
+    asyncio.run(app(scope, cast(Any, receive), cast(Any, send)))
+
+    assert response_started[0]["status"] == 401
+
+
+def test_media_auth_raw_middleware_rejects_incomplete_and_oversized_body_frames() -> None:
+    import asyncio
+
+    app = create_media_auth_app(
+        authorizer=AccessAuthorizer(
+            store=RecordingAccessStore(policy=policy(), grant=grant_for()),
+            verifier=verifier(),
+        ),
+        callback_verifier=verifier(),
+    )
+    base_scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": f"/internal/v1/media-auth/{NODE_ID}",
+        "raw_path": f"/internal/v1/media-auth/{NODE_ID}".encode("ascii"),
+        "query_string": b"",
+        "root_path": "",
+        "server": ("127.0.0.1", 8010),
+        "client": ("127.0.0.1", 30000),
+        "headers": [
+            (b"content-length", b"1"),
+            (b"authorization", callback_headers()["authorization"].encode("ascii")),
+        ],
+    }
+
+    frames: tuple[dict[str, object], ...] = (
+        {"type": "http.disconnect"},
+        {"type": "http.request", "body": b"{}", "more_body": False},
+        {"type": "http.request", "body": b"", "more_body": False},
+    )
+    for message in frames:
+        response_started: list[dict[str, object]] = []
+
+        async def receive(frame: dict[str, object] = message) -> dict[str, object]:
+            return frame
+
+        async def send(
+            response: dict[str, object],
+            observed: list[dict[str, object]] = response_started,
+        ) -> None:
+            observed.append(response)
+
+        asyncio.run(app(base_scope, cast(Any, receive), cast(Any, send)))
+        assert response_started[0]["status"] == 401
+
+
 def test_media_auth_readiness_checks_database_schema_without_exposing_errors() -> None:
     store = RecordingAccessStore(policy=policy(), grant=grant_for())
     healthy = TestClient(

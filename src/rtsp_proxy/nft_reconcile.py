@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -344,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         reconcile_nftables(nft=arguments.nft, policy=arguments.policy)
-    except NftReconcileError:
+    except NftReconcileError as error:
+        print(str(error), file=sys.stderr)
         return 1
     return 0

@@ -421,15 +421,20 @@ diff --git a/internal/auth/manager.go b/internal/auth/manager.go
 index 82d5f79..f6e1b62 100644
 --- a/internal/auth/manager.go
 +++ b/internal/auth/manager.go
-@@ -132,7 +132,12 @@ func (m *Manager) Authenticate(req *Request) (string, *Error) {
+@@ -132,7 +132,17 @@ func (m *Manager) Authenticate(req *Request) (string, *Error) {
  		user, err = m.authenticateInternal(req)
  
  	case conf.AuthMethodHTTP:
 -		user, err = m.authenticateHTTP(req, token)
 +		// Keep loopback management and runtime-probe identities local while
-+		// forwarding every other request to the external authorizer.
-+		user, err = m.authenticateInternal(req)
-+		if err != nil {
++		// forwarding downstream media requests to the external authorizer.
++		// An internal-user miss must not fall back for management actions: a
++		// wrong local API password would otherwise block on the callback.
++		if req.Action == conf.AuthActionAPI ||
++			req.Action == conf.AuthActionMetrics ||
++			req.Path == "__rtsp_proxy_runtime_probe" {
++			user, err = m.authenticateInternal(req)
++		} else {
 +			user, err = m.authenticateHTTP(req, token)
 +		}
  
@@ -439,7 +444,7 @@ diff --git a/internal/auth/manager_test.go b/internal/auth/manager_test.go
 index 4a8be30..3d0fb64 100644
 --- a/internal/auth/manager_test.go
 +++ b/internal/auth/manager_test.go
-@@ -455,6 +455,67 @@ func TestAuthHTTPExclude(t *testing.T) {
+@@ -455,6 +455,91 @@ func TestAuthHTTPExclude(t *testing.T) {
  	require.Equal(t, "", user)
  }
  
@@ -468,6 +473,30 @@ index 4a8be30..3d0fb64 100644
 +	})
 +	require.Nil(t, err)
 +	require.Equal(t, "management", user)
++}
++
++func TestAuthHTTPManagementMissNeverFallsBackToCallback(t *testing.T) {
++	m := Manager{
++		Method:      conf.AuthMethodHTTP,
++		HTTPAddress: "http://not-to-be-used:9120/auth",
++		InternalUsers: []conf.AuthInternalUser{{
++			User: conf.Credential("management"),
++			Pass: conf.Credential("secret"),
++			Permissions: []conf.AuthInternalUserPermission{{
++				Action: conf.AuthActionAPI,
++			}},
++		}},
++	}
++
++	_, err := m.Authenticate(&Request{
++		Action: conf.AuthActionAPI,
++		Credentials: &Credentials{
++			User: "management",
++			Pass: "wrong-secret",
++		},
++		IP: net.ParseIP("127.0.0.1"),
++	})
++	require.NotNil(t, err)
 +}
 +
 +func TestAuthHTTPCallbackBasicIdentity(t *testing.T) {

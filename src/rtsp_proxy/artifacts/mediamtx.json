@@ -18,10 +18,10 @@
       "activation_compatible": true,
       "architectures": {
         "amd64": {
-          "binary_sha256": "9e6e61d4a33dd4283623c964dbf39cd8c84c807894f8db6edf97ee223c34b9d9"
+          "binary_sha256": "3ca0e018599b2768a1965144aa56d55fedcc71ba1c8d4cfa279635e9e99b9198"
         },
         "arm64": {
-          "binary_sha256": "401650a862659dd3f7a8d39b186703342e46c06cd99a0864b3dca5f63a44992a"
+          "binary_sha256": "943dbe98d2b7ab103d437a33eac9890f7fe882ac0e867d96ee43cfcfdbf6b298"
         }
       }
     }

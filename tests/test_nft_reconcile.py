@@ -229,6 +229,22 @@ def test_inventory_and_cli_fail_closed_on_malformed_kernel_output(
     ) == 1
 
 
+def test_cli_emits_only_bounded_reason_code_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        nft_reconcile,
+        "reconcile_nftables",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            NftReconcileError("nft_table_ownership_unproven")
+        ),
+    )
+
+    assert nft_reconcile.main([]) == 1
+    assert capsys.readouterr().err == "nft_table_ownership_unproven\n"
+
+
 @pytest.mark.parametrize(
     "payload",
     (

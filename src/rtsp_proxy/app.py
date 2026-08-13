@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from starlette.middleware.base import RequestResponseEndpoint
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rtsp_proxy.access import (
     AccessAuthorizer,
@@ -343,6 +343,114 @@ class _MediaAuthAdmissionGate:
 
     def leave(self) -> None:
         self._inflight.release()
+
+
+class _MediaAuthAdmissionMiddleware:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        callback_verifier: PepperVerifier | None,
+        body_timeout_seconds: float,
+        admission: _MediaAuthAdmissionGate,
+    ) -> None:
+        self._app = app
+        self._callback_verifier = callback_verifier
+        self._body_timeout_seconds = body_timeout_seconds
+        self._admission = admission
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") in {
+            "/health/live",
+            "/health/ready",
+            "/internal/v1/metrics",
+        }:
+            await self._app(scope, receive, send)
+            return
+        path = str(scope.get("path", ""))
+        prefix = "/internal/v1/media-auth/"
+        try:
+            node_id = UUID(path.removeprefix(prefix))
+        except ValueError:
+            await _media_auth_denied()(scope, receive, send)
+            return
+        headers: dict[bytes, bytes] = {}
+        for name, value in scope.get("headers", []):
+            lowered = name.lower()
+            if lowered in {b"authorization", b"content-length"} and lowered in headers:
+                await _media_auth_denied()(scope, receive, send)
+                return
+            headers[lowered] = value
+        try:
+            body_length = int(headers[b"content-length"])
+            authorization = headers.get(b"authorization", b"").decode("ascii")
+        except (KeyError, UnicodeError, ValueError):
+            await _media_auth_denied()(scope, receive, send)
+            return
+        if (
+            scope.get("method") != "POST"
+            or not path.startswith(prefix)
+            or body_length < 0
+            or body_length > 2048
+            or self._callback_verifier is None
+            or not self._callback_verifier.verify_callback_authorization(
+                node_id,
+                authorization,
+            )
+            or not self._admission.enter()
+        ):
+            await _media_auth_denied()(scope, receive, send)
+            return
+        try:
+            try:
+                body = await self._read_body(receive, expected_length=body_length)
+            except (TimeoutError, RuntimeError):
+                await _media_auth_denied()(scope, receive, send)
+                return
+            delivered = False
+
+            async def replay() -> Message:
+                nonlocal delivered
+                if delivered:
+                    return {"type": "http.disconnect"}
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            buffered: list[Message] = []
+
+            async def buffer(message: Message) -> None:
+                buffered.append(message)
+
+            try:
+                await self._app(scope, replay, buffer)
+            except Exception:
+                await _media_auth_denied()(scope, replay, send)
+                return
+            for message in buffered:
+                await send(message)
+        finally:
+            self._admission.leave()
+
+    async def _read_body(self, receive: Receive, *, expected_length: int) -> bytes:
+        chunks: list[bytes] = []
+        received = 0
+        more_body = True
+        with anyio.fail_after(self._body_timeout_seconds):
+            while more_body:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    raise RuntimeError("media_auth_body_incomplete")
+                chunk = message.get("body", b"")
+                if not isinstance(chunk, bytes):
+                    raise RuntimeError("media_auth_body_invalid")
+                received += len(chunk)
+                if received > expected_length:
+                    raise RuntimeError("media_auth_body_invalid")
+                chunks.append(chunk)
+                more_body = bool(message.get("more_body", False))
+        if received != expected_length:
+            raise RuntimeError("media_auth_body_incomplete")
+        return b"".join(chunks)
 
 
 def _media_auth_denied() -> Response:
@@ -1614,61 +1722,12 @@ def create_media_auth_app(
         burst=burst,
     )
 
-    @app.middleware("http")
-    async def media_auth_admission(
-        request: Request,
-        call_next: RequestResponseEndpoint,
-    ) -> Response:
-        if request.url.path in {
-            "/health/live",
-            "/health/ready",
-            "/internal/v1/metrics",
-        }:
-            return await call_next(request)
-        content_length = request.headers.get("content-length")
-        if content_length is None:
-            return _media_auth_denied()
-        try:
-            body_length = int(content_length)
-        except ValueError:
-            return _media_auth_denied()
-        if request.method != "POST" or body_length < 0 or body_length > 2048:
-            return _media_auth_denied()
-        prefix = "/internal/v1/media-auth/"
-        try:
-            node_id = UUID(request.url.path.removeprefix(prefix))
-        except ValueError:
-            return _media_auth_denied()
-        if (
-            not request.url.path.startswith(prefix)
-            or callback_verifier is None
-            or not callback_verifier.verify_callback_authorization(
-                node_id,
-                request.headers.get("authorization"),
-            )
-        ):
-            return _media_auth_denied()
-        if not admission.enter():
-            return _media_auth_denied()
-        try:
-            try:
-                with anyio.fail_after(body_timeout_seconds):
-                    body = await request.body()
-            except (TimeoutError, RuntimeError):
-                return _media_auth_denied()
-            if len(body) != body_length:
-                return _media_auth_denied()
-
-            async def receive() -> dict[str, object]:
-                return {"type": "http.request", "body": body, "more_body": False}
-
-            bounded_request = Request(request.scope, receive)
-            try:
-                return await call_next(bounded_request)
-            except Exception:
-                return _media_auth_denied()
-        finally:
-            admission.leave()
+    app.add_middleware(
+        _MediaAuthAdmissionMiddleware,
+        callback_verifier=callback_verifier,
+        body_timeout_seconds=body_timeout_seconds,
+        admission=admission,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def media_auth_validation_denied(

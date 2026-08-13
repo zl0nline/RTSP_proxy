@@ -13,7 +13,7 @@
     "version": "v1.20.0-rtsp-proxy.2",
     "linux_arch": "arm64",
     "binary": "bin/mediamtx",
-    "binary_sha256": "401650a862659dd3f7a8d39b186703342e46c06cd99a0864b3dca5f63a44992a"
+    "binary_sha256": "943dbe98d2b7ab103d437a33eac9890f7fe882ac0e867d96ee43cfcfdbf6b298"
   },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260810",

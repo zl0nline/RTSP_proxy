@@ -321,7 +321,7 @@ def test_current_and_previous_patched_releases_have_distinct_trust_entries() -> 
     )
     assert current_version == "v1.20.0-rtsp-proxy.2"
     assert current.root == (
-        "9e6e61d4a33dd4283623c964dbf39cd8c84c807894f8db6edf97ee223c34b9d9"
+        "3ca0e018599b2768a1965144aa56d55fedcc71ba1c8d4cfa279635e9e99b9198"
     )
     assert current != previous
 

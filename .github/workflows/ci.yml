@@ -307,8 +307,18 @@ jobs:
       - name: Verify Phase D two-node administration and RTP isolation
         run: |
           sudo install -m 0644 deploy/systemd/rtsp-proxy-media@.service /etc/systemd/system/
+          sudo install -m 0644 deploy/systemd/rtsp-proxy-nftables.service /etc/systemd/system/
+          sudo install -d -m 0755 /opt/rtsp-proxy/releases/native-contract/.venv/bin
+          sudo install -m 0755 /usr/bin/true \
+            /opt/rtsp-proxy/releases/native-contract/.venv/bin/rtsp-proxy-nft-reconcile
+          if [ ! -e /opt/rtsp-proxy/current ]; then
+            sudo ln -s releases/native-contract /opt/rtsp-proxy/current
+          fi
           sudo systemctl daemon-reload
-          sudo systemd-analyze verify /etc/systemd/system/rtsp-proxy-media@.service
+          sudo systemd-analyze verify \
+            /etc/systemd/system/rtsp-proxy-nftables.service \
+            /etc/systemd/system/rtsp-proxy-media@.service
+          sudo systemctl start rtsp-proxy-nftables.service
           sudo env \
             MEDIAMTX_BINARY="/opt/rtsp-proxy/releases/native-contract/bin/mediamtx" \
             RTSP_PULL_SERVER_BINARY="$PWD/tools/load/rtsp-pull-server" \
