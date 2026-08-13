@@ -146,6 +146,10 @@ def test_csrf_role_scope_idle_absolute_and_revocation_fail_closed() -> None:
             csrf_token="wrong",
             require_csrf=True,
         )
+    assert tuple(event.reason_code for event in store.request_security_events()) == (
+        "operator_permission_denied",
+        "operator_csrf_invalid",
+    )
 
     current = NOW + timedelta(minutes=31)
     with pytest.raises(OperatorAuthenticationRequired, match="operator_session_expired"):
@@ -157,6 +161,7 @@ def test_csrf_role_scope_idle_absolute_and_revocation_fail_closed() -> None:
     current = NOW
     revoked = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
     control.revoke(revoked.session_token)
+    assert store.request_security_events()[-1].event_type == "operator.session_logout"
     with pytest.raises(OperatorAuthenticationRequired, match="operator_session_revoked"):
         control.authenticate(
             session_token=revoked.session_token,
@@ -241,11 +246,26 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
                 "FROM operator_sessions"
             )
         ).one()
+        session_audit = connection.execute(
+            text(
+                "SELECT id, event_type, payload FROM audit_events "
+                "WHERE event_type = 'operator.session_issued'"
+            )
+        ).one()
+        session_outbox = connection.execute(
+            text(
+                "SELECT id, event_type, payload FROM outbox_messages "
+                "WHERE event_type = 'operator.session_issued'"
+            )
+        ).one()
     engine.dispose()
     assert row.token_sha256 != issued.session_token
     assert row.csrf_sha256 != issued.csrf_token
     assert row.idle_timeout == timedelta(minutes=30)
     assert row.absolute_timeout == timedelta(hours=12)
+    assert session_audit == session_outbox
+    assert session_audit.payload["account_id"] == str(ACCOUNT_ID)
+    assert session_audit.payload["mfa_verified"] is True
 
     reopened = PostgresOperatorSessionStore(postgres_database_url)
     principal = OperatorSessionControl(
@@ -322,15 +342,13 @@ def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:
 
     missing_csrf = client.delete("/api/v1/operator/session", headers=cookie)
     assert missing_csrf.status_code == 401
-    assert missing_csrf.json() == {
-        "detail": {"code": "operator_authentication_required"}
-    }
+    assert missing_csrf.json() == {"detail": {"code": "operator_authentication_required"}}
     logged_out = client.delete(
         "/api/v1/operator/session",
         headers={**cookie, "X-CSRF-Token": issued.csrf_token},
     )
     assert logged_out.status_code == 204
-    assert "__Host-rtsp_proxy_session=\"\"" in logged_out.headers["set-cookie"]
+    assert '__Host-rtsp_proxy_session=""' in logged_out.headers["set-cookie"]
     assert "Max-Age=0" in logged_out.headers["set-cookie"]
     assert "HttpOnly" in logged_out.headers["set-cookie"]
     assert "Secure" in logged_out.headers["set-cookie"]
@@ -396,9 +414,7 @@ def test_sixth_login_revokes_only_the_oldest_active_session(
     raw_tokens = tuple(chr(ord("a") + index) * 43 for index in range(12))
     control = OperatorSessionControl(store=store, token_factory=iter(raw_tokens).__next__)
 
-    issued = tuple(
-        control.issue(account_id=ACCOUNT_ID, mfa_verified=True) for _index in range(6)
-    )
+    issued = tuple(control.issue(account_id=ACCOUNT_ID, mfa_verified=True) for _index in range(6))
 
     with pytest.raises(OperatorAuthenticationRequired, match="operator_session_revoked"):
         control.authenticate(
@@ -452,9 +468,7 @@ def test_authorization_update_is_server_versioned_and_compare_and_swap(
     assert updated.authz_version == 2
     assert updated.roles == frozenset({OperatorRole.VIEWER})
     if isinstance(store, InMemoryOperatorSessionStore):
-        assert store.authorization_events() == (
-            store.authorization_events()[0],
-        )
+        assert store.authorization_events() == (store.authorization_events()[0],)
         event = store.authorization_events()[0]
         assert event.account_id == ACCOUNT_ID
         assert event.actor == MUTATION_CONTEXT.actor
@@ -502,18 +516,26 @@ def test_postgres_authorization_change_is_atomic_with_audit_and_outbox(
 
     engine = create_engine(postgres_database_url, hide_parameters=True)
     with engine.connect() as connection:
-        audit = connection.execute(
-            text(
-                "SELECT id, aggregate_revision, payload FROM audit_events "
-                "WHERE aggregate_type = 'operator_account'"
+        audit = (
+            connection.execute(
+                text(
+                    "SELECT id, aggregate_revision, payload FROM audit_events "
+                    "WHERE aggregate_type = 'operator_account'"
+                )
             )
-        ).mappings().one()
-        outbox = connection.execute(
-            text(
-                "SELECT id, aggregate_revision, payload FROM outbox_messages "
-                "WHERE aggregate_type = 'operator_account'"
+            .mappings()
+            .one()
+        )
+        outbox = (
+            connection.execute(
+                text(
+                    "SELECT id, aggregate_revision, payload FROM outbox_messages "
+                    "WHERE aggregate_type = 'operator_account'"
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     assert audit == outbox
     assert audit["aggregate_revision"] == updated.authz_version == 2
     assert audit["payload"] == {
@@ -579,18 +601,20 @@ def test_postgres_authorization_change_rolls_back_when_normative_append_fails(
 
     assert store.get_account(ACCOUNT_ID) == account
     with engine.connect() as connection:
-        assert connection.scalar(
-            text(
-                "SELECT count(*) FROM audit_events "
-                "WHERE aggregate_type = 'operator_account'"
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM audit_events WHERE aggregate_type = 'operator_account'")
             )
-        ) == 0
-        assert connection.scalar(
-            text(
-                "SELECT count(*) FROM outbox_messages "
-                "WHERE aggregate_type = 'operator_account'"
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM outbox_messages WHERE aggregate_type = 'operator_account'"
+                )
             )
-        ) == 0
+            == 0
+        )
     engine.dispose()
     store.close()
 
@@ -658,9 +682,7 @@ def test_concurrent_authorization_updates_have_one_monotonic_winner(
             return error
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = tuple(
-            executor.map(mutate, (OperatorRole.VIEWER, OperatorRole.ADMIN))
-        )
+        results = tuple(executor.map(mutate, (OperatorRole.VIEWER, OperatorRole.ADMIN)))
 
     winners = tuple(result for result in results if isinstance(result, OperatorAccount))
     conflicts = tuple(result for result in results if isinstance(result, OperatorConflict))
@@ -808,8 +830,6 @@ def test_logout_normalizes_authoritative_store_outage_to_retryable_503() -> None
     )
 
     assert response.status_code == 503
-    assert response.json() == {
-        "detail": {"code": "operator_session_unavailable"}
-    }
+    assert response.json() == {"detail": {"code": "operator_session_unavailable"}}
     assert response.headers["retry-after"] == "1"
     assert response.headers["cache-control"] == "no-store"

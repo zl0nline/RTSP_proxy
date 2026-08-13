@@ -11,11 +11,14 @@ requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }
 dependencies = [
   "alembic>=1.16,<2",
+  "anyio>=4,<5",
   "fastapi>=0.116,<1",
   "pydantic-settings>=2.10,<3",
   "psycopg[binary]>=3.2,<4",
   "sqlalchemy>=2.0,<3",
   "uvicorn>=0.35,<1",
+  "joserfc>=1.7,<2",
+  "cryptography>=50,<51",
 ]
 
 [project.scripts]
@@ -28,6 +31,7 @@ rtsp-proxy-migrate = "rtsp_proxy.migrate:run_migrations"
 rtsp-proxy-node-helper = "rtsp_proxy.node_runtime:run_node_runtime_helper"
 rtsp-proxy-nft-reconcile = "rtsp_proxy.nft_reconcile:main"
 rtsp-proxy-phase-d-transition = "rtsp_proxy.phase_d_transition:main"
+rtsp-proxy-break-glass = "rtsp_proxy.break_glass_cli:main"
 
 [dependency-groups]
 dev = [

@@ -936,12 +936,15 @@ green. The exact evidence boundary is recorded in
 Status: **IN PROGRESS**. The bounded collector, generation-bound per-path
 metrics, persisted fleet snapshot API, incident state machine, durable SMTP
 dispatcher, digest-only PostgreSQL operator sessions, authoritative
-`authz_version` fencing and CSRF/RBAC HTTP boundary are implemented locally and
-await independent review/native CI. OIDC/break-glass activation and browser UI
-remain pending. No Phase-F completion claim is made yet.
+`authz_version` fencing, CSRF/RBAC HTTP boundary, browser-bound OIDC Code+PKCE
+with exact MFA claims, and durable break-glass TOTP audit/email admission are
+implemented locally. Live OIDC discovery/claims compatibility is polled through
+bounded readiness and emits one durable failure/recovery alert per transition.
+This slice awaits independent review/native CI. Browser UI and the operator
+rotation drill remain pending. No Phase-F completion claim is made yet.
 
 - [ ] node/camera pages and actions;
-- [~] RBAC/CSRF/session foundation (OIDC/break-glass and security audit pending);
+- [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

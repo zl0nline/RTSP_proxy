@@ -14,11 +14,12 @@ instance, один внешний RTSP port и не более 100 зареги�
 > - Node registry/placement, isolated per-node Linux runtime, Phase-D
 >   administration and Phase-E access/security: **complete on native
 >   amd64/arm64 CI**.
-> - Phase-F observability and operator-session foundation: **implemented locally, review/CI
+> - Phase-F observability and operator-auth foundation: **implemented locally, review/CI
 >   pending** — bounded fleet collector, persisted dashboard snapshot API and
 >   durable failure/recovery email dispatcher, plus digest-only PostgreSQL
->   sessions, RBAC version fencing and CSRF boundary. OIDC/break-glass login,
->   operator UI and browser workflows remain pending.
+>   sessions, RBAC version fencing, CSRF boundary, browser-bound OIDC Code+PKCE
+>   and audited break-glass password+TOTP login. Operator UI, browser E2E and
+>   the break-glass rotation drill remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -283,12 +284,12 @@ policy, preflights every restored listener before writing desired state and
 preserves stable RUNNING/STOPPED/DRAINING/MAINTENANCE/FAILED intent. Transitional
 node states cannot be exported. It is not exposed over HTTP.
 
-Ещё не реализованы OIDC/break-glass login, operator dashboard UI и complete
-browser workflows. Digest-only PostgreSQL sessions, authoritative RBAC version
-fencing, CSRF boundary, fleet snapshot API и durable notifications уже входят
-в Phase-F foundation, но до независимого review и native CI не считаются
-завершённой фазой. Наличие load harness и зелёного Phase-E CI не означает
-готовый product или published capacity.
+OIDC Code+PKCE с MFA claim contract и break-glass password+TOTP login уже
+реализованы локально вместе с durable audit/email каждого emergency-login.
+Operator dashboard UI, complete browser workflows и rotation drill ещё не
+реализованы. Эта Phase-F foundation до независимого review и native CI не
+считается завершённой фазой. Наличие load harness и зелёного Phase-E CI не
+означает готовый product или published capacity.
 
 ## Локальная разработка
 

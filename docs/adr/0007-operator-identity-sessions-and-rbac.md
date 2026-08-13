@@ -17,8 +17,12 @@ normal authentication mechanism.
 ## Decision
 
 - Production login uses OIDC authorization code flow with PKCE. The IdP must
-  report MFA in a configured `acr`/`amr` contract before a browser session is
+  report MFA in a configured exact `acr`/`amr` contract before a browser session is
   issued. SAML is not implemented in the initial release.
+- Authorization state is additionally bound to a short-lived
+  `Secure`/`HttpOnly` browser flow cookie whose digest is stored with the
+  one-time flow. State copied from another browser is rejected before token
+  exchange.
 - A separate local break-glass identity is allowed only with the
   `break_glass` role, mandatory TOTP MFA, an operator-owned rotation runbook and
   a durable alert for every successful or failed use.
@@ -45,6 +49,15 @@ normal authentication mechanism.
 - Health endpoints remain available to local service supervision. The entire
   `/api/v1` control surface is protected when operator authentication is
   activated; partial per-route activation is forbidden.
+- Unauthenticated login paths have bounded concurrency, durable per-IP and
+  per-account progressive limits, bounded active OIDC flows, and expired-flow
+  cleanup. The OIDC account key is a digest of the canonical issuer + subject,
+  not `sub` alone.
+- Startup and periodic readiness validate the live discovery contract used by
+  claim mapping (issuer/endpoints, Code+PKCE, RS256 and required identity/MFA
+  claims). A single writer owns those bounded probes; HTTP readiness reads its
+  synchronized cached state and never starts provider work. Health transitions
+  enqueue one durable failure/recovery alert.
 
 ## Consequences
 
@@ -78,16 +91,17 @@ node lifecycle pool.
 
 - [x] Opaque digest-only session, CSRF, idle/absolute expiry and parallel-request tests
 - [x] PostgreSQL restart persistence and authoritative downgrade fence test
-- [ ] OIDC PKCE/MFA/claim-drift and IdP outage contract tests
-- [ ] Break-glass TOTP, alert, rate-limit and rotation drill
+- [x] OIDC PKCE/browser binding/MFA/claim-drift and IdP outage contract tests
+- [~] Break-glass TOTP, safe provisioning CLI, durable alert and rate-limit
+  contract (operator rotation drill pending)
 - [ ] Full API negative RBAC/scope/no-oracle matrix
 - [ ] Browser cookie/security-header/leak and accessibility E2E
 
 ## Rollout and rollback
 
-Application release `0.4.0` first runs against `0011_observability`; then the
-additive `0012_operator_sessions` migration is applied. Operator auth is enabled
-only after OIDC discovery/JWKS and break-glass readiness both pass. Rollback
-before migration returns to `0.3.0`. After migration, `0.3.0` is no longer
-schema-compatible; rollback uses a rebuilt `0.4.x` that understands 0012 rather
-than an older binary.
+Application release `0.5.0` first runs against `0012_operator_sessions`; then
+the additive `0013_operator_login` migration is applied. Operator auth is
+enabled only after pinned JWKS/group mapping and break-glass readiness both
+pass. Rollback before migration returns to `0.4.0`. After migration, `0.4.0` is
+no longer schema-compatible; rollback uses a rebuilt `0.5.x` that understands
+0013 rather than an older binary.

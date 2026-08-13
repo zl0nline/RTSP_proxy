@@ -101,9 +101,7 @@ class NodeMetricSample:
             self.path_counters
         ):
             raise ValueError("path_metric_counters_invalid")
-        if len({counter.public_id for counter in self.path_counters}) != len(
-            self.path_counters
-        ):
+        if len({counter.public_id for counter in self.path_counters}) != len(self.path_counters):
             raise ValueError("path_metric_counters_invalid")
         if self.path_counters and (
             sum(counter.received_bytes_total for counter in self.path_counters)
@@ -197,8 +195,27 @@ class NotificationMessage:
     failure_delivery_outcome: NotificationStatus | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class OperatorSecurityAlert:
+    id: UUID
+    account_id: UUID
+    event_type: str
+    outcome: str
+    reason_code: str
+    status: NotificationStatus
+    attempts: int
+    available_at: datetime
+    claim_token: UUID | None = None
+    claimed_at: datetime | None = None
+    last_error_code: str | None = None
+
+
 class NotificationTransport(Protocol):
     def send(self, message: NotificationMessage) -> None: ...
+
+
+class OperatorSecurityAlertTransport(Protocol):
+    def send(self, message: OperatorSecurityAlert) -> None: ...
 
 
 class NotificationDeliveryAmbiguous(RuntimeError):
@@ -279,7 +296,7 @@ class SmtpNotificationTransport:
         )
         self._monotonic = monotonic_clock
 
-    def send(self, message: NotificationMessage) -> None:
+    def send(self, message: NotificationMessage | OperatorSecurityAlert) -> None:
         password = _read_smtp_password(
             self._password_file,
             trusted_owner_uid=self._trusted_password_owner_uid,
@@ -287,31 +304,47 @@ class SmtpNotificationTransport:
         email = EmailMessage()
         email["From"] = self._from_address
         email["To"] = self._to_address
-        email["Subject"] = (
-            "RTSP Proxy: node failure"
-            if message.kind is NotificationKind.FAILURE
-            else "RTSP Proxy: node recovered"
-        )
-        email["Message-ID"] = (
-            f"<node-incident.{message.incident_id}.{message.kind.value}@rtsp-proxy>"
-        )
-        email["X-RTSP-Proxy-Dedupe-Key"] = message.dedupe_key
-        failure_outcome = (
-            "unknown"
-            if message.failure_delivery_outcome is None
-            else message.failure_delivery_outcome.value
-        )
-        email.set_content(
-            "RTSP Proxy node incident\n"
-            f"node_id: {message.node_id}\n"
-            f"event: {message.kind.value}\n"
-            f"incident_id: {message.incident_id}\n"
-            + (
-                ""
-                if message.kind is NotificationKind.FAILURE
-                else f"failure_delivery: {failure_outcome}\n"
+        if isinstance(message, OperatorSecurityAlert):
+            email["Subject"] = (
+                "RTSP Proxy: break-glass authentication attempt"
+                if message.event_type == "operator.break_glass_login"
+                else "RTSP Proxy: OIDC claim contract changed"
             )
-        )
+            email["Message-ID"] = f"<operator-security.{message.id}@rtsp-proxy>"
+            email["X-RTSP-Proxy-Dedupe-Key"] = f"operator-security:{message.id}"
+            email.set_content(
+                "RTSP Proxy security alert\n"
+                f"event: {message.event_type}\n"
+                f"account_id: {message.account_id}\n"
+                f"outcome: {message.outcome}\n"
+                f"reason_code: {message.reason_code}\n"
+            )
+        else:
+            email["Subject"] = (
+                "RTSP Proxy: node failure"
+                if message.kind is NotificationKind.FAILURE
+                else "RTSP Proxy: node recovered"
+            )
+            email["Message-ID"] = (
+                f"<node-incident.{message.incident_id}.{message.kind.value}@rtsp-proxy>"
+            )
+            email["X-RTSP-Proxy-Dedupe-Key"] = message.dedupe_key
+            failure_outcome = (
+                "unknown"
+                if message.failure_delivery_outcome is None
+                else message.failure_delivery_outcome.value
+            )
+            email.set_content(
+                "RTSP Proxy node incident\n"
+                f"node_id: {message.node_id}\n"
+                f"event: {message.kind.value}\n"
+                f"incident_id: {message.incident_id}\n"
+                + (
+                    ""
+                    if message.kind is NotificationKind.FAILURE
+                    else f"failure_delivery: {failure_outcome}\n"
+                )
+            )
         tls_context = ssl.create_default_context(
             cafile=(None if self._ca_file is None else str(self._ca_file))
         )
@@ -338,9 +371,7 @@ class SmtpNotificationTransport:
                 self._apply_timeout(client, deadline)
                 recipient_code, recipient_response = client.rcpt(self._to_address)
                 if not 200 <= recipient_code < 300:
-                    raise smtplib.SMTPResponseException(
-                        recipient_code, recipient_response
-                    )
+                    raise smtplib.SMTPResponseException(recipient_code, recipient_response)
                 self._apply_timeout(client, deadline)
                 data_ready_code, data_ready_response = client.docmd("DATA")
                 if data_ready_code != 354:
@@ -531,6 +562,77 @@ class NotificationDispatcher:
         )
 
 
+class OperatorSecurityAlertStore(Protocol):
+    def claim_security_alert(
+        self,
+        *,
+        now: datetime,
+        lease_timeout: timedelta,
+    ) -> OperatorSecurityAlert | None: ...
+
+    def complete_security_alert(
+        self,
+        alert_id: UUID,
+        *,
+        claim_token: UUID,
+        succeeded: bool,
+        completed_at: datetime,
+        max_attempts: int,
+        retry_delay: timedelta,
+        delivery_ambiguous: bool,
+    ) -> OperatorSecurityAlert: ...
+
+
+class OperatorSecurityAlertDispatcher:
+    def __init__(
+        self,
+        *,
+        store: OperatorSecurityAlertStore,
+        transport: OperatorSecurityAlertTransport,
+        max_attempts: int = 3,
+        retry_delay: timedelta = timedelta(minutes=1),
+        lease_timeout: timedelta = timedelta(minutes=2),
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if not 1 <= max_attempts <= 10:
+            raise ValueError("notification_max_attempts_invalid")
+        self._store = store
+        self._transport = transport
+        self._max_attempts = max_attempts
+        self._retry_delay = retry_delay
+        self._lease_timeout = lease_timeout
+        self._clock = clock
+
+    def run_once(self) -> OperatorSecurityAlert | None:
+        alert = self._store.claim_security_alert(
+            now=self._clock(),
+            lease_timeout=self._lease_timeout,
+        )
+        if alert is None:
+            return None
+        if alert.claim_token is None:
+            raise ValueError("notification_claim_invalid")
+        ambiguous = False
+        try:
+            self._transport.send(alert)
+        except NotificationDeliveryAmbiguous:
+            ambiguous = True
+            succeeded = False
+        except Exception:
+            succeeded = False
+        else:
+            succeeded = True
+        return self._store.complete_security_alert(
+            alert.id,
+            claim_token=alert.claim_token,
+            succeeded=succeeded,
+            completed_at=self._clock(),
+            max_attempts=self._max_attempts,
+            retry_delay=self._retry_delay,
+            delivery_ambiguous=ambiguous,
+        )
+
+
 class FleetCollector:
     def __init__(
         self,
@@ -572,9 +674,7 @@ class FleetCollector:
         self._monotonic_clock = monotonic_clock
         self._collection_interval_seconds = collection_interval_seconds
         self._cycle_timeout_seconds = (
-            collection_interval_seconds
-            if cycle_timeout_seconds is None
-            else cycle_timeout_seconds
+            collection_interval_seconds if cycle_timeout_seconds is None else cycle_timeout_seconds
         )
         self._metric_history: dict[
             UUID,
@@ -732,9 +832,8 @@ class FleetCollector:
             elapsed = observed_monotonic - previous[1]
             received_delta = metric_sample.received_bytes_total - previous[3].received_bytes_total
             sent_delta = metric_sample.sent_bytes_total - previous[3].sent_bytes_total
-            counters_reset = (
-                previous[0] != _node_process_generation(node)
-                or _path_counters_reset(previous[3], metric_sample)
+            counters_reset = previous[0] != _node_process_generation(node) or _path_counters_reset(
+                previous[3], metric_sample
             )
             if elapsed > self._collection_interval_seconds * 2:
                 return self._node_snapshot(
@@ -831,17 +930,12 @@ class InMemoryObservabilityStore:
     ) -> NotificationIncident | None:
         with self._lock:
             latest = next(
-                (
-                    incident
-                    for incident in reversed(self._incidents)
-                    if incident.node_id == node.id
-                ),
+                (incident for incident in reversed(self._incidents) if incident.node_id == node.id),
                 None,
             )
             failed = node.runtime_state is NodeState.FAILED
             recovered = (
-                node.runtime_state is NodeState.RUNNING
-                and node.health is NodeHealth.HEALTHY
+                node.runtime_state is NodeState.RUNNING and node.health is NodeHealth.HEALTHY
             )
             if failed:
                 if latest is not None and latest.state is IncidentState.OPEN:
@@ -904,8 +998,7 @@ class InMemoryObservabilityStore:
                 message.incident_id
                 for message in self._notifications
                 if message.kind is NotificationKind.FAILURE
-                and message.status
-                in {NotificationStatus.SENT, NotificationStatus.FAILED_FINAL}
+                and message.status in {NotificationStatus.SENT, NotificationStatus.FAILED_FINAL}
             }
             for index, message in enumerate(self._notifications):
                 due = message.status is NotificationStatus.PENDING and message.available_at <= now
@@ -1010,11 +1103,7 @@ class InMemoryObservabilityStore:
 
     def _close_incident_if_complete(self, incident_id: UUID, completed_at: datetime) -> None:
         incident_index = next(
-            (
-                index
-                for index, incident in enumerate(self._incidents)
-                if incident.id == incident_id
-            ),
+            (index for index, incident in enumerate(self._incidents) if incident.id == incident_id),
             None,
         )
         if (
@@ -1070,9 +1159,7 @@ class PostgresObservabilityStore:
             database_url,
             pool_pre_ping=True,
             hide_parameters=True,
-            pool_timeout=(
-                30 if statement_timeout_ms is None else statement_timeout_ms / 1000
-            ),
+            pool_timeout=(30 if statement_timeout_ms is None else statement_timeout_ms / 1000),
             connect_args=connect_args,
         )
 
@@ -1095,12 +1182,13 @@ class PostgresObservabilityStore:
                     "timestamp with time zone,jsonb)', 'EXECUTE')"
                 )
             ).one()
-            if not all(capabilities) or connection.scalar(
-                text("SELECT rtsp_proxy_collector_ready()")
-            ) is not True:
+            if (
+                not all(capabilities)
+                or connection.scalar(text("SELECT rtsp_proxy_collector_ready()")) is not True
+            ):
                 raise RuntimeError("collector_capability_unavailable")
 
-    def assert_notification_ready(self) -> None:
+    def assert_notification_ready(self, *, require_security_alerts: bool = True) -> None:
         with self._engine.connect() as connection:
             capabilities = connection.execute(
                 text(
@@ -1115,10 +1203,86 @@ class PostgresObservabilityStore:
                     "timestamp with time zone,integer,interval,boolean)', 'EXECUTE')"
                 )
             ).one()
-            if not all(capabilities) or connection.scalar(
-                text("SELECT rtsp_proxy_notifier_ready()")
-            ) is not True:
+            if (
+                not all(capabilities)
+                or connection.scalar(text("SELECT rtsp_proxy_notifier_ready()")) is not True
+            ):
                 raise RuntimeError("notification_capability_unavailable")
+            if not require_security_alerts:
+                return
+            security_capabilities = connection.execute(
+                text(
+                    "SELECT "
+                    "has_function_privilege(session_user, "
+                    "'public.rtsp_proxy_security_alert_ready()', 'EXECUTE'), "
+                    "has_function_privilege(session_user, "
+                    "'public.rtsp_proxy_security_alert_claim(timestamp with time zone,"
+                    "timestamp with time zone,uuid)', 'EXECUTE'), "
+                    "has_function_privilege(session_user, "
+                    "'public.rtsp_proxy_security_alert_complete(uuid,uuid,boolean,"
+                    "timestamp with time zone,integer,interval,boolean)', 'EXECUTE')"
+                )
+            ).one()
+            if (
+                not all(security_capabilities)
+                or connection.scalar(text("SELECT rtsp_proxy_security_alert_ready()")) is not True
+            ):
+                raise RuntimeError("security_alert_capability_unavailable")
+
+    def claim_security_alert(
+        self,
+        *,
+        now: datetime,
+        lease_timeout: timedelta,
+    ) -> OperatorSecurityAlert | None:
+        with self._engine.begin() as connection:
+            expired_at = now - lease_timeout
+            claim_token = uuid4()
+            row = (
+                connection.execute(
+                    text("SELECT * FROM rtsp_proxy_security_alert_claim(:now, :expired, :token)"),
+                    {"now": now, "expired": expired_at, "token": claim_token},
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return None if row is None else _security_alert_from_row(row)
+
+    def complete_security_alert(
+        self,
+        alert_id: UUID,
+        *,
+        claim_token: UUID,
+        succeeded: bool,
+        completed_at: datetime,
+        max_attempts: int,
+        retry_delay: timedelta,
+        delivery_ambiguous: bool,
+    ) -> OperatorSecurityAlert:
+        with self._engine.begin() as connection:
+            row = (
+                connection.execute(
+                    text(
+                        "SELECT * FROM rtsp_proxy_security_alert_complete("
+                        ":id, :token, :succeeded, :completed, :max_attempts, "
+                        ":retry_delay, :ambiguous)"
+                    ),
+                    {
+                        "id": alert_id,
+                        "token": claim_token,
+                        "succeeded": succeeded,
+                        "ambiguous": delivery_ambiguous,
+                        "max_attempts": max_attempts,
+                        "completed": completed_at,
+                        "retry_delay": retry_delay,
+                    },
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            raise ValueError("notification_not_claimed")
+        return _security_alert_from_row(row)
 
     def observe_incident(
         self,
@@ -1177,10 +1341,7 @@ class PostgresObservabilityStore:
             claim_token = uuid4()
             row = (
                 connection.execute(
-                    text(
-                        "SELECT * FROM rtsp_proxy_notifier_claim("
-                        ":now, :expired, :claim_token)"
-                    ),
+                    text("SELECT * FROM rtsp_proxy_notifier_claim(:now, :expired, :claim_token)"),
                     {
                         "now": now,
                         "expired": lease_expired_at,
@@ -1272,9 +1433,7 @@ class PostgresObservabilityStore:
                     scrape_status=NodeScrapeStatus(item["scrape_status"]),
                     scrape_reason=item["scrape_reason"],
                     metrics=(
-                        None
-                        if item["metrics"] is None
-                        else NodeMetricSample(**item["metrics"])
+                        None if item["metrics"] is None else NodeMetricSample(**item["metrics"])
                     ),
                     metric_observed_at=(
                         None
@@ -1304,11 +1463,7 @@ def _notification(
     incident: NotificationIncident,
     kind: NotificationKind,
 ) -> NotificationMessage:
-    available_at = (
-        incident.opened_at
-        if kind is NotificationKind.FAILURE
-        else incident.recovered_at
-    )
+    available_at = incident.opened_at if kind is NotificationKind.FAILURE else incident.recovered_at
     if available_at is None:
         raise ValueError("notification_timestamp_missing")
     return NotificationMessage(
@@ -1376,6 +1531,22 @@ def _notification_from_row(row: RowMapping) -> NotificationMessage:
     )
 
 
+def _security_alert_from_row(row: RowMapping) -> OperatorSecurityAlert:
+    return OperatorSecurityAlert(
+        id=row["id"],
+        account_id=row["account_id"],
+        event_type=row["event_type"],
+        outcome=row["outcome"],
+        reason_code=row["reason_code"],
+        status=NotificationStatus(row["status"]),
+        attempts=row["attempts"],
+        available_at=row["available_at"],
+        claim_token=row.get("claim_token"),
+        claimed_at=row.get("claimed_at"),
+        last_error_code=row.get("last_error_code"),
+    )
+
+
 def _snapshot_payload(snapshot: FleetSnapshot) -> dict[str, object]:
     payload = asdict(snapshot)
     payload["generated_at"] = snapshot.generated_at.isoformat()
@@ -1418,13 +1589,9 @@ def parse_mediamtx_path_metrics(payload: bytes) -> NodeMetricSample:
                     raise ValueError
                 continue
             label_pairs = _METRIC_LABEL.findall(raw_labels)
-            labels = {
-                key.decode("ascii"): label.decode("ascii")
-                for key, label in label_pairs
-            }
+            labels = {key.decode("ascii"): label.decode("ascii") for key, label in label_pairs}
             if b",".join(
-                b'%s="%s"' % (key, label)
-                for key, label in label_pairs
+                b'%s="%s"' % (key, label) for key, label in label_pairs
             ) != raw_labels or len(labels) != len(label_pairs):
                 raise ValueError
             public_id = PublicId.parse(labels["name"])

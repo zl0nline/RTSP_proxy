@@ -61,9 +61,7 @@ _ROLE_PERMISSIONS: dict[OperatorRole, frozenset[OperatorPermission]] = {
 }
 
 MAX_AUTHZ_VERSION = (1 << 63) - 1
-_SCOPE_PATTERN = re.compile(
-    r"^(?:server:\*|(?:group|camera):[A-Za-z0-9][A-Za-z0-9._-]{0,127})$"
-)
+_SCOPE_PATTERN = re.compile(r"^(?:server:\*|(?:group|camera):[A-Za-z0-9][A-Za-z0-9._-]{0,127})$")
 
 
 class OperatorAuthenticationRequired(RuntimeError):
@@ -106,6 +104,14 @@ class OperatorAuthorizationEvent:
     scopes: frozenset[str]
     enabled: bool
     authz_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorRequestSecurityEvent:
+    account_id: UUID
+    session_id: UUID
+    event_type: str
+    reason_code: str
 
 
 class OperatorSessionFailure(StrEnum):
@@ -254,6 +260,16 @@ class OperatorSessionStore(Protocol):
 
     def revoke_session(self, token_sha256: str) -> bool: ...
 
+    def record_request_security_event(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        authz_version: int,
+        event_type: str,
+        reason_code: str,
+    ) -> None: ...
+
 
 class InMemoryOperatorSessionStore:
     def __init__(
@@ -265,6 +281,7 @@ class InMemoryOperatorSessionStore:
         self._accounts = {account.id: account for account in accounts}
         self._sessions: dict[UUID, OperatorSession] = {}
         self._authorization_events: list[OperatorAuthorizationEvent] = []
+        self._request_security_events: list[OperatorRequestSecurityEvent] = []
         self._lock = RLock()
         self._clock = clock
 
@@ -306,9 +323,7 @@ class InMemoryOperatorSessionStore:
                 enabled=enabled,
             )
             self._accounts[account_id] = updated
-            self._authorization_events.append(
-                _authorization_event(updated, context=context)
-            )
+            self._authorization_events.append(_authorization_event(updated, context=context))
             return updated
 
     def authorization_events(self) -> tuple[OperatorAuthorizationEvent, ...]:
@@ -330,10 +345,7 @@ class InMemoryOperatorSessionStore:
             account = self._accounts.get(account_id)
             if account is None or not account.enabled:
                 raise OperatorAuthenticationRequired("operator_account_unavailable")
-            if any(
-                existing.token_sha256 == token_sha256
-                for existing in self._sessions.values()
-            ):
+            if any(existing.token_sha256 == token_sha256 for existing in self._sessions.values()):
                 raise ValueError("operator_session_token_conflict")
             issued_at = self._now()
             session = OperatorSession(
@@ -418,7 +430,39 @@ class InMemoryOperatorSessionStore:
             if session is None or session.revoked_at is not None:
                 return False
             self._sessions[session.id] = replace(session, revoked_at=self._now())
+            self._request_security_events.append(
+                OperatorRequestSecurityEvent(
+                    account_id=session.account_id,
+                    session_id=session.id,
+                    event_type="operator.session_logout",
+                    reason_code="operator_initiated",
+                )
+            )
             return True
+
+    def record_request_security_event(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        authz_version: int,
+        event_type: str,
+        reason_code: str,
+    ) -> None:
+        del authz_version
+        with self._lock:
+            self._request_security_events.append(
+                OperatorRequestSecurityEvent(
+                    account_id=account_id,
+                    session_id=session_id,
+                    event_type=event_type,
+                    reason_code=reason_code,
+                )
+            )
+
+    def request_security_events(self) -> tuple[OperatorRequestSecurityEvent, ...]:
+        with self._lock:
+            return tuple(self._request_security_events)
 
     def _evaluate(
         self,
@@ -459,6 +503,8 @@ class PostgresOperatorSessionStore:
             database_url,
             pool_pre_ping=True,
             hide_parameters=True,
+            pool_size=1,
+            max_overflow=0,
             pool_timeout=statement_timeout_ms / 1000,
             connect_args={
                 "connect_timeout": max(1, math.ceil(statement_timeout_ms / 1000)),
@@ -468,6 +514,14 @@ class PostgresOperatorSessionStore:
 
     def close(self) -> None:
         self._engine.dispose()
+
+    def assert_ready(self) -> None:
+        try:
+            with self._engine.connect() as connection:
+                connection.execute(text("SELECT id FROM operator_accounts LIMIT 0"))
+                connection.execute(text("SELECT id FROM operator_sessions LIMIT 0"))
+        except SQLAlchemyError:
+            raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
 
     def get_account(self, account_id: UUID) -> OperatorAccount | None:
         try:
@@ -654,6 +708,13 @@ class PostgresOperatorSessionStore:
                     ),
                     {"account_id": account_id, "new_session_id": session_id},
                 )
+                _record_session_issued_event(
+                    connection,
+                    account_id=account_id,
+                    session_id=session_id,
+                    authz_version=int(row["authz_version"]),
+                    mfa_verified=mfa_verified,
+                )
         except OperatorAuthenticationRequired:
             raise
         except SQLAlchemyError:
@@ -732,25 +793,67 @@ class PostgresOperatorSessionStore:
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
         latest = self.read_session(token_sha256)
-        return OperatorSessionFailure.CHANGED if not isinstance(
-            latest,
-            OperatorSessionFailure,
-        ) else latest
+        return (
+            OperatorSessionFailure.CHANGED
+            if not isinstance(
+                latest,
+                OperatorSessionFailure,
+            )
+            else latest
+        )
 
     def revoke_session(self, token_sha256: str) -> bool:
         try:
             with self._engine.begin() as connection:
                 connection.execute(text("SET LOCAL synchronous_commit = on"))
-                return (
+                row = (
                     connection.execute(
                         text(
-                            "UPDATE operator_sessions SET revoked_at = clock_timestamp() "
-                            "WHERE token_sha256 = :token_sha256 AND revoked_at IS NULL "
-                            "RETURNING id"
+                            "UPDATE operator_sessions AS session SET "
+                            "revoked_at = clock_timestamp() FROM operator_accounts AS account "
+                            "WHERE session.token_sha256 = :token_sha256 "
+                            "AND session.revoked_at IS NULL "
+                            "AND account.id = session.account_id RETURNING session.id, "
+                            "session.account_id, account.authz_version"
                         ),
                         {"token_sha256": token_sha256},
-                    ).one_or_none()
-                    is not None
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    return False
+                _record_request_security_event(
+                    connection,
+                    account_id=row["account_id"],
+                    session_id=row["id"],
+                    authz_version=row["authz_version"],
+                    event_type="operator.session_logout",
+                    reason_code="operator_initiated",
+                )
+                return True
+        except SQLAlchemyError:
+            raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
+
+    def record_request_security_event(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        authz_version: int,
+        event_type: str,
+        reason_code: str,
+    ) -> None:
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                _record_request_security_event(
+                    connection,
+                    account_id=account_id,
+                    session_id=session_id,
+                    authz_version=authz_version,
+                    event_type=event_type,
+                    reason_code=reason_code,
                 )
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
@@ -812,9 +915,9 @@ class OperatorSessionControl:
         session = authentication.session
         account = authentication.account
         if require_csrf and (
-            csrf_token is None
-            or not hmac.compare_digest(session.csrf_sha256, _digest(csrf_token))
+            csrf_token is None or not hmac.compare_digest(session.csrf_sha256, _digest(csrf_token))
         ):
+            self._record_denial(authentication, "operator_csrf_invalid")
             raise OperatorAuthenticationRequired("operator_csrf_invalid")
         allowed = frozenset(
             permission_value
@@ -822,8 +925,10 @@ class OperatorSessionControl:
             for permission_value in _ROLE_PERMISSIONS[role]
         )
         if permission not in allowed:
+            self._record_denial(authentication, "operator_permission_denied")
             raise OperatorAuthorizationDenied("operator_permission_denied")
         if required_scope not in account.scopes:
+            self._record_denial(authentication, "operator_scope_denied")
             raise OperatorAuthorizationDenied("operator_scope_denied")
         touched = self._store.touch_authorized_session(
             session.id,
@@ -850,11 +955,25 @@ class OperatorSessionControl:
         if not self._store.revoke_session(_digest(session_token)):
             raise OperatorAuthenticationRequired("operator_session_invalid")
 
+    def _record_denial(
+        self,
+        authentication: AuthenticatedOperatorSession,
+        reason_code: str,
+    ) -> None:
+        self._store.record_request_security_event(
+            account_id=authentication.account.id,
+            session_id=authentication.session.id,
+            authz_version=authentication.account.authz_version,
+            event_type="operator.authorization_denied",
+            reason_code=reason_code,
+        )
+
     def _token(self) -> str:
         token = self._token_factory()
         if not isinstance(token, str) or len(token) < 43 or len(token) > 1024:
             raise ValueError("operator_session_token_invalid")
         return token
+
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -917,6 +1036,92 @@ def _record_authorization_event(
     )
     connection.execute(audit_statement, parameters)
     connection.execute(outbox_statement, parameters)
+
+
+def _record_session_issued_event(
+    connection: Connection,
+    *,
+    account_id: UUID,
+    session_id: UUID,
+    authz_version: int,
+    mfa_verified: bool,
+) -> None:
+    payload = json.dumps(
+        {
+            "account_id": str(account_id),
+            "mfa_verified": mfa_verified,
+            "outcome": "accepted",
+            "session_id": str(session_id),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account_id,
+        "aggregate_revision": authz_version,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, "
+                "'operator.session_issued', :aggregate_revision, CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
+
+
+def _record_request_security_event(
+    connection: Connection,
+    *,
+    account_id: UUID,
+    session_id: UUID,
+    authz_version: int,
+    event_type: str,
+    reason_code: str,
+) -> None:
+    if event_type not in {
+        "operator.session_logout",
+        "operator.authorization_denied",
+    } or reason_code not in {
+        "operator_initiated",
+        "operator_csrf_invalid",
+        "operator_permission_denied",
+        "operator_scope_denied",
+    }:
+        raise ValueError("operator_security_event_invalid")
+    payload = json.dumps(
+        {
+            "account_id": str(account_id),
+            "outcome": "accepted" if event_type.endswith("logout") else "rejected",
+            "reason_code": reason_code,
+            "session_id": str(session_id),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account_id,
+        "event_type": event_type,
+        "aggregate_revision": authz_version,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, :event_type, "
+                ":aggregate_revision, CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
 
 
 def _account_from_row(row: RowMapping) -> OperatorAccount:

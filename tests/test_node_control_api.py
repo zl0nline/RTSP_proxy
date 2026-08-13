@@ -105,9 +105,7 @@ def test_operator_can_register_a_node_with_an_automatically_allocated_port() -> 
     response = TestClient(app).post("/api/v1/nodes", json={"name": "media-a"})
 
     assert response.status_code == 201
-    assert response.headers["location"] == (
-        "/api/v1/nodes/00000000-0000-0000-0000-000000000001"
-    )
+    assert response.headers["location"] == ("/api/v1/nodes/00000000-0000-0000-0000-000000000001")
     assert response.json() == {
         "id": "00000000-0000-0000-0000-000000000001",
         "name": "media-a",
@@ -155,9 +153,7 @@ def test_node_creation_lock_contention_returns_one_reservation_for_later_start()
     response = client.post("/api/v1/nodes", json={"name": "busy"})
 
     assert response.status_code == 201
-    assert response.headers["location"] == (
-        "/api/v1/nodes/00000000-0000-0000-0000-000000000001"
-    )
+    assert response.headers["location"] == ("/api/v1/nodes/00000000-0000-0000-0000-000000000001")
     assert response.json()["state"] == "provisioning"
     assert len(store.list_nodes()) == 1
 
@@ -544,25 +540,25 @@ def test_operator_can_list_registered_nodes_through_the_control_api() -> None:
                 "id": "00000000-0000-0000-0000-000000000001",
                 "name": "media-a",
                 "external_port": 12000,
-                    "state": "provisioning",
-                    "runtime_state": "provisioning",
+                "state": "provisioning",
+                "runtime_state": "provisioning",
                 "health": "unknown",
-                    "registered_cameras": 0,
-                    "camera_capacity": 100,
-                    "desired_revision": 1,
-                    "applied_revision": 0,
+                "registered_cameras": 0,
+                "camera_capacity": 100,
+                "desired_revision": 1,
+                "applied_revision": 0,
             },
             {
                 "id": "00000000-0000-0000-0000-000000000002",
                 "name": "media-b",
                 "external_port": 12001,
-                    "state": "provisioning",
-                    "runtime_state": "provisioning",
+                "state": "provisioning",
+                "runtime_state": "provisioning",
                 "health": "unknown",
-                    "registered_cameras": 0,
-                    "camera_capacity": 100,
-                    "desired_revision": 1,
-                    "applied_revision": 0,
+                "registered_cameras": 0,
+                "camera_capacity": 100,
+                "desired_revision": 1,
+                "applied_revision": 0,
             },
         ],
         "count": 2,
@@ -582,9 +578,9 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             management_observed_at=observed_at,
-                config_compatible=True,
-                applied_revision=1,
-                registered_cameras=50,
+            config_compatible=True,
+            applied_revision=1,
+            registered_cameras=50,
             active_sources=2,
         ),
         MediaNode(
@@ -596,9 +592,9 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             management_observed_at=observed_at,
-                config_compatible=True,
-                applied_revision=1,
-                registered_cameras=10,
+            config_compatible=True,
+            applied_revision=1,
+            registered_cameras=10,
             active_sources=5,
         ),
         MediaNode(
@@ -610,9 +606,9 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
             health=NodeHealth.HEALTHY,
             management_fresh=True,
             management_observed_at=observed_at,
-                config_compatible=True,
-                applied_revision=1,
-                registered_cameras=10,
+            config_compatible=True,
+            applied_revision=1,
+            registered_cameras=10,
             active_sources=1,
         ),
     )
@@ -755,9 +751,9 @@ def test_automatic_placement_skips_maintenance_stale_or_incompatible_nodes() -> 
         health=NodeHealth.HEALTHY,
         management_fresh=True,
         management_observed_at=observed_at,
-            config_compatible=True,
-            applied_revision=1,
-            registered_cameras=10,
+        config_compatible=True,
+        applied_revision=1,
+        registered_cameras=10,
     )
     store = InMemoryNodeStore(nodes=(*blocked, target))
     client = TestClient(
@@ -795,9 +791,9 @@ def test_operator_can_place_a_camera_on_a_specific_eligible_node() -> None:
                 health=NodeHealth.HEALTHY,
                 management_fresh=True,
                 management_observed_at=observed_at,
-                    config_compatible=True,
-                    applied_revision=1,
-                    registered_cameras=40,
+                config_compatible=True,
+                applied_revision=1,
+                registered_cameras=40,
             ),
             MediaNode(
                 id=second_node_id,
@@ -808,9 +804,9 @@ def test_operator_can_place_a_camera_on_a_specific_eligible_node() -> None:
                 health=NodeHealth.HEALTHY,
                 management_fresh=True,
                 management_observed_at=observed_at,
-                    config_compatible=True,
-                    applied_revision=1,
-                    registered_cameras=1,
+                config_compatible=True,
+                applied_revision=1,
+                registered_cameras=1,
             ),
         )
     )
@@ -915,10 +911,13 @@ def test_camera_update_and_disable_are_revisioned_desired_state() -> None:
             camera_mutation_control=mutations,
         )
     )
-    assert client.post(
-        "/api/v1/cameras",
-        json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
-    ).status_code == 201
+    assert (
+        client.post(
+            "/api/v1/cameras",
+            json={"name": "entrance", "source_url": "rtsp://camera.local/main"},
+        ).status_code
+        == 201
+    )
 
     updated = client.put(
         f"/api/v1/cameras/{camera_id}",
@@ -1009,9 +1008,7 @@ def test_camera_move_preview_and_request_expose_desired_saga_state() -> None:
         f"/api/v1/cameras/{camera_id}/moves",
         json={"target_node_id": str(target_id), "force": False},
     )
-    status_response = client.get(
-        "/api/v1/camera-moves/30000000-0000-0000-0000-000000000001"
-    )
+    status_response = client.get("/api/v1/camera-moves/30000000-0000-0000-0000-000000000001")
 
     assert preview.status_code == 200
     assert preview.json()["occupied"] is False
@@ -1136,7 +1133,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_access_policies', 'camera_access_grants')"
             )
         )
-    assert revision == "0012_operator_sessions"
+    assert revision == "0013_operator_login"
     assert table_count == 6
 
 
@@ -1409,9 +1406,7 @@ def test_phase_d_transition_round_trip_preserves_camera_uuid_and_public_rtsp_pat
             {"id": camera_id, "public_id": public_id},
         )
         connection.execute(
-            text(
-                "INSERT INTO public_id_tombstones (public_id) VALUES (:public_id)"
-            ),
+            text("INSERT INTO public_id_tombstones (public_id) VALUES (:public_id)"),
             {"public_id": public_id},
         )
         connection.execute(
@@ -1452,9 +1447,7 @@ def test_phase_d_transition_round_trip_preserves_camera_uuid_and_public_rtsp_pat
     with engine.begin() as connection:
         database_name = str(connection.scalar(text("SELECT current_database()")))
         quoted_database = connection.dialect.identifier_preparer.quote(database_name)
-        connection.execute(
-            text(f"ALTER DATABASE {quoted_database} SET synchronous_commit = off")
-        )
+        connection.execute(text(f"ALTER DATABASE {quoted_database} SET synchronous_commit = off"))
         connection.execute(
             text(
                 "CREATE FUNCTION require_sync_transition() RETURNS trigger AS $$ "
@@ -1625,10 +1618,7 @@ def test_management_freshness_migration_fails_closed_until_a_new_observation(
 
     with engine.connect() as connection:
         observation = connection.execute(
-            text(
-                "SELECT management_fresh, management_observed_at "
-                "FROM media_nodes"
-            )
+            text("SELECT management_fresh, management_observed_at FROM media_nodes")
         ).one()
     assert observation == (False, None)
 
@@ -1656,7 +1646,7 @@ def test_new_control_plane_is_a_compatibility_bridge_for_previous_schema(
 ) -> None:
     migration = Config("alembic.ini")
     migration.set_main_option("sqlalchemy.url", postgres_database_url)
-    command.upgrade(migration, "0011_observability")
+    command.upgrade(migration, "0012_operator_sessions")
     monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
     monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
 
@@ -1742,18 +1732,26 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
     assert response.status_code == 201
     engine = create_engine(postgres_database_url)
     with engine.connect() as connection:
-        audit = connection.execute(
-            text(
-                "SELECT aggregate_id, event_type, payload "
-                "FROM audit_events ORDER BY occurred_at, id"
+        audit = (
+            connection.execute(
+                text(
+                    "SELECT aggregate_id, event_type, payload "
+                    "FROM audit_events ORDER BY occurred_at, id"
+                )
             )
-        ).mappings().one()
-        outbox = connection.execute(
-            text(
-                "SELECT aggregate_id, event_type, payload, status "
-                "FROM outbox_messages ORDER BY occurred_at, id"
+            .mappings()
+            .one()
+        )
+        outbox = (
+            connection.execute(
+                text(
+                    "SELECT aggregate_id, event_type, payload, status "
+                    "FROM outbox_messages ORDER BY occurred_at, id"
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         expected_payload = {
             "name": "audited",
             "external_port": 12000,
@@ -1809,18 +1807,26 @@ def test_node_start_commits_revisioned_desired_state_before_runtime_observation(
     assert response.json()["desired_revision"] == 2
     engine = create_engine(postgres_database_url)
     with engine.connect() as connection:
-        events = connection.execute(
-            text(
-                "SELECT event_type, aggregate_revision FROM audit_events "
-                "ORDER BY aggregate_revision"
+        events = (
+            connection.execute(
+                text(
+                    "SELECT event_type, aggregate_revision FROM audit_events "
+                    "ORDER BY aggregate_revision"
+                )
             )
-        ).tuples().all()
-        outbox = connection.execute(
-            text(
-                "SELECT event_type, aggregate_revision FROM outbox_messages "
-                "ORDER BY aggregate_revision"
+            .tuples()
+            .all()
+        )
+        outbox = (
+            connection.execute(
+                text(
+                    "SELECT event_type, aggregate_revision FROM outbox_messages "
+                    "ORDER BY aggregate_revision"
+                )
             )
-        ).tuples().all()
+            .tuples()
+            .all()
+        )
     assert events == [
         ("media_node.created", 1),
         ("media_node.desired_state_changed", 2),
@@ -1881,9 +1887,7 @@ def test_normative_mutation_forces_synchronous_durability(
                 """
             )
         )
-    asynchronous_default_url = (
-        postgres_database_url + "?options=-c%20synchronous_commit%3Doff"
-    )
+    asynchronous_default_url = postgres_database_url + "?options=-c%20synchronous_commit%3Doff"
     store = PostgresNodeStore(asynchronous_default_url)
     client = TestClient(
         create_app(
@@ -2102,13 +2106,17 @@ def test_postgresql_release_transition_is_revisioned_and_audited(
     assert updated.config_compatible is False
     engine = create_engine(postgres_database_url)
     with engine.connect() as connection:
-        event = connection.execute(
-            text(
-                "SELECT event_type, payload FROM audit_events "
-                "WHERE aggregate_id = :node_id AND event_type = :event_type"
-            ),
-            {"node_id": node_id, "event_type": "media_node.release_changed"},
-        ).mappings().one()
+        event = (
+            connection.execute(
+                text(
+                    "SELECT event_type, payload FROM audit_events "
+                    "WHERE aggregate_id = :node_id AND event_type = :event_type"
+                ),
+                {"node_id": node_id, "event_type": "media_node.release_changed"},
+            )
+            .mappings()
+            .one()
+        )
     assert event["payload"]["release_id"] == "release-2"
 
 
@@ -2125,8 +2133,14 @@ def test_systemd_web_entrypoint_wires_the_persistent_node_control(
     monkeypatch.setenv("RTSP_PROXY_NODE_PORT_RANGE_END", "12002")
     launched: dict[str, object] = {}
 
-    def capture_run(app: object, *, host: str, port: int) -> None:
-        launched.update(app=app, host=host, port=port)
+    def capture_run(
+        app: object,
+        *,
+        host: str,
+        port: int,
+        access_log: bool,
+    ) -> None:
+        launched.update(app=app, host=host, port=port, access_log=access_log)
 
     monkeypatch.setattr("rtsp_proxy.runtime.uvicorn.run", capture_run)
 
@@ -2134,6 +2148,7 @@ def test_systemd_web_entrypoint_wires_the_persistent_node_control(
 
     assert launched["host"] == "127.0.0.1"
     assert launched["port"] == 8000
+    assert launched["access_log"] is False
     response = TestClient(cast(FastAPI, launched["app"])).post(
         "/api/v1/nodes",
         json={"name": "entrypoint-node"},
@@ -3062,13 +3077,9 @@ def test_lifecycle_commands_report_an_unknown_exact_node(operation: str) -> None
         new_node_id=uuid4,
         node_runtime=RecordingLifecycleRuntime(),
     )
-    client = TestClient(
-        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
-    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
 
-    response = client.post(
-        f"/api/v1/nodes/00000000-0000-0000-0000-000000000099/{operation}"
-    )
+    response = client.post(f"/api/v1/nodes/00000000-0000-0000-0000-000000000099/{operation}")
 
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "node_not_found"
@@ -3082,9 +3093,7 @@ def test_restart_requires_a_running_desired_node() -> None:
         new_node_id=lambda: node_id,
         node_runtime=RecordingLifecycleRuntime(),
     )
-    client = TestClient(
-        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
-    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
     assert client.post("/api/v1/nodes", json={"name": "media-a"}).status_code == 201
 
     response = client.post(f"/api/v1/nodes/{node_id}/restart")
@@ -3107,9 +3116,7 @@ def test_lifecycle_lock_contention_is_a_retryable_public_error(operation: str) -
         create_app(
             Settings(role=RuntimeRole.WEB),
             node_control=NodeControl(
-                store=BusyStore(
-                    nodes=(MediaNode(id=node_id, name="busy", external_port=12000),)
-                ),
+                store=BusyStore(nodes=(MediaNode(id=node_id, name="busy", external_port=12000),)),
                 choose_port=lambda available: available[0],
                 new_node_id=uuid4,
                 node_runtime=RecordingLifecycleRuntime(),
@@ -3141,9 +3148,7 @@ def test_release_lock_contention_is_a_retryable_public_error() -> None:
                 node_mediamtx_binary_sha256="b" * 64,
             ),
             node_control=NodeControl(
-                store=BusyStore(
-                    nodes=(MediaNode(id=node_id, name="busy", external_port=12000),)
-                ),
+                store=BusyStore(nodes=(MediaNode(id=node_id, name="busy", external_port=12000),)),
                 choose_port=lambda available: available[0],
                 new_node_id=uuid4,
                 node_runtime=RecordingLifecycleRuntime(),
@@ -3206,9 +3211,7 @@ def test_stop_requires_an_empty_node_until_the_drain_phase() -> None:
         new_node_id=uuid4,
         node_runtime=RecordingLifecycleRuntime(),
     )
-    client = TestClient(
-        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
-    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
 
     response = client.post(f"/api/v1/nodes/{node_id}/stop")
 
@@ -3235,9 +3238,7 @@ def test_restart_requires_an_empty_node_until_the_drain_phase() -> None:
         new_node_id=uuid4,
         node_runtime=RecordingLifecycleRuntime(),
     )
-    client = TestClient(
-        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
-    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
 
     response = client.post(f"/api/v1/nodes/{node_id}/restart")
 
@@ -3529,8 +3530,7 @@ def test_concurrent_automatic_placements_do_not_create_ghost_placements(
 
     assert [response.status_code for response in responses] == [409, 409]
     assert all(
-        response.json()["detail"]["code"] == "eligible_node_missing"
-        for response in responses
+        response.json()["detail"]["code"] == "eligible_node_missing" for response in responses
     )
     listed = client.get("/api/v1/nodes").json()
     assert listed["count"] == 1
@@ -3770,6 +3770,7 @@ def test_postgresql_lifecycle_guard_has_a_bounded_dedicated_connection_pool(
     )
     node_ids = tuple(UUID(f"00000000-0000-0000-0000-{index:012d}") for index in range(1, 4))
     for index, node_id in enumerate(node_ids):
+
         def current_node_id(node_id: UUID = node_id) -> UUID:
             return node_id
 
@@ -3939,6 +3940,7 @@ def test_postgresql_move_deadline_is_rechecked_in_the_switch_transaction(
         (source_id, "source", 12000),
         (target_id, "target", 12001),
     ):
+
         def allocate_node_id(selected: UUID = node_id) -> UUID:
             return selected
 
@@ -4007,6 +4009,7 @@ def test_postgresql_move_switch_honors_shutdown_while_placement_lock_is_held(
         (source_id, "source", 12000),
         (target_id, "target", 12001),
     ):
+
         def allocate_node_id(selected: UUID = node_id) -> UUID:
             return selected
 
@@ -4107,8 +4110,9 @@ def test_postgresql_lifecycle_guard_rejects_an_unknown_node(
     upgrade_database(postgres_database_url)
     store = PostgresNodeStore(postgres_database_url)
 
-    with pytest.raises(LookupError, match="node_not_found"), store.lifecycle_guard(
-        UUID("00000000-0000-0000-0000-000000000001")
+    with (
+        pytest.raises(LookupError, match="node_not_found"),
+        store.lifecycle_guard(UUID("00000000-0000-0000-0000-000000000001")),
     ):
         pytest.fail("unknown node entered lifecycle guard")
 
@@ -4188,6 +4192,7 @@ def test_concurrent_manual_and_automatic_node_creation_cannot_exceed_max_nodes(
     failed = next(response for response in responses if response.status_code == 409)
     assert failed.json()["detail"]["code"] == "max_nodes_reached"
     assert client.get("/api/v1/nodes").json()["count"] == 1
+
 
 def node_confirmation_service() -> ConfirmationTokenService:
     return ConfirmationTokenService(
@@ -4549,9 +4554,7 @@ def test_node_administration_public_errors_are_typed() -> None:
         f"/api/v1/nodes/{unknown_id}/port-change",
         json={"new_port": 12001, "confirmation_token": "invalid"},
     )
-    missing_reconfigure_preview = client.post(
-        f"/api/v1/nodes/{unknown_id}/reconfigure/preview"
-    )
+    missing_reconfigure_preview = client.post(f"/api/v1/nodes/{unknown_id}/reconfigure/preview")
     missing_reconfigure = client.post(
         f"/api/v1/nodes/{unknown_id}/reconfigure",
         json={"confirmation_token": "invalid"},
@@ -4576,9 +4579,7 @@ def test_node_administration_public_errors_are_typed() -> None:
     assert missing_reconfigure.status_code == 404
     assert missing_delete.status_code == 404
     assert invalid_transition.status_code == 409
-    assert invalid_transition.json()["detail"]["code"] == (
-        "node_administrative_transition_invalid"
-    )
+    assert invalid_transition.json()["detail"]["code"] == ("node_administrative_transition_invalid")
     assert out_of_range.status_code == 422
     assert unchanged.status_code == 409
     assert unchanged.json()["detail"]["code"] == "node_port_unchanged"
@@ -4746,9 +4747,7 @@ def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures
         node_runtime=RecordingLifecycleRuntime(),
         confirmations=node_confirmation_service(),
     )
-    client = TestClient(
-        create_app(Settings(role=RuntimeRole.WEB), node_control=control)
-    )
+    client = TestClient(create_app(Settings(role=RuntimeRole.WEB), node_control=control))
 
     preview_cases: tuple[tuple[Exception, int], ...] = (
         (NodeLifecycleBusy("node_lifecycle_busy"), 503),
@@ -4762,9 +4761,7 @@ def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures
             == expected_status
         )
     control.preview_error = None
-    token = client.post(
-        f"/api/v1/nodes/{node_id}/reconfigure/preview"
-    ).json()["confirmation_token"]
+    token = client.post(f"/api/v1/nodes/{node_id}/reconfigure/preview").json()["confirmation_token"]
     reconfigure_cases: tuple[tuple[Exception, int], ...] = (
         (NodeLifecycleBusy("node_lifecycle_busy"), 503),
         (NodeRuntimeUnavailable("node_runtime_unavailable"), 503),
@@ -5547,11 +5544,14 @@ def test_in_memory_store_rejects_invalid_camera_and_move_transitions() -> None:
     for operation in operations:
         with pytest.raises(CameraNotFound):
             operation()
-    assert store.update_camera(
-        camera_id,
-        name="entrance",
-        source_url="rtsp://camera.local/main",
-    ).desired_revision == 1
+    assert (
+        store.update_camera(
+            camera_id,
+            name="entrance",
+            source_url="rtsp://camera.local/main",
+        ).desired_revision
+        == 1
+    )
     store.set_camera_enabled(camera_id, enabled=False)
     assert store.set_camera_enabled(camera_id, enabled=False).state.value == "disabled"
     with pytest.raises(CameraLifecycleConflict, match="camera_not_enabled"):
@@ -5868,8 +5868,7 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
     with engine.connect() as connection:
         saga = connection.execute(
             text(
-                "SELECT state, registered_cameras, blast_radius_sha256 "
-                "FROM node_port_change_sagas"
+                "SELECT state, registered_cameras, blast_radius_sha256 FROM node_port_change_sagas"
             )
         ).one()
         historical_node = connection.scalar(
@@ -6011,6 +6010,7 @@ def test_postgresql_port_change_fences_camera_updates_and_moves(
         (source_id, "source", 12000, 13000, 14000),
         (target_id, "target", 12001, 13001, 14001),
     ):
+
         def allocate_node_id(selected: UUID = node_id) -> UUID:
             return selected
 
@@ -6151,9 +6151,7 @@ def test_camera_and_move_routes_cover_success_and_typed_failures() -> None:
     assert preview.status_code == 200
     assert requested.status_code == 202
     assert client.get(f"/api/v1/camera-moves/{move_id}").status_code == 200
-    missing_move = client.get(
-        "/api/v1/camera-moves/40000000-0000-0000-0000-000000000001"
-    )
+    missing_move = client.get("/api/v1/camera-moves/40000000-0000-0000-0000-000000000001")
     assert missing_move.status_code == 404
     assert client.delete(f"/api/v1/cameras/{camera.id}").status_code == 409
     assert client.get("/api/v1/cameras").json()["count"] == 1
@@ -6238,15 +6236,21 @@ def test_disruptive_camera_routes_preview_and_confirm_exact_current_reader() -> 
     )
 
     media.clients[node_id].runtime[camera.public_id] = (True, 2)
-    assert client.post(
-        f"/api/v1/cameras/{camera_id}/mutations/preview",
-        json={"operation": "disable"},
-    ).status_code == 409
+    assert (
+        client.post(
+            f"/api/v1/cameras/{camera_id}/mutations/preview",
+            json={"operation": "disable"},
+        ).status_code
+        == 409
+    )
     media.clients[node_id].runtime[camera.public_id] = (True, 1)
-    assert client.post(
-        f"/api/v1/cameras/{camera_id}/mutations/preview",
-        json={"operation": "update_source"},
-    ).status_code == 422
+    assert (
+        client.post(
+            f"/api/v1/cameras/{camera_id}/mutations/preview",
+            json={"operation": "update_source"},
+        ).status_code
+        == 422
+    )
     preview = client.post(
         f"/api/v1/cameras/{camera_id}/mutations/preview",
         json={"operation": "disable"},
@@ -6270,10 +6274,13 @@ def test_disruptive_camera_routes_preview_and_confirm_exact_current_reader() -> 
             "source_url": "rtsp://camera.local/sub",
         },
     ).json()
-    assert client.put(
-        f"/api/v1/cameras/{camera_id}",
-        json={"name": "entrance-new", "source_url": "rtsp://camera.local/sub"},
-    ).status_code == 409
+    assert (
+        client.put(
+            f"/api/v1/cameras/{camera_id}",
+            json={"name": "entrance-new", "source_url": "rtsp://camera.local/sub"},
+        ).status_code
+        == 409
+    )
     updated = client.put(
         f"/api/v1/cameras/{camera_id}",
         json={
@@ -6327,19 +6334,28 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
     move_id = UUID("30000000-0000-0000-0000-000000000001")
 
     assert missing.get("/api/v1/cameras").status_code == 503
-    assert missing.put(
-        f"/api/v1/cameras/{camera_id}",
-        json={"name": "x", "source_url": "rtsp://camera.local/main"},
-    ).status_code == 503
+    assert (
+        missing.put(
+            f"/api/v1/cameras/{camera_id}",
+            json={"name": "x", "source_url": "rtsp://camera.local/main"},
+        ).status_code
+        == 503
+    )
     assert missing.get(f"/api/v1/cameras/{camera_id}/runtime").status_code == 503
-    assert missing.post(
-        f"/api/v1/cameras/{camera_id}/moves/preview",
-        json={"target_node_id": str(node_id)},
-    ).status_code == 503
-    assert missing.post(
-        f"/api/v1/cameras/{camera_id}/moves",
-        json={"target_node_id": str(node_id)},
-    ).status_code == 503
+    assert (
+        missing.post(
+            f"/api/v1/cameras/{camera_id}/moves/preview",
+            json={"target_node_id": str(node_id)},
+        ).status_code
+        == 503
+    )
+    assert (
+        missing.post(
+            f"/api/v1/cameras/{camera_id}/moves",
+            json={"target_node_id": str(node_id)},
+        ).status_code
+        == 503
+    )
     assert missing.get(f"/api/v1/camera-moves/{move_id}").status_code == 503
 
     store_without_runtime = InMemoryNodeStore()
@@ -6364,10 +6380,13 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
     )
     assert without_runtime.post(f"/api/v1/cameras/{camera_id}/disable").status_code == 503
     assert without_runtime.delete(f"/api/v1/cameras/{camera_id}").status_code == 503
-    assert without_runtime.post(
-        f"/api/v1/cameras/{camera_id}/mutations/preview",
-        json={"operation": "disable"},
-    ).status_code == 503
+    assert (
+        without_runtime.post(
+            f"/api/v1/cameras/{camera_id}/mutations/preview",
+            json={"operation": "disable"},
+        ).status_code
+        == 503
+    )
 
     class ErrorCameraControl(CameraControl):
         error: Exception = CameraNotFound("camera_not_found")
@@ -6466,9 +6485,12 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
         (CameraReaderInvariantViolation("camera_reader_limit_violated"), 409),
     ):
         moves.error = error
-        assert client.post(
-            f"/api/v1/cameras/{camera_id}/moves/preview", json=preview_request
-        ).status_code == expected
+        assert (
+            client.post(
+                f"/api/v1/cameras/{camera_id}/moves/preview", json=preview_request
+            ).status_code
+            == expected
+        )
     for request_error, expected in (
         (CameraNotFound("camera_not_found"), 404),
         (NodeNotFound("node_not_found"), 404),
@@ -6478,9 +6500,10 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
         (NodeCameraCapacityReached("node_camera_capacity_reached"), 409),
     ):
         moves.error = request_error
-        assert client.post(
-            f"/api/v1/cameras/{camera_id}/moves", json=preview_request
-        ).status_code == expected
+        assert (
+            client.post(f"/api/v1/cameras/{camera_id}/moves", json=preview_request).status_code
+            == expected
+        )
 
 
 @pytest.mark.parametrize(

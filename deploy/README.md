@@ -184,13 +184,19 @@ Verifier reads actual Linux architecture, validates artifact paths/digests and
 version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
 activation.
 
-MediaMTX release `0.2.1` is the race-safe native node target; the operator
-session slice does not change it. Application release `0.4.0` is the additive
-schema bridge: its manifest and startup gate accept both
-`0011_observability` and `0012_operator_sessions`, while release `0.3.0`
-remains on 0011. Deploy and smoke 0.4.0 on every control-plane process before
-the database advances to 0012. This ordering makes the N/N-1 window executable
-rather than merely declarative.
+MediaMTX release `0.2.1` remains the race-safe native node target. Application
+release `0.5.0` is the additive operator-login schema bridge: its manifest and
+startup gate accept both `0012_operator_sessions` and `0013_operator_login`,
+while release `0.4.0` remains on 0012. Deploy and smoke 0.5.0 on every
+control-plane process before the database advances to 0013. This ordering
+makes the N/N-1 window executable rather than merely declarative.
+Existing OIDC account/session rows remain valid across this additive step.
+Because schema 0012 did not carry verifiable password/TOTP material, migration
+atomically disables an existing `break_glass` row, increments its authz fence
+and revokes its sessions. The packaged `rtsp-proxy-break-glass` command upgrades
+that same disabled identity with fresh password/TOTP material and another
+monotonic authz revision; it never invents credentials in SQL. Readiness remains
+red until this explicit reprovisioning and the accepted/rejected SMTP drill pass.
 
 Before starting a control-plane release, apply the migrations packaged inside
 that exact wheel environment:
@@ -201,14 +207,86 @@ RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_pro
 ```
 
 The runner upgrades to the packaged `head` and uses the same direct native
-PostgreSQL contract on amd64 and arm64. Release `0.4.0` declares the additive
-rolling window `0011_observability..0012_operator_sessions`: first deploy the
-new web/reconciler while PostgreSQL remains on 0011, then apply 0012. Operator
-authentication remains disabled until OIDC and break-glass readiness are both
-proven; the session tables alone do not protect the API. Retire 0.3.0 only after
-all processes run 0.4.0 and the new revision is exercised. Any schema outside
-the declared window fails closed; an older binary must never start against an
-unsupported newer schema.
+PostgreSQL contract on amd64 and arm64. Release `0.5.0` declares the additive
+rolling window `0012_operator_sessions..0013_operator_login`: first deploy the
+new web/reconciler while PostgreSQL remains on 0012, then apply 0013. Keep
+operator authentication disabled until every WEB process has the complete,
+root-owned OIDC and break-glass configuration; once enabled it is a single
+fail-closed runtime boundary, not an independently switchable set of stores.
+The existing WORKER continues incident delivery while the database is on 0012
+and deliberately does not touch the 0013 security-alert queue. Immediately
+after applying 0013, rerun `deploy/postgresql/rtsp_proxy_notifier.sql` and
+restart every WORKER. Its readiness stays red with
+the stable external reason `outbox_unavailable` until that restart creates the
+security-alert dispatcher (the internal diagnostic is
+`security_dispatcher_restart_required`); this prevents a pre-migration worker
+from reporting a false-green outbox boundary.
+The five WEB authentication files are delivered by installing
+`deploy/systemd/rtsp-proxy-web-auth.conf.example` as
+`/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running
+`systemctl daemon-reload`, and restarting WEB. The drop-in uses
+`LoadCredential=`; the environment file contains
+only IdP endpoints/client ID and the exact accepted ACR/AMR policy. Before
+enabling those variables, provision exactly one enabled `break_glass` account,
+verify that readiness can decrypt its TOTP material, and verify SMTP delivery
+of both an accepted and a rejected drill. Every attempt is admitted through a
+bounded concurrency gate plus durable per-IP and per-account progressive
+lockout, and creates both a sanitized audit/outbox event and a dedicated
+durable email alert.
+
+WEB readiness polls the configured IdP discovery document through verified TLS
+with a bounded response. It requires the exact issuer/endpoints, Code+PKCE S256,
+RS256 support and the `sub`, display-name, groups, nonce, audience, lifetime and
+MFA claim families used by the local mapping. The check is cached for at most
+30 seconds. A healthy→failed or failed→healthy transition creates exactly one
+durable `operator.oidc_claim_contract` SMTP alert; repeated probes in the same
+state update health without flooding the outbox.
+
+Provision the emergency identity from the same release virtual environment.
+Use one immutable UUID for its entire lifetime. The encryption-key and TOTP
+files contain unpadded or padded base64url (32 and at least 20 decoded bytes),
+are regular non-linked files owned by the effective command UID with mode
+`0400` or `0600`, and must be prepared over an offline operator-controlled
+channel. The password is read twice from the controlling terminal and is never
+accepted in argv or the environment:
+
+```sh
+export RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_proxy'
+export RTSP_PROXY_BREAK_GLASS_ENCRYPTION_KEY_FILE=/root/rtsp-proxy-break-glass.key
+export RTSP_PROXY_BREAK_GLASS_TOTP_FILE=/root/rtsp-proxy-break-glass.totp
+/opt/rtsp-proxy/releases/<release-id>/.venv/bin/rtsp-proxy-break-glass \
+  --account-id 11111111-2222-4333-8444-555555555555 \
+  --username emergency-admin \
+  --actor operator:alice \
+  --reason 'scheduled emergency credential rotation'
+```
+
+Run the command as root with the shown `/root` inputs, or as the dedicated
+service UID with equivalently protected files it owns. The command writes the
+credential material and a sanitized
+`operator.break_glass_provisioned` audit/outbox pair in one synchronous
+transaction. It refuses a different UUID for an existing subject and refuses
+to overwrite an enabled account. Remove the one-use TOTP input file after a
+successful enrollment, then restart WEB and complete both accepted and
+rejected SMTP drills before declaring readiness.
+Exactly one WEB health monitor performs the external discovery/token and local
+store probes at startup and every 30 seconds. HTTP `/health/ready` only reads
+its immutable synchronized result; requests cannot fan out IdP/DB work or race
+the durable failure/recovery transition recorder.
+
+Existing canonical `oidc:<sha256(issuer NUL sub)>` accounts remain unchanged.
+Any noncanonical legacy OIDC row blocks new account provisioning with
+`oidc_account_mapping_required`, even when its old subject text equals the
+verified IdP `sub`: that text has no issuer provenance and is never sufficient
+to inherit its UUID, roles, scopes or sessions. Resolve the row through an
+offline audited maintenance transaction that binds the exact issuer and
+subject before enabling OIDC account provisioning. Login traffic never guesses
+or rewrites this mapping.
+
+Retire 0.4.0 only after all processes run 0.5.0 and login, session revocation,
+and break-glass recovery are exercised. Any schema outside the declared window
+fails closed; an older binary must never start against an unsupported newer
+schema.
 
 `0005_node_runtime` intentionally rejects an upgrade when legacy Phase-B
 `media_nodes` rows exist. Those rows lack trustworthy per-node management

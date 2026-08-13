@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from pydantic import Field, IPvAnyAddress, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings.sources import NoDecode
 
 from rtsp_proxy.release import (
     ReleaseVerificationError,
@@ -100,6 +101,22 @@ class Settings(BaseSettings):
     smtp_timeout_seconds: float = Field(default=10, gt=0, le=30)
     notification_max_attempts: int = Field(default=3, ge=1, le=10)
     notification_retry_seconds: int = Field(default=60, ge=1, le=3600)
+    oidc_issuer: str | None = Field(default=None, max_length=2048)
+    oidc_client_id: str | None = Field(default=None, min_length=1, max_length=256)
+    oidc_authorization_endpoint: str | None = Field(default=None, max_length=2048)
+    oidc_token_endpoint: str | None = Field(default=None, max_length=2048)
+    oidc_jwks_file: Path | None = None
+    oidc_redirect_uri: str | None = Field(default=None, max_length=2048)
+    oidc_client_secret_file: Path | None = None
+    oidc_derivation_key_file: Path | None = None
+    oidc_group_roles_file: Path | None = None
+    oidc_mfa_acr: Annotated[tuple[str, ...], NoDecode] = ()
+    oidc_mfa_amr: Annotated[tuple[str, ...], NoDecode] = ()
+    break_glass_encryption_key_file: Path | None = None
+
+    @property
+    def operator_auth_enabled(self) -> bool:
+        return self.oidc_issuer is not None
 
     @field_validator("node_port_reserved", mode="before")
     @classmethod
@@ -112,6 +129,21 @@ class Settings(BaseSettings):
             except ValueError as error:
                 raise ValueError("node_port_reserved_invalid") from error
         return value
+
+    @field_validator("oidc_mfa_acr", "oidc_mfa_amr", mode="before")
+    @classmethod
+    def parse_oidc_mfa_acr(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            values = tuple(part.strip() for part in value.split(",") if part.strip())
+            return values
+        return value
+
+    @field_validator("oidc_mfa_acr", "oidc_mfa_amr")
+    @classmethod
+    def canonicalize_oidc_mfa_acr(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(len(item) > 256 for item in value):
+            raise ValueError("oidc_mfa_acr_invalid")
+        return tuple(sorted(value))
 
     @field_validator("node_port_reserved")
     @classmethod
@@ -129,9 +161,7 @@ class Settings(BaseSettings):
         )
         if any(start > end for start, end in ranges):
             raise ValueError("node_port_range_invalid")
-        external, api, metrics = (
-            set(range(start, end + 1)) for start, end in ranges
-        )
+        external, api, metrics = (set(range(start, end + 1)) for start, end in ranges)
         if external & api or external & metrics or api & metrics:
             raise ValueError("node_port_ranges_overlap")
         if any(self.http_port in configured for configured in (external, api, metrics)):
@@ -147,18 +177,26 @@ class Settings(BaseSettings):
                 raise ValueError("access_pepper_file_required")
             if self.database_url is None:
                 raise ValueError("database_url_required")
-        if self.role in {
-            RuntimeRole.WORKER,
-            RuntimeRole.RECONCILER,
-            RuntimeRole.PROBE,
-            RuntimeRole.COLLECTOR,
-        } and self.database_url is None:
+        if (
+            self.role
+            in {
+                RuntimeRole.WORKER,
+                RuntimeRole.RECONCILER,
+                RuntimeRole.PROBE,
+                RuntimeRole.COLLECTOR,
+            }
+            and self.database_url is None
+        ):
             raise ValueError("database_url_required")
-        if self.role in {
-            RuntimeRole.RECONCILER,
-            RuntimeRole.PROBE,
-            RuntimeRole.COLLECTOR,
-        } and self.node_runtime_socket is None:
+        if (
+            self.role
+            in {
+                RuntimeRole.RECONCILER,
+                RuntimeRole.PROBE,
+                RuntimeRole.COLLECTOR,
+            }
+            and self.node_runtime_socket is None
+        ):
             raise ValueError("node_runtime_socket_required")
         smtp_values = (
             self.smtp_host,
@@ -181,6 +219,52 @@ class Settings(BaseSettings):
                 raise ValueError("smtp_ca_file_must_be_absolute")
         elif self.role is RuntimeRole.WORKER:
             raise ValueError("smtp_configuration_required")
+        operator_auth_values = (
+            self.oidc_issuer,
+            self.oidc_client_id,
+            self.oidc_authorization_endpoint,
+            self.oidc_token_endpoint,
+            self.oidc_jwks_file,
+            self.oidc_redirect_uri,
+            self.oidc_client_secret_file,
+            self.oidc_derivation_key_file,
+            self.oidc_group_roles_file,
+            self.break_glass_encryption_key_file,
+        )
+        if (
+            any(value is not None for value in operator_auth_values)
+            or self.oidc_mfa_acr
+            or self.oidc_mfa_amr
+        ):
+            if (
+                any(value is None for value in operator_auth_values)
+                or not self.oidc_mfa_acr
+                or len(self.oidc_mfa_amr) < 2
+            ):
+                raise ValueError("operator_auth_configuration_incomplete")
+            if self.role is not RuntimeRole.WEB:
+                raise ValueError("operator_auth_web_role_required")
+            if self.database_url is None:
+                raise ValueError("operator_auth_requires_database")
+            endpoints = (
+                self.oidc_issuer,
+                self.oidc_authorization_endpoint,
+                self.oidc_token_endpoint,
+                self.oidc_redirect_uri,
+            )
+            if any(
+                endpoint is None or not endpoint.startswith("https://") for endpoint in endpoints
+            ):
+                raise ValueError("oidc_endpoint_must_be_https")
+            paths = (
+                self.oidc_jwks_file,
+                self.oidc_client_secret_file,
+                self.oidc_derivation_key_file,
+                self.oidc_group_roles_file,
+                self.break_glass_encryption_key_file,
+            )
+            if any(path is None or not path.is_absolute() for path in paths):
+                raise ValueError("operator_auth_file_must_be_absolute")
         if set(self.node_port_reserved) & (api | metrics):
             raise ValueError("node_management_port_reserved")
         available = external.difference(self.node_port_reserved)

@@ -32,6 +32,11 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
     web = read_unit("rtsp-proxy-web.service")
     media = read_unit("mediamtx.service")
     assert web["Service"]["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy.env")
+    assert web["Service"]["Environment"] == "RTSP_PROXY_ROLE=web"
+    auth_drop_in = read_unit("rtsp-proxy-web-auth.conf.example")["Service"]
+    assert "%d/oidc-client-secret" in auth_drop_in["Environment"]
+    assert "oidc-client-secret:" in auth_drop_in["LoadCredential"]
+    assert "break-glass-key:" in auth_drop_in["LoadCredential"]
     assert media["Service"]["ExecStart"].endswith(" /etc/rtsp-proxy/mediamtx/mediamtx.yml")
 
     users = Path("deploy/sysusers.d/rtsp-proxy.conf").read_text(encoding="utf-8")
@@ -79,9 +84,7 @@ def test_collector_has_a_dedicated_read_only_helper_boundary() -> None:
     assert metrics_socket["ListenStream"] == "/run/rtsp-proxy-node-metrics/metrics.sock"
     assert metrics_socket["SocketGroup"] == "rtsp-proxy-collector"
     assert metrics_socket["SocketMode"] == "0660"
-    assert metrics_helper["Service"]["Environment"] == (
-        "RTSP_PROXY_NODE_HELPER_READ_ONLY=true"
-    )
+    assert metrics_helper["Service"]["Environment"] == ("RTSP_PROXY_NODE_HELPER_READ_ONLY=true")
     assert metrics_helper["Service"]["ReadOnlyPaths"] == (
         "/etc/rtsp-proxy/nodes /etc/rtsp-proxy/control-plane/access-peppers.json"
     )
@@ -120,15 +123,11 @@ def test_media_auth_callback_is_a_dedicated_unprivileged_loopback_service() -> N
     assert service["User"] == "rtsp-proxy-auth"
     assert service["Group"] == "rtsp-proxy-auth"
     assert service["Environment"] == "RTSP_PROXY_ROLE=auth"
-    assert service["EnvironmentFile"] == (
-        "/etc/rtsp-proxy/control-plane/rtsp-proxy-auth.env"
-    )
+    assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-auth.env")
     assert service["ExecStart"] == "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-auth"
     assert service["NoNewPrivileges"] == "yes"
     assert service["CapabilityBoundingSet"] == ""
-    assert service["ReadOnlyPaths"] == (
-        "/etc/rtsp-proxy/control-plane/access-peppers.json"
-    )
+    assert service["ReadOnlyPaths"] == ("/etc/rtsp-proxy/control-plane/access-peppers.json")
     assert service["ReadWritePaths"] == "/run/rtsp-proxy-auth"
     assert "StateDirectory" not in service
     assert "LogsDirectory" not in service
@@ -158,8 +157,7 @@ def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
     assert service["ProtectSystem"] == "strict"
     assert service["CapabilityBoundingSet"] == ""
     assert service["InaccessiblePaths"] == (
-        "/etc/rtsp-proxy/nodes/%i/management.json "
-        "/etc/rtsp-proxy/nodes/%i/reader.json"
+        "/etc/rtsp-proxy/nodes/%i/management.json /etc/rtsp-proxy/nodes/%i/reader.json"
     )
     assert service["TimeoutStopSec"] == "15s"
     assert service["LimitNOFILE"] == "131072"
@@ -333,9 +331,7 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
 def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     media = catalog["mediamtx"]
-    trusted = json.loads(
-        Path("src/rtsp_proxy/artifacts/mediamtx.json").read_text(encoding="utf-8")
-    )
+    trusted = json.loads(Path("src/rtsp_proxy/artifacts/mediamtx.json").read_text(encoding="utf-8"))
     patch_path = Path(media["patch"])
 
     assert media["source_commit"] == "1b943637a4b5778bb929a7af7687b048fecaa03f"
@@ -352,10 +348,7 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
     )
     gortsplib_patch = Path(gortsplib["patch"])
     assert gortsplib_patch.is_file()
-    assert (
-        hashlib.sha256(gortsplib_patch.read_bytes()).hexdigest()
-        == gortsplib["patch_sha256"]
-    )
+    assert hashlib.sha256(gortsplib_patch.read_bytes()).hexdigest() == gortsplib["patch_sha256"]
     build_script = Path("tools/build_mediamtx.sh").read_text(encoding="utf-8")
     assert 'go mod edit -replace "github.com/bluenviron/gortsplib/v5=' in build_script
     assert build_script.count("TestServerSessionRecordStateMetricsRace") == 2
@@ -379,23 +372,17 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
 
 def test_current_and_previous_patched_releases_have_distinct_trust_entries() -> None:
     previous_version, previous = trusted_mediamtx_identity("amd64", "0.1.0")
-    previous_callback_version, previous_callback = trusted_mediamtx_identity(
-        "amd64", "0.2.0"
-    )
+    previous_callback_version, previous_callback = trusted_mediamtx_identity("amd64", "0.2.0")
     current_version, current = trusted_mediamtx_identity("amd64", "0.2.1")
 
     assert previous_version == "v1.20.0-rtsp-proxy.1"
-    assert previous.root == (
-        "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6"
-    )
+    assert previous.root == ("29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6")
     assert previous_callback_version == "v1.20.0-rtsp-proxy.2"
     assert previous_callback.root == (
         "3ca0e018599b2768a1965144aa56d55fedcc71ba1c8d4cfa279635e9e99b9198"
     )
     assert current_version == "v1.20.0-rtsp-proxy.3"
-    assert current.root == (
-        "e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f"
-    )
+    assert current.root == ("e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f")
     assert current != previous
 
 

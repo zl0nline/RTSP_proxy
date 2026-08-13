@@ -1,21 +1,35 @@
+import asyncio
+import base64
 import json
 import os
 import platform
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import sleep
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from joserfc.jwk import RSAKey
 from pydantic import ValidationError
+from sqlalchemy import create_engine, text
 
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
-from rtsp_proxy.health import DependencyResult, ReadinessProvider
+from rtsp_proxy.health import DependencyResult, ReadinessProvider, RoleReadinessProvider
+from rtsp_proxy.operator_access import (
+    OperatorAccount,
+    OperatorIdentitySource,
+    OperatorMutationContext,
+    OperatorRole,
+)
+from rtsp_proxy.operator_identity import BreakGlassCredentials, PostgresBreakGlassStore
 from rtsp_proxy.release import trusted_mediamtx_identity
 from rtsp_proxy.runtime import (
     ConfigurationError,
+    _dispatch_notification_fairly,
     _load_access_verifier,
     create_app_from_environment,
     create_background_app,
@@ -177,6 +191,27 @@ def test_readiness_rejects_missing_duplicate_or_unexpected_provider_checks(
     assert expected_reason in {check["reason"] for check in response.json()["checks"]}
 
 
+def test_sync_readiness_probes_do_not_block_the_asgi_event_loop() -> None:
+    def bounded_blocking_probe() -> None:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+
+    response = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            readiness=RoleReadinessProvider(
+                {
+                    "database": bounded_blocking_probe,
+                    "schema": bounded_blocking_probe,
+                    "session_store": bounded_blocking_probe,
+                }
+            ),
+        )
+    ).get("/health/ready")
+
+    assert response.status_code == 200
+
+
 def test_systemd_environment_selects_the_runtime_role(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
 
@@ -186,6 +221,63 @@ def test_systemd_environment_selects_the_runtime_role(monkeypatch: pytest.Monkey
     assert response.json() == {
         "status": "ok",
         "role": "web",
+    }
+
+
+def test_notification_worker_alternates_between_security_and_incident_queues() -> None:
+    calls: list[str] = []
+
+    class Dispatcher:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def run_once(self) -> object:
+            calls.append(self.name)
+            return object()
+
+    security = Dispatcher("security")
+    incident = Dispatcher("incident")
+
+    first, prefer_security = _dispatch_notification_fairly(
+        security_dispatcher=security,
+        incident_dispatcher=incident,
+        prefer_security=True,
+    )
+    second, prefer_security = _dispatch_notification_fairly(
+        security_dispatcher=security,
+        incident_dispatcher=incident,
+        prefer_security=prefer_security,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert calls == ["security", "incident"]
+    assert prefer_security is True
+
+
+def test_web_bridge_is_ready_with_operator_authentication_disabled(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0012_operator_sessions")
+
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    app = create_app_from_environment()
+
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert {item["name"]: item["status"] for item in response.json()["checks"]} == {
+        "database": "pass",
+        "schema": "pass",
+        "session_store": "pass",
     }
 
 
@@ -200,6 +292,180 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
 
     assert str(settings.http_host) == "127.0.0.2"
     assert settings.http_port == 8080
+
+
+def test_operator_login_configuration_is_all_or_nothing_and_https_only(
+    tmp_path: Path,
+) -> None:
+    configured = {
+        "role": RuntimeRole.WEB,
+        "database_url": "postgresql+psycopg://rtsp_proxy@127.0.0.1/rtsp_proxy",
+        "oidc_issuer": "https://idp.example.test",
+        "oidc_client_id": "rtsp-proxy",
+        "oidc_authorization_endpoint": "https://idp.example.test/oauth2/authorize",
+        "oidc_token_endpoint": "https://idp.example.test/oauth2/token",
+        "oidc_jwks_file": tmp_path / "oidc-jwks.json",
+        "oidc_redirect_uri": "https://management.example.test/auth/oidc/callback",
+        "oidc_client_secret_file": tmp_path / "oidc-client-secret",
+        "oidc_derivation_key_file": tmp_path / "oidc-derivation-key",
+        "oidc_group_roles_file": tmp_path / "oidc-group-roles.json",
+        "oidc_mfa_acr": ("urn:example:loa:2",),
+        "oidc_mfa_amr": ("otp", "pwd"),
+        "break_glass_encryption_key_file": tmp_path / "break-glass-key",
+    }
+
+    settings = Settings(**configured)  # type: ignore[arg-type]
+
+    assert settings.operator_auth_enabled is True
+    with pytest.raises(ValidationError, match="operator_auth_configuration_incomplete"):
+        Settings(**(configured | {"oidc_token_endpoint": None}))  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="oidc_endpoint_must_be_https"):
+        Settings(
+            **(configured | {"oidc_issuer": "http://idp.example.test"})  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError, match="operator_auth_requires_database"):
+        Settings(**(configured | {"database_url": None}))  # type: ignore[arg-type]
+
+
+def test_web_runtime_wires_oidc_sessions_readiness_and_durable_flow_from_environment(
+    postgres_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    break_glass = PostgresBreakGlassStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    break_glass.provision(
+        account=OperatorAccount(
+            id=UUID("60000000-0000-0000-0000-000000000006"),
+            identity_source=OperatorIdentitySource.BREAK_GLASS,
+            subject="local:emergency-admin",
+            display_name="Emergency administrator",
+            roles=frozenset({OperatorRole.BREAK_GLASS}),
+            scopes=frozenset({"server:*"}),
+            authz_version=1,
+            enabled=True,
+        ),
+        password_scrypt=BreakGlassCredentials.hash_password(
+            "correct horse battery staple",
+            salt=b"S" * 16,
+        ),
+        totp_secret=b"B" * 20,
+        context=OperatorMutationContext(
+            actor="system:test-bootstrap",
+            reason="test fixture provisioning",
+        ),
+    )
+    break_glass.close()
+    key = RSAKey.generate_key(2048, {"kid": "idp-key-1", "use": "sig"}, auto_kid=False)
+    files = {
+        "RTSP_PROXY_OIDC_JWKS_FILE": (
+            tmp_path / "oidc-jwks.json",
+            json.dumps({"keys": [key.as_dict(private=False)]}).encode("utf-8"),
+        ),
+        "RTSP_PROXY_OIDC_CLIENT_SECRET_FILE": (
+            tmp_path / "oidc-client-secret",
+            b"client-secret\n",
+        ),
+        "RTSP_PROXY_OIDC_DERIVATION_KEY_FILE": (
+            tmp_path / "oidc-derivation-key",
+            base64.urlsafe_b64encode(b"D" * 32).rstrip(b"=") + b"\n",
+        ),
+        "RTSP_PROXY_OIDC_GROUP_ROLES_FILE": (
+            tmp_path / "oidc-group-roles.json",
+            b'{"rtsp-operators":["operator"]}',
+        ),
+        "RTSP_PROXY_BREAK_GLASS_ENCRYPTION_KEY_FILE": (
+            tmp_path / "break-glass-key",
+            base64.urlsafe_b64encode(b"K" * 32).rstrip(b"=") + b"\n",
+        ),
+    }
+    for environment_name, (path, payload) in files.items():
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        monkeypatch.setenv(environment_name, str(path))
+    real_fstat = os.fstat
+    monkeypatch.setattr(
+        "rtsp_proxy.operator_identity.os.fstat",
+        lambda descriptor: SimpleNamespace(
+            st_mode=real_fstat(descriptor).st_mode,
+            st_nlink=real_fstat(descriptor).st_nlink,
+            st_uid=os.geteuid(),
+            st_gid=0,
+            st_size=real_fstat(descriptor).st_size,
+        ),
+    )
+    readiness_probe_calls = {"discovery": 0, "token": 0}
+
+    def discovery_ready(_endpoint: object) -> None:
+        readiness_probe_calls["discovery"] += 1
+
+    def token_ready(_endpoint: object) -> None:
+        readiness_probe_calls["token"] += 1
+
+    monkeypatch.setattr(
+        "rtsp_proxy.operator_identity.HttpsOidcTokenEndpoint.assert_ready",
+        token_ready,
+    )
+    monkeypatch.setattr(
+        "rtsp_proxy.operator_identity.HttpsOidcDiscoveryEndpoint.assert_ready",
+        discovery_ready,
+    )
+    environment = {
+        "RTSP_PROXY_ROLE": "web",
+        "RTSP_PROXY_DATABASE_URL": postgres_database_url,
+        "RTSP_PROXY_OIDC_ISSUER": "https://idp.example.test",
+        "RTSP_PROXY_OIDC_CLIENT_ID": "rtsp-proxy",
+        "RTSP_PROXY_OIDC_AUTHORIZATION_ENDPOINT": ("https://idp.example.test/oauth2/authorize"),
+        "RTSP_PROXY_OIDC_TOKEN_ENDPOINT": "https://idp.example.test/oauth2/token",
+        "RTSP_PROXY_OIDC_REDIRECT_URI": ("https://management.example.test/auth/oidc/callback"),
+        "RTSP_PROXY_OIDC_MFA_ACR": "urn:example:loa:2",
+        "RTSP_PROXY_OIDC_MFA_AMR": "pwd,otp",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    with TestClient(
+        create_app_from_environment(),
+        base_url="https://management.example.test",
+    ) as client:
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            readiness_responses = tuple(
+                executor.map(lambda _index: client.get("/health/ready"), range(32))
+            )
+        readiness = readiness_responses[0]
+        redirect = client.get("/auth/oidc/login", follow_redirects=False)
+        anonymous = client.get("/api/v1/nodes")
+
+    assert all(response.status_code == 200 for response in readiness_responses)
+    assert readiness_probe_calls == {"discovery": 1, "token": 1}
+    assert {item["name"]: item["status"] for item in readiness.json()["checks"]} == {
+        "database": "pass",
+        "schema": "pass",
+        "session_store": "pass",
+    }
+    assert redirect.status_code == 303
+    assert redirect.headers["location"].startswith("https://idp.example.test/oauth2/authorize?")
+    assert anonymous.status_code == 401
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        flow = connection.execute(
+            text("SELECT state_sha256, consumed_at FROM oidc_login_flows")
+        ).one()
+        claim_transition_alerts = connection.scalar(
+            text(
+                "SELECT count(*) FROM operator_security_alerts "
+                "WHERE event_type = 'operator.oidc_claim_contract'"
+            )
+        )
+    engine.dispose()
+    assert len(flow.state_sha256) == 64
+    assert flow.consumed_at is None
+    assert claim_transition_alerts == 0
 
 
 def test_node_limits_and_port_range_are_environment_driven() -> None:
@@ -643,3 +909,45 @@ def test_notification_background_role_starts_without_plaintext_secret_env(
 
     with TestClient(app) as client:
         assert client.get("/health/live").json()["role"] == "worker"
+
+
+def test_notification_worker_keeps_incident_delivery_available_on_0012_bridge(
+    postgres_database_url: str,
+    tmp_path: Path,
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0012_operator_sessions")
+    app = create_background_app(
+        Settings(
+            role=RuntimeRole.WORKER,
+            database_url=postgres_database_url,
+            smtp_host="smtp.example.test",
+            smtp_username="mailer",
+            smtp_password_file=tmp_path / "systemd-credential-smtp-password",
+            smtp_from_address="proxy@example.test",
+            smtp_to_address="operator@example.test",
+            smtp_timeout_seconds=1,
+        ),
+        expected_role=RuntimeRole.WORKER,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+        assert response.status_code == 200
+        assert {item["name"]: item["status"] for item in response.json()["checks"]} == {
+            "database": "pass",
+            "schema": "pass",
+            "outbox": "pass",
+        }
+        command.upgrade(migration, "0013_operator_login")
+        response = client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"][2] == {
+            "name": "outbox",
+            "status": "fail",
+            "reason": "outbox_unavailable",
+        }

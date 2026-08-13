@@ -2,6 +2,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from anyio import to_thread
+
 from rtsp_proxy.config import RuntimeRole
 
 
@@ -54,7 +56,7 @@ class RoleReadinessProvider:
                 )
                 continue
             try:
-                check()
+                await to_thread.run_sync(check)
             except Exception:
                 results.append(
                     DependencyResult(name=name, ready=False, reason=f"{name}_unavailable")

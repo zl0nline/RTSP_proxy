@@ -9,7 +9,7 @@ from uuid import UUID
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -58,12 +58,20 @@ from rtsp_proxy.nodes import (
 )
 from rtsp_proxy.observability import SnapshotReader
 from rtsp_proxy.operator_access import (
+    IssuedOperatorSession,
     OperatorAuthenticationRequired,
     OperatorAuthorizationDenied,
     OperatorPermission,
     OperatorPrincipal,
     OperatorSessionControl,
     OperatorSessionUnavailable,
+)
+from rtsp_proxy.operator_identity import (
+    BreakGlassControl,
+    OidcLoginControl,
+    OidcLoginInvalid,
+    OidcLoginRateLimited,
+    OidcLoginUnavailable,
 )
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
@@ -207,6 +215,12 @@ class OperatorSessionResponse(BaseModel):
     scopes: list[str]
     authz_version: int
     mfa_verified_at: datetime | None
+
+
+class BreakGlassLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=1024)
+    totp: str = Field(pattern=r"^[0-9]{6}$")
 
 
 class CameraCreateRequest(BaseModel):
@@ -528,6 +542,8 @@ def create_app(
     access_grant_control: AccessGrantControl | None = None,
     fleet_snapshots: SnapshotReader | None = None,
     operator_sessions: OperatorSessionControl | None = None,
+    operator_login: OidcLoginControl | None = None,
+    break_glass: BreakGlassControl | None = None,
     fleet_snapshot_max_age_seconds: float = 30,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     startup: Callable[[], None] | None = None,
@@ -545,6 +561,122 @@ def create_app(
 
     app = FastAPI(title="RTSP Proxy Control Plane", lifespan=lifespan)
     readiness_provider = readiness or MissingReadinessProvider()
+
+    if operator_login is not None:
+
+        @app.get("/auth/oidc/login", include_in_schema=False)
+        def oidc_login(request: Request) -> Response:
+            try:
+                redirect = operator_login.begin(source_ip=_request_source_ip(request))
+            except OidcLoginRateLimited as error:
+                return _operator_rate_limited(error.retry_after_seconds)
+            except OidcLoginUnavailable:
+                return _operator_login_unavailable()
+            response = RedirectResponse(
+                redirect.location,
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Cache-Control": "no-store"},
+            )
+            response.set_cookie(
+                "__Secure-rtsp_proxy_oidc_flow",
+                redirect.browser_token,
+                secure=True,
+                httponly=True,
+                samesite="lax",
+                path="/auth/oidc/callback",
+                max_age=600,
+            )
+            return response
+
+        @app.get("/auth/oidc/callback", include_in_schema=False)
+        def oidc_callback(
+            request: Request,
+            state: str = "",
+            code: str = "",
+        ) -> Response:
+            try:
+                completed = operator_login.complete(
+                    state=state,
+                    code=code,
+                    browser_token=request.cookies.get(
+                        "__Secure-rtsp_proxy_oidc_flow",
+                        "",
+                    ),
+                )
+            except OidcLoginInvalid:
+                try:
+                    operator_login.record_rejection(source_ip=_request_source_ip(request))
+                except OidcLoginRateLimited as error:
+                    response = _operator_rate_limited(error.retry_after_seconds)
+                    _clear_oidc_flow_cookie(response)
+                    return response
+                except OidcLoginUnavailable:
+                    response = _operator_login_unavailable()
+                    _clear_oidc_flow_cookie(response)
+                    return response
+                response = JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": {"code": "operator_login_failed"}},
+                    headers={"Cache-Control": "no-store"},
+                )
+                _clear_oidc_flow_cookie(response)
+                return response
+            except OidcLoginRateLimited as error:
+                try:
+                    operator_login.record_rejection(source_ip=_request_source_ip(request))
+                except OidcLoginRateLimited:
+                    pass
+                except OidcLoginUnavailable:
+                    response = _operator_login_unavailable()
+                    _clear_oidc_flow_cookie(response)
+                    return response
+                response = _operator_rate_limited(error.retry_after_seconds)
+                _clear_oidc_flow_cookie(response)
+                return response
+            except OidcLoginUnavailable:
+                response = _operator_login_unavailable()
+                _clear_oidc_flow_cookie(response)
+                return response
+            completed_response = RedirectResponse(
+                completed.return_to,
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Cache-Control": "no-store"},
+            )
+            _set_operator_session_cookies(completed_response, completed.session)
+            _clear_oidc_flow_cookie(completed_response)
+            return completed_response
+
+    if break_glass is not None:
+
+        @app.post("/auth/break-glass/login", include_in_schema=False)
+        def break_glass_login(
+            request: Request,
+            payload: BreakGlassLoginRequest,
+        ) -> Response:
+            try:
+                issued = break_glass.login(
+                    username=payload.username,
+                    password=payload.password,
+                    totp=payload.totp,
+                    source_ip=_request_source_ip(request),
+                )
+            except OidcLoginRateLimited as error:
+                return _operator_rate_limited(error.retry_after_seconds)
+            except OidcLoginInvalid:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": {"code": "operator_login_failed"}},
+                    headers={"Cache-Control": "no-store"},
+                )
+            except OidcLoginUnavailable:
+                return _operator_login_unavailable()
+            response = RedirectResponse(
+                "/",
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Cache-Control": "no-store"},
+            )
+            _set_operator_session_cookies(response, issued)
+            return response
 
     if operator_sessions is not None:
 
@@ -664,9 +796,7 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "fleet_snapshot_pending"},
             )
-        if snapshot.generated_at < clock() - timedelta(
-            seconds=fleet_snapshot_max_age_seconds
-        ):
+        if snapshot.generated_at < clock() - timedelta(seconds=fleet_snapshot_max_age_seconds):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "fleet_snapshot_stale"},
@@ -734,6 +864,13 @@ def create_app(
             path="/",
             secure=True,
             httponly=True,
+            samesite="strict",
+        )
+        response.delete_cookie(
+            "__Host-rtsp_proxy_csrf",
+            path="/",
+            secure=True,
+            httponly=False,
             samesite="strict",
         )
 
@@ -1000,9 +1137,7 @@ def create_app(
             registered_cameras=preview.registered_cameras,
             blast_radius_sha256=preview.blast_radius_sha256,
             target_release_id=preview.target_release_id,
-            target_mediamtx_binary_sha256=(
-                preview.target_mediamtx_binary_sha256
-            ),
+            target_mediamtx_binary_sha256=(preview.target_mediamtx_binary_sha256),
             confirmation_token=preview.confirmation_token,
         )
 
@@ -1498,9 +1633,7 @@ def create_app(
             return _camera_response(
                 camera_mutation_control.delete(
                     camera_id,
-                    confirmation_token=(
-                        None if request is None else request.confirmation_token
-                    ),
+                    confirmation_token=(None if request is None else request.confirmation_token),
                 )
             )
         except CameraNotFound:
@@ -1988,8 +2121,7 @@ def create_media_auth_app(
             lines.append(f"rtsp_proxy_access_decisions_total{{{labels}}} {count}")
         lines.extend(
             (
-                "rtsp_proxy_access_audit_events_dropped_total "
-                f"{snapshot.dropped_audit}",
+                f"rtsp_proxy_access_audit_events_dropped_total {snapshot.dropped_audit}",
                 "rtsp_proxy_access_last_use_persistence_failures_total "
                 f"{snapshot.last_use_persistence_failures}",
             )
@@ -2097,6 +2229,61 @@ def _operator_error_response(status_code: int, code: str) -> JSONResponse:
         status_code=status_code,
         content={"detail": {"code": code}},
         headers={"Cache-Control": "no-store"},
+    )
+
+
+def _operator_login_unavailable() -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": {"code": "operator_login_unavailable"}},
+        headers={"Cache-Control": "no-store", "Retry-After": "1"},
+    )
+
+
+def _operator_rate_limited(retry_after_seconds: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": {"code": "operator_login_rate_limited"}},
+        headers={
+            "Cache-Control": "no-store",
+            "Retry-After": str(retry_after_seconds),
+        },
+    )
+
+
+def _request_source_ip(request: Request) -> str:
+    return "unknown" if request.client is None else request.client.host
+
+
+def _set_operator_session_cookies(
+    response: Response,
+    issued: IssuedOperatorSession,
+) -> None:
+    response.set_cookie(
+        "__Host-rtsp_proxy_session",
+        issued.session_token,
+        secure=True,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    response.set_cookie(
+        "__Host-rtsp_proxy_csrf",
+        issued.csrf_token,
+        secure=True,
+        httponly=False,
+        samesite="strict",
+        path="/",
+    )
+
+
+def _clear_oidc_flow_cookie(response: Response) -> None:
+    response.delete_cookie(
+        "__Secure-rtsp_proxy_oidc_flow",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+        path="/auth/oidc/callback",
     )
 
 

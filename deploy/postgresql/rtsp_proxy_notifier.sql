@@ -43,6 +43,14 @@ TO rtsp_proxy_notifier;
 GRANT EXECUTE ON FUNCTION rtsp_proxy_notifier_complete(
     uuid, uuid, boolean, timestamptz, integer, interval, boolean
 ) TO rtsp_proxy_notifier;
+GRANT EXECUTE ON FUNCTION rtsp_proxy_security_alert_ready()
+TO rtsp_proxy_notifier;
+GRANT EXECUTE ON FUNCTION rtsp_proxy_security_alert_claim(
+    timestamptz, timestamptz, uuid
+) TO rtsp_proxy_notifier;
+GRANT EXECUTE ON FUNCTION rtsp_proxy_security_alert_complete(
+    uuid, uuid, boolean, timestamptz, integer, interval, boolean
+) TO rtsp_proxy_notifier;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     REVOKE ALL ON TABLES FROM rtsp_proxy_notifier;
