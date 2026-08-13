@@ -23,7 +23,10 @@
 - an external FFmpeg/ffprobe consumer receives H.264 through a standard Basic
   Auth RTSP URL and does not require a proxy-specific scheme or handshake;
 - four simultaneous first readers of one cold on-demand path all succeed while
-  the origin observes exactly one upstream proxy reader;
+  the origin observes exactly one upstream proxy reader; this historical path
+  is installed directly by the compatibility test with lab-only
+  `maxReaders=4`, outside the product adapter whose invariant remains exactly
+  one downstream reader;
 - both internal and HTTP callback auth modes pass the ordinary RTSP contract;
   callback input contains the expected user/password/action/path/protocol;
 - callback denial revokes new sessions within 10 seconds; callback outage

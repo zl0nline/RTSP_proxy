@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -398,7 +399,7 @@ def test_two_real_nodes_keep_process_listener_and_session_isolation(
             timeout=10,
         )
         assert denied.returncode != 0
-        assert "453 Not Enough Bandwidth" in denied.stderr
+        assert re.search(r"\b453\s*\(?Not Enough Bandwidth\)?", denied.stderr)
         second_media.put_path(
             MediaPathConfig(
                 name=runtime_probe,

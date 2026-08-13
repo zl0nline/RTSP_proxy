@@ -176,6 +176,27 @@ def run_lab_ffmpeg_reader(
     )
 
 
+def put_lab_fanout_path(*, api_url: str, path: str, source_url: str) -> None:
+    """Install one historical lab-only fan-out path outside the product adapter."""
+
+    request = urllib.request.Request(
+        f"{api_url}/v3/config/paths/replace/{path}",
+        data=json.dumps(
+            {
+                "source": source_url,
+                "sourceOnDemand": True,
+                "sourceOnDemandCloseAfter": "10s",
+                "rtspTransport": "tcp",
+                "maxReaders": 4,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        assert response.status == 200
+
+
 def metrics_lines(url: str) -> list[str]:
     with urllib.request.urlopen(url, timeout=2) as response:
         payload = response.read()
@@ -554,13 +575,12 @@ paths: {{}}
                 ),
             )
         )
-        client.put_path(
-            MediaPathConfig(
-                name=PublicId.parse(race_public_id),
-                source_url=(
-                    f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/fixture"
-                ),
-            )
+        put_lab_fanout_path(
+            api_url=f"http://127.0.0.1:{proxy_api_port}",
+            path=race_public_id,
+            source_url=(
+                f"rtsp://origin-reader:origin-secret@127.0.0.1:{origin_rtsp_port}/fixture"
+            ),
         )
         client.put_path(
             MediaPathConfig(
