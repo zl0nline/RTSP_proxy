@@ -340,14 +340,34 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
 
     assert media["source_commit"] == "1b943637a4b5778bb929a7af7687b048fecaa03f"
     assert media["go_version"] == "go1.26.5"
-    assert media["version"] == "v1.20.0-rtsp-proxy.2"
+    assert media["version"] == "v1.20.0-rtsp-proxy.3"
     assert hashlib.sha256(patch_path.read_bytes()).hexdigest() == media["patch_sha256"]
+    gortsplib = media["gortsplib"]
+    assert gortsplib["version"] == "v5.6.3"
+    race_test_patch = Path(gortsplib["race_test_patch"])
+    assert race_test_patch.is_file()
+    assert (
+        hashlib.sha256(race_test_patch.read_bytes()).hexdigest()
+        == gortsplib["race_test_patch_sha256"]
+    )
+    gortsplib_patch = Path(gortsplib["patch"])
+    assert gortsplib_patch.is_file()
+    assert (
+        hashlib.sha256(gortsplib_patch.read_bytes()).hexdigest()
+        == gortsplib["patch_sha256"]
+    )
+    build_script = Path("tools/build_mediamtx.sh").read_text(encoding="utf-8")
+    assert 'go mod edit -replace "github.com/bluenviron/gortsplib/v5=' in build_script
+    assert build_script.count("TestServerSessionRecordStateMetricsRace") == 2
+    assert "unpatched gortsplib unexpectedly passed" in build_script
     assert trusted["schema_version"] == 2
-    assert trusted["releases"]["0.2.0"] == {
+    assert trusted["releases"]["0.2.1"] == {
         "version": media["version"],
         "activation_compatible": True,
         "architectures": media["architectures"],
     }
+    assert trusted["releases"]["0.2.0"]["version"] == "v1.20.0-rtsp-proxy.2"
+    assert trusted["releases"]["0.2.0"]["activation_compatible"] is True
     assert trusted["releases"]["0.1.0"]["version"] == "v1.20.0-rtsp-proxy.1"
     assert trusted["releases"]["0.1.0"]["activation_compatible"] is False
 
@@ -359,15 +379,22 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
 
 def test_current_and_previous_patched_releases_have_distinct_trust_entries() -> None:
     previous_version, previous = trusted_mediamtx_identity("amd64", "0.1.0")
-    current_version, current = trusted_mediamtx_identity("amd64", "0.2.0")
+    previous_callback_version, previous_callback = trusted_mediamtx_identity(
+        "amd64", "0.2.0"
+    )
+    current_version, current = trusted_mediamtx_identity("amd64", "0.2.1")
 
     assert previous_version == "v1.20.0-rtsp-proxy.1"
     assert previous.root == (
         "29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6"
     )
-    assert current_version == "v1.20.0-rtsp-proxy.2"
-    assert current.root == (
+    assert previous_callback_version == "v1.20.0-rtsp-proxy.2"
+    assert previous_callback.root == (
         "3ca0e018599b2768a1965144aa56d55fedcc71ba1c8d4cfa279635e9e99b9198"
+    )
+    assert current_version == "v1.20.0-rtsp-proxy.3"
+    assert current.root == (
+        "e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f"
     )
     assert current != previous
 

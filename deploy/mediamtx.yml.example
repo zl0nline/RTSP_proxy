@@ -1,4 +1,4 @@
-# MediaMTX v1.20.0-rtsp-proxy.2 baseline. Dynamic paths are intentionally
+# MediaMTX v1.20.0-rtsp-proxy.3 baseline. Dynamic paths are intentionally
 # absent until the adapter/auth contract is proven and configured.
 
 logLevel: info

@@ -162,12 +162,16 @@ release proof.
 
 `artifact-catalog.json` pins FFmpeg/ffprobe URLs and digests. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
-one SHA-256-bound local patch and Go `1.26.5`; resulting amd64/arm64 binary
-digests and the distinct `v1.20.0-rtsp-proxy.2` identity are pinned in the same
-catalog. The patch makes `maxReaders` a synchronous non-disruptive hot update
-and maps a rejected late SETUP to RTSP 453. Example release manifests bind the
-resulting identity. Python wheel is platform-independent; native artifacts are
-verified per architecture.
+two SHA-256-bound production patches, one deterministic race-regression patch,
+and Go `1.26.5`; resulting amd64/arm64 binary
+digests and the distinct `v1.20.0-rtsp-proxy.3` identity are pinned in the same
+catalog. The MediaMTX patch makes `maxReaders` a synchronous non-disruptive hot
+update and maps a rejected late SETUP to RTSP 453. The gortsplib v5.6.3 patch
+locks the RECORD state transition that concurrent metrics collection reads.
+The build first proves the regression fails on stock v5.6.3, then proves it and
+the MediaMTX race suites pass after patching. Example release
+manifests bind the resulting identity. Python wheel is platform-independent;
+native artifacts are verified per architecture.
 
 Before changing `current`, run from candidate environment:
 
@@ -180,7 +184,9 @@ Verifier reads actual Linux architecture, validates artifact paths/digests and
 version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
 activation.
 
-Release `0.2.0` is the compatibility bridge for the next additive migration:
+Release `0.2.0` is the compatibility bridge for the next additive migration;
+MediaMTX release `0.2.1` is its race-safe native successor and is the default
+node target. The application manifest remains `0.3.0`. The bridge
 its manifest and startup gate accept both `0010_camera_access` and
 `0011_observability`, while its own migration head remains 0010. Deploy and
 smoke this bridge on every control-plane process before any host advances the
@@ -264,14 +270,15 @@ null endpoint snapshots when its deleted node no longer makes the old port
 reconstructible; all new and active moves require exact endpoint snapshots.
 
 Activation atomically switches `current`, reloads systemd and updates control
-roles. The packaged trust catalog records current `0.2.0` and historical
-patched `0.1.0` with distinct architecture-specific digests; stock v1.20.0 is
-never trusted. Phase-E `.1 → .2` uses the later documented drained,
+roles. The packaged trust catalog records current race-safe `0.2.1`, previous
+callback-compatible `0.2.0`, and historical patched `0.1.0` with distinct
+architecture-specific digests; stock v1.20.0 is never trusted. Phase-E
+`.1 → .2` uses the later documented drained,
 blast-radius-confirmed reconfigure because the ordinary release endpoint
 remains intentionally limited to empty stopped nodes. `.1` is not configured
-as `PREVIOUS_*`: it lacks callback-compatible management auth. Before a future
-N→N+1 rollout enables rollback, the new wheel must catalogue and prove both
-callback-compatible N and N+1 identities; only then may `PREVIOUS_*` be set.
+as a rollback target: it lacks callback-compatible management auth. The
+`0.2.0 → 0.2.1` race-only transition is the first pair for which `PREVIOUS_*`
+may be set after both architecture artifacts are verified.
 
 ## Security
 

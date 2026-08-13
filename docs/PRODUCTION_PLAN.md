@@ -479,12 +479,17 @@ simultaneous connects, ACL/auth and absence of media UDP sockets on amd64/arm64.
 
 Pinned upstream MediaMTX v1.20.0 does not natively produce both exact 453 and a
 race-safe non-disruptive admission fence. The product therefore builds
-`v1.20.0-rtsp-proxy.2` from exact commit
+`v1.20.0-rtsp-proxy.3` from exact commit
 `1b943637a4b5778bb929a7af7687b048fecaa03f` plus the reviewed SHA-256-bound
-patch in `patches/mediamtx-v1.20.0/`. The patch makes `maxReaders` a synchronous
-hot-only update, keeps an established session alive, and maps late SETUP to
-453. If this contract stops applying, another bounded admission mechanism must
-be accepted and proven; silently returning another code is not acceptable.
+patch in `patches/mediamtx-v1.20.0/` and a narrowly scoped, SHA-256-bound
+gortsplib v5.6.3 race fix plus a separately hash-bound deterministic regression.
+The production patches make `maxReaders` a synchronous hot-only
+update, keep an established session alive, map late SETUP to 453, and serialize
+the RTSP RECORD state transition against metrics reads. The build proves stock
+v5.6.3 fails the exact regression, then runs the patched dependency and
+MediaMTX race tests before each architecture build. If this contract stops
+applying, another bounded admission mechanism must be accepted and proven;
+silently returning another code is not acceptable.
 
 ## 15. Access control and auth
 
@@ -917,7 +922,9 @@ retried from DRAINING even when runtime is FAILED/STOPPED. Patched `.1` remains
 historical provenance but is not callback-compatible, so the first `.1 → .2`
 activation has no binary rollback target. Recovery retries `.2`; rollback stays
 NO-GO until a future callback-compatible previous release is catalogued and
-proven. It never installs allow-all/static users.
+proven. The race-only `.2 → .3` / `0.2.0 → 0.2.1` transition now supplies the
+first callback-compatible rollback pair; it does not change node config or the
+ordinary RTSP contract. It never installs allow-all/static users.
 Ordinary `rtsp://` interleaved TCP and the external port remain unchanged.
 
 Exit: **met** — security/RTSP review PASS and native amd64/arm64 contracts

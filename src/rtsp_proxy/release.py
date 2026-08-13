@@ -121,7 +121,7 @@ def _trusted_mediamtx_identity(
 
 def trusted_mediamtx_activation_identity(
     machine: str,
-    release_id: str = "0.2.0",
+    release_id: str = "0.2.1",
 ) -> tuple[str, Sha256]:
     """Return an identity only when the packaged catalog permits activation."""
 
@@ -149,7 +149,7 @@ def trusted_mediamtx_activation_identity(
 
 def trusted_mediamtx_identity(
     machine: str,
-    release_id: str = "0.2.0",
+    release_id: str = "0.2.1",
 ) -> tuple[str, Sha256]:
     """Return one release's packaged MediaMTX identity for a Linux architecture."""
 

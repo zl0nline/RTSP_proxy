@@ -338,7 +338,7 @@ def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity()
         confirmation_secret="test-confirmation-secret-that-is-at-least-43-bytes",
     )
 
-    assert settings.node_release_id == "0.2.0"
+    assert settings.node_release_id == "0.2.1"
 
     reconciler = Settings(
         role=RuntimeRole.RECONCILER,

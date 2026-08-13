@@ -26,6 +26,11 @@ source_repository=$(jq --raw-output '.mediamtx.source_repository' "$catalog")
 source_commit=$(jq --raw-output '.mediamtx.source_commit' "$catalog")
 patch_path=$(jq --raw-output '.mediamtx.patch' "$catalog")
 patch_sha256=$(jq --raw-output '.mediamtx.patch_sha256' "$catalog")
+gortsplib_version=$(jq --raw-output '.mediamtx.gortsplib.version' "$catalog")
+gortsplib_race_test_patch_path=$(jq --raw-output '.mediamtx.gortsplib.race_test_patch' "$catalog")
+gortsplib_race_test_patch_sha256=$(jq --raw-output '.mediamtx.gortsplib.race_test_patch_sha256' "$catalog")
+gortsplib_patch_path=$(jq --raw-output '.mediamtx.gortsplib.patch' "$catalog")
+gortsplib_patch_sha256=$(jq --raw-output '.mediamtx.gortsplib.patch_sha256' "$catalog")
 expected_go_version=$(jq --raw-output '.mediamtx.go_version' "$catalog")
 version=$(jq --raw-output '.mediamtx.version' "$catalog")
 expected_binary_sha256=$(
@@ -52,6 +57,8 @@ if [ "$(go version | awk '{print $3}')" != "$expected_go_version" ]; then
     exit 1
 fi
 sha256_check "$patch_sha256" "$repo_root/$patch_path"
+sha256_check "$gortsplib_race_test_patch_sha256" "$repo_root/$gortsplib_race_test_patch_path"
+sha256_check "$gortsplib_patch_sha256" "$repo_root/$gortsplib_patch_path"
 
 build_root=$(mktemp -d)
 trap 'rm -rf -- "$build_root"' EXIT HUP INT TERM
@@ -65,8 +72,44 @@ test "$(git -C "$source_root" rev-parse HEAD)" = "$source_commit"
 git -C "$source_root" apply --check "$repo_root/$patch_path"
 git -C "$source_root" apply "$repo_root/$patch_path"
 
+gortsplib_source="$source_root/third_party/gortsplib"
+mkdir -p "$source_root/third_party"
 (
     cd "$source_root"
+    actual_gortsplib_version=$(
+        go list -m -f '{{.Version}}' github.com/bluenviron/gortsplib/v5
+    )
+    if [ "$actual_gortsplib_version" != "$gortsplib_version" ]; then
+        echo "gortsplib version mismatch: expected $gortsplib_version, got $actual_gortsplib_version" >&2
+        exit 1
+    fi
+    module_directory=$(
+        go mod download -json "github.com/bluenviron/gortsplib/v5@$gortsplib_version" |
+            jq --raw-output '.Dir'
+    )
+    cp -R "$module_directory" "$gortsplib_source"
+)
+chmod -R u+w "$gortsplib_source"
+git -C "$gortsplib_source" init --quiet
+git -C "$gortsplib_source" apply --check "$repo_root/$gortsplib_race_test_patch_path"
+git -C "$gortsplib_source" apply "$repo_root/$gortsplib_race_test_patch_path"
+(
+    cd "$gortsplib_source"
+    if go test -race -run '^TestServerSessionRecordStateMetricsRace$' .; then
+        echo "unpatched gortsplib unexpectedly passed the RECORD-state race regression" >&2
+        exit 1
+    fi
+)
+git -C "$gortsplib_source" apply --check "$repo_root/$gortsplib_patch_path"
+git -C "$gortsplib_source" apply "$repo_root/$gortsplib_patch_path"
+(
+    cd "$gortsplib_source"
+    go test -race -run '^TestServerSessionRecordStateMetricsRace$' .
+)
+
+(
+    cd "$source_root"
+    go mod edit -replace "github.com/bluenviron/gortsplib/v5=./third_party/gortsplib"
     go generate ./...
     go test -race ./internal/auth ./internal/core ./internal/servers/rtsp
 )

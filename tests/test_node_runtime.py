@@ -2009,7 +2009,7 @@ def test_helper_settings_reject_overlap_and_non_absolute_privileged_paths() -> N
         helper_settings(mediamtx_binary_sha256="a" * 64)
 
     settings = helper_settings()
-    assert settings.policy().release_id == "0.2.0"
+    assert settings.policy().release_id == "0.2.1"
 
 
 def test_helper_policy_allows_current_and_previous_verified_releases(
@@ -2017,9 +2017,9 @@ def test_helper_policy_allows_current_and_previous_verified_releases(
 ) -> None:
     previous_digest = "b" * 64
 
-    def trusted_identity(_machine: str, release_id: str = "0.2.0") -> tuple[str, Sha256]:
-        digest = TRUSTED_MEDIAMTX_SHA256 if release_id == "0.2.0" else previous_digest
-        return "v1.20.0-rtsp-proxy.2", Sha256.model_validate(digest)
+    def trusted_identity(_machine: str, release_id: str = "0.2.1") -> tuple[str, Sha256]:
+        digest = TRUSTED_MEDIAMTX_SHA256 if release_id == "0.2.1" else previous_digest
+        return "v1.20.0-rtsp-proxy.3", Sha256.model_validate(digest)
 
     monkeypatch.setattr(
         "rtsp_proxy.node_runtime.trusted_mediamtx_activation_identity",
@@ -2099,7 +2099,7 @@ def test_helper_settings_require_a_complete_distinct_previous_release() -> None:
         helper_settings(previous_release_id="release-2026.08.11")
     with pytest.raises(ValueError, match="node_helper_previous_release_duplicate"):
         helper_settings(
-            previous_release_id="0.2.0",
+            previous_release_id="0.2.1",
             previous_mediamtx_binary=Path(
                 "/opt/rtsp-proxy/releases/release-2026.08.11/bin/mediamtx"
             ),
@@ -2335,7 +2335,7 @@ def helper_settings(
         "api_port_end": 13099,
         "metrics_port_start": 14000,
         "metrics_port_end": 14099,
-        "release_id": "0.2.0",
+        "release_id": "0.2.1",
         "mediamtx_binary_sha256": TRUSTED_MEDIAMTX_SHA256,
     }
     values.update(changes)

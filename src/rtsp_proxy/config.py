@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     collector_interval_seconds: float = Field(default=5, ge=1, le=60)
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     node_release_id: str = Field(
-        default="0.2.0",
+        default="0.2.1",
         pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
     )
     node_mediamtx_binary_sha256: str = Field(

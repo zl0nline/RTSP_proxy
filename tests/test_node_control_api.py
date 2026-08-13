@@ -1759,7 +1759,7 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
             "external_port": 12000,
             "api_port": 20000,
             "metrics_port": 20100,
-            "release_id": "0.2.0",
+            "release_id": "0.2.1",
             "creation_mode": "operator",
             "camera_capacity": 100,
             "desired_revision": 1,
@@ -2377,7 +2377,7 @@ def test_node_create_can_complete_provision_start_and_persist_applied_revision()
     assert runtime.calls == [(NodeRuntimeAction.PROVISION_START, node_id)]
     persisted = control.list_nodes()[0]
     assert persisted.process_id == 3001
-    assert persisted.observed_release_id == "0.2.0"
+    assert persisted.observed_release_id == "0.2.1"
 
 
 def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
@@ -4308,7 +4308,7 @@ def test_reconfigure_requires_drain_and_exact_confirmation_then_preserves_endpoi
     assert preview.status_code == 200
     assert preview.json()["external_port"] == 12000
     assert preview.json()["registered_cameras"] == 1
-    assert preview.json()["target_release_id"] == "0.2.0"
+    assert preview.json()["target_release_id"] == "0.2.1"
     assert preview.json()["target_mediamtx_binary_sha256"] == "0" * 64
     assert reconfigured.status_code == 200
     assert reconfigured.json()["state"] == "draining"

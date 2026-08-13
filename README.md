@@ -209,7 +209,7 @@ review, fixes и native amd64/arm64 CI.
 - architecture/digest-aware release verifier;
 - direct-Linux systemd/sysusers/tmpfiles baseline;
 - typed MediaMTX adapter plus the reproducible
-  `v1.20.0-rtsp-proxy.2` source build pinned to upstream commit
+  `v1.20.0-rtsp-proxy.3` source build pinned to upstream commit
   `1b943637a4b5778bb929a7af7687b048fecaa03f`;
 - native ordinary RTSP/TCP H.264/H.265 compatibility contracts;
 - reproducible GStreamer load generator/readers;
@@ -234,11 +234,9 @@ ordinary RTSP/TCP session or packet progress. Restart is transactionally fenced
 against placement; future rolling activation may use a separately catalogued
 callback-compatible previous release while empty stopped nodes transition one
 at a time.
-Release `0.2.0` keeps independently verified patched `0.1.0` only as historical
-trust provenance. It is not a Phase-E rollback target because it predates the
-authenticated callback-management patch; stock MediaMTX is never accepted.
-Rollback is NO-GO until a future callback-compatible release is catalogued as
-the previous activation target. The native
+Release `0.2.1` is the race-safe native target and keeps independently verified,
+callback-compatible `0.2.0` as its rollback identity; `0.1.0` remains historical
+trust provenance only. Stock MediaMTX is never accepted. The native
 test executes real systemd instances and proves process/listener/RTP isolation;
 its release identity and listener teardown checks remain fail closed while
 correctly accounting for exec transitions and completed TCP `TIME_WAIT` state.

@@ -10,11 +10,11 @@
     "wheel_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "mediamtx": {
-    "release_id": "0.2.0",
-    "version": "v1.20.0-rtsp-proxy.2",
+    "release_id": "0.2.1",
+    "version": "v1.20.0-rtsp-proxy.3",
     "linux_arch": "arm64",
     "binary": "bin/mediamtx",
-    "binary_sha256": "943dbe98d2b7ab103d437a33eac9890f7fe882ac0e867d96ee43cfcfdbf6b298"
+    "binary_sha256": "3637b2e96e24428d35dadbe2578ed9b3be6943b71c4f898ea8feab33577c87c3"
   },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260810",

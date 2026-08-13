@@ -55,11 +55,10 @@ writing, forces synchronous desired/audit/outbox durability and continues each
 node's normative revision. An operator-supplied legacy digest is never promoted
 to trusted identity. Stable desired lifecycle/admin state is restored exactly;
 transitional state blocks export and STOPPED/MAINTENANCE/FAILED is never
-promoted to RUNNING. The versioned catalog carries current `0.2.0` and
-historical patched `0.1.0` identities and never admits stock v1.20.0. Phase E
-does not advertise `.1` as rollback because it lacks callback-compatible
-management auth. Every later N→N+1 rollout must package and prove a compatible
-previous identity before enabling its rollback pin.
+promoted to RUNNING. The versioned catalog carries current race-safe `0.2.1`,
+callback-compatible previous `0.2.0`, and historical patched `0.1.0` identities,
+and never admits stock v1.20.0. Phase E does not advertise `.1` as rollback
+because it lacks callback-compatible management auth.
 
 Local evidence: full unit/contract suite passes with native-only contracts
 skipped when Linux artifacts are unavailable. The published native Phase D

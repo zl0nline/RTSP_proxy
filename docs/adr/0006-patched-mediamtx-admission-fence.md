@@ -18,9 +18,11 @@ fence.
 
 ## Decision
 
-Build `v1.20.0-rtsp-proxy.2` directly on Linux from upstream commit
+Build `v1.20.0-rtsp-proxy.3` directly on Linux from upstream commit
 `1b943637a4b5778bb929a7af7687b048fecaa03f` and
-`patches/mediamtx-v1.20.0/0001-hot-reader-limit-and-rtsp-453.patch`.
+`patches/mediamtx-v1.20.0/0001-hot-reader-limit-and-rtsp-453.patch`, with
+the pinned gortsplib v5.6.3 RECORD-state race fix and deterministic regression
+in `patches/gortsplib-v5.6.3/`.
 
 The patch:
 
@@ -33,10 +35,14 @@ The patch:
 - maps reader-limit rejection to RTSP `453 Not Enough Bandwidth`.
 - checks node-internal API/metrics users before the external callback, so the
   loopback management plane remains credentialed and node-scoped.
+- serializes gortsplib's successful RECORD transition with its public state
+  readers, preventing concurrent metrics collection from racing RTSP publish.
 
 The artifact catalog binds upstream commit, patch SHA-256, Go version, patched
-version string, and the resulting amd64/arm64 binary SHA-256 values. Release
-verification rejects stock or otherwise different binaries.
+version strings, all patch SHA-256 values, and the resulting amd64/arm64 binary
+SHA-256 values. The regression must fail before and pass after the dependency
+patch; the MediaMTX race suites then run before compilation.
+Release verification rejects stock or otherwise different binaries.
 
 ## Consequences
 
@@ -57,7 +63,9 @@ reader is admitted after reopening. Failure of any proof blocks release.
 
 ## Rollout and rollback
 
-Only catalog-verified binaries may be activated. The packaged trust catalog is
+Only catalog-verified binaries may be activated. Release `0.2.1` is the current
+race-safe identity; callback-compatible `0.2.0` is its rollback target. The
+packaged trust catalog is
 versioned by deployment release ID and architecture. During an N→N+1 rollout it
 contains both the current N+1 identity and the previous N identity with their
 distinct binary digests; the helper validates each release ID against its own
@@ -65,6 +73,5 @@ entry. Release `0.2.0` catalogues the prior patched `0.1.0` identity and its
 distinct architecture-specific digests as historical provenance only. Since
 `.1` predates internal-user-before-callback behavior, it is not an activation
 or rollback target for Phase E. Rollout uses the blast-radius-confirmed
-non-empty `.1 → .2` reconfigure path. Binary rollback remains NO-GO until a
-future callback-compatible previous release is catalogued; stock v1.20.0 is
-never a fallback.
+non-empty `.1 → .2` reconfigure path. Race-safe `0.2.1` keeps callback-compatible
+`0.2.0` as its verified previous target; stock v1.20.0 is never a fallback.

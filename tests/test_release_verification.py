@@ -324,7 +324,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
     assert {manifest.release_id for manifest in manifests} == {"0.3.0"}
-    assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.0"}
+    assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
 
 
 def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:
