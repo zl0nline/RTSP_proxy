@@ -10,6 +10,7 @@ from email.message import Message
 from io import BytesIO
 from types import TracebackType
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request
 from uuid import UUID
@@ -41,6 +42,7 @@ from rtsp_proxy.operator_access import (
     OperatorMutationContext,
     OperatorRole,
     OperatorSessionControl,
+    OperatorSessionUnavailable,
 )
 from rtsp_proxy.operator_identity import (
     BreakGlassControl,
@@ -49,10 +51,12 @@ from rtsp_proxy.operator_identity import (
     HttpsOidcTokenEndpoint,
     InMemoryBreakGlassStore,
     InMemoryOidcFlowStore,
+    OidcFlow,
     OidcIdentity,
     OidcLoginControl,
     OidcLoginInvalid,
     OidcLoginRateLimited,
+    OidcLoginUnavailable,
     OidcProvider,
     PostgresBreakGlassStore,
     PostgresOidcAccountResolver,
@@ -362,6 +366,123 @@ def test_oidc_readiness_requires_a_bounded_authenticated_idp_response() -> None:
             unavailable.assert_ready()
 
 
+def test_oidc_token_endpoint_rejects_invalid_protocol_and_transport_responses() -> None:
+    def endpoint_for(response_or_error: _TokenResponse | BaseException) -> HttpsOidcTokenEndpoint:
+        def open_request(*_args: Any, **_kwargs: Any) -> _TokenResponse:
+            if isinstance(response_or_error, BaseException):
+                raise response_or_error
+            return response_or_error
+
+        return HttpsOidcTokenEndpoint(
+            token_endpoint="https://idp.example.test/oauth2/token",
+            client_id="rtsp-proxy",
+            client_secret="client-secret",
+            redirect_uri="https://management.example.test/auth/oidc/callback",
+            maximum_response_bytes=1024,
+            opener=open_request,
+        )
+
+    with pytest.raises(ValueError, match="oidc_token_endpoint_configuration_invalid"):
+        HttpsOidcTokenEndpoint(
+            token_endpoint="http://idp.example.test/oauth2/token",
+            client_id="rtsp-proxy",
+            client_secret="client-secret",
+            redirect_uri="https://management.example.test/auth/oidc/callback",
+        )
+    with pytest.raises(OidcLoginInvalid, match="oidc_callback_invalid"):
+        endpoint_for(_TokenResponse(b"{}" )).exchange(code="", code_verifier="short")
+
+    invalid_responses = (
+        _TokenResponse(b'{"error":"invalid_grant"}', status=400),
+        _TokenResponse(b"{}", content_type="text/plain"),
+        _TokenResponse(b"not-json"),
+        _TokenResponse(b"{}"),
+        _TokenResponse(b'{"id_token":7}'),
+    )
+    for response in invalid_responses:
+        with pytest.raises(OidcLoginInvalid, match="oidc_callback_failed"):
+            endpoint_for(response).exchange(code="code", code_verifier="V" * 43)
+
+    with pytest.raises(OidcLoginUnavailable, match="oidc_provider_unavailable"):
+        endpoint_for(_TokenResponse(b"{}", status=503)).exchange(
+            code="code",
+            code_verifier="V" * 43,
+        )
+
+    for status, expected_error in (
+        (400, OidcLoginInvalid),
+        (503, OidcLoginUnavailable),
+    ):
+        headers = Message()
+        headers["Content-Type"] = "application/json"
+        error = HTTPError(
+            "https://idp.example.test/oauth2/token",
+            status,
+            "token failure",
+            headers,
+            BytesIO(b'{"error":"invalid_grant"}'),
+        )
+        with pytest.raises(expected_error):
+            endpoint_for(error).exchange(code="code", code_verifier="V" * 43)
+
+    with pytest.raises(OidcLoginUnavailable, match="oidc_provider_unavailable"):
+        endpoint_for(URLError("IdP unavailable")).exchange(
+            code="code",
+            code_verifier="V" * 43,
+        )
+
+
+def test_oidc_token_readiness_handles_http_errors_transport_and_cache_expiry() -> None:
+    now = [0.0]
+    calls: list[Request] = []
+    headers = Message()
+    headers["Content-Type"] = "application/json"
+
+    def expected_http_error(request: Request, **_kwargs: Any) -> _TokenResponse:
+        calls.append(request)
+        raise HTTPError(
+            request.full_url,
+            400,
+            "invalid grant",
+            headers,
+            BytesIO(b'{"error":"invalid_grant"}'),
+        )
+
+    endpoint = HttpsOidcTokenEndpoint(
+        token_endpoint="https://idp.example.test/oauth2/token",
+        client_id="rtsp-proxy",
+        client_secret="client-secret",
+        redirect_uri="https://management.example.test/auth/oidc/callback",
+        opener=expected_http_error,
+        monotonic_clock=lambda: now[0],
+    )
+    endpoint.assert_ready()
+    endpoint.assert_ready()
+    now[0] = 31
+    endpoint.assert_ready()
+    assert len(calls) == 2
+
+    bad_headers = Message()
+    bad_headers["Content-Type"] = "text/html"
+    invalid_http_error = HTTPError(
+        "https://idp.example.test/oauth2/token",
+        400,
+        "invalid client",
+        bad_headers,
+        BytesIO(b"invalid client"),
+    )
+    for failure in (invalid_http_error, URLError("IdP unavailable")):
+        unavailable = HttpsOidcTokenEndpoint(
+            token_endpoint="https://idp.example.test/oauth2/token",
+            client_id="rtsp-proxy",
+            client_secret="client-secret",
+            redirect_uri="https://management.example.test/auth/oidc/callback",
+            opener=lambda *_args, failure=failure, **_kwargs: (_ for _ in ()).throw(failure),
+        )
+        with pytest.raises(OidcLoginUnavailable, match="oidc_provider_unavailable"):
+            unavailable.assert_ready()
+
+
 def test_oidc_discovery_readiness_requires_exact_claim_and_protocol_contract() -> None:
     discovery_document = {
         "issuer": "https://idp.example.test",
@@ -403,6 +524,80 @@ def test_oidc_discovery_readiness_requires_exact_claim_and_protocol_contract() -
     )
     with pytest.raises(Exception, match="oidc_claim_contract_unavailable"):
         drifted.assert_ready()
+
+
+def test_oidc_discovery_rejects_invalid_configuration_and_bounded_responses() -> None:
+    document = {
+        "issuer": "https://idp.example.test",
+        "authorization_endpoint": "https://idp.example.test/oauth2/authorize",
+        "token_endpoint": "https://idp.example.test/oauth2/token",
+        "claims_supported": [
+            "acr",
+            "amr",
+            "aud",
+            "exp",
+            "groups",
+            "iat",
+            "iss",
+            "name",
+            "nonce",
+            "sub",
+        ],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+    }
+
+    with pytest.raises(ValueError, match="oidc_discovery_configuration_invalid"):
+        HttpsOidcDiscoveryEndpoint(
+            issuer="http://idp.example.test",
+            authorization_endpoint="https://idp.example.test/oauth2/authorize",
+            token_endpoint="https://idp.example.test/oauth2/token",
+        )
+
+    calls = [0]
+
+    def valid_document(*_args: Any, **_kwargs: Any) -> _TokenResponse:
+        calls[0] += 1
+        return _TokenResponse(json.dumps(document).encode())
+
+    cached = HttpsOidcDiscoveryEndpoint(
+        issuer="https://idp.example.test/",
+        authorization_endpoint="https://idp.example.test/oauth2/authorize",
+        token_endpoint="https://idp.example.test/oauth2/token",
+        opener=valid_document,
+    )
+    cached.assert_ready()
+    cached.assert_ready()
+    assert calls == [1]
+
+    invalid_responses: tuple[_TokenResponse | BaseException, ...] = (
+        _TokenResponse(b"{}", status=503),
+        _TokenResponse(json.dumps(document).encode(), content_type="text/plain"),
+        _TokenResponse(b"x" * 1025),
+        _TokenResponse(b"not-json"),
+        _TokenResponse(json.dumps(document | {"response_types_supported": []}).encode()),
+        URLError("IdP unavailable"),
+    )
+    for response_or_error in invalid_responses:
+        def open_request(
+            *_args: Any,
+            response_or_error: _TokenResponse | BaseException = response_or_error,
+            **_kwargs: Any,
+        ) -> _TokenResponse:
+            if isinstance(response_or_error, BaseException):
+                raise response_or_error
+            return response_or_error
+
+        unavailable = HttpsOidcDiscoveryEndpoint(
+            issuer="https://idp.example.test",
+            authorization_endpoint="https://idp.example.test/oauth2/authorize",
+            token_endpoint="https://idp.example.test/oauth2/token",
+            maximum_response_bytes=1024,
+            opener=open_request,
+        )
+        with pytest.raises(OidcLoginUnavailable, match="oidc_claim_contract_unavailable"):
+            unavailable.assert_ready()
 
 
 def test_oidc_login_redirect_uses_server_side_state_nonce_and_pkce_s256() -> None:
@@ -569,6 +764,137 @@ def test_oidc_callback_consumes_flow_once_and_issues_only_opaque_cookies() -> No
     assert flows.rejection_count() == 1
 
 
+def test_oidc_login_control_rejects_invalid_flow_and_account_boundaries() -> None:
+    provider = OidcProvider(
+        issuer="https://idp.example.test",
+        client_id="rtsp-proxy",
+        authorization_endpoint="https://idp.example.test/oauth2/authorize",
+        token_endpoint="https://idp.example.test/oauth2/token",
+        redirect_uri="https://management.example.test/auth/oidc/callback",
+    )
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:operator-42",
+        display_name="Operator",
+        roles=frozenset({OperatorRole.OPERATOR}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="oidc_flow_configuration_invalid"):
+        OidcLoginControl(
+            provider=provider,
+            flows=InMemoryOidcFlowStore(clock=lambda: NOW),
+            derivation_key=b"short",
+            state_factory=lambda: "S" * 43,
+        )
+
+    invalid_state = OidcLoginControl(
+        provider=provider,
+        flows=InMemoryOidcFlowStore(clock=lambda: NOW),
+        derivation_key=b"D" * 32,
+        state_factory=lambda: "short",
+        clock=lambda: NOW,
+    )
+    with pytest.raises(OidcLoginInvalid, match="oidc_state_invalid"):
+        invalid_state.begin()
+
+    naive_clock = OidcLoginControl(
+        provider=provider,
+        flows=InMemoryOidcFlowStore(clock=lambda: NOW),
+        derivation_key=b"D" * 32,
+        state_factory=iter(("S" * 43, "B" * 43)).__next__,
+        clock=lambda: NOW.replace(tzinfo=None),
+    )
+    with pytest.raises(OidcLoginInvalid, match="oidc_clock_invalid"):
+        naive_clock.begin()
+
+    unconfigured_flows = InMemoryOidcFlowStore(clock=lambda: NOW)
+    unconfigured = OidcLoginControl(
+        provider=provider,
+        flows=unconfigured_flows,
+        derivation_key=b"D" * 32,
+        state_factory=lambda: "S" * 43,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(OidcLoginInvalid, match="oidc_callback_invalid"):
+        unconfigured.complete(state="é" * 43, code="code", browser_token="B" * 43)
+    unconfigured.record_rejection(source_ip="x" * 129)
+    assert unconfigured_flows.rejection_count() == 1
+
+    class TokenEndpoint:
+        def exchange(self, *, code: str, code_verifier: str) -> str:
+            del code, code_verifier
+            return "signed-id-token"
+
+    class ClaimsVerifier:
+        def __init__(self, *, mfa_verified: bool) -> None:
+            self._mfa_verified = mfa_verified
+
+        def verify(self, *, id_token: str, nonce: str) -> OidcIdentity:
+            del id_token, nonce
+            return OidcIdentity(
+                subject="operator-42",
+                display_name="Operator",
+                groups=frozenset({"rtsp-operators"}),
+                roles=frozenset({OperatorRole.OPERATOR}),
+                mfa_verified=self._mfa_verified,
+            )
+
+    def complete_with(
+        *,
+        mfa_verified: bool = True,
+        resolver: Any = lambda _identity: ACCOUNT_ID,
+        sessions: Any = None,
+    ) -> None:
+        flows = InMemoryOidcFlowStore(clock=lambda: NOW)
+        control = OidcLoginControl(
+            provider=provider,
+            flows=flows,
+            derivation_key=b"D" * 32,
+            state_factory=iter(("S" * 43, "B" * 43)).__next__,
+            token_endpoint=TokenEndpoint(),
+            claims_verifier=ClaimsVerifier(mfa_verified=mfa_verified),
+            account_resolver=resolver,
+            sessions=(
+                OperatorSessionControl(
+                    store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+                    token_factory=iter(("T" * 43, "C" * 43)).__next__,
+                )
+                if sessions is None
+                else sessions
+            ),
+            clock=lambda: NOW,
+        )
+        control.begin()
+        control.complete(
+            state="S" * 43,
+            code="authorization-code",
+            browser_token="B" * 43,
+        )
+
+    with pytest.raises(OidcLoginInvalid, match="oidc_mfa_required"):
+        complete_with(mfa_verified=False)
+    with pytest.raises(OidcLoginInvalid, match="oidc_account_unavailable"):
+        complete_with(resolver=lambda _identity: None)
+
+    def rejected_resolver(_identity: OidcIdentity) -> UUID:
+        raise OidcLoginInvalid("oidc_account_unavailable")
+
+    with pytest.raises(OidcLoginInvalid, match="oidc_account_unavailable"):
+        complete_with(resolver=rejected_resolver)
+
+    class UnavailableSessions:
+        def issue(self, *, account_id: UUID, mfa_verified: bool) -> None:
+            del account_id, mfa_verified
+            raise OperatorSessionUnavailable("operator_session_store_unavailable")
+
+    with pytest.raises(OidcLoginUnavailable, match="operator_session_store_unavailable"):
+        complete_with(sessions=UnavailableSessions())
+
+
 def test_oidc_id_token_requires_rs256_issuer_audience_nonce_mfa_and_group_mapping() -> None:
     key = RSAKey.generate_key(
         2048,
@@ -703,6 +1029,54 @@ def test_postgres_oidc_callback_limit_survives_store_restart(
     reopened.close()
 
 
+def test_postgres_oidc_flow_enforces_capacity_and_identity_attempt_limits(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    with pytest.raises(ValueError, match="database_statement_timeout_invalid"):
+        PostgresOidcFlowStore(postgres_database_url, statement_timeout_ms=99)
+
+    store = PostgresOidcFlowStore(postgres_database_url)
+    store.assert_ready()
+    source_digest = "c" * 64
+    identity_digest = "f" * 64
+    for index in range(10):
+        store.create(
+            state_sha256=f"{index:064x}",
+            browser_sha256="b" * 64,
+            source_ip_sha256=source_digest,
+            return_to="/",
+            lifetime=timedelta(minutes=5),
+        )
+    with pytest.raises(OidcLoginRateLimited, match="operator_login_rate_limited"):
+        store.create(
+            state_sha256="a" * 64,
+            browser_sha256="b" * 64,
+            source_ip_sha256=source_digest,
+            return_to="/",
+            lifetime=timedelta(minutes=5),
+        )
+    with pytest.raises(OidcLoginInvalid, match="oidc_flow_invalid"):
+        store.consume("f" * 64, browser_sha256="b" * 64)
+
+    store.assert_identity_allowed(identity_sha256=identity_digest)
+    for _attempt in range(5):
+        store.record_identity_rejection(identity_sha256=identity_digest)
+    with pytest.raises(OidcLoginRateLimited, match="operator_login_rate_limited"):
+        store.assert_identity_allowed(identity_sha256=identity_digest)
+    store.record_success(
+        source_ip_sha256=source_digest,
+        identity_sha256=identity_digest,
+    )
+    store.assert_identity_allowed(identity_sha256=identity_digest)
+
+    for _attempt in range(5):
+        store.record_rejection(source_ip_sha256="e" * 64)
+    with pytest.raises(OidcLoginRateLimited, match="operator_login_rate_limited"):
+        store.record_rejection(source_ip_sha256="e" * 64)
+    store.close()
+
+
 def test_postgres_oidc_identity_provisions_once_with_audit_and_rejects_role_drift(
     postgres_database_url: str,
 ) -> None:
@@ -761,6 +1135,20 @@ def test_postgres_oidc_identity_provisions_once_with_audit_and_rejects_role_drif
     )
     with pytest.raises(Exception, match="oidc_account_unavailable"):
         resolver.resolve(drifted)
+
+    renamed = OidcIdentity(
+        subject="operator-42",
+        display_name="Оператор смены",
+        groups=frozenset({"rtsp-operators"}),
+        roles=frozenset({OperatorRole.OPERATOR}),
+        mfa_verified=True,
+    )
+    assert resolver.resolve(renamed) == account_id
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT display_name FROM operator_accounts WHERE id = :id"),
+            {"id": account_id},
+        ) == "Оператор смены"
     engine.dispose()
     resolver.close()
 
@@ -884,6 +1272,8 @@ def test_postgres_break_glass_consumes_totp_and_appends_security_event_atomicall
         totp_secret=totp_secret,
         context=TEST_MUTATION_CONTEXT,
     )
+    assert store.existing_break_glass_account_id() == ACCOUNT_ID
+    store.assert_ready()
     code = TOTP(totp_secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
 
     account_id = store.authenticate(
@@ -950,6 +1340,119 @@ def test_postgres_break_glass_consumes_totp_and_appends_security_event_atomicall
         )
     engine.dispose()
     store.close()
+
+
+def test_operator_identity_public_models_and_controls_reject_invalid_boundaries() -> None:
+    verifier = BreakGlassCredentials.hash_password(
+        "correct horse battery staple",
+        salt=b"S" * 16,
+    )
+    credentials = BreakGlassCredentials(
+        password_scrypt=verifier,
+        totp_secret=b"B" * 20,
+        last_totp_step=None,
+    )
+    assert credentials.verifies_password("wrong password") is False
+    assert credentials.verifies_password("x" * 1025) is False
+    invalid_credentials = (
+        {
+            "password_scrypt": b"short",
+            "totp_secret": b"B" * 20,
+            "last_totp_step": None,
+        },
+        {
+            "password_scrypt": verifier,
+            "totp_secret": b"short",
+            "last_totp_step": None,
+        },
+        {
+            "password_scrypt": verifier,
+            "totp_secret": b"B" * 20,
+            "last_totp_step": -1,
+        },
+    )
+    for invalid in invalid_credentials:
+        with pytest.raises(ValueError, match="break_glass_credentials_invalid"):
+            BreakGlassCredentials(**invalid)
+    for password, salt in (("short", b"S" * 16), ("valid password length", b"short")):
+        with pytest.raises(ValueError, match="break_glass_password_invalid"):
+            BreakGlassCredentials.hash_password(password, salt=salt)
+
+    oidc_account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:operator",
+        display_name="Operator",
+        roles=frozenset({OperatorRole.OPERATOR}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    with pytest.raises(ValueError, match="break_glass_account_invalid"):
+        InMemoryBreakGlassStore(account=oidc_account, credentials=credentials)
+    valid_identity = {
+        "subject": "operator-42",
+        "display_name": "Operator",
+        "groups": frozenset({"rtsp-operators"}),
+        "roles": frozenset({OperatorRole.OPERATOR}),
+        "mfa_verified": True,
+    }
+    for field, invalid_value in (
+        ("subject", ""),
+        ("display_name", ""),
+        ("groups", frozenset()),
+        ("roles", frozenset()),
+    ):
+        with pytest.raises(ValueError, match="oidc_identity_invalid"):
+            OidcIdentity(**(valid_identity | {field: invalid_value}))  # type: ignore[arg-type]
+    valid_provider = {
+        "issuer": "https://idp.example.test",
+        "client_id": "rtsp-proxy",
+        "authorization_endpoint": "https://idp.example.test/oauth2/authorize",
+        "token_endpoint": "https://idp.example.test/oauth2/token",
+        "redirect_uri": "https://management.example.test/auth/oidc/callback",
+    }
+    for field, invalid_value in (
+        ("issuer", "http://idp.example.test"),
+        ("client_id", ""),
+        ("authorization_endpoint", "https://other-idp.example.test/authorize"),
+        ("token_endpoint", "https://other-idp.example.test/token"),
+        ("redirect_uri", "http://management.example.test/auth/oidc/callback"),
+    ):
+        with pytest.raises(ValueError, match="oidc_provider_invalid"):
+            OidcProvider(**(valid_provider | {field: invalid_value}))
+
+    break_glass_account = OperatorAccount(
+        identity_source=OperatorIdentitySource.BREAK_GLASS,
+        id=ACCOUNT_ID,
+        subject="local:emergency-admin",
+        display_name="Emergency administrator",
+        roles=frozenset({OperatorRole.BREAK_GLASS}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    control = BreakGlassControl(
+        store=InMemoryBreakGlassStore(
+            account=break_glass_account,
+            credentials=credentials,
+        ),
+        sessions=OperatorSessionControl(
+            store=InMemoryOperatorSessionStore(accounts=(break_glass_account,), clock=lambda: NOW),
+            token_factory=iter(("T" * 43, "C" * 43)).__next__,
+        ),
+        clock=lambda: NOW.replace(tzinfo=None),
+    )
+    valid_code = TOTP(b"B" * 20, 6, hashes.SHA1(), 30).generate(
+        int(NOW.timestamp())
+    ).decode("ascii")
+    with pytest.raises(OidcLoginInvalid, match="break_glass_login_failed"):
+        control.login(
+            username="emergency-admin",
+            password="correct horse battery staple",
+            totp=valid_code,
+            source_ip="192.0.2.10",
+        )
 
 
 def test_break_glass_cli_provisions_exact_identity_without_exposing_secrets(
@@ -1346,3 +1849,137 @@ def test_break_glass_failures_do_not_globally_lock_the_emergency_account(
 
     assert account_id == ACCOUNT_ID
     store.close()
+
+
+def test_operator_identity_postgres_adapters_normalize_database_outage() -> None:
+    database_url = "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.BREAK_GLASS,
+        id=ACCOUNT_ID,
+        subject="local:emergency-admin",
+        display_name="Emergency administrator",
+        roles=frozenset({OperatorRole.BREAK_GLASS}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    with pytest.raises(ValueError, match="break_glass_store_configuration_invalid"):
+        PostgresBreakGlassStore(database_url, encryption_key=b"short")
+    break_glass = PostgresBreakGlassStore(
+        database_url,
+        encryption_key=b"K" * 32,
+        statement_timeout_ms=100,
+    )
+    break_glass_operations = (
+        break_glass.existing_break_glass_account_id,
+        break_glass.assert_ready,
+        lambda: break_glass.record_claim_contract_health(healthy=False),
+        lambda: break_glass.provision(
+            account=account,
+            password_scrypt=BreakGlassCredentials.hash_password(
+                "correct horse battery staple",
+                salt=b"S" * 16,
+            ),
+            totp_secret=b"B" * 20,
+            context=TEST_MUTATION_CONTEXT,
+        ),
+        lambda: break_glass.authenticate(
+            username="emergency-admin",
+            password="correct horse battery staple",
+            totp="000000",
+            source_ip="192.0.2.10",
+            now=NOW,
+        ),
+    )
+    for operation in break_glass_operations:
+        with pytest.raises(OidcLoginUnavailable):
+            operation()
+    break_glass.close()
+
+    flows = PostgresOidcFlowStore(database_url, statement_timeout_ms=100)
+    flow_operations = (
+        flows.assert_ready,
+        lambda: flows.create(
+            state_sha256="a" * 64,
+            browser_sha256="b" * 64,
+            source_ip_sha256="c" * 64,
+            return_to="/",
+            lifetime=timedelta(minutes=5),
+        ),
+        lambda: flows.consume("a" * 64, browser_sha256="b" * 64),
+        lambda: flows.record_rejection(source_ip_sha256="c" * 64),
+        lambda: flows.assert_identity_allowed(identity_sha256="d" * 64),
+        lambda: flows.record_identity_rejection(identity_sha256="d" * 64),
+        lambda: flows.record_success(
+            source_ip_sha256="c" * 64,
+            identity_sha256="d" * 64,
+        ),
+    )
+    for flow_operation in flow_operations:
+        with pytest.raises(OidcLoginUnavailable):
+            flow_operation()
+    flows.close()
+
+    with pytest.raises(ValueError, match="database_statement_timeout_invalid"):
+        PostgresOidcAccountResolver(database_url, issuer="http://idp.example.test")
+    resolver = PostgresOidcAccountResolver(
+        database_url,
+        issuer="https://idp.example.test",
+        statement_timeout_ms=100,
+    )
+    with pytest.raises(OidcLoginUnavailable, match="oidc_account_store_unavailable"):
+        resolver.resolve(
+            OidcIdentity(
+                subject="operator-42",
+                display_name="Operator",
+                groups=frozenset({"rtsp-operators"}),
+                roles=frozenset({OperatorRole.OPERATOR}),
+                mfa_verified=True,
+            )
+        )
+    resolver.close()
+
+
+def test_in_memory_oidc_flow_rejects_invalid_duplicate_and_expired_state() -> None:
+    valid_flow = {
+        "state_sha256": "a" * 64,
+        "browser_sha256": "b" * 64,
+        "source_ip_sha256": "c" * 64,
+        "return_to": "/",
+        "created_at": NOW,
+        "expires_at": NOW + timedelta(minutes=5),
+    }
+    for field, invalid_value in (
+        ("state_sha256", "short"),
+        ("browser_sha256", "short"),
+        ("source_ip_sha256", "short"),
+        ("return_to", "//attacker.example.test"),
+        ("created_at", NOW.replace(tzinfo=None)),
+        ("expires_at", NOW),
+    ):
+        with pytest.raises(ValueError, match="oidc_flow_invalid"):
+            OidcFlow(**(valid_flow | {field: invalid_value}))  # type: ignore[arg-type]
+
+    current_time = [NOW]
+    flows = InMemoryOidcFlowStore(clock=lambda: current_time[0])
+    flows.create(
+        state_sha256="a" * 64,
+        browser_sha256="b" * 64,
+        source_ip_sha256="c" * 64,
+        return_to="/",
+        lifetime=timedelta(seconds=1),
+    )
+    with pytest.raises(OidcLoginInvalid, match="oidc_flow_conflict"):
+        flows.create(
+            state_sha256="a" * 64,
+            browser_sha256="b" * 64,
+            source_ip_sha256="c" * 64,
+            return_to="/",
+            lifetime=timedelta(seconds=1),
+        )
+    current_time[0] = NOW + timedelta(seconds=1)
+    with pytest.raises(OidcLoginInvalid, match="oidc_flow_invalid"):
+        flows.consume("a" * 64, browser_sha256="b" * 64)
+    flows.assert_identity_allowed(identity_sha256="d" * 64)
+    flows.record_identity_rejection(identity_sha256="d" * 64)
+    flows.record_success(source_ip_sha256="c" * 64, identity_sha256="d" * 64)

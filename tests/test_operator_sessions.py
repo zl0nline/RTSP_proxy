@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -23,7 +24,9 @@ from rtsp_proxy.operator_access import (
     OperatorMutationContext,
     OperatorPermission,
     OperatorRole,
+    OperatorSession,
     OperatorSessionControl,
+    OperatorSessionFailure,
     OperatorSessionUnavailable,
     PostgresOperatorSessionStore,
 )
@@ -34,6 +37,138 @@ MUTATION_CONTEXT = OperatorMutationContext(
     actor="oidc:admin@example.test",
     reason="operator authorization test",
 )
+
+
+def test_operator_session_public_contract_rejects_invalid_boundary_states() -> None:
+    with pytest.raises(ValueError, match="operator_mutation_context_invalid"):
+        OperatorMutationContext(actor="", reason="invalid fixture")
+    valid_session = OperatorSession(
+        id=UUID("70000000-0000-0000-0000-000000000007"),
+        account_id=ACCOUNT_ID,
+        token_sha256="a" * 64,
+        csrf_sha256="b" * 64,
+        authz_version=1,
+        issued_at=NOW,
+        last_seen_at=NOW,
+        idle_expires_at=NOW + timedelta(minutes=30),
+        absolute_expires_at=NOW + timedelta(hours=12),
+        mfa_verified_at=NOW,
+    )
+    for changes in (
+        {"token_sha256": "short"},
+        {"csrf_sha256": "short"},
+        {"authz_version": 0},
+        {"issued_at": NOW.replace(tzinfo=None)},
+        {"last_seen_at": NOW.replace(tzinfo=None)},
+        {"idle_expires_at": NOW},
+        {"absolute_expires_at": NOW},
+    ):
+        with pytest.raises(ValueError, match="operator_session_invalid"):
+            replace(valid_session, **changes)
+
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:operator@example.test",
+        display_name="Оператор",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW)
+    with pytest.raises(ValueError, match="operator_authz_initial_version_invalid"):
+        store.create_account(
+            OperatorAccount(
+                identity_source=OperatorIdentitySource.OIDC,
+                id=UUID("61000000-0000-0000-0000-000000000006"),
+                subject="oidc:second@example.test",
+                display_name="Second operator",
+                roles=frozenset({OperatorRole.VIEWER}),
+                scopes=frozenset({"server:*"}),
+                authz_version=2,
+                enabled=True,
+            )
+        )
+    with pytest.raises(OperatorConflict, match="operator_account_exists"):
+        store.create_account(account)
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_account_unavailable"):
+        store.issue_session(
+            session_id=UUID("70000000-0000-0000-0000-000000000007"),
+            account_id=UUID("62000000-0000-0000-0000-000000000006"),
+            token_sha256="a" * 64,
+            csrf_sha256="b" * 64,
+            idle_timeout=timedelta(minutes=30),
+            absolute_timeout=timedelta(hours=12),
+            mfa_verified=True,
+        )
+
+    session = store.issue_session(
+        session_id=UUID("70000000-0000-0000-0000-000000000007"),
+        account_id=ACCOUNT_ID,
+        token_sha256="a" * 64,
+        csrf_sha256="b" * 64,
+        idle_timeout=timedelta(minutes=30),
+        absolute_timeout=timedelta(hours=12),
+        mfa_verified=True,
+    )
+    with pytest.raises(ValueError, match="operator_session_token_conflict"):
+        store.issue_session(
+            session_id=UUID("71000000-0000-0000-0000-000000000007"),
+            account_id=ACCOUNT_ID,
+            token_sha256="a" * 64,
+            csrf_sha256="c" * 64,
+            idle_timeout=timedelta(minutes=30),
+            absolute_timeout=timedelta(hours=12),
+            mfa_verified=True,
+        )
+    assert store.read_session("z" * 64) is OperatorSessionFailure.INVALID
+    assert (
+        store.touch_authorized_session(
+            session.id,
+            token_sha256="z" * 64,
+            expected_authz_version=1,
+            idle_timeout=timedelta(minutes=30),
+        )
+        is OperatorSessionFailure.CHANGED
+    )
+    assert store.revoke_session("z" * 64) is False
+
+    disabled = store.update_authorization(
+        account_id=ACCOUNT_ID,
+        expected_authz_version=1,
+        roles=account.roles,
+        scopes=account.scopes,
+        enabled=False,
+        context=MUTATION_CONTEXT,
+    )
+    assert disabled.enabled is False
+    assert store.read_session("a" * 64) is OperatorSessionFailure.ACCOUNT_UNAVAILABLE
+
+    naive_clock_store = InMemoryOperatorSessionStore(clock=lambda: NOW.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="operator_session_clock_invalid"):
+        naive_clock_store.read_session("a" * 64)
+
+    with pytest.raises(ValueError, match="operator_session_timing_invalid"):
+        OperatorSessionControl(
+            store=store,
+            token_factory=lambda: "t" * 43,
+            idle_timeout=timedelta(hours=2),
+            absolute_timeout=timedelta(hours=1),
+        )
+    no_mfa = OperatorSessionControl(store=store, token_factory=lambda: "t" * 43)
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_mfa_required"):
+        no_mfa.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+    bad_token = OperatorSessionControl(store=store, token_factory=lambda: "short")
+    with pytest.raises(ValueError, match="operator_session_token_invalid"):
+        bad_token.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_session_invalid"):
+        no_mfa.authenticate(
+            session_token="x" * 1025,
+            permission=OperatorPermission.DASHBOARD_READ,
+        )
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_session_invalid"):
+        no_mfa.revoke("missing")
 
 
 def test_opaque_session_authenticates_dashboard_and_mutation_with_csrf() -> None:
@@ -297,6 +432,57 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
             permission=OperatorPermission.DASHBOARD_READ,
         )
     reopened.close()
+
+
+def test_postgres_logout_is_idempotent_and_appends_one_normative_event(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:operator@example.test",
+        display_name="Оператор",
+        roles=frozenset({OperatorRole.OPERATOR}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresOperatorSessionStore(postgres_database_url)
+    store.create_account(account)
+    control = OperatorSessionControl(
+        store=store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+
+    control.revoke(issued.session_token)
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_session_invalid"):
+        control.revoke(issued.session_token)
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                "SELECT id, event_type, payload FROM audit_events "
+                "WHERE event_type = 'operator.session_logout'"
+            )
+        ).one()
+        outbox = connection.execute(
+            text(
+                "SELECT id, event_type, payload FROM outbox_messages "
+                "WHERE event_type = 'operator.session_logout'"
+            )
+        ).one()
+    engine.dispose()
+    store.close()
+    assert audit == outbox
+    assert audit.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "outcome": "accepted",
+        "reason_code": "operator_initiated",
+        "session_id": str(issued.session.id),
+    }
 
 
 def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:

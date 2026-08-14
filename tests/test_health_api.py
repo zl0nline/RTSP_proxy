@@ -34,6 +34,9 @@ from rtsp_proxy.runtime import (
     create_app_from_environment,
     create_background_app,
     load_settings,
+    run_auth,
+    run_background,
+    run_web,
 )
 
 TRUSTED_MEDIAMTX_SHA256 = trusted_mediamtx_identity(platform.machine())[1].root
@@ -468,6 +471,87 @@ def test_web_runtime_wires_oidc_sessions_readiness_and_durable_flow_from_environ
     assert claim_transition_alerts == 0
 
 
+def test_web_runtime_rejects_malformed_operator_credentials_before_serving(
+    postgres_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    key = RSAKey.generate_key(2048, {"kid": "idp-key-1", "use": "sig"}, auto_kid=False)
+    paths = {
+        "client_secret": tmp_path / "oidc-client-secret",
+        "derivation": tmp_path / "oidc-derivation-key",
+        "encryption": tmp_path / "break-glass-key",
+        "jwks": tmp_path / "oidc-jwks.json",
+        "roles": tmp_path / "oidc-group-roles.json",
+    }
+    valid_payloads = {
+        "client_secret": b"client-secret\n",
+        "derivation": base64.urlsafe_b64encode(b"D" * 32).rstrip(b"=") + b"\n",
+        "encryption": base64.urlsafe_b64encode(b"K" * 32).rstrip(b"=") + b"\n",
+        "jwks": json.dumps({"keys": [key.as_dict(private=False)]}).encode(),
+        "roles": b'{"rtsp-operators":["operator"]}',
+    }
+    for name, path in paths.items():
+        path.write_bytes(valid_payloads[name])
+        path.chmod(0o600)
+
+    real_fstat = os.fstat
+    monkeypatch.setattr(
+        "rtsp_proxy.operator_identity.os.fstat",
+        lambda descriptor: SimpleNamespace(
+            st_mode=real_fstat(descriptor).st_mode,
+            st_nlink=real_fstat(descriptor).st_nlink,
+            st_uid=os.geteuid(),
+            st_gid=0,
+            st_size=real_fstat(descriptor).st_size,
+        ),
+    )
+    environment = {
+        "RTSP_PROXY_ROLE": "web",
+        "RTSP_PROXY_DATABASE_URL": postgres_database_url,
+        "RTSP_PROXY_OIDC_ISSUER": "https://idp.example.test",
+        "RTSP_PROXY_OIDC_CLIENT_ID": "rtsp-proxy",
+        "RTSP_PROXY_OIDC_AUTHORIZATION_ENDPOINT": "https://idp.example.test/oauth2/authorize",
+        "RTSP_PROXY_OIDC_TOKEN_ENDPOINT": "https://idp.example.test/oauth2/token",
+        "RTSP_PROXY_OIDC_REDIRECT_URI": "https://management.example.test/auth/oidc/callback",
+        "RTSP_PROXY_OIDC_MFA_ACR": "urn:example:loa:2",
+        "RTSP_PROXY_OIDC_MFA_AMR": "pwd,otp",
+        "RTSP_PROXY_OIDC_CLIENT_SECRET_FILE": str(paths["client_secret"]),
+        "RTSP_PROXY_OIDC_DERIVATION_KEY_FILE": str(paths["derivation"]),
+        "RTSP_PROXY_BREAK_GLASS_ENCRYPTION_KEY_FILE": str(paths["encryption"]),
+        "RTSP_PROXY_OIDC_JWKS_FILE": str(paths["jwks"]),
+        "RTSP_PROXY_OIDC_GROUP_ROLES_FILE": str(paths["roles"]),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    invalid_files = (
+        ("client_secret", b"\n"),
+        ("client_secret", b"line-one\nline-two\n"),
+        ("derivation", b"short\n"),
+        ("derivation", b"!" * 43),
+        ("jwks", b"[]"),
+        ("roles", b"{}"),
+        ("roles", b'{"rtsp-operators":["break_glass"]}'),
+        ("roles", b'{"rtsp-operators":[]}'),
+    )
+    for name, payload in invalid_files:
+        for reset_name, path in paths.items():
+            path.write_bytes(valid_payloads[reset_name])
+        paths[name].write_bytes(payload)
+        with pytest.raises(ConfigurationError, match="operator_auth_file_invalid"):
+            create_app_from_environment()
+
+    for name, path in paths.items():
+        path.write_bytes(valid_payloads[name])
+    paths["jwks"].write_bytes(b'{"invalid":true}')
+    with pytest.raises(ValueError, match="oidc_jwks_invalid"):
+        create_app_from_environment()
+
+
 def test_node_limits_and_port_range_are_environment_driven() -> None:
     settings = load_settings(
         {
@@ -766,6 +850,54 @@ def test_background_entrypoint_accepts_only_non_web_roles() -> None:
             Settings(role=RuntimeRole.WEB),
             expected_role=RuntimeRole.WEB,
         )
+
+
+def test_console_entrypoints_enforce_role_and_pass_validated_apps_to_uvicorn(
+    postgres_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    uvicorn_calls: list[tuple[object, str, int]] = []
+
+    def run_server(app: object, *, host: str, port: int, **_kwargs: object) -> None:
+        uvicorn_calls.append((app, host, port))
+        with TestClient(app) as client:  # type: ignore[arg-type]
+            assert client.get("/health/live").status_code == 200
+
+    monkeypatch.setattr("rtsp_proxy.runtime.uvicorn.run", run_server)
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "auth")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    monkeypatch.setenv(
+        "RTSP_PROXY_ACCESS_PEPPER_FILE",
+        str(tmp_path / "access-peppers.json"),
+    )
+    with pytest.raises(ConfigurationError, match="web_role_required"):
+        run_web()
+
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.delenv("RTSP_PROXY_ACCESS_PEPPER_FILE")
+    with pytest.raises(ConfigurationError, match="auth_role_required"):
+        run_auth()
+
+    monkeypatch.setenv("RTSP_PROXY_HTTP_HOST", "127.0.0.2")
+    monkeypatch.setenv("RTSP_PROXY_HTTP_PORT", "9080")
+    run_web()
+    assert uvicorn_calls[-1][1:] == ("127.0.0.2", 9080)
+
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "worker")
+    monkeypatch.setenv("RTSP_PROXY_SMTP_HOST", "smtp.example.test")
+    monkeypatch.setenv("RTSP_PROXY_SMTP_USERNAME", "mailer")
+    monkeypatch.setenv(
+        "RTSP_PROXY_SMTP_PASSWORD_FILE",
+        str(tmp_path / "systemd-credential-smtp-password"),
+    )
+    monkeypatch.setenv("RTSP_PROXY_SMTP_FROM_ADDRESS", "proxy@example.test")
+    monkeypatch.setenv("RTSP_PROXY_SMTP_TO_ADDRESS", "operator@example.test")
+    run_background(["--expected-role", "worker"])
+    assert uvicorn_calls[-1][1:] == ("127.0.0.2", 9080)
 
 
 def test_background_entrypoint_fails_closed_when_config_changes_instance_role() -> None:
