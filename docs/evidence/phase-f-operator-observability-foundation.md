@@ -49,8 +49,10 @@ and the bounded camera catalog passed run `31790262853` at commit
 with exact `camera:<uuid>` scope and global `server:*` superset passed run
 `31794353270` at commit `e38af30dc492984956f1bb8f55434ce9430fe127`.
 Server-rendered update/enable/disable/delete forms with bounded CSRF parsing,
-exact submitted-revision CAS and reader-aware confirmation are implemented
-locally after that run. The supplied confirmation token remains mandatory and
+exact submitted-revision CAS and reader-aware confirmation passed all six jobs
+at commit `a6b2fd4cb1e9538dc679c581b4f1a81a5d2cb4f6`
+([CI run 31805146878](https://github.com/zl0nline/RTSP_proxy/actions/runs/31805146878)).
+The supplied confirmation token remains mandatory and
 digest/revision-bound even if the observed reader disconnects before apply;
 stale conflicts expose only expected/current revisions. One bounded camera-name
 contract is enforced by UI, domain, in-memory and PostgreSQL adapters. Name

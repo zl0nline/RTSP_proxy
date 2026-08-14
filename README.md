@@ -23,7 +23,7 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   camera catalog with search/filter and a secret-free camera detail page are
 >   green in native CI. Server-rendered update/enable/disable/delete workflows
 >   with bounded form CSRF, optimistic revision fencing and reader-aware
->   confirmation are implemented locally;
+>   confirmation are also green in native amd64/arm64 CI;
 >   camera move UI, complete browser E2E and the break-glass rotation drill remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
@@ -299,7 +299,10 @@ Read-only operator dashboard для server/node overview и bounded camera catal
 `control.read` permission и проекцией без `source_url` прошли native
 amd64/arm64 CI. Secret-free camera detail с exact `camera:<uuid>` scope и
 глобальным `server:*` superset также прошёл native CI. Server-rendered update,
-enable, disable и delete реализованы локально: form body ограничен, CSRF связан
+enable, disable и delete прошли native amd64/arm64 CI в commit
+`a6b2fd4cb1e9538dc679c581b4f1a81a5d2cb4f6`
+([run 31805146878](https://github.com/zl0nline/RTSP_proxy/actions/runs/31805146878)):
+form body ограничен, CSRF связан
 с сессией, каждое действие связано с показанной `desired_revision`, а занятый
 single-reader stream требует свежий confirmation token. Stale revision
 возвращает безопасный 409 без source URL; имя камеры одинаково ограничено 128

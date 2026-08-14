@@ -979,7 +979,9 @@ It shows only the ordinary `rtsp://` endpoint template, placement and revision
 state. It requires `control.read` plus the exact
 `camera:<uuid>` scope, while `server:*` remains the explicit global superset;
 cross-camera denials are resolved before lookup and expose no existence oracle.
-Server-rendered update/enable/disable/delete workflows are implemented locally.
+Server-rendered update/enable/disable/delete workflows passed all six native
+amd64/arm64 jobs at commit `a6b2fd4cb1e9538dc679c581b4f1a81a5d2cb4f6`
+([CI run 31805146878](https://github.com/zl0nline/RTSP_proxy/actions/runs/31805146878)).
 Unsafe forms use a session-bound hidden CSRF token, a 32 KiB/eight-field/two-second
 parser, exact camera scope and `control.mutate`. An unoccupied path is changed
 immediately after runtime preview, but only through CAS against the revision
@@ -997,7 +999,7 @@ composition root. Camera move UI, complete browser E2E and the operator rotation
 drill remain pending. No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
-  camera catalog and camera detail CI-green; update/enable/disable/delete local;
+  camera catalog/detail and update/enable/disable/delete CI-green;
   camera move UI pending);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
