@@ -40,7 +40,9 @@ to standalone `.service` and `.socket` units; the web-auth drop-in remains
 parsed and asserted by the deployment contract tests instead of being treated
 as a standalone unit.
 
-This is functional evidence, not Phase F completion or production capacity
-evidence. Server-rendered dashboard pages, complete browser workflows,
-accessibility/confirmation E2E, the operator rotation drill, physical-hardware
-capacity and the 24-hour soak remain open. Production therefore remains NO-GO.
+This is functional evidence for the non-UI foundation, not Phase F completion
+or production capacity evidence. Server-rendered dashboard work is tracked by
+later commits and CI outside this evidence boundary. Camera mutations, complete
+browser accessibility/confirmation E2E, the operator rotation drill,
+physical-hardware capacity and the 24-hour soak remain open. Production
+therefore remains NO-GO.

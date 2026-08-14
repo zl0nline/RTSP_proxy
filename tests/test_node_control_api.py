@@ -1133,7 +1133,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_access_policies', 'camera_access_grants')"
             )
         )
-    assert revision == "0013_operator_login"
+    assert revision == "0014_camera_catalog_projection"
     assert table_count == 6
 
 

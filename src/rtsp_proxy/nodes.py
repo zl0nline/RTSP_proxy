@@ -230,6 +230,64 @@ class CameraPlacement:
     applied_revision: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CameraCatalogItem:
+    id: UUID
+    name: str
+    public_id: PublicId
+    node_id: UUID
+    node_name: str
+    node_port: int
+    placement_mode: PlacementMode
+    state: CameraState
+    desired_revision: int
+    applied_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class CameraCatalogQuery:
+    after: UUID | None = None
+    limit: int = 50
+    search: str | None = None
+    node_id: UUID | None = None
+    state: CameraState | None = None
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.limit <= 100:
+            raise ValueError("camera_catalog_limit_invalid")
+        if self.search is None:
+            return
+        normalized = self.search.strip()
+        if (
+            not normalized
+            or len(normalized) < 3
+            or len(normalized) > 128
+            or any(ord(character) < 32 for character in normalized)
+        ):
+            raise ValueError("camera_catalog_search_invalid")
+        object.__setattr__(self, "search", normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class CameraCatalogPage:
+    items: tuple[CameraCatalogItem, ...]
+    next_after: UUID | None
+
+    def __post_init__(self) -> None:
+        if len(self.items) > 100 or tuple(sorted(item.id for item in self.items)) != tuple(
+            item.id for item in self.items
+        ):
+            raise ValueError("camera_catalog_page_invalid")
+        if self.next_after is not None and (
+            not self.items or self.next_after != self.items[-1].id
+        ):
+            raise ValueError("camera_catalog_cursor_invalid")
+
+
+class CameraCatalogUnavailable(RuntimeError):
+    """The bounded, secret-free camera catalog cannot be read safely."""
+
+
 PortChoice = Callable[[tuple[int, ...]], int]
 NodeIdFactory = Callable[[], UUID]
 PublicIdFactory = Callable[[], str]
@@ -1046,6 +1104,36 @@ class InMemoryNodeStore:
         with self._lock:
             return tuple(
                 camera for camera in self._cameras if camera.state is not CameraState.DELETED
+            )
+
+    def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
+        with self._lock:
+            node_names = {node.id: node.name for node in self._nodes}
+            candidates = sorted(
+                (
+                    camera
+                    for camera in self._cameras
+                    if camera.state is not CameraState.DELETED
+                    and (query.after is None or camera.id > query.after)
+                    and (query.node_id is None or camera.node_id == query.node_id)
+                    and (query.state is None or camera.state is query.state)
+                    and (
+                        query.search is None
+                        or query.search in camera.name
+                        or query.search in str(camera.public_id)
+                    )
+                ),
+                key=lambda camera: camera.id.int,
+            )
+            selected = candidates[: query.limit + 1]
+            has_more = len(selected) > query.limit
+            items = tuple(
+                _camera_catalog_item(camera, node_name=node_names[camera.node_id])
+                for camera in selected[: query.limit]
+            )
+            return CameraCatalogPage(
+                items=items,
+                next_after=items[-1].id if has_more else None,
             )
 
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
@@ -2213,6 +2301,14 @@ class CameraControl:
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         return self._store.list_cameras()
 
+    def catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
+        try:
+            return self._store.camera_catalog(query)
+        except CameraCatalogUnavailable:
+            raise
+        except Exception:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
+
     def update_camera(
         self,
         camera_id: UUID,
@@ -2357,6 +2453,8 @@ class CameraStore(Protocol):
     ) -> CameraPlacement: ...
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]: ...
+
+    def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage: ...
 
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None: ...
 
@@ -2574,6 +2672,25 @@ def validate_runtime_observation(
         or observation.applied_revision != node.desired_revision
     ):
         raise InvalidNodeRuntimeObservation("runtime_config_identity_invalid")
+
+
+def _camera_catalog_item(
+    camera: CameraPlacement,
+    *,
+    node_name: str,
+) -> CameraCatalogItem:
+    return CameraCatalogItem(
+        id=camera.id,
+        name=camera.name,
+        public_id=camera.public_id,
+        node_id=camera.node_id,
+        node_name=node_name,
+        node_port=camera.node_port,
+        placement_mode=camera.placement_mode,
+        state=camera.state,
+        desired_revision=camera.desired_revision,
+        applied_revision=camera.applied_revision,
+    )
 
 
 def select_port_with_bounded_recheck(

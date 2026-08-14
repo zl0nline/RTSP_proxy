@@ -198,8 +198,8 @@ that same disabled identity with fresh password/TOTP material and another
 monotonic authz revision; it never invents credentials in SQL. Readiness remains
 red until this explicit reprovisioning and the accepted/rejected SMTP drill pass.
 
-Before starting a control-plane release, apply the migrations packaged inside
-that exact wheel environment:
+On a fresh installation, apply the migrations packaged inside the exact wheel
+environment before starting any control-plane process:
 
 ```sh
 RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_proxy' \
@@ -207,9 +207,12 @@ RTSP_PROXY_DATABASE_URL='postgresql+psycopg://rtsp_proxy@127.0.0.1:5432/rtsp_pro
 ```
 
 The runner upgrades to the packaged `head` and uses the same direct native
-PostgreSQL contract on amd64 and arm64. Release `0.5.0` declares the additive
-rolling window `0012_operator_sessions..0013_operator_login`: first deploy the
-new web/reconciler while PostgreSQL remains on 0012, then apply 0013. Keep
+PostgreSQL contract on amd64 and arm64. For an additive rolling upgrade, do not
+apply the new revision first: install, verify and smoke the bridge release on
+every process while PostgreSQL remains at the old supported revision, then run
+the packaged migration once. Release `0.5.0` declares the rolling window
+`0012_operator_sessions..0013_operator_login`: first deploy the new
+web/reconciler while PostgreSQL remains on 0012, then apply 0013. Keep
 operator authentication disabled until every WEB process has the complete,
 root-owned OIDC and break-glass configuration; once enabled it is a single
 fail-closed runtime boundary, not an independently switchable set of stores.
@@ -221,6 +224,35 @@ the stable external reason `outbox_unavailable` until that restart creates the
 security-alert dispatcher (the internal diagnostic is
 `security_dispatcher_restart_required`); this prevents a pre-migration worker
 from reporting a false-green outbox boundary.
+
+Application release `0.6.0` adds the index-only
+`0014_camera_catalog_projection` revision. The release remains executable on
+`0012_operator_sessions`, `0013_operator_login` and 0014 while processes are
+rolled; install 0.6.0 everywhere before advancing PostgreSQL to 0014. Migration
+0014 installs the trusted `pg_trgm` extension plus the camera name/public-path,
+state and node-placement catalog indexes. Before running it, briefly suspend
+dashboard camera mutations and clear long control-plane database transactions;
+established RTSP sessions and media-node processes keep running. The migration
+sets a one-second lock wait and a 30-second statement deadline. Either all four
+indexes and the revision commit together, or PostgreSQL leaves the database at
+0013 with no partial catalog indexes. A timeout is an operator-visible failed
+migration: remove the blocking transaction and retry the same packaged command.
+
+The camera page requires exact revision 0014, `pg_trgm`, and exact canonical
+definitions for all four catalog indexes on every request. Missing or drifted
+projection state returns a sanitized unavailable response; it never falls back
+to an unindexed scan. WEB database operations also carry a two-second
+statement/connect/pool deadline. After migration, open the camera catalog and
+verify every WEB and background process is ready before ending the mutation
+window.
+
+Release `0.5.0` is a rollback target only while PostgreSQL has not advanced past
+0013. After revision 0014 commits, application rollback to a manifest whose
+maximum schema is 0013 is **NO-GO**. Fix forward with verified 0.6.0 artifacts,
+or stop the control plane and restore the pre-migration PostgreSQL backup; an
+Alembic downgrade is not a supported product rollback. Media nodes and ordinary
+`rtsp://` interleaved-TCP sessions are outside this control-plane rollback
+boundary.
 The five WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
 `/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running

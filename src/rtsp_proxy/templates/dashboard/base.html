@@ -11,6 +11,12 @@
     <header class="site-header">
       <a class="brand" href="/dashboard" aria-label="RTSP Proxy — обзор">RTSP Proxy</a>
       {% if principal %}
+      <nav class="primary-nav" aria-label="Основная навигация">
+        <a href="/dashboard">Ноды</a>
+        <a href="/dashboard/cameras">Камеры</a>
+      </nav>
+      {% endif %}
+      {% if principal %}
       <div class="operator" aria-label="Текущий оператор">
         <span>{{ principal.display_name }}</span>
         <span class="operator-role">{{ principal.roles | map(attribute='value') | sort | join(', ') }}</span>

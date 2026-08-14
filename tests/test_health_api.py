@@ -3,12 +3,14 @@ import base64
 import json
 import os
 import platform
+import socket
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Thread
 from time import sleep
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -994,6 +996,64 @@ def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
         observations.close()
     assert snapshot is not None
     assert snapshot.configured_nodes == 0
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "0012_operator_sessions",
+        "0013_operator_login",
+        "0014_camera_catalog_projection",
+    ],
+)
+def test_collector_remains_ready_across_declared_schema_bridge(
+    revision: str,
+    postgres_database_url: str,
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, revision)
+    socket_path = Path("/tmp") / f"rtsp-proxy-{uuid4().hex}.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    listener.settimeout(3)
+
+    def answer_health() -> None:
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return
+        with connection:
+            connection.makefile("rb").readline(65_537)
+            connection.sendall(
+                b'{"error":null,"observation":null,"ok":true,"schema_version":1}\n'
+            )
+
+    health_thread = Thread(target=answer_health)
+    health_thread.start()
+    try:
+        app = create_background_app(
+            Settings(
+                role=RuntimeRole.COLLECTOR,
+                database_url=postgres_database_url,
+                node_runtime_socket=socket_path,
+                node_runtime_timeout_seconds=2,
+                node_mediamtx_binary_sha256=TRUSTED_MEDIAMTX_SHA256,
+                collector_interval_seconds=1,
+            ),
+            expected_role=RuntimeRole.COLLECTOR,
+        )
+        with TestClient(app) as client:
+            assert client.get("/health/ready").status_code == 200
+    finally:
+        listener.close()
+        health_thread.join(timeout=4)
+        socket_path.unlink(missing_ok=True)
+    assert not health_thread.is_alive()
 
 
 def test_observability_roles_require_current_schema_after_bridge_deployment(

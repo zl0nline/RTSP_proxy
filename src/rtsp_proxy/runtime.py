@@ -346,7 +346,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             settings.database_url,
             statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
         )
-        if store.schema_is_current()
+        if store.schema_supports_operator_login()
         else None
     )
     try:
@@ -652,8 +652,6 @@ def create_background_app(
     if expected_role is RuntimeRole.PROBE:
         raise ConfigurationError("probe_role_not_implemented")
     store = _open_verified_store(settings)
-    if store is not None and expected_role is RuntimeRole.COLLECTOR:
-        store.assert_schema_current()
     startup: Callable[[], None] | None = None
     shutdown: Callable[[], None] | None = None if store is None else store.close
     worker_security_alerts_enabled: bool | None = None
@@ -849,7 +847,7 @@ def create_background_app(
             max_attempts=settings.notification_max_attempts,
             retry_delay=timedelta(seconds=settings.notification_retry_seconds),
         )
-        worker_security_alerts_enabled = store.schema_is_current()
+        worker_security_alerts_enabled = store.schema_supports_operator_login()
         security_dispatcher = (
             OperatorSecurityAlertDispatcher(
                 store=observability,
@@ -974,7 +972,7 @@ def _background_readiness(
         assert settings.database_url is not None
 
         def outbox_ready() -> None:
-            require_security_alerts = store.schema_is_current()
+            require_security_alerts = store.schema_supports_operator_login()
             if require_security_alerts and worker_security_alerts_enabled is not True:
                 raise RuntimeError("security_dispatcher_restart_required")
             observability = PostgresObservabilityStore(
@@ -1021,7 +1019,8 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
             if settings.role is RuntimeRole.AUTH
             else (
                 _BACKGROUND_DATABASE_TIMEOUT_MS
-                if settings.role in {RuntimeRole.COLLECTOR, RuntimeRole.WORKER}
+                if settings.role
+                in {RuntimeRole.WEB, RuntimeRole.COLLECTOR, RuntimeRole.WORKER}
                 else None
             )
         ),

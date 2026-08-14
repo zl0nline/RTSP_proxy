@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Literal
+from urllib.parse import urlencode
 from uuid import UUID
 
 import anyio
@@ -30,6 +31,7 @@ from rtsp_proxy.dashboard import (
     DashboardUnavailable,
     FleetSnapshotFailureReason,
     FleetSnapshotReadFailure,
+    render_camera_catalog,
     render_node_detail,
     render_overview,
     render_unavailable,
@@ -43,10 +45,13 @@ from rtsp_proxy.health import (
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.nodes import (
+    CameraCatalogQuery,
+    CameraCatalogUnavailable,
     CameraControl,
     CameraLifecycleConflict,
     CameraMove,
     CameraNotFound,
+    CameraState,
     EligibleNodeMissing,
     InvalidCameraSource,
     MaximumNodesReached,
@@ -792,6 +797,41 @@ def create_app(
             return snapshot_response
         return _dashboard_html_response(
             render_overview(snapshot=snapshot_response, principal=principal)
+        )
+
+    @app.get(
+        "/dashboard/cameras",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def dashboard_camera_catalog(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        if camera_control is None:
+            return _camera_catalog_unavailable_response(principal)
+        try:
+            query = _camera_catalog_query(request)
+        except ValueError:
+            return _dashboard_unavailable_response(
+                DashboardUnavailable(
+                    title="Некорректный запрос каталога",
+                    message="Проверьте фильтры, курсор и размер страницы.",
+                ),
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                principal=principal,
+            )
+        try:
+            page = camera_control.catalog(query)
+        except CameraCatalogUnavailable:
+            return _camera_catalog_unavailable_response(principal)
+        return _dashboard_html_response(
+            render_camera_catalog(
+                page=page,
+                query=query,
+                next_url=_camera_catalog_next_url(query, page.next_after),
+                principal=principal,
+            )
         )
 
     @app.get(
@@ -2296,7 +2336,13 @@ def _retryable_service_response(code: str) -> JSONResponse:
 
 def _operator_permission_for_request(request: Request) -> OperatorPermission:
     path = request.url.path
-    if path.startswith("/dashboard") or request.url.path in {
+    if path == "/dashboard/cameras" or path.startswith("/dashboard/cameras/"):
+        return (
+            OperatorPermission.CONTROL_READ
+            if request.method in {"GET", "HEAD", "OPTIONS"}
+            else OperatorPermission.CONTROL_MUTATE
+        )
+    if path.startswith("/dashboard") or path in {
         "/api/v1/operator/session",
         "/api/v1/dashboard/snapshot",
     }:
@@ -2413,6 +2459,62 @@ def _dashboard_unavailable_response(
         status_code=status_code,
         retry_after="5" if status_code == status.HTTP_503_SERVICE_UNAVAILABLE else None,
     )
+
+
+def _camera_catalog_unavailable_response(principal: OperatorPrincipal) -> HTMLResponse:
+    return _dashboard_unavailable_response(
+        DashboardUnavailable(
+            title="Каталог камер недоступен",
+            message="Безопасно прочитать список камер сейчас невозможно.",
+        ),
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        principal=principal,
+    )
+
+
+def _camera_catalog_query(request: Request) -> CameraCatalogQuery:
+    allowed = {"after", "limit", "q", "node_id", "state"}
+    values: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key not in allowed or key in values:
+            raise ValueError("camera_catalog_query_invalid")
+        values[key] = value
+    after_value = values.get("after")
+    node_id_value = values.get("node_id")
+    state_raw = values.get("state")
+    try:
+        limit = int(values.get("limit", "50"))
+        after = UUID(after_value) if after_value else None
+        node_id = UUID(node_id_value) if node_id_value else None
+        state_value = CameraState(state_raw) if state_raw else None
+    except (TypeError, ValueError):
+        raise ValueError("camera_catalog_query_invalid") from None
+    if state_value is CameraState.DELETED:
+        raise ValueError("camera_catalog_query_invalid")
+    return CameraCatalogQuery(
+        after=after,
+        limit=limit,
+        search=values.get("q") or None,
+        node_id=node_id,
+        state=state_value,
+    )
+
+
+def _camera_catalog_next_url(
+    query: CameraCatalogQuery,
+    next_after: UUID | None,
+) -> str | None:
+    if next_after is None:
+        return None
+    parameters: list[tuple[str, str]] = [("limit", str(query.limit))]
+    if query.search is not None:
+        parameters.append(("q", query.search))
+    if query.node_id is not None:
+        parameters.append(("node_id", str(query.node_id)))
+    if query.state is not None:
+        parameters.append(("state", query.state.value))
+    parameters.append(("after", str(next_after)))
+    return f"/dashboard/cameras?{urlencode(parameters)}"
 
 
 def _operator_error_response(status_code: int, code: str) -> JSONResponse:

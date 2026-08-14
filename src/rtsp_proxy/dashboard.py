@@ -8,6 +8,7 @@ from typing import Final
 
 from jinja2 import Environment, PackageLoader, StrictUndefined, select_autoescape
 
+from rtsp_proxy.nodes import CameraCatalogPage, CameraCatalogQuery, CameraState
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import OperatorPrincipal
 
@@ -84,6 +85,22 @@ def render_node_detail(
         snapshot=snapshot,
         node=node,
         principal=principal,
+    )
+
+
+def render_camera_catalog(
+    *,
+    page: CameraCatalogPage,
+    query: CameraCatalogQuery,
+    next_url: str | None,
+    principal: OperatorPrincipal,
+) -> str:
+    return _environment().get_template("dashboard/cameras.html").render(
+        page=page,
+        query=query,
+        next_url=next_url,
+        principal=principal,
+        states=(CameraState.ENABLED, CameraState.DISABLED, CameraState.DELETING),
     )
 
 

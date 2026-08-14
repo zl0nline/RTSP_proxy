@@ -1,0 +1,91 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Каталог камер — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">До 100 камер на ноду</p>
+      <h1>Каталог камер</h1>
+    </div>
+    <p class="updated">Показано: {{ page.items | length }}</p>
+  </div>
+
+  <form class="catalog-filters" method="get" action="/dashboard/cameras" aria-label="Фильтры каталога камер">
+    <label>
+      <span>Имя или public path (регистр учитывается)</span>
+      <input type="search" name="q" value="{{ query.search or '' }}" minlength="3" maxlength="128" placeholder="Минимум 3 символа">
+    </label>
+    <label>
+      <span>UUID ноды</span>
+      <input type="text" name="node_id" value="{{ query.node_id or '' }}" maxlength="36" placeholder="Все ноды">
+    </label>
+    <label>
+      <span>Состояние</span>
+      <select name="state">
+        <option value="">Все</option>
+        {% for state in states %}
+        <option value="{{ state.value }}"{% if query.state == state %} selected{% endif %}>{{ state.value }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>На странице</span>
+      <input type="number" name="limit" value="{{ query.limit }}" min="1" max="100" inputmode="numeric">
+    </label>
+    <button type="submit">Применить</button>
+  </form>
+
+  <section class="panel catalog-panel" aria-labelledby="cameras-title">
+    <div class="panel-heading">
+      <div>
+        <p class="eyebrow">Control plane</p>
+        <h2 id="cameras-title">Зарегистрированные камеры</h2>
+      </div>
+      <span class="count">{{ page.items | length }}</span>
+    </div>
+    {% if page.items %}
+    <div class="table-scroll" tabindex="0" aria-label="Прокручиваемая таблица камер">
+      <table aria-label="Каталог камер">
+        <thead>
+          <tr>
+            <th scope="col">Камера</th>
+            <th scope="col">Public path</th>
+            <th scope="col">Нода</th>
+            <th scope="col">Порт</th>
+            <th scope="col">Размещение</th>
+            <th scope="col">Состояние</th>
+            <th scope="col">Revision</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for camera in page.items %}
+          <tr>
+            <th scope="row">
+              {{ camera.name }}
+              <small class="node-id">{{ camera.id }}</small>
+            </th>
+            <td><code>/{{ camera.public_id }}</code></td>
+            <td>
+              {{ camera.node_name }}
+              <small class="node-id">{{ camera.node_id }}</small>
+            </td>
+            <td><code>{{ camera.node_port }}</code></td>
+            <td>{{ camera.placement_mode.value }}</td>
+            <td><span class="camera-state camera-state-{{ camera.state.value }}">{{ camera.state.value }}</span></td>
+            <td>{{ camera.applied_revision }} / {{ camera.desired_revision }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="empty-state">По выбранным фильтрам камер нет.</p>
+    {% endif %}
+  </section>
+
+  <nav class="pagination" aria-label="Пагинация каталога">
+    <span>Для возврата используйте кнопку браузера «Назад».</span>
+    {% if next_url %}<a class="button-link" href="{{ next_url }}">Следующая страница</a>{% endif %}
+  </nav>
+</main>
+{% endblock %}

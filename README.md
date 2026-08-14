@@ -19,8 +19,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   durable failure/recovery email dispatcher, plus digest-only PostgreSQL
 >   sessions, RBAC version fencing, CSRF boundary, browser-bound OIDC Code+PKCE
 >   and audited break-glass password+TOTP login. Authenticated read-only
->   server/node dashboard pages are implemented locally; camera workflows,
->   browser E2E and the break-glass rotation drill remain pending.
+>   server/node dashboard pages are green in native CI; a bounded, keyset-paginated,
+>   secret-free camera catalog with search/filter is implemented locally. Camera
+>   detail/mutation workflows, browser E2E and the break-glass rotation drill remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -290,8 +291,11 @@ OIDC Code+PKCE с MFA claim contract и break-glass password+TOTP login уже
 durable audit/email каждого emergency-login. Точная граница доказанного
 foundation зафиксирована в
 [`docs/evidence/phase-f-operator-observability-foundation.md`](docs/evidence/phase-f-operator-observability-foundation.md).
-Read-only operator dashboard для server/node overview реализован локально;
-camera catalog, mutation/confirmation workflows, полный browser E2E и rotation
+Read-only operator dashboard для server/node overview прошёл native amd64/arm64
+CI. Bounded camera catalog с keyset pagination, index-backed literal
+search/filter, отдельным
+`control.read` permission и проекцией без `source_url` реализован локально;
+camera detail и mutation/confirmation workflows, полный browser E2E и rotation
 drill ещё не реализованы, поэтому Phase F целиком не завершена. Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.

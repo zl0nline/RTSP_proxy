@@ -25,6 +25,7 @@ from sqlalchemy import (
     delete,
     func,
     insert,
+    or_,
     select,
     text,
     update,
@@ -39,6 +40,10 @@ from sqlalchemy.sql.selectable import Select
 from rtsp_proxy.access import AccessGrant, AccessPolicy, AccessTarget
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
+    CameraCatalogItem,
+    CameraCatalogPage,
+    CameraCatalogQuery,
+    CameraCatalogUnavailable,
     CameraLifecycleConflict,
     CameraMove,
     CameraMoveExpired,
@@ -417,6 +422,25 @@ outbox_messages = Table(
 _NODE_REGISTRY_LOCK_KEY = 0x52545350524F5859
 _NODE_PROVISIONING_LOCK_KEY = 0x4E4F444550524F56
 _CAMERA_PLACEMENT_LOCK_KEY = 0x43414D504C414345
+_CAMERA_CATALOG_INDEX_DEFINITIONS = {
+    "ix_camera_placements_catalog_node_camera": (
+        "CREATE INDEX ix_camera_placements_catalog_node_camera "
+        "ON public.camera_placements USING btree (node_id, camera_id)"
+    ),
+    "ix_cameras_catalog_name_trgm": (
+        "CREATE INDEX ix_cameras_catalog_name_trgm "
+        "ON public.cameras USING gin (name gin_trgm_ops)"
+    ),
+    "ix_cameras_catalog_public_id_trgm": (
+        "CREATE INDEX ix_cameras_catalog_public_id_trgm "
+        "ON public.cameras USING gin (public_id gin_trgm_ops)"
+    ),
+    "ix_cameras_catalog_state_id": (
+        "CREATE INDEX ix_cameras_catalog_state_id "
+        "ON public.cameras USING btree (state, id) "
+        "WHERE ((state)::text <> 'deleted'::text)"
+    ),
+}
 
 
 class DatabaseSchemaMismatch(RuntimeError):
@@ -481,7 +505,11 @@ class PostgresNodeStore:
                 )
         except SQLAlchemyError:
             raise DatabaseSchemaMismatch("database_schema_mismatch") from None
-        if revisions not in (("0012_operator_sessions",), (APPLICATION_SCHEMA,)):
+        if revisions not in (
+            ("0012_operator_sessions",),
+            ("0013_operator_login",),
+            (APPLICATION_SCHEMA,),
+        ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     def assert_schema_current(self) -> None:
@@ -501,6 +529,25 @@ class PostgresNodeStore:
         except DatabaseSchemaMismatch:
             return False
         return True
+
+    def schema_supports_operator_login(self) -> bool:
+        try:
+            with self._engine.connect() as connection:
+                revisions = tuple(
+                    connection.scalars(text("SELECT version_num FROM alembic_version"))
+                )
+        except SQLAlchemyError:
+            raise DatabaseSchemaMismatch("database_schema_mismatch") from None
+        return revisions in (("0013_operator_login",), (APPLICATION_SCHEMA,))
+
+    def assert_camera_catalog_ready(self) -> None:
+        try:
+            with self._engine.connect() as connection:
+                self._require_camera_catalog_projection(connection)
+        except CameraCatalogUnavailable:
+            raise
+        except SQLAlchemyError:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
 
     @contextmanager
     def provisioning_guard(self) -> Iterator[None]:
@@ -1641,6 +1688,44 @@ class PostgresNodeStore:
                 ).mappings()
             )
 
+    def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
+        statement = self._camera_catalog_query()
+        if query.after is not None:
+            statement = statement.where(cameras.c.id > query.after)
+        if query.node_id is not None:
+            statement = statement.where(camera_placements.c.node_id == query.node_id)
+        if query.state is not None:
+            statement = statement.where(cameras.c.state == query.state.value)
+        if query.search is not None:
+            escaped = (
+                query.search.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            pattern = f"%{escaped}%"
+            statement = statement.where(
+                or_(
+                    cameras.c.name.like(pattern, escape="\\"),
+                    cameras.c.public_id.like(pattern, escape="\\"),
+                )
+            )
+        try:
+            with self._engine.connect() as connection:
+                self._require_camera_catalog_projection(connection)
+                rows = tuple(
+                    connection.execute(statement.limit(query.limit + 1)).mappings()
+                )
+        except CameraCatalogUnavailable:
+            raise
+        except SQLAlchemyError:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
+        has_more = len(rows) > query.limit
+        items = tuple(_camera_catalog_item(row) for row in rows[: query.limit])
+        return CameraCatalogPage(
+            items=items,
+            next_after=items[-1].id if has_more else None,
+        )
+
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
         with self._engine.connect() as connection:
             row = (
@@ -1713,6 +1798,65 @@ class PostgresNodeStore:
             .join(media_nodes, media_nodes.c.id == camera_placements.c.node_id)
             .order_by(cameras.c.id)
         )
+
+    @staticmethod
+    def _camera_catalog_query() -> Select[tuple[object, ...]]:
+        return (
+            select(
+                cameras.c.id,
+                cameras.c.name,
+                cameras.c.public_id,
+                cameras.c.state,
+                cameras.c.desired_revision,
+                cameras.c.applied_revision,
+                camera_placements.c.node_id,
+                camera_placements.c.placement_mode,
+                media_nodes.c.name.label("node_name"),
+                media_nodes.c.external_port.label("node_port"),
+            )
+            .join(camera_placements, camera_placements.c.camera_id == cameras.c.id)
+            .join(media_nodes, media_nodes.c.id == camera_placements.c.node_id)
+            .where(cameras.c.state != CameraState.DELETED.value)
+            .order_by(cameras.c.id)
+        )
+
+    @staticmethod
+    def _require_camera_catalog_projection(connection: Connection) -> None:
+        revisions = tuple(
+            connection.scalars(text("SELECT version_num FROM alembic_version"))
+        )
+        if revisions != (APPLICATION_SCHEMA,):
+            raise CameraCatalogUnavailable("camera_catalog_unavailable")
+        if connection.scalar(
+            text("SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")
+        ) != 1:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable")
+        observed = {
+            name: (definition, valid, ready, live)
+            for name, definition, valid, ready, live in connection.execute(
+                text(
+                    "SELECT index_class.relname, pg_get_indexdef(index_row.indexrelid), "
+                    "index_row.indisvalid, index_row.indisready, index_row.indislive "
+                    "FROM pg_index AS index_row "
+                    "JOIN pg_class AS index_class "
+                    "ON index_class.oid = index_row.indexrelid "
+                    "JOIN pg_namespace AS index_namespace "
+                    "ON index_namespace.oid = index_class.relnamespace "
+                    "WHERE index_namespace.nspname = 'public' "
+                    "AND index_class.relname IN ("
+                    "'ix_camera_placements_catalog_node_camera', "
+                    "'ix_cameras_catalog_name_trgm', "
+                    "'ix_cameras_catalog_public_id_trgm', "
+                    "'ix_cameras_catalog_state_id')"
+                )
+            ).tuples()
+        }
+        expected = {
+            name: (definition, True, True, True)
+            for name, definition in _CAMERA_CATALOG_INDEX_DEFINITIONS.items()
+        }
+        if observed != expected:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable")
 
     def update_camera(
         self,
@@ -3039,6 +3183,21 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
         node_port=int(row["node_port"]),
         placement_mode=PlacementMode(str(row["placement_mode"])),
         placement_generation=int(row["placement_generation"]),
+        state=CameraState(str(row["state"])),
+        desired_revision=int(row["desired_revision"]),
+        applied_revision=int(row["applied_revision"]),
+    )
+
+
+def _camera_catalog_item(row: RowMapping) -> CameraCatalogItem:
+    return CameraCatalogItem(
+        id=_uuid(row["id"]),
+        name=str(row["name"]),
+        public_id=PublicId.parse(str(row["public_id"])),
+        node_id=_uuid(row["node_id"]),
+        node_name=str(row["node_name"]),
+        node_port=int(row["node_port"]),
+        placement_mode=PlacementMode(str(row["placement_mode"])),
         state=CameraState(str(row["state"])),
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),

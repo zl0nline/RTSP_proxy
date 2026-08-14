@@ -2,13 +2,25 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 from fastapi.testclient import TestClient
 
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
-from rtsp_proxy.nodes import NodeHealth, NodeState
+from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.nodes import (
+    CameraCatalogItem,
+    CameraCatalogPage,
+    CameraCatalogQuery,
+    CameraCatalogUnavailable,
+    CameraControl,
+    CameraState,
+    NodeHealth,
+    NodeState,
+    PlacementMode,
+)
 from rtsp_proxy.observability import (
     FleetSnapshot,
     InMemoryObservabilityStore,
@@ -28,6 +40,34 @@ from rtsp_proxy.operator_access import (
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+
+class StaticCameraCatalog:
+    def __init__(self) -> None:
+        self.last_query: CameraCatalogQuery | None = None
+        self.source_url = "rtsp://admin:secret@camera.internal/private"
+
+    def catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
+        self.last_query = query
+        item = CameraCatalogItem(
+            id=CAMERA_ID,
+            name="Front <script>alert(1)</script>",
+            public_id=PublicId.parse("a" * 25 + "a"),
+            node_id=NODE_ID,
+            node_name="edge <north>",
+            node_port=10543,
+            placement_mode=PlacementMode.AUTOMATIC,
+            state=CameraState.ENABLED,
+            desired_revision=3,
+            applied_revision=2,
+        )
+        return CameraCatalogPage(items=(item,), next_after=item.id)
+
+
+class FailingCameraCatalog:
+    def catalog(self, _query: CameraCatalogQuery) -> CameraCatalogPage:
+        raise CameraCatalogUnavailable("postgres password must not escape")
 
 
 def _authenticated_dashboard(
@@ -35,13 +75,15 @@ def _authenticated_dashboard(
     observations: SnapshotReader | None,
     clock: datetime = NOW,
     raise_server_exceptions: bool = True,
+    camera_control: CameraControl | None = None,
+    role: OperatorRole = OperatorRole.VIEWER,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
         id=ACCOUNT_ID,
         subject="oidc:viewer@example.test",
         display_name="Дежурный <script>alert(1)</script>",
-        roles=frozenset({OperatorRole.VIEWER}),
+        roles=frozenset({role}),
         scopes=frozenset({"server:*"}),
         authz_version=1,
         enabled=True,
@@ -58,6 +100,7 @@ def _authenticated_dashboard(
             operator_sessions=sessions,
             fleet_snapshot_max_age_seconds=30,
             clock=lambda: clock,
+            camera_control=camera_control,
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
@@ -294,3 +337,69 @@ def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None
     assert disabled_dashboard.status_code == 503
     assert disabled_dashboard.headers["content-type"].startswith("text/html")
     assert "Сессии операторов не настроены" in disabled_dashboard.text
+
+
+def test_camera_catalog_is_authenticated_bounded_escaped_and_secret_free() -> None:
+    catalog = StaticCameraCatalog()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+    )
+    path = f"/dashboard/cameras?limit=1&q=Front&node_id={NODE_ID}&state=enabled"
+
+    anonymous = client.get(path)
+    response = client.get(path, headers=headers)
+
+    assert anonymous.status_code == 401
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert catalog.last_query == CameraCatalogQuery(
+        limit=1,
+        search="Front",
+        node_id=NODE_ID,
+        state=CameraState.ENABLED,
+    )
+    assert "Front &lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "edge &lt;north&gt;" in response.text
+    assert "/aaaaaaaaaaaaaaaaaaaaaaaaaa" in response.text
+    assert "10543" in response.text
+    assert "2 / 3" in response.text
+    assert catalog.source_url not in response.text
+    assert "admin:secret" not in response.text
+    assert f"after={CAMERA_ID}" in response.text
+    assert "q=Front" in response.text
+
+    browser_form_response = client.get(
+        "/dashboard/cameras?q=Front&node_id=&state=&limit=50",
+        headers=headers,
+    )
+
+    assert browser_form_response.status_code == 200
+
+
+def test_camera_catalog_requires_control_read_and_fails_closed() -> None:
+    catalog = StaticCameraCatalog()
+    auditor, auditor_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        role=OperatorRole.AUDITOR,
+    )
+    unavailable, unavailable_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, FailingCameraCatalog()),
+        raise_server_exceptions=False,
+    )
+
+    denied = auditor.get("/dashboard/cameras", headers=auditor_headers)
+    failed = unavailable.get("/dashboard/cameras", headers=unavailable_headers)
+    invalid = unavailable.get("/dashboard/cameras?limit=101", headers=unavailable_headers)
+
+    assert denied.status_code == 403
+    assert "Недостаточно прав" in denied.text
+    assert failed.status_code == 503
+    assert failed.headers["retry-after"] == "5"
+    assert "Каталог камер недоступен" in failed.text
+    assert "postgres password" not in failed.text
+    assert invalid.status_code == 422
+    assert invalid.headers["content-type"].startswith("text/html")
+    assert "Некорректный запрос каталога" in invalid.text
