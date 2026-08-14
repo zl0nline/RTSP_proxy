@@ -927,7 +927,7 @@ class OperatorSessionControl:
         if permission not in allowed:
             self._record_denial(authentication, "operator_permission_denied")
             raise OperatorAuthorizationDenied("operator_permission_denied")
-        if required_scope not in account.scopes:
+        if required_scope not in account.scopes and "server:*" not in account.scopes:
             self._record_denial(authentication, "operator_scope_denied")
             raise OperatorAuthorizationDenied("operator_scope_denied")
         touched = self._store.touch_authorized_session(

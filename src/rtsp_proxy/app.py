@@ -32,6 +32,7 @@ from rtsp_proxy.dashboard import (
     FleetSnapshotFailureReason,
     FleetSnapshotReadFailure,
     render_camera_catalog,
+    render_camera_detail,
     render_node_detail,
     render_overview,
     render_unavailable,
@@ -707,6 +708,7 @@ def create_app(
             session_token = request.cookies.get("__Host-rtsp_proxy_session", "")
             require_csrf = request.method not in {"GET", "HEAD", "OPTIONS"}
             permission = _operator_permission_for_request(request)
+            required_scope = _operator_scope_for_request(request)
             try:
                 principal = await anyio.to_thread.run_sync(
                     lambda: operator_sessions.authenticate(
@@ -714,6 +716,7 @@ def create_app(
                         permission=permission,
                         csrf_token=request.headers.get("X-CSRF-Token"),
                         require_csrf=require_csrf,
+                        required_scope=required_scope,
                     ),
                     abandon_on_cancel=True,
                 )
@@ -832,6 +835,36 @@ def create_app(
                 next_url=_camera_catalog_next_url(query, page.next_after),
                 principal=principal,
             )
+        )
+
+    @app.get(
+        "/dashboard/cameras/{camera_id}",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def dashboard_camera_page(request: Request, camera_id: UUID) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        if camera_control is None:
+            return _camera_catalog_unavailable_response(principal)
+        try:
+            camera = camera_control.detail(camera_id)
+        except CameraCatalogUnavailable:
+            return _camera_catalog_unavailable_response(principal)
+        if camera is None:
+            return _dashboard_unavailable_response(
+                DashboardUnavailable(
+                    title="Камера не найдена",
+                    message=(
+                        "Камеры с таким идентификатором нет в текущем каталоге."  # noqa: RUF001
+                    ),
+                ),
+                status_code=status.HTTP_404_NOT_FOUND,
+                principal=principal,
+            )
+        return _dashboard_html_response(
+            render_camera_detail(camera=camera, principal=principal)
         )
 
     @app.get(
@@ -2366,6 +2399,22 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return OperatorPermission.CONTROL_READ
     return OperatorPermission.CONTROL_MUTATE
+
+
+def _operator_scope_for_request(request: Request) -> str:
+    camera_detail_prefix = "/dashboard/cameras/"
+    if request.method in {"GET", "HEAD", "OPTIONS"} and request.url.path.startswith(
+        camera_detail_prefix
+    ):
+        resource = request.url.path.removeprefix(camera_detail_prefix)
+        if resource and "/" not in resource:
+            try:
+                camera_id = UUID(resource)
+            except ValueError:
+                pass
+            else:
+                return f"camera:{camera_id}"
+    return "server:*"
 
 
 def _operator_protected_path(path: str) -> bool:

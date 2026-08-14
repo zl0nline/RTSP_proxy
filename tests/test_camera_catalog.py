@@ -191,6 +191,31 @@ def test_camera_catalog_query_rejects_unbounded_or_ambiguous_input(
             CameraCatalogQuery(**kwargs)
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+def test_camera_detail_projection_is_secret_free_and_adapter_consistent(
+    persistent: bool,
+    postgres_database_url: str,
+) -> None:
+    camera_control, store = _catalog(
+        persistent=persistent,
+        postgres_database_url=postgres_database_url,
+    )
+    try:
+        detail = camera_control.detail(CAMERA_IDS[0])
+
+        assert detail is not None
+        assert detail.id == CAMERA_IDS[0]
+        assert detail.name == "Warehouse"
+        assert detail.node_name == "node-a"
+        assert detail.node_port == 12000
+        assert not hasattr(detail, "source_url")
+        assert camera_control.detail(UUID(int=0)) is None
+    finally:
+        close = getattr(store, "close", None)
+        if close is not None:
+            close()
+
+
 def test_postgres_camera_catalog_uses_indexed_projection_at_10k_rows(
     postgres_database_url: str,
 ) -> None:

@@ -50,7 +50,14 @@ class StaticCameraCatalog:
 
     def catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         self.last_query = query
-        item = CameraCatalogItem(
+        item = self.detail(CAMERA_ID)
+        assert item is not None
+        return CameraCatalogPage(items=(item,), next_after=item.id)
+
+    def detail(self, camera_id: UUID) -> CameraCatalogItem | None:
+        if camera_id != CAMERA_ID:
+            return None
+        return CameraCatalogItem(
             id=CAMERA_ID,
             name="Front <script>alert(1)</script>",
             public_id=PublicId.parse("a" * 25 + "a"),
@@ -62,11 +69,13 @@ class StaticCameraCatalog:
             desired_revision=3,
             applied_revision=2,
         )
-        return CameraCatalogPage(items=(item,), next_after=item.id)
 
 
 class FailingCameraCatalog:
     def catalog(self, _query: CameraCatalogQuery) -> CameraCatalogPage:
+        raise CameraCatalogUnavailable("postgres password must not escape")
+
+    def detail(self, _camera_id: UUID) -> CameraCatalogItem | None:
         raise CameraCatalogUnavailable("postgres password must not escape")
 
 
@@ -77,6 +86,7 @@ def _authenticated_dashboard(
     raise_server_exceptions: bool = True,
     camera_control: CameraControl | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
+    scopes: frozenset[str] = frozenset({"server:*"}),
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
@@ -84,7 +94,7 @@ def _authenticated_dashboard(
         subject="oidc:viewer@example.test",
         display_name="Дежурный <script>alert(1)</script>",
         roles=frozenset({role}),
-        scopes=frozenset({"server:*"}),
+        scopes=scopes,
         authz_version=1,
         enabled=True,
     )
@@ -366,6 +376,7 @@ def test_camera_catalog_is_authenticated_bounded_escaped_and_secret_free() -> No
     assert "2 / 3" in response.text
     assert catalog.source_url not in response.text
     assert "admin:secret" not in response.text
+    assert f'/dashboard/cameras/{CAMERA_ID}' in response.text
     assert f"after={CAMERA_ID}" in response.text
     assert "q=Front" in response.text
 
@@ -403,3 +414,77 @@ def test_camera_catalog_requires_control_read_and_fails_closed() -> None:
     assert invalid.status_code == 422
     assert invalid.headers["content-type"].startswith("text/html")
     assert "Некорректный запрос каталога" in invalid.text
+
+
+def test_camera_detail_is_authenticated_escaped_and_secret_free() -> None:
+    catalog = StaticCameraCatalog()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}"
+
+    anonymous = client.get(path)
+    response = client.get(path, headers=headers)
+    missing = client.get(
+        "/dashboard/cameras/00000000-0000-4000-8000-000000000000",
+        headers=headers,
+    )
+
+    assert anonymous.status_code == 401
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "Front &lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "edge &lt;north&gt;" in response.text
+    assert "rtsp://&lt;server-address&gt;:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa" in (
+        response.text
+    )
+    assert catalog.source_url not in response.text
+    assert "admin:secret" not in response.text
+    assert missing.status_code == 404
+    assert "Камера не найдена" in missing.text
+
+
+def test_camera_detail_requires_control_read_and_fails_closed() -> None:
+    auditor, auditor_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        role=OperatorRole.AUDITOR,
+    )
+    unavailable, unavailable_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, FailingCameraCatalog()),
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}"
+
+    denied = auditor.get(path, headers=auditor_headers)
+    failed = unavailable.get(path, headers=unavailable_headers)
+
+    assert denied.status_code == 403
+    assert failed.status_code == 503
+    assert failed.headers["retry-after"] == "5"
+    assert "postgres password" not in failed.text
+
+
+def test_camera_detail_honors_exact_camera_scope_without_an_existence_oracle() -> None:
+    own_camera, own_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        scopes=frozenset({f"camera:{CAMERA_ID}"}),
+    )
+    other_camera_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+
+    own = own_camera.get(f"/dashboard/cameras/{CAMERA_ID}", headers=own_headers)
+    cross_camera = own_camera.get(
+        f"/dashboard/cameras/{other_camera_id}",
+        headers=own_headers,
+    )
+    nonexistent = own_camera.get(
+        "/dashboard/cameras/00000000-0000-4000-8000-000000000000",
+        headers=own_headers,
+    )
+
+    assert own.status_code == 200
+    assert cross_camera.status_code == 403
+    assert nonexistent.status_code == 403
+    assert cross_camera.text == nonexistent.text

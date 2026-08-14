@@ -62,6 +62,8 @@ code { font: inherit; color: #ffd166; }
 .detail-list div { padding: 1.5rem; border-right: 1px solid #274d41; border-bottom: 1px solid #274d41; }
 .detail-list dt { margin-bottom: 0.5rem; color: #93aaa2; }
 .detail-list dd { margin: 0; font-size: 1.15rem; font-weight: 700; }
+.camera-detail-panel { margin: 2.5rem 0 1rem; }
+.detail-note { margin: 0; padding: 1.2rem 1.5rem; color: #b9cbc5; line-height: 1.55; }
 .centered-state { display: grid; min-height: calc(100vh - 4.5rem); place-items: center; padding: 2rem 0; }
 .state-card { width: min(100%, 38rem); padding: clamp(1.5rem, 5vw, 3.5rem); }
 .state-card h1 { margin-bottom: 1.5rem; font-size: clamp(2rem, 7vw, 3.6rem); }

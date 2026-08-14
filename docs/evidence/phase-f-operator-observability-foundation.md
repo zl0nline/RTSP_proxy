@@ -41,8 +41,13 @@ parsed and asserted by the deployment contract tests instead of being treated
 as a standalone unit.
 
 This is functional evidence for the non-UI foundation, not Phase F completion
-or production capacity evidence. Server-rendered dashboard work is tracked by
-later commits and CI outside this evidence boundary. Camera mutations, complete
-browser accessibility/confirmation E2E, the operator rotation drill,
+or production capacity evidence. Subsequent server-rendered dashboard evidence
+is tracked outside the foundation boundary: server/node pages passed run
+`31784945654` at commit `808e74e121b5ed56f6626490a20bc919ab8328eb`,
+and the bounded camera catalog passed run `31790262853` at commit
+`3edb3026d1f2ececaebd86ddbdcebda3b32fb877`. The secret-free camera detail page
+with exact `camera:<uuid>` scope and global `server:*` superset is implemented
+locally after those runs. Camera mutations, complete browser
+accessibility/confirmation E2E, the operator rotation drill,
 physical-hardware capacity and the 24-hour soak remain open. Production
 therefore remains NO-GO.

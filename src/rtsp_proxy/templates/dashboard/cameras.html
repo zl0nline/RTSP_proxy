@@ -61,7 +61,7 @@
           {% for camera in page.items %}
           <tr>
             <th scope="row">
-              {{ camera.name }}
+              <a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a>
               <small class="node-id">{{ camera.id }}</small>
             </th>
             <td><code>/{{ camera.public_id }}</code></td>

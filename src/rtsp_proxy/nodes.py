@@ -1136,6 +1136,27 @@ class InMemoryNodeStore:
                 next_after=items[-1].id if has_more else None,
             )
 
+    def camera_detail(self, camera_id: UUID) -> CameraCatalogItem | None:
+        with self._lock:
+            camera = next(
+                (
+                    candidate
+                    for candidate in self._cameras
+                    if candidate.id == camera_id
+                    and candidate.state is not CameraState.DELETED
+                ),
+                None,
+            )
+            if camera is None:
+                return None
+            node = next(
+                (candidate for candidate in self._nodes if candidate.id == camera.node_id),
+                None,
+            )
+            if node is None:
+                raise CameraCatalogUnavailable("camera_catalog_unavailable")
+            return _camera_catalog_item(camera, node_name=node.name)
+
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
         with self._lock:
             return next(
@@ -2309,6 +2330,14 @@ class CameraControl:
         except Exception:
             raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
 
+    def detail(self, camera_id: UUID) -> CameraCatalogItem | None:
+        try:
+            return self._store.camera_detail(camera_id)
+        except CameraCatalogUnavailable:
+            raise
+        except Exception:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
+
     def update_camera(
         self,
         camera_id: UUID,
@@ -2455,6 +2484,8 @@ class CameraStore(Protocol):
     def list_cameras(self) -> tuple[CameraPlacement, ...]: ...
 
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage: ...
+
+    def camera_detail(self, camera_id: UUID) -> CameraCatalogItem | None: ...
 
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None: ...
 

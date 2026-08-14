@@ -1726,6 +1726,23 @@ class PostgresNodeStore:
             next_after=items[-1].id if has_more else None,
         )
 
+    def camera_detail(self, camera_id: UUID) -> CameraCatalogItem | None:
+        try:
+            with self._engine.connect() as connection:
+                self._require_camera_catalog_projection(connection)
+                row = (
+                    connection.execute(
+                        self._camera_catalog_query().where(cameras.c.id == camera_id)
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+        except CameraCatalogUnavailable:
+            raise
+        except SQLAlchemyError:
+            raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
+        return None if row is None else _camera_catalog_item(row)
+
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
         with self._engine.connect() as connection:
             row = (

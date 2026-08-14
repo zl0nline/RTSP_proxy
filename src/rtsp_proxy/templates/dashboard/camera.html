@@ -1,0 +1,35 @@
+{% extends "dashboard/base.html" %}
+{% block title %}{{ camera.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><span>{{ camera.name }}</span>
+  </nav>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Камера · порт ноды {{ camera.node_port }}</p>
+      <h1>{{ camera.name }}</h1>
+    </div>
+    <span class="camera-state camera-state-{{ camera.state.value }}">{{ camera.state.value }}</span>
+  </div>
+
+  <section class="panel camera-detail-panel" aria-labelledby="camera-details-title">
+    <div class="panel-heading"><h2 id="camera-details-title">Публичный поток</h2></div>
+    <dl class="detail-list">
+      <div><dt>RTSP endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ camera.node_port }}/{{ camera.public_id }}</code></dd></div>
+      <div><dt>Public path</dt><dd><code>/{{ camera.public_id }}</code></dd></div>
+      <div><dt>UUID камеры</dt><dd><small>{{ camera.id }}</small></dd></div>
+    </dl>
+    <p class="detail-note">Подставьте внешний или локальный адрес сервера. Поток использует обычный RTSP поверх TCP; source URL и учётные данные камеры не раскрываются.</p>
+  </section>
+
+  <section class="panel" aria-labelledby="placement-title">
+    <div class="panel-heading"><h2 id="placement-title">Размещение и состояние</h2></div>
+    <dl class="detail-list">
+      <div><dt>Нода</dt><dd><a href="/dashboard/nodes/{{ camera.node_id }}">{{ camera.node_name }}</a><small>{{ camera.node_id }}</small></dd></div>
+      <div><dt>Режим размещения</dt><dd>{{ camera.placement_mode.value }}</dd></div>
+      <div><dt>Revision</dt><dd>{{ camera.applied_revision }} / {{ camera.desired_revision }}<small>applied / desired</small></dd></div>
+    </dl>
+  </section>
+</main>
+{% endblock %}

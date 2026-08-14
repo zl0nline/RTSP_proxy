@@ -949,10 +949,13 @@ passed all six native amd64/arm64 jobs at commit `808e74e121b5ed56f6626490a20bc9
 ([CI run 31784945654](https://github.com/zl0nline/RTSP_proxy/actions/runs/31784945654)).
 They use fail-closed snapshot freshness, semantic tables, keyboard focus, local
 assets and strict browser security headers. A separate bounded camera-catalog
-read model with PostgreSQL keyset pagination, `pg_trgm`-indexed case-sensitive
+read model passed all six native jobs at commit
+`3edb3026d1f2ececaebd86ddbdcebda3b32fb877`
+([CI run 31790262853](https://github.com/zl0nline/RTSP_proxy/actions/runs/31790262853)).
+It provides PostgreSQL keyset pagination, `pg_trgm`-indexed case-sensitive
 literal search (minimum three characters), indexed node/state filters, a
 two-second WEB database deadline, `control.read` authorization and no
-`source_url` field is implemented locally. The 10k-camera contract asserts the
+`source_url` field. The 10k-camera contract asserts the
 search plan can use the catalog index instead of relying on the page `LIMIT`.
 The route is enabled only on exact schema 0014 after canonical read-back of the
 extension and all four indexes; drift fails closed rather than scanning. The
@@ -961,11 +964,16 @@ one-second-lock/30-second catalog migration. After 0014 commits, rollback to an
 application manifest capped at 0013 is explicitly NO-GO; recovery is fix-forward
 or restoration of the pre-migration PostgreSQL backup with the control plane
 stopped. Collector/worker compatibility across the declared bridge is retained.
-Camera detail and mutating/confirmation workflows, complete browser E2E and the
-operator rotation drill remain pending. No Phase-F completion claim is made yet.
+A secret-free camera detail page using the same bounded projection is
+implemented locally and shows only the ordinary `rtsp://` endpoint template,
+placement and revision state. It requires `control.read` plus the exact
+`camera:<uuid>` scope, while `server:*` remains the explicit global superset;
+cross-camera denials are resolved before lookup and expose no existence oracle.
+Mutating/confirmation workflows, complete browser E2E and the operator rotation
+drill remain pending. No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview and bounded
-  camera catalog complete; camera detail and mutations pending);
+  camera catalog CI-green; camera detail local; mutations pending);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
