@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -25,6 +26,7 @@ from rtsp_proxy.nodes import (
     CameraNotFound,
     CameraPlacement,
     CameraState,
+    EligibleNodeMissing,
     InMemoryNodeStore,
     MediaNode,
     NodeHealth,
@@ -32,6 +34,7 @@ from rtsp_proxy.nodes import (
     NodeLifecycleConflict,
     NodeRuntimeObservation,
     NodeState,
+    camera_placement_fingerprint,
 )
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
@@ -406,6 +409,135 @@ def test_move_preview_fails_closed_when_reader_limit_is_already_violated() -> No
         match="camera_reader_limit_violated",
     ):
         control.preview(CAMERA_A, target_node_id=NODE_B)
+
+
+def test_move_targets_are_eligible_nonfull_nodes_sorted_by_load() -> None:
+    node_c = UUID("00000000-0000-0000-0000-000000000003")
+    node_d = UUID("00000000-0000-0000-0000-000000000004")
+    node_e = UUID("00000000-0000-0000-0000-000000000005")
+    store = InMemoryNodeStore(
+        nodes=(
+            running_node(NODE_A, 12000),
+            replace(running_node(NODE_B, 12001), registered_cameras=20),
+            replace(running_node(node_c, 12002), registered_cameras=5),
+            replace(running_node(node_d, 12003), registered_cameras=100),
+            replace(
+                running_node(node_e, 12004),
+                health=NodeHealth.UNHEALTHY,
+                registered_cameras=1,
+            ),
+        )
+    )
+    CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_A,
+        new_public_id=lambda: str(PUBLIC_A),
+    ).create_camera(
+        name="entrance",
+        source_url="rtsp://camera.invalid/main",
+        node_id=NODE_A,
+    )
+    control = CameraMoveControl(
+        store=store,
+        runtime=CameraRuntimeObserver(
+            store=store,
+            media_nodes=RecordingMediaNodeFactory(),
+        ),
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+        new_move_id=lambda: UUID("30000000-0000-0000-0000-000000000001"),
+    )
+
+    targets = control.targets(CAMERA_A, expected_revision=1)
+
+    assert [target.id for target in targets] == [node_c, NODE_B]
+    assert [target.registered_cameras for target in targets] == [5, 20]
+
+
+def test_move_target_discovery_rejects_a_disabled_camera() -> None:
+    store = camera_store()
+    store.set_camera_enabled(CAMERA_A, enabled=False, expected_revision=1)
+    factory = RecordingMediaNodeFactory()
+    control, _moves = move_services(store, factory)
+
+    with pytest.raises(CameraLifecycleConflict, match="camera_not_enabled"):
+        control.targets(CAMERA_A, expected_revision=2)
+    with pytest.raises(CameraLifecycleConflict, match="camera_not_enabled"):
+        control.preview(CAMERA_A, target_node_id=NODE_B, expected_revision=2)
+
+
+def test_move_control_uses_configured_management_freshness_end_to_end() -> None:
+    now = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=(
+            replace(
+                running_node(NODE_A, 12000),
+                management_observed_at=now,
+                runtime_observed_at=now,
+            ),
+            replace(
+                running_node(NODE_B, 12001),
+                management_observed_at=now - timedelta(seconds=45),
+                runtime_observed_at=now - timedelta(seconds=45),
+            ),
+        ),
+        clock=lambda: now,
+    )
+    CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_A,
+        new_public_id=lambda: str(PUBLIC_A),
+        management_freshness_seconds=60,
+    ).create_camera(
+        name="entrance",
+        source_url="rtsp://camera.invalid/main",
+        node_id=NODE_A,
+    )
+    factory = RecordingMediaNodeFactory()
+    control = CameraMoveControl(
+        store=store,
+        runtime=CameraRuntimeObserver(store=store, media_nodes=factory),
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+        new_move_id=lambda: UUID("30000000-0000-0000-0000-000000000001"),
+        management_freshness_seconds=60,
+    )
+
+    assert [target.id for target in control.targets(CAMERA_A)] == [NODE_B]
+    assert control.request_move(CAMERA_A, target_node_id=NODE_B).target_node_id == NODE_B
+
+    strict_control = CameraMoveControl(
+        store=store,
+        runtime=CameraRuntimeObserver(store=store, media_nodes=factory),
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+        new_move_id=lambda: UUID("30000000-0000-0000-0000-000000000002"),
+        management_freshness_seconds=30,
+    )
+    with pytest.raises(EligibleNodeMissing, match="manual_node_ineligible"):
+        strict_control.preview(CAMERA_A, target_node_id=NODE_B)
+
+
+def test_move_targets_exclude_a_node_with_a_prepared_port_change() -> None:
+    store = camera_store()
+    store.begin_port_change(
+        change_id=UUID("40000000-0000-0000-0000-000000000001"),
+        node_id=NODE_B,
+        new_port=12002,
+        allowed_ports=(12000, 12001, 12002),
+        expected_revision=1,
+        expected_registered_cameras=0,
+        expected_blast_radius_sha256=camera_placement_fingerprint(()),
+    )
+    control, _moves = move_services(store, RecordingMediaNodeFactory())
+
+    assert control.targets(CAMERA_A, expected_revision=1) == ()
 
 
 def test_node_port_confirmation_is_bound_to_blast_radius_and_expiry() -> None:

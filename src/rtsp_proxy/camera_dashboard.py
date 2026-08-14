@@ -12,6 +12,9 @@ from rtsp_proxy.dashboard import (
     render_camera_catalog,
     render_camera_detail,
     render_camera_edit,
+    render_camera_move,
+    render_camera_move_confirmation,
+    render_camera_move_status,
     render_camera_mutation_confirmation,
     render_unavailable,
 )
@@ -27,8 +30,11 @@ from rtsp_proxy.nodes import (
     CameraNotFound,
     CameraRevisionConflict,
     CameraState,
+    EligibleNodeMissing,
     InvalidCameraName,
     InvalidCameraSource,
+    NodeCameraCapacityReached,
+    NodeNotFound,
 )
 from rtsp_proxy.operator_access import (
     OperatorPermission,
@@ -36,9 +42,12 @@ from rtsp_proxy.operator_access import (
 )
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
+    CameraMoveControl,
     CameraMutationControl,
     CameraMutationOperation,
+    CameraOccupied,
     CameraReaderInvariantViolation,
+    MoveConfirmationRequired,
     ReconcileRetry,
 )
 
@@ -47,6 +56,7 @@ def camera_dashboard_router(
     *,
     camera_control: CameraControl | None,
     camera_mutation_control: CameraMutationControl | None,
+    camera_move_control: CameraMoveControl | None,
 ) -> APIRouter:
     """Build the complete secret-free camera dashboard surface."""
 
@@ -108,6 +118,10 @@ def camera_dashboard_router(
                     principal.allows(OperatorPermission.CONTROL_MUTATE)
                     and _valid_csrf_cookie(request)
                 ),
+                can_move=(
+                    camera_move_control is not None
+                    and camera.state is CameraState.ENABLED
+                ),
             )
         )
 
@@ -138,6 +152,165 @@ def camera_dashboard_router(
                 camera=camera,
                 principal=principal,
                 csrf_token=csrf_token,
+            )
+        )
+
+    @router.get(
+        "/dashboard/cameras/{camera_id}/move",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_move(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if camera_move_control is None:
+            return _move_unavailable(principal)
+        camera = _camera_item(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        if not _valid_csrf_cookie(request):
+            return _unavailable_response(
+                DashboardUnavailable(
+                    title="Требуется новая сессия",
+                    message="CSRF cookie отсутствует или повреждён. Выполните вход повторно.",
+                ),
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                principal=principal,
+            )
+        try:
+            targets = camera_move_control.targets(
+                camera_id,
+                expected_revision=camera.desired_revision,
+            )
+        except Exception as error:
+            expected = _move_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        if not targets:
+            return _unavailable_response(
+                DashboardUnavailable(
+                    title="Нет доступной целевой ноды",
+                    message="Освободите место или восстановите подходящую ноду и повторите.",
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+                principal=principal,
+            )
+        return _html_response(
+            render_camera_move(
+                camera=camera,
+                targets=targets,
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+            )
+        )
+
+    @router.post(
+        "/dashboard/cameras/{camera_id}/moves/preview",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_move_preview(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if camera_move_control is None:
+            return _move_unavailable(principal)
+        try:
+            form = _form(request)
+            target_node_id, expected_revision, _confirmation_token = _move_fields(form)
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        camera = _camera_item(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        try:
+            preview = camera_move_control.preview(
+                camera_id,
+                target_node_id=target_node_id,
+                expected_revision=expected_revision,
+            )
+            if not preview.occupied:
+                move = camera_move_control.request_move(
+                    camera_id,
+                    target_node_id=target_node_id,
+                    expected_revision=expected_revision,
+                )
+                return _move_redirect(camera_id, move.id)
+        except Exception as error:
+            expected = _move_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _html_response(
+            render_camera_move_confirmation(
+                camera=camera,
+                preview=preview,
+                principal=principal,
+                csrf_token=form.csrf_token,
+            )
+        )
+
+    @router.post(
+        "/dashboard/cameras/{camera_id}/moves/apply",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_move_apply(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if camera_move_control is None:
+            return _move_unavailable(principal)
+        try:
+            form = _form(request)
+            target_node_id, expected_revision, confirmation_token = _move_fields(
+                form,
+                confirmation=True,
+            )
+            move = camera_move_control.request_move(
+                camera_id,
+                target_node_id=target_node_id,
+                expected_revision=expected_revision,
+                force=True,
+                confirmation_token=confirmation_token,
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            expected = _move_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _move_redirect(camera_id, move.id)
+
+    @router.get(
+        "/dashboard/cameras/{camera_id}/moves/{move_id}",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_move_status(
+        request: Request,
+        camera_id: UUID,
+        move_id: UUID,
+    ) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if camera_move_control is None:
+            return _move_unavailable(principal)
+        move = camera_move_control.get_move(move_id)
+        if move is None or move.camera_id != camera_id:
+            return _move_not_found(principal)
+        camera = _camera_item(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        return _html_response(
+            render_camera_move_status(
+                camera=camera,
+                move=move,
+                principal=principal,
             )
         )
 
@@ -322,6 +495,27 @@ def _mutation_fields(
     return operation, expected_revision, None, None
 
 
+def _move_fields(
+    form: DashboardForm,
+    *,
+    confirmation: bool = False,
+) -> tuple[UUID, int, str | None]:
+    fields = {"_csrf", "target_node_id", "expected_revision"}
+    if confirmation:
+        fields.add("confirmation_token")
+    form.require_exact_fields(frozenset(fields))
+    try:
+        target_node_id = UUID(form.required("target_node_id", max_length=36))
+    except ValueError:
+        raise DashboardFormInvalid("dashboard_form_invalid") from None
+    confirmation_token = (
+        form.required("confirmation_token", max_length=4096)
+        if confirmation
+        else None
+    )
+    return target_node_id, _positive_revision(form), confirmation_token
+
+
 def _apply_mutation(
     control: CameraMutationControl,
     *,
@@ -449,6 +643,45 @@ def _mutation_error(
     return None
 
 
+def _move_error(
+    error: Exception,
+    principal: OperatorPrincipal,
+) -> HTMLResponse | None:
+    mutation_error = _mutation_error(error, principal)
+    if mutation_error is not None:
+        return mutation_error
+    if isinstance(error, NodeNotFound):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Целевая нода не найдена",
+                message="Обновите список доступных нод и повторите.",
+            ),
+            status_code=status.HTTP_404_NOT_FOUND,
+            principal=principal,
+        )
+    if isinstance(
+        error,
+        (
+            CameraOccupied,
+            MoveConfirmationRequired,
+            EligibleNodeMissing,
+            NodeCameraCapacityReached,
+        ),
+    ):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Перемещение не подтверждено",
+                message=(
+                    "Состояние камеры или число читателей изменилось. "
+                    "Вернитесь к камере и сформируйте новое подтверждение."
+                ),
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    return None
+
+
 def _catalog_query(request: Request) -> CameraCatalogQuery:
     allowed = {"after", "limit", "q", "node_id", "state"}
     values: dict[str, str] = {}
@@ -502,6 +735,14 @@ def _redirect(camera_id: UUID) -> RedirectResponse:
     )
 
 
+def _move_redirect(camera_id: UUID, move_id: UUID) -> RedirectResponse:
+    return RedirectResponse(
+        f"/dashboard/cameras/{camera_id}/moves/{move_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _form_invalid(principal: OperatorPrincipal) -> HTMLResponse:
     return _unavailable_response(
         DashboardUnavailable(
@@ -520,6 +761,30 @@ def _mutation_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
             message="Безопасно выполнить это действие сейчас невозможно.",
         ),
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        principal=principal,
+    )
+
+
+def _move_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
+    return _unavailable_response(
+        DashboardUnavailable(
+            title="Перемещение камеры недоступно",
+            message="Безопасно выполнить перемещение сейчас невозможно.",
+        ),
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        principal=principal,
+    )
+
+
+def _move_not_found(principal: OperatorPrincipal) -> HTMLResponse:
+    return _unavailable_response(
+        DashboardUnavailable(
+            title="Перемещение не найдено",
+            message=(
+                "Запроса с таким идентификатором нет для этой камеры."  # noqa: RUF001
+            ),
+        ),
+        status_code=status.HTTP_404_NOT_FOUND,
         principal=principal,
     )
 

@@ -819,6 +819,62 @@ class PostgresNodeStore:
             )
             return None if row is None else _media_node(row)
 
+    def list_camera_move_targets(
+        self,
+        camera_id: UUID,
+        *,
+        management_freshness_seconds: int = 30,
+    ) -> tuple[MediaNode, ...]:
+        with self._engine.connect() as connection:
+            placement = (
+                connection.execute(
+                    select(
+                        cameras.c.state,
+                        camera_placements.c.node_id,
+                    )
+                    .join(
+                        camera_placements,
+                        camera_placements.c.camera_id == cameras.c.id,
+                    )
+                    .where(cameras.c.id == camera_id)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if placement is None or placement["state"] == CameraState.DELETED.value:
+                raise CameraNotFound("camera_not_found")
+            if placement["state"] != CameraState.ENABLED.value:
+                raise CameraLifecycleConflict("camera_not_enabled")
+            prepared_nodes = frozenset(
+                connection.scalars(
+                    select(node_port_change_sagas.c.node_id).where(
+                        node_port_change_sagas.c.state
+                        == NodePortChangeState.PREPARED.value
+                    )
+                )
+            )
+            source_node_id = UUID(str(placement["node_id"]))
+            if source_node_id in prepared_nodes:
+                return ()
+            database_now = connection.scalar(select(func.clock_timestamp()))
+            if database_now is None:
+                return ()
+            rows = connection.execute(
+                select(media_nodes)
+                .where(media_nodes.c.id != source_node_id)
+                .order_by(media_nodes.c.id)
+            ).mappings()
+            return tuple(
+                node
+                for row in rows
+                if (node := _media_node(row)).id not in prepared_nodes
+                and is_node_eligible(
+                    node,
+                    management_freshness_seconds=management_freshness_seconds,
+                    now=database_now,
+                )
+            )
+
     def apply_runtime_observation(
         self,
         node_id: UUID,
@@ -2101,6 +2157,7 @@ class PostgresNodeStore:
         force: bool,
         confirmed_disconnect_readers: int = 0,
         timeout_seconds: int = 300,
+        management_freshness_seconds: int = 30,
     ) -> CameraMove:
         if timeout_seconds < 1 or timeout_seconds > 3600:
             raise ValueError("camera_move_timeout_invalid")
@@ -2141,7 +2198,11 @@ class PostgresNodeStore:
             self._require_no_active_port_change(connection, camera.node_id)
             self._require_no_active_port_change(connection, target.id)
             database_now = connection.scalar(select(func.clock_timestamp()))
-            if database_now is None or not is_node_eligible(target, now=database_now):
+            if database_now is None or not is_node_eligible(
+                target,
+                management_freshness_seconds=management_freshness_seconds,
+                now=database_now,
+            ):
                 raise EligibleNodeMissing("manual_node_ineligible")
             move_expires_at = database_now + timedelta(seconds=timeout_seconds)
             desired_revision = camera.desired_revision + 1

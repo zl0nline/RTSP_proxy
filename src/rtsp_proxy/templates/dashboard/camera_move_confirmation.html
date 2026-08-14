@@ -1,0 +1,27 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Подтвердить перемещение {{ camera.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a><span aria-hidden="true">/</span><span>Подтверждение перемещения</span>
+  </nav>
+  <div class="page-heading">
+    <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1>Подтвердите перемещение</h1></div>
+  </div>
+  <section class="panel mutation-panel" aria-labelledby="move-confirmation-title">
+    <div class="panel-heading"><h2 id="move-confirmation-title">Будет отключён {{ preview.disconnect_readers }} downstream-клиент</h2></div>
+    <dl class="detail-list">
+      <div><dt>Старый endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ preview.source_port }}/{{ camera.public_id }}</code></dd></div>
+      <div><dt>Новый endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ preview.target_port }}/{{ camera.public_id }}</code></dd></div>
+    </dl>
+    <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/moves/apply">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="target_node_id" value="{{ preview.target_node_id }}">
+      <input type="hidden" name="expected_revision" value="{{ preview.desired_revision }}">
+      <input type="hidden" name="confirmation_token" value="{{ preview.confirmation_token }}">
+      <p>Текущий клиент будет отключён. После завершения saga он должен подключиться к новому порту; public path останется прежним.</p>
+      <div class="form-actions"><button class="danger-button" type="submit">Подтвердить отключение и перемещение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
+    </form>
+  </section>
+</main>
+{% endblock %}

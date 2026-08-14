@@ -1,0 +1,24 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Перемещение {{ camera.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a><span aria-hidden="true">/</span><span>Перемещение</span>
+  </nav>
+  <div class="page-heading">
+    <div><p class="eyebrow">Move {{ move.id }}</p><h1>Запрос на перемещение принят</h1></div>
+    <span class="camera-state">{{ move.state.value }}</span>
+  </div>
+  <section class="panel" role="status" aria-live="polite" aria-labelledby="move-state-title">
+    <div class="panel-heading"><h2 id="move-state-title">Фактическое состояние saga: {{ move.state.value }}</h2></div>
+    <dl class="detail-list">
+      <div><dt>Старый endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ move.source_port }}/{{ camera.public_id }}</code></dd></div>
+      <div><dt>Новый endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ move.target_port }}/{{ camera.public_id }}</code></dd></div>
+      <div><dt>Подтверждено отключений</dt><dd>{{ move.confirmed_disconnect_readers }}</dd></div>
+      {% if move.abort_reason %}<div><dt>Причина остановки</dt><dd>{{ move.abort_reason }}</dd></div>{% endif %}
+    </dl>
+    <p class="detail-note">Страница читает persisted move по его ID. Обновите её для нового состояния; завершение не предполагается до state <code>complete</code>.</p>
+    <div class="form-actions"><a href="/dashboard/cameras/{{ camera.id }}">Вернуться к камере</a></div>
+  </section>
+</main>
+{% endblock %}

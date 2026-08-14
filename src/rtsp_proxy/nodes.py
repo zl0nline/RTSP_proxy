@@ -604,6 +604,36 @@ class InMemoryNodeStore:
         with self._lock:
             return next((node for node in self._nodes if node.id == node_id), None)
 
+    def list_camera_move_targets(
+        self,
+        camera_id: UUID,
+        *,
+        management_freshness_seconds: int = 30,
+    ) -> tuple[MediaNode, ...]:
+        with self._lock:
+            camera = next(
+                (candidate for candidate in self._cameras if candidate.id == camera_id),
+                None,
+            )
+            if camera is None or camera.state is CameraState.DELETED:
+                raise CameraNotFound("camera_not_found")
+            if camera.state is not CameraState.ENABLED:
+                raise CameraLifecycleConflict("camera_not_enabled")
+            if self._node_has_prepared_port_change(camera.node_id):
+                return ()
+            now = self._clock()
+            return tuple(
+                node
+                for node in self._nodes
+                if node.id != camera.node_id
+                and not self._node_has_prepared_port_change(node.id)
+                and is_node_eligible(
+                    node,
+                    management_freshness_seconds=management_freshness_seconds,
+                    now=now,
+                )
+            )
+
     def apply_runtime_observation(
         self,
         node_id: UUID,
@@ -1323,6 +1353,7 @@ class InMemoryNodeStore:
         force: bool,
         confirmed_disconnect_readers: int = 0,
         timeout_seconds: int = 300,
+        management_freshness_seconds: int = 30,
     ) -> CameraMove:
         if timeout_seconds < 1 or timeout_seconds > 3600:
             raise ValueError("camera_move_timeout_invalid")
@@ -1348,7 +1379,11 @@ class InMemoryNodeStore:
                 raise CameraLifecycleConflict("camera_already_on_target")
             if target is None:
                 raise NodeNotFound("node_not_found")
-            if not is_node_eligible(target):
+            if not is_node_eligible(
+                target,
+                management_freshness_seconds=management_freshness_seconds,
+                now=self._clock(),
+            ):
                 raise EligibleNodeMissing("manual_node_ineligible")
             if self._node_has_prepared_port_change(camera.node_id) or (
                 self._node_has_prepared_port_change(target_node_id)
@@ -2584,6 +2619,13 @@ class ReconcileStore(Protocol):
 
 
 class CameraMoveStore(ReconcileStore, Protocol):
+    def list_camera_move_targets(
+        self,
+        camera_id: UUID,
+        *,
+        management_freshness_seconds: int = 30,
+    ) -> tuple[MediaNode, ...]: ...
+
     def create_camera_move(
         self,
         *,
@@ -2594,6 +2636,7 @@ class CameraMoveStore(ReconcileStore, Protocol):
         force: bool,
         confirmed_disconnect_readers: int = 0,
         timeout_seconds: int = 300,
+        management_freshness_seconds: int = 30,
     ) -> CameraMove: ...
 
     def get_camera_move(self, move_id: UUID) -> CameraMove | None: ...

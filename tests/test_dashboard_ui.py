@@ -18,6 +18,8 @@ from rtsp_proxy.nodes import (
     CameraCatalogQuery,
     CameraCatalogUnavailable,
     CameraControl,
+    CameraMove,
+    CameraMoveState,
     CameraState,
     InMemoryNodeStore,
     MediaNode,
@@ -41,9 +43,13 @@ from rtsp_proxy.operator_access import (
     OperatorSessionControl,
 )
 from rtsp_proxy.reconcile import (
+    CameraMoveControl,
+    CameraMovePreview,
+    CameraMoveTarget,
     CameraMutationControl,
     CameraMutationOperation,
     CameraMutationPreview,
+    CameraRuntimeObservation,
     ConfirmationTokenService,
 )
 
@@ -167,6 +173,95 @@ class RecordingCameraMutations:
         self.calls.append(("delete", camera_id, expected_revision, confirmation_token))
 
 
+class RecordingCameraMoves:
+    def __init__(self, *, occupied: bool) -> None:
+        self.occupied = occupied
+        self.calls: list[tuple[object, ...]] = []
+        self.target = CameraMoveTarget(
+            id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            name="edge <south>",
+            external_port=10544,
+            registered_cameras=10,
+            camera_capacity=100,
+        )
+        self.move = CameraMove(
+            id=UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+            camera_id=CAMERA_ID,
+            public_id=PublicId.parse("a" * 26),
+            source_url="rtsp://camera.internal/main",
+            source_node_id=NODE_ID,
+            target_node_id=self.target.id,
+            source_generation=1,
+            target_generation=2,
+            desired_revision=4,
+            force=occupied,
+            confirmed_disconnect_readers=1 if occupied else 0,
+            source_port=10543,
+            target_port=10544,
+            source_endpoint="rtsp://server:10543/" + "a" * 26,
+            target_endpoint="rtsp://server:10544/" + "a" * 26,
+            expires_at=NOW + timedelta(minutes=5),
+            state=CameraMoveState.PREPARE_TARGET,
+        )
+
+    def targets(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None = None,
+    ) -> tuple[CameraMoveTarget, ...]:
+        self.calls.append(("targets", camera_id, expected_revision))
+        return (self.target,)
+
+    def preview(
+        self,
+        camera_id: UUID,
+        *,
+        target_node_id: UUID,
+        expected_revision: int | None = None,
+    ) -> CameraMovePreview:
+        self.calls.append(
+            ("preview", camera_id, target_node_id, expected_revision)
+        )
+        return CameraMovePreview(
+            camera_id=camera_id,
+            source_node_id=NODE_ID,
+            target_node_id=target_node_id,
+            desired_revision=3,
+            occupied=self.occupied,
+            disconnect_readers=1 if self.occupied else 0,
+            confirmation_token="move-confirmation-token" if self.occupied else None,
+            source_port=10543,
+            target_port=10544,
+            source_endpoint="rtsp://server:10543/" + "a" * 26,
+            target_endpoint="rtsp://server:10544/" + "a" * 26,
+        )
+
+    def request_move(
+        self,
+        camera_id: UUID,
+        *,
+        target_node_id: UUID,
+        expected_revision: int | None = None,
+        force: bool = False,
+        confirmation_token: str | None = None,
+    ) -> CameraMove:
+        self.calls.append(
+            (
+                "request",
+                camera_id,
+                target_node_id,
+                expected_revision,
+                force,
+                confirmation_token,
+            )
+        )
+        return self.move
+
+    def get_move(self, move_id: UUID) -> CameraMove | None:
+        return self.move if move_id == self.move.id else None
+
+
 class RuntimeMediaNode:
     def __init__(self) -> None:
         self.paths: dict[PublicId, MediaPathConfig] = {}
@@ -238,6 +333,84 @@ def _domain_camera_mutations(
     return cameras, mutations, store
 
 
+class MutableCameraRuntime:
+    def __init__(self, *, source_node_id: UUID, reader_count: int) -> None:
+        self.source_node_id = source_node_id
+        self.reader_count = reader_count
+
+    def observe(self, camera_id: UUID) -> CameraRuntimeObservation:
+        return CameraRuntimeObservation(
+            camera_id=camera_id,
+            node_id=self.source_node_id,
+            ready=True,
+            reader_count=self.reader_count,
+            occupied=self.reader_count == 1,
+            reader_limit_violated=self.reader_count > 1,
+        )
+
+
+def _domain_camera_moves(
+    *,
+    reader_count: int,
+) -> tuple[CameraControl, CameraMoveControl, InMemoryNodeStore, MutableCameraRuntime]:
+    target_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    observed_at = datetime.now(UTC)
+    nodes = (
+        MediaNode(
+            id=NODE_ID,
+            name="edge-north",
+            external_port=10543,
+            state=NodeState.RUNNING,
+            runtime_state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=True,
+            desired_revision=1,
+            applied_revision=1,
+        ),
+        MediaNode(
+            id=target_id,
+            name="edge-south",
+            external_port=10544,
+            state=NodeState.RUNNING,
+            runtime_state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            management_observed_at=observed_at,
+            config_compatible=True,
+            desired_revision=1,
+            applied_revision=1,
+        ),
+    )
+    store = InMemoryNodeStore(nodes=nodes)
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    cameras.create_camera(
+        name="Front entrance",
+        source_url="rtsp://camera.internal/main",
+        node_id=NODE_ID,
+    )
+    runtime = MutableCameraRuntime(
+        source_node_id=NODE_ID,
+        reader_count=reader_count,
+    )
+    moves = CameraMoveControl(
+        store=store,
+        runtime=cast(Any, runtime),
+        confirmations=ConfirmationTokenService(
+            secret=b"dashboard-confirmation-secret-at-least-32-bytes",
+            lifetime_seconds=30,
+            wall_time=lambda: 1_700_000_000.0,
+        ),
+        new_move_id=lambda: UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+    )
+    return cameras, moves, store, runtime
+
+
 def _authenticated_dashboard(
     *,
     observations: SnapshotReader | None,
@@ -245,6 +418,7 @@ def _authenticated_dashboard(
     raise_server_exceptions: bool = True,
     camera_control: CameraControl | None = None,
     camera_mutation_control: object | None = None,
+    camera_move_control: object | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
     scopes: frozenset[str] = frozenset({"server:*"}),
 ) -> tuple[TestClient, dict[str, str]]:
@@ -272,6 +446,7 @@ def _authenticated_dashboard(
             clock=lambda: clock,
             camera_control=camera_control,
             camera_mutation_control=cast(Any, camera_mutation_control),
+            camera_move_control=cast(Any, camera_move_control),
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
@@ -952,6 +1127,240 @@ def test_dashboard_camera_update_uses_domain_name_contract() -> None:
     assert "Некорректное имя камеры" in response.text
     assert "rtsp://camera.internal/new-main" not in response.text
     assert store.get_camera(CAMERA_ID).name == "Front entrance"  # type: ignore[union-attr]
+
+
+def test_camera_move_form_lists_only_targets_and_requires_mutation_permission() -> None:
+    catalog = StaticCameraCatalog()
+    moves = RecordingCameraMoves(occupied=False)
+    operator, operator_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_move_control=moves,
+        role=OperatorRole.OPERATOR,
+    )
+    viewer, viewer_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_move_control=moves,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    move_path = f"{detail_path}/move"
+
+    detail = operator.get(detail_path, headers=operator_headers)
+    move_form = operator.get(move_path, headers=operator_headers)
+    denied = viewer.get(move_path, headers=viewer_headers)
+
+    assert detail.status_code == 200
+    assert f'href="{move_path}"' in detail.text
+    assert move_form.status_code == 200
+    assert 'name="target_node_id"' in move_form.text
+    assert f'value="{moves.target.id}"' in move_form.text
+    assert "edge &lt;south&gt;" in move_form.text
+    assert "10 / 100" in move_form.text
+    assert 'name="expected_revision" value="3"' in move_form.text
+    assert catalog.source_url not in move_form.text
+    assert "admin:secret" not in move_form.text
+    assert denied.status_code == 403
+    assert moves.calls == [("targets", CAMERA_ID, 3)]
+
+
+def test_unoccupied_camera_move_uses_submitted_revision_and_starts_immediately() -> None:
+    moves = RecordingCameraMoves(occupied=False)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_move_control=moves,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+
+    response = client.post(
+        f"{detail_path}/moves/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "target_node_id": str(moves.target.id),
+            "expected_revision": "3",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    status_path = f"{detail_path}/moves/{moves.move.id}"
+    assert response.headers["location"] == status_path
+    assert moves.calls == [
+        ("preview", CAMERA_ID, moves.target.id, 3),
+        ("request", CAMERA_ID, moves.target.id, 3, False, None),
+    ]
+
+
+def test_occupied_camera_move_requires_exact_blast_radius_confirmation() -> None:
+    catalog = StaticCameraCatalog()
+    moves = RecordingCameraMoves(occupied=True)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_move_control=moves,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    preview = client.post(
+        f"{detail_path}/moves/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "target_node_id": str(moves.target.id),
+            "expected_revision": "3",
+        },
+    )
+    applied = client.post(
+        f"{detail_path}/moves/apply",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "target_node_id": str(moves.target.id),
+            "expected_revision": "3",
+            "confirmation_token": "move-confirmation-token",
+        },
+        follow_redirects=False,
+    )
+
+    assert preview.status_code == 200
+    assert "Будет отключён 1 downstream-клиент" in preview.text
+    assert "rtsp://&lt;server-address&gt;:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa" in preview.text
+    assert "rtsp://&lt;server-address&gt;:10544/aaaaaaaaaaaaaaaaaaaaaaaaaa" in preview.text
+    assert 'value="move-confirmation-token"' in preview.text
+    assert catalog.source_url not in preview.text
+    assert applied.status_code == 303
+    status_path = f"{detail_path}/moves/{moves.move.id}"
+    assert applied.headers["location"] == status_path
+    accepted = client.get(applied.headers["location"], headers=headers)
+    assert accepted.status_code == 200
+    assert "Запрос на перемещение принят" in accepted.text
+    assert "prepare_target" in accepted.text
+    assert catalog.source_url not in accepted.text
+    assert moves.calls == [
+        ("preview", CAMERA_ID, moves.target.id, 3),
+        (
+            "request",
+            CAMERA_ID,
+            moves.target.id,
+            3,
+            True,
+            "move-confirmation-token",
+        ),
+    ]
+
+
+def test_camera_move_status_is_authoritative_and_camera_scoped() -> None:
+    catalog = StaticCameraCatalog()
+    moves = RecordingCameraMoves(occupied=False)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_move_control=moves,
+        role=OperatorRole.OPERATOR,
+        scopes=frozenset({f"camera:{CAMERA_ID}"}),
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    forged_query = client.get(f"{detail_path}?move=requested", headers=headers)
+    missing = client.get(
+        f"{detail_path}/moves/00000000-0000-4000-8000-000000000000",
+        headers=headers,
+    )
+    moves.move = replace(
+        moves.move,
+        camera_id=UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+    )
+    cross_camera = client.get(
+        f"{detail_path}/moves/{moves.move.id}",
+        headers=headers,
+    )
+
+    assert forged_query.status_code == 200
+    assert "Запрос на перемещение принят" not in forged_query.text
+    assert missing.status_code == 404
+    assert cross_camera.status_code == 404
+    assert missing.text == cross_camera.text
+    assert catalog.source_url not in cross_camera.text
+
+
+def test_camera_move_rejects_a_revision_stale_since_the_rendered_form() -> None:
+    cameras, moves, store, _runtime = _domain_camera_moves(reader_count=0)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cameras,
+        camera_move_control=moves,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    target_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    rendered = client.get(f"{detail_path}/move", headers=headers)
+    assert 'name="expected_revision" value="1"' in rendered.text
+    store.update_camera(
+        CAMERA_ID,
+        name="Concurrent rename",
+        source_url="rtsp://camera.internal/main",
+        expected_revision=1,
+    )
+
+    stale = client.post(
+        f"{detail_path}/moves/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "target_node_id": str(target_id),
+            "expected_revision": "1",
+        },
+    )
+
+    assert stale.status_code == 409
+    assert "Ожидалась revision 1, текущая revision 2" in stale.text
+    assert "rtsp://camera.internal/main" not in stale.text
+    assert store.list_incomplete_camera_moves() == ()
+
+
+def test_camera_move_confirmation_expires_when_reader_count_changes() -> None:
+    cameras, moves, store, runtime = _domain_camera_moves(reader_count=1)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cameras,
+        camera_move_control=moves,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    target_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    preview = client.post(
+        f"{detail_path}/moves/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "target_node_id": str(target_id),
+            "expected_revision": "1",
+        },
+    )
+    token_match = re.search(
+        r'name="confirmation_token" value="([^"]+)"',
+        preview.text,
+    )
+    assert token_match is not None
+    runtime.reader_count = 0
+
+    stale_blast_radius = client.post(
+        f"{detail_path}/moves/apply",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "target_node_id": str(target_id),
+            "expected_revision": "1",
+            "confirmation_token": token_match.group(1),
+        },
+        follow_redirects=False,
+    )
+
+    assert stale_blast_radius.status_code == 409
+    assert "Состояние камеры или число читателей изменилось" in stale_blast_radius.text
+    assert store.list_incomplete_camera_moves() == ()
 
 
 def test_dashboard_mutation_form_is_bounded_and_requires_control_mutate() -> None:

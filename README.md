@@ -24,7 +24,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   green in native CI. Server-rendered update/enable/disable/delete workflows
 >   with bounded form CSRF, optimistic revision fencing and reader-aware
 >   confirmation are also green in native amd64/arm64 CI;
->   camera move UI, complete browser E2E and the break-glass rotation drill remain pending.
+>   revision-fenced camera move UI is implemented locally; complete automated
+>   browser E2E and the break-glass rotation drill remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -311,8 +312,14 @@ contract активируется только после fail-closed 0015 prefl
 содержит UUID только доступных для исправления камер, но не имена или source
 URL. Неизменяемые удалённые строки сохраняются лишь как внутренние tombstones и
 не блокируют upgrade. Новый source URL не повторяется в confirmation HTML.
-Camera move UI, полный browser
-E2E и rotation drill ещё не реализованы, поэтому Phase F целиком не завершена.
+Camera move UI реализован локально: оператор выбирает только eligible
+незаполненную ноду, форма несёт показанную revision, а occupied stream требует
+confirmation, связанный с точным target и числом читателей. Public path не
+меняется, новый внешний URL отличается портом; source URL не попадает в HTML.
+После POST dashboard открывает camera-scoped status по persisted `move_id` и
+показывает фактический state saga, а не доверяет query-параметру.
+Полный автоматизированный browser E2E и rotation drill ещё не реализованы,
+поэтому Phase F целиком не завершена.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.

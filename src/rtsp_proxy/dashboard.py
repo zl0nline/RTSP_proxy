@@ -12,11 +12,16 @@ from rtsp_proxy.nodes import (
     CameraCatalogItem,
     CameraCatalogPage,
     CameraCatalogQuery,
+    CameraMove,
     CameraState,
 )
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import OperatorPrincipal
-from rtsp_proxy.reconcile import CameraMutationPreview
+from rtsp_proxy.reconcile import (
+    CameraMovePreview,
+    CameraMoveTarget,
+    CameraMutationPreview,
+)
 
 DASHBOARD_CSP: Final = (
     "default-src 'none'; style-src 'self'; base-uri 'none'; "
@@ -116,12 +121,14 @@ def render_camera_detail(
     principal: OperatorPrincipal,
     csrf_token: str,
     can_mutate: bool,
+    can_move: bool,
 ) -> str:
     return _environment().get_template("dashboard/camera.html").render(
         camera=camera,
         principal=principal,
         csrf_token=csrf_token,
         can_mutate=can_mutate,
+        can_move=can_move,
     )
 
 
@@ -152,6 +159,51 @@ def render_camera_mutation_confirmation(
         principal=principal,
         csrf_token=csrf_token,
         name=name,
+    )
+
+
+def render_camera_move(
+    *,
+    camera: CameraCatalogItem,
+    targets: tuple[CameraMoveTarget, ...],
+    principal: OperatorPrincipal,
+    csrf_token: str,
+) -> str:
+    return _environment().get_template("dashboard/camera_move.html").render(
+        camera=camera,
+        targets=targets,
+        principal=principal,
+        csrf_token=csrf_token,
+    )
+
+
+def render_camera_move_confirmation(
+    *,
+    camera: CameraCatalogItem,
+    preview: CameraMovePreview,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+) -> str:
+    return _environment().get_template(
+        "dashboard/camera_move_confirmation.html"
+    ).render(
+        camera=camera,
+        preview=preview,
+        principal=principal,
+        csrf_token=csrf_token,
+    )
+
+
+def render_camera_move_status(
+    *,
+    camera: CameraCatalogItem,
+    move: CameraMove,
+    principal: OperatorPrincipal,
+) -> str:
+    return _environment().get_template("dashboard/camera_move_status.html").render(
+        camera=camera,
+        move=move,
+        principal=principal,
     )
 
 

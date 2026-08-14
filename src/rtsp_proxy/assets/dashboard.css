@@ -49,7 +49,7 @@ code { font: inherit; color: #ffd166; }
 .empty-state { padding: 3rem 1.5rem; color: #93aaa2; text-align: center; }
 .catalog-filters { display: grid; grid-template-columns: minmax(12rem, 2fr) minmax(12rem, 1.4fr) minmax(9rem, 1fr) minmax(7rem, 0.5fr) auto; gap: 1rem; align-items: end; margin: 2.5rem 0 1rem; padding: 1.25rem; border: 1px solid #274d41; border-radius: 1rem; background: #0d1c18; }
 .catalog-filters label { display: grid; gap: 0.45rem; color: #b9cbc5; font-size: 0.78rem; font-weight: 700; }
-.catalog-filters input, .catalog-filters select, .catalog-filters button, .mutation-form input, .action-grid button, .mutation-form button { min-height: 2.75rem; border: 1px solid #3a5f53; border-radius: 0.55rem; background: #08110f; color: #ecf7f2; font: inherit; }
+.catalog-filters input, .catalog-filters select, .catalog-filters button, .mutation-form input, .mutation-form select, .action-grid button, .mutation-form button { min-height: 2.75rem; border: 1px solid #3a5f53; border-radius: 0.55rem; background: #08110f; color: #ecf7f2; font: inherit; }
 .catalog-filters input, .catalog-filters select { width: 100%; padding: 0 0.75rem; }
 .catalog-filters button, .button-link, .action-grid button, .mutation-form button { padding: 0.75rem 1rem; background: #77e2bd; color: #08110f; font-weight: 850; cursor: pointer; }
 .camera-state { display: inline-flex; padding: 0.3rem 0.6rem; border: 1px solid #3a5f53; border-radius: 999px; font-size: 0.75rem; font-weight: 800; text-transform: uppercase; }
@@ -70,7 +70,7 @@ code { font: inherit; color: #ffd166; }
 .danger-button { border-color: #b64d4d !important; background: #7a2929 !important; color: #fff !important; }
 .mutation-form { display: grid; gap: 1.2rem; padding: 1.5rem; }
 .mutation-form label { display: grid; gap: 0.5rem; color: #b9cbc5; font-weight: 700; }
-.mutation-form input { width: 100%; padding: 0 0.75rem; }
+.mutation-form input, .mutation-form select { width: 100%; padding: 0 0.75rem; }
 .mutation-form p { margin-bottom: 0; color: #b9cbc5; line-height: 1.55; }
 .form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
 .centered-state { display: grid; min-height: calc(100vh - 4.5rem); place-items: center; padding: 2rem 0; }

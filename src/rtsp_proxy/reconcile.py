@@ -31,7 +31,6 @@ from rtsp_proxy.nodes import (
     NodeNotFound,
     NodeState,
     ReconcileStore,
-    is_node_eligible,
     validate_camera_name,
     validate_camera_source_url,
 )
@@ -185,6 +184,15 @@ class CameraMovePreview:
     target_port: int
     source_endpoint: str
     target_endpoint: str
+
+
+@dataclass(frozen=True, slots=True)
+class CameraMoveTarget:
+    id: UUID
+    name: str
+    external_port: int
+    registered_cameras: int
+    camera_capacity: int
 
 
 class ConfirmationTokenService:
@@ -575,6 +583,7 @@ class CameraMoveControl:
         confirmations: ConfirmationTokenService,
         new_move_id: Callable[[], UUID],
         move_timeout_seconds: int = 300,
+        management_freshness_seconds: int = 30,
     ) -> None:
         self._store = store
         self._runtime = runtime
@@ -583,19 +592,66 @@ class CameraMoveControl:
         if move_timeout_seconds < 1 or move_timeout_seconds > 3600:
             raise ValueError("camera_move_timeout_invalid")
         self._move_timeout_seconds = move_timeout_seconds
+        if management_freshness_seconds < 1 or management_freshness_seconds > 300:
+            raise ValueError("management_freshness_seconds_invalid")
+        self._management_freshness_seconds = management_freshness_seconds
 
-    def preview(self, camera_id: UUID, *, target_node_id: UUID) -> CameraMovePreview:
-        camera = self._store.get_camera(camera_id)
-        if camera is None:
-            raise CameraNotFound("camera_not_found")
-        target = self._store.get_node(target_node_id)
-        if target is None:
+    def targets(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None = None,
+    ) -> tuple[CameraMoveTarget, ...]:
+        self._camera(camera_id, expected_revision=expected_revision)
+        nodes = self._store.list_camera_move_targets(
+            camera_id,
+            management_freshness_seconds=self._management_freshness_seconds,
+        )
+        return tuple(
+            CameraMoveTarget(
+                id=node.id,
+                name=node.name,
+                external_port=node.external_port,
+                registered_cameras=node.registered_cameras,
+                camera_capacity=node.camera_capacity,
+            )
+            for node in sorted(
+                nodes,
+                key=lambda node: (
+                    node.registered_cameras,
+                    node.name,
+                    str(node.id),
+                ),
+            )
+        )
+
+    def preview(
+        self,
+        camera_id: UUID,
+        *,
+        target_node_id: UUID,
+        expected_revision: int | None = None,
+    ) -> CameraMovePreview:
+        camera = self._camera(camera_id, expected_revision=expected_revision)
+        target = next(
+            (
+                node
+                for node in self._store.list_camera_move_targets(
+                    camera_id,
+                    management_freshness_seconds=self._management_freshness_seconds,
+                )
+                if node.id == target_node_id
+            ),
+            None,
+        )
+        known_target = self._store.get_node(target_node_id)
+        if known_target is None:
             raise NodeNotFound("node_not_found")
-        if target.id == camera.node_id:
+        if known_target.id == camera.node_id:
             raise CameraLifecycleConflict("camera_already_on_target")
-        if target.registered_cameras >= target.camera_capacity:
+        if known_target.registered_cameras >= known_target.camera_capacity:
             raise NodeCameraCapacityReached("node_camera_capacity_reached")
-        if not is_node_eligible(target):
+        if target is None:
             raise EligibleNodeMissing("manual_node_ineligible")
         observation = self._runtime.observe(camera_id)
         if observation.reader_limit_violated:
@@ -631,14 +687,19 @@ class CameraMoveControl:
         camera_id: UUID,
         *,
         target_node_id: UUID,
+        expected_revision: int | None = None,
         force: bool = False,
         confirmation_token: str | None = None,
     ) -> CameraMove:
-        preview = self.preview(camera_id, target_node_id=target_node_id)
+        preview = self.preview(
+            camera_id,
+            target_node_id=target_node_id,
+            expected_revision=expected_revision,
+        )
         if preview.occupied and not force:
             raise CameraOccupied("camera_occupied")
-        if preview.occupied and (
-            confirmation_token is None
+        if confirmation_token is not None and (
+            not force
             or not self._confirmations.verify(
                 confirmation_token,
                 camera_id=preview.camera_id,
@@ -649,6 +710,8 @@ class CameraMoveControl:
             )
         ):
             raise MoveConfirmationRequired("move_confirmation_required")
+        if preview.occupied and confirmation_token is None:
+            raise MoveConfirmationRequired("move_confirmation_required")
         return self._store.create_camera_move(
             move_id=self._new_move_id(),
             camera_id=camera_id,
@@ -657,10 +720,32 @@ class CameraMoveControl:
             force=force,
             confirmed_disconnect_readers=preview.disconnect_readers,
             timeout_seconds=self._move_timeout_seconds,
+            management_freshness_seconds=self._management_freshness_seconds,
         )
 
     def get_move(self, move_id: UUID) -> CameraMove | None:
         return self._store.get_camera_move(move_id)
+
+    def _camera(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None,
+    ) -> CameraPlacement:
+        camera = self._store.get_camera(camera_id)
+        if camera is None:
+            raise CameraNotFound("camera_not_found")
+        if (
+            expected_revision is not None
+            and camera.desired_revision != expected_revision
+        ):
+            raise CameraRevisionConflict(
+                expected_revision=expected_revision,
+                current_revision=camera.desired_revision,
+            )
+        if camera.state is not CameraState.ENABLED:
+            raise CameraLifecycleConflict("camera_not_enabled")
+        return camera
 
 
 class CameraMutationControl:

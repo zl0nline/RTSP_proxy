@@ -6163,6 +6163,7 @@ def test_postgresql_port_change_fences_camera_updates_and_moves(
         expected_registered_cameras=1,
         expected_blast_radius_sha256=camera_placement_fingerprint(((camera_id, 1),)),
     )
+    assert store.list_camera_move_targets(camera.id) == ()
 
     for operation in (
         lambda: store.update_camera(
@@ -6185,6 +6186,79 @@ def test_postgresql_port_change_fences_camera_updates_and_moves(
     assert store.list_node_active_moves(source_id) == ()
     with pytest.raises(NodeNotFound):
         store.list_node_cameras(UUID(int=99))
+    store.close()
+
+
+def test_postgresql_camera_move_uses_the_configured_freshness_at_commit(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    source_id = UUID("00000000-0000-0000-0000-000000000011")
+    target_id = UUID("00000000-0000-0000-0000-000000000012")
+    camera_id = UUID("10000000-0000-0000-0000-000000000011")
+    for node_id, name, port, api_port, metrics_port in (
+        (source_id, "source", 12100, 13100, 14100),
+        (target_id, "target", 12101, 13101, 14101),
+    ):
+
+        def allocate_node_id(selected: UUID = node_id) -> UUID:
+            return selected
+
+        node = store.register_automatically(
+            name=name,
+            allowed_ports=(port,),
+            max_nodes=2,
+            preferred_port=port,
+            choose_port=lambda ports: ports[0],
+            new_node_id=allocate_node_id,
+            api_ports=(api_port,),
+            metrics_ports=(metrics_port,),
+        )
+        node = store.request_desired_state(node.id, NodeState.RUNNING)
+        store.apply_runtime_observation(
+            node.id,
+            runtime_observation_for(node.id, revision=node.desired_revision),
+        )
+    camera = store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=PublicId.parse("e" * 25 + "a"),
+        node_id=source_id,
+    )
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE media_nodes "
+                "SET management_observed_at = clock_timestamp() - interval '45 seconds' "
+                "WHERE id = :node_id"
+            ),
+            {"node_id": target_id},
+        )
+
+    assert store.list_camera_move_targets(
+        camera.id,
+        management_freshness_seconds=30,
+    ) == ()
+    assert [
+        node.id
+        for node in store.list_camera_move_targets(
+            camera.id,
+            management_freshness_seconds=60,
+        )
+    ] == [target_id]
+    move = store.create_camera_move(
+        move_id=UUID("30000000-0000-0000-0000-000000000011"),
+        camera_id=camera.id,
+        target_node_id=target_id,
+        expected_revision=camera.desired_revision,
+        force=False,
+        management_freshness_seconds=60,
+    )
+    assert move.target_node_id == target_id
+    engine.dispose()
     store.close()
 
 

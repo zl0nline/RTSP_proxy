@@ -59,7 +59,14 @@ contract is enforced by UI, domain, in-memory and PostgreSQL adapters. Name
 activation additionally requires the bounded 0015 legacy preflight; it reports
 only non-deleted camera UUIDs and the catalog revalidates visible names
 fail-closed. Immutable deleted rows remain hidden permanent tombstones and do
-not block the migration. Camera move UI,
-complete browser accessibility/confirmation E2E, the operator rotation
+not block the migration. A local server-rendered move workflow lists only
+eligible non-full target nodes, carries the rendered camera revision through
+preview/apply and requires a target/reader-count-bound token before disrupting
+an occupied path. Candidate enumeration is a DB-clock store projection that
+excludes prepared port changes; the transactional switch still rechecks it.
+The camera-scoped status route binds a persisted `move_id`, shows its actual
+state and does not claim completion early. The public path is unchanged and no
+source URL is rendered. Complete automated
+browser accessibility/confirmation E2E, the operator rotation
 drill, physical-hardware capacity and the 24-hour soak remain open. Production
 therefore remains NO-GO.

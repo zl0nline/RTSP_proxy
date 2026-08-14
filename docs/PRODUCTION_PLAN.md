@@ -995,12 +995,21 @@ fail-closed 0015 preflight; catalog projection revalidates them on every read.
 The new source URL is never repeated in confirmation HTML and must be re-entered
 exactly. Camera routes and mutation
 orchestration live in a dedicated controller/router rather than the application
-composition root. Camera move UI, complete browser E2E and the operator rotation
-drill remain pending. No Phase-F completion claim is made yet.
+composition root. The local move UI lists only eligible non-full targets sorted
+by load, binds preview/apply to the submitted camera revision and invalidates an
+occupied-reader confirmation if its target or reader count changes. It starts
+the durable move saga and redirects to a camera-scoped persisted `move_id`; the
+status page reads its actual state and reports accepted—not completed. Target
+enumeration uses the store's DB-clock eligibility projection and excludes
+prepared source/target port changes, while the switch transaction rechecks all
+conditions. The ordinary public path stays immutable while the node port
+changes. Complete automated
+browser E2E and the operator rotation drill remain pending. No Phase-F
+completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green;
-  camera move UI pending);
+  camera move UI implemented locally and pending native CI);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;

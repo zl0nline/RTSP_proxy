@@ -1,0 +1,28 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Переместить {{ camera.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a><span aria-hidden="true">/</span><span>Переместить</span>
+  </nav>
+  <div class="page-heading">
+    <div><p class="eyebrow">Revision {{ camera.desired_revision }} · текущий порт {{ camera.node_port }}</p><h1>Переместить камеру</h1></div>
+  </div>
+  <section class="panel mutation-panel" aria-labelledby="camera-move-title">
+    <div class="panel-heading"><h2 id="camera-move-title">Целевая нода</h2></div>
+    <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/moves/preview">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
+      <label>Доступная нода
+        <select name="target_node_id" required>
+          {% for target in targets %}
+          <option value="{{ target.id }}">{{ target.name }} · порт {{ target.external_port }} · {{ target.registered_cameras }} / {{ target.camera_capacity }} камер</option>
+          {% endfor %}
+        </select>
+      </label>
+      <p>Внешний URL изменит только порт ноды; public path <code>/{{ camera.public_id }}</code> останется прежним. Seamless switch без gateway не обещается.</p>
+      <div class="form-actions"><button type="submit">Проверить перемещение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
+    </form>
+  </section>
+</main>
+{% endblock %}

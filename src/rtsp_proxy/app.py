@@ -823,6 +823,7 @@ def create_app(
         camera_dashboard_router(
             camera_control=camera_control,
             camera_mutation_control=camera_mutation_control,
+            camera_move_control=camera_move_control,
         )
     )
 
@@ -2359,7 +2360,7 @@ def _retryable_service_response(code: str) -> JSONResponse:
 def _operator_permission_for_request(request: Request) -> OperatorPermission:
     path = request.url.path
     if path == "/dashboard/cameras" or path.startswith("/dashboard/cameras/"):
-        if path.endswith("/edit"):
+        if path.endswith(("/edit", "/move")):
             return OperatorPermission.CONTROL_MUTATE
         return (
             OperatorPermission.CONTROL_READ
