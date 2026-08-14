@@ -995,7 +995,10 @@ fail-closed 0015 preflight; catalog projection revalidates them on every read.
 The new source URL is never repeated in confirmation HTML and must be re-entered
 exactly. Camera routes and mutation
 orchestration live in a dedicated controller/router rather than the application
-composition root. The local move UI lists only eligible non-full targets sorted
+composition root. The move UI passed all six native amd64/arm64 jobs at commit
+`ffd12509e99fdff6336ffc5676cf3e9363b1fe66`
+([CI run 31811342043](https://github.com/zl0nline/RTSP_proxy/actions/runs/31811342043)).
+It lists only eligible non-full targets sorted
 by load, binds preview/apply to the submitted camera revision and invalidates an
 occupied-reader confirmation if its target or reader count changes. It starts
 the durable move saga and redirects to a camera-scoped persisted `move_id`; the
@@ -1009,7 +1012,7 @@ completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green;
-  camera move UI implemented locally and pending native CI);
+  camera move UI CI-green);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;

@@ -59,7 +59,11 @@ contract is enforced by UI, domain, in-memory and PostgreSQL adapters. Name
 activation additionally requires the bounded 0015 legacy preflight; it reports
 only non-deleted camera UUIDs and the catalog revalidates visible names
 fail-closed. Immutable deleted rows remain hidden permanent tombstones and do
-not block the migration. A local server-rendered move workflow lists only
+not block the migration. The server-rendered move workflow passed all six
+native amd64/arm64 jobs at commit
+`ffd12509e99fdff6336ffc5676cf3e9363b1fe66`
+([CI run 31811342043](https://github.com/zl0nline/RTSP_proxy/actions/runs/31811342043)).
+It lists only
 eligible non-full target nodes, carries the rendered camera revision through
 preview/apply and requires a target/reader-count-bound token before disrupting
 an occupied path. Candidate enumeration is a DB-clock store projection that

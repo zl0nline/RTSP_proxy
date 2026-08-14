@@ -24,7 +24,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   green in native CI. Server-rendered update/enable/disable/delete workflows
 >   with bounded form CSRF, optimistic revision fencing and reader-aware
 >   confirmation are also green in native amd64/arm64 CI;
->   revision-fenced camera move UI is implemented locally; complete automated
+>   revision-fenced camera move UI is also green in native amd64/arm64 CI;
+>   complete automated
 >   browser E2E and the break-glass rotation drill remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
@@ -312,7 +313,10 @@ contract активируется только после fail-closed 0015 prefl
 содержит UUID только доступных для исправления камер, но не имена или source
 URL. Неизменяемые удалённые строки сохраняются лишь как внутренние tombstones и
 не блокируют upgrade. Новый source URL не повторяется в confirmation HTML.
-Camera move UI реализован локально: оператор выбирает только eligible
+Camera move UI прошёл все шесть amd64/arm64 CI jobs в commit
+`ffd12509e99fdff6336ffc5676cf3e9363b1fe66`
+([run 31811342043](https://github.com/zl0nline/RTSP_proxy/actions/runs/31811342043)):
+оператор выбирает только eligible
 незаполненную ноду, форма несёт показанную revision, а occupied stream требует
 confirmation, связанный с точным target и числом читателей. Public path не
 меняется, новый внешний URL отличается портом; source URL не попадает в HTML.
