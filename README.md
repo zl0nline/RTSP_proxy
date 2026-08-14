@@ -4,7 +4,7 @@
 на независимые bounded nodes: каждая node — отдельный MediaMTX process/systemd
 instance, один внешний RTSP port и не более 100 зарегистрированных камер.
 
-> **Статус на 13 августа 2026**
+> **Статус на 14 августа 2026**
 >
 > - Bounded-node architecture: **согласована**, issues #1–#14 обновлены.
 > - Phase 0A MediaMTX/ordinary-RTSP compatibility: **complete** на native
@@ -14,8 +14,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 > - Node registry/placement, isolated per-node Linux runtime, Phase-D
 >   administration and Phase-E access/security: **complete on native
 >   amd64/arm64 CI**.
-> - Phase-F observability and operator-auth foundation: **implemented locally, review/CI
->   pending** — bounded fleet collector, persisted dashboard snapshot API and
+> - Phase-F observability and operator-auth foundation: **reviewed and green in
+>   native amd64/arm64 CI** — bounded fleet collector, persisted dashboard snapshot API and
 >   durable failure/recovery email dispatcher, plus digest-only PostgreSQL
 >   sessions, RBAC version fencing, CSRF boundary, browser-bound OIDC Code+PKCE
 >   and audited break-glass password+TOTP login. Operator UI, browser E2E and
@@ -285,10 +285,13 @@ preserves stable RUNNING/STOPPED/DRAINING/MAINTENANCE/FAILED intent. Transitiona
 node states cannot be exported. It is not exposed over HTTP.
 
 OIDC Code+PKCE с MFA claim contract и break-glass password+TOTP login уже
-реализованы локально вместе с durable audit/email каждого emergency-login.
+реализованы и прошли независимый review и native amd64/arm64 CI вместе с
+durable audit/email каждого emergency-login. Точная граница доказанного
+foundation зафиксирована в
+[`docs/evidence/phase-f-operator-observability-foundation.md`](docs/evidence/phase-f-operator-observability-foundation.md).
 Operator dashboard UI, complete browser workflows и rotation drill ещё не
-реализованы. Эта Phase-F foundation до независимого review и native CI не
-считается завершённой фазой. Наличие load harness и зелёного Phase-E CI не
+реализованы, поэтому Phase F целиком ещё не завершена. Наличие load harness и
+зелёного functional CI не
 означает готовый product или published capacity.
 
 ## Локальная разработка

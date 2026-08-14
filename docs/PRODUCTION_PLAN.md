@@ -940,8 +940,12 @@ dispatcher, digest-only PostgreSQL operator sessions, authoritative
 with exact MFA claims, and durable break-glass TOTP audit/email admission are
 implemented locally. Live OIDC discovery/claims compatibility is polled through
 bounded readiness and emits one durable failure/recovery alert per transition.
-This slice awaits independent review/native CI. Browser UI and the operator
-rotation drill remain pending. No Phase-F completion claim is made yet.
+The foundation passed independent Spec/Standards review and all six native
+amd64/arm64 CI jobs at commit `292a0302590838451e4f454322930804271b4d71`;
+the exact evidence boundary is recorded in
+[`docs/evidence/phase-f-operator-observability-foundation.md`](evidence/phase-f-operator-observability-foundation.md).
+Browser UI, complete browser workflows and the operator rotation drill remain
+pending. No Phase-F completion claim is made yet.
 
 - [ ] node/camera pages and actions;
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
