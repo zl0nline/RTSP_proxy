@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.media import MediaPathConfig
 from rtsp_proxy.nodes import (
     CameraCatalogItem,
     CameraCatalogPage,
@@ -17,6 +19,8 @@ from rtsp_proxy.nodes import (
     CameraCatalogUnavailable,
     CameraControl,
     CameraState,
+    InMemoryNodeStore,
+    MediaNode,
     NodeHealth,
     NodeState,
     PlacementMode,
@@ -36,17 +40,25 @@ from rtsp_proxy.operator_access import (
     OperatorRole,
     OperatorSessionControl,
 )
+from rtsp_proxy.reconcile import (
+    CameraMutationControl,
+    CameraMutationOperation,
+    CameraMutationPreview,
+    ConfirmationTokenService,
+)
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+CSRF_TOKEN = "c" * 43
 
 
 class StaticCameraCatalog:
     def __init__(self) -> None:
         self.last_query: CameraCatalogQuery | None = None
         self.source_url = "rtsp://admin:secret@camera.internal/private"
+        self.enabled_calls: list[tuple[UUID, bool]] = []
 
     def catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         self.last_query = query
@@ -70,6 +82,16 @@ class StaticCameraCatalog:
             applied_revision=2,
         )
 
+    def set_camera_enabled(
+        self,
+        camera_id: UUID,
+        *,
+        enabled: bool,
+        expected_revision: int | None = None,
+    ) -> None:
+        assert expected_revision == 3
+        self.enabled_calls.append((camera_id, enabled))
+
 
 class FailingCameraCatalog:
     def catalog(self, _query: CameraCatalogQuery) -> CameraCatalogPage:
@@ -79,12 +101,150 @@ class FailingCameraCatalog:
         raise CameraCatalogUnavailable("postgres password must not escape")
 
 
+class RecordingCameraMutations:
+    def __init__(self, *, occupied: bool) -> None:
+        self.occupied = occupied
+        self.calls: list[tuple[object, ...]] = []
+
+    def preview(
+        self,
+        camera_id: UUID,
+        *,
+        operation: CameraMutationOperation,
+        expected_revision: int | None = None,
+        name: str | None = None,
+        source_url: str | None = None,
+    ) -> CameraMutationPreview:
+        self.calls.append(
+            ("preview", camera_id, operation, expected_revision, name, source_url)
+        )
+        return CameraMutationPreview(
+            camera_id=camera_id,
+            operation=operation,
+            desired_revision=3,
+            occupied=self.occupied,
+            disconnect_readers=1 if self.occupied else 0,
+            mutation_sha256="d" * 64,
+            confirmation_token="confirmation-token" if self.occupied else None,
+        )
+
+    def update(
+        self,
+        camera_id: UUID,
+        *,
+        name: str,
+        source_url: str,
+        expected_revision: int | None = None,
+        confirmation_token: str | None,
+    ) -> None:
+        self.calls.append(
+            (
+                "update",
+                camera_id,
+                name,
+                source_url,
+                expected_revision,
+                confirmation_token,
+            )
+        )
+
+    def disable(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None = None,
+        confirmation_token: str | None,
+    ) -> None:
+        self.calls.append(("disable", camera_id, expected_revision, confirmation_token))
+
+    def delete(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None = None,
+        confirmation_token: str | None,
+    ) -> None:
+        self.calls.append(("delete", camera_id, expected_revision, confirmation_token))
+
+
+class RuntimeMediaNode:
+    def __init__(self) -> None:
+        self.paths: dict[PublicId, MediaPathConfig] = {}
+        self.runtime: dict[PublicId, tuple[bool, int] | None] = {}
+
+    def put_path(self, path: MediaPathConfig) -> None:
+        self.paths[path.name] = path
+
+    def get_path(self, name: PublicId) -> MediaPathConfig | None:
+        return self.paths.get(name)
+
+    def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
+        return self.runtime.get(name)
+
+
+class RuntimeMediaNodes:
+    def __init__(self, node_id: UUID) -> None:
+        self.client = RuntimeMediaNode()
+        self.node_id = node_id
+
+    def for_node(self, node: MediaNode) -> RuntimeMediaNode:
+        assert node.id == self.node_id
+        return self.client
+
+
+def _domain_camera_mutations(
+    *,
+    reader_count: int,
+) -> tuple[CameraControl, CameraMutationControl, InMemoryNodeStore]:
+    node = MediaNode(
+        id=NODE_ID,
+        name="edge-north",
+        external_port=10543,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+            management_observed_at=datetime.now(UTC),
+        config_compatible=True,
+        desired_revision=1,
+        applied_revision=1,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    cameras = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    camera = cameras.create_camera(
+        name="Front entrance",
+        source_url="rtsp://camera.internal/main",
+        node_id=NODE_ID,
+    )
+    media = RuntimeMediaNodes(NODE_ID)
+    media.client.paths[camera.public_id] = MediaPathConfig(
+        name=camera.public_id,
+        source_url=camera.source_url,
+    )
+    media.client.runtime[camera.public_id] = (True, reader_count)
+    mutations = CameraMutationControl(
+        store=store,
+        media_nodes=cast(Any, media),
+        confirmations=ConfirmationTokenService(
+            secret=b"dashboard-confirmation-secret-at-least-32-bytes",
+            lifetime_seconds=30,
+            wall_time=lambda: 1_700_000_000.0,
+        ),
+    )
+    return cameras, mutations, store
+
+
 def _authenticated_dashboard(
     *,
     observations: SnapshotReader | None,
     clock: datetime = NOW,
     raise_server_exceptions: bool = True,
     camera_control: CameraControl | None = None,
+    camera_mutation_control: object | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
     scopes: frozenset[str] = frozenset({"server:*"}),
 ) -> tuple[TestClient, dict[str, str]]:
@@ -111,11 +271,17 @@ def _authenticated_dashboard(
             fleet_snapshot_max_age_seconds=30,
             clock=lambda: clock,
             camera_control=camera_control,
+            camera_mutation_control=cast(Any, camera_mutation_control),
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
     )
-    return client, {"Cookie": f"__Host-rtsp_proxy_session={issued.session_token}"}
+    return client, {
+        "Cookie": (
+            f"__Host-rtsp_proxy_session={issued.session_token}; "
+            f"__Host-rtsp_proxy_csrf={issued.csrf_token}"
+        )
+    }
 
 
 def _snapshot() -> FleetSnapshot:
@@ -488,3 +654,336 @@ def test_camera_detail_honors_exact_camera_scope_without_an_existence_oracle() -
     assert cross_camera.status_code == 403
     assert nonexistent.status_code == 403
     assert cross_camera.text == nonexistent.text
+
+
+def test_camera_dashboard_forms_require_bound_csrf_and_confirm_occupied_disable() -> None:
+    catalog = StaticCameraCatalog()
+    mutations = RecordingCameraMutations(occupied=True)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_mutation_control=mutations,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    preview_path = f"{detail_path}/mutations/preview"
+    apply_path = f"{detail_path}/mutations/apply"
+
+    detail = client.get(detail_path, headers=headers)
+    missing_csrf = client.post(
+        preview_path,
+        headers=headers,
+        data={"operation": "disable"},
+    )
+    wrong_csrf = client.post(
+        preview_path,
+        headers=headers,
+        data={"_csrf": "wrong", "operation": "disable"},
+    )
+    preview = client.post(
+        preview_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "disable",
+            "expected_revision": "3",
+        },
+    )
+    applied = client.post(
+        apply_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "disable",
+            "expected_revision": "3",
+            "confirmation_token": "confirmation-token",
+        },
+        follow_redirects=False,
+    )
+
+    assert detail.status_code == 200
+    assert f'action="{preview_path}"' in detail.text
+    assert f'value="{CSRF_TOKEN}"' in detail.text
+    assert catalog.source_url not in detail.text
+    assert missing_csrf.status_code == 401
+    assert wrong_csrf.status_code == 401
+    assert preview.status_code == 200
+    assert "Будет отключён 1 downstream-клиент" in preview.text
+    assert 'value="confirmation-token"' in preview.text
+    assert applied.status_code == 303
+    assert applied.headers["location"] == detail_path
+    assert mutations.calls == [
+        ("preview", CAMERA_ID, CameraMutationOperation.DISABLE, 3, None, None),
+        ("disable", CAMERA_ID, 3, "confirmation-token"),
+    ]
+
+
+def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry() -> None:
+    catalog = StaticCameraCatalog()
+    mutations = RecordingCameraMutations(occupied=True)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_mutation_control=mutations,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    edit_path = f"{detail_path}/edit"
+    source_url = "rtsp://new-admin:new-secret@camera.internal/private"
+
+    edit = client.get(edit_path, headers=headers)
+    preview = client.post(
+        f"{detail_path}/mutations/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "update_source",
+            "expected_revision": "3",
+            "name": "Front updated",
+            "source_url": source_url,
+        },
+    )
+    applied = client.post(
+        f"{detail_path}/mutations/apply",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "update_source",
+            "expected_revision": "3",
+            "name": "Front updated",
+            "source_url": source_url,
+            "confirmation_token": "confirmation-token",
+        },
+        follow_redirects=False,
+    )
+
+    assert edit.status_code == 200
+    assert 'value="Front &lt;script&gt;alert(1)&lt;/script&gt;"' in edit.text
+    assert catalog.source_url not in edit.text
+    assert preview.status_code == 200
+    assert source_url not in preview.text
+    assert "Введите новый source URL ещё раз" in preview.text
+    assert applied.status_code == 303
+    assert applied.headers["location"] == detail_path
+    assert mutations.calls == [
+        (
+            "preview",
+            CAMERA_ID,
+            CameraMutationOperation.UPDATE_SOURCE,
+            3,
+            "Front updated",
+            source_url,
+        ),
+        (
+            "update",
+            CAMERA_ID,
+            "Front updated",
+            source_url,
+            3,
+            "confirmation-token",
+        ),
+    ]
+
+
+def test_dashboard_update_reentry_is_bound_to_the_domain_confirmation_token() -> None:
+    cameras, mutations, store = _domain_camera_mutations(reader_count=1)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cameras,
+        camera_mutation_control=mutations,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    previewed_source = "rtsp://camera.internal/new-main"
+    changed_source = "rtsp://camera.internal/other-main"
+    preview = client.post(
+        f"{detail_path}/mutations/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "update_source",
+            "expected_revision": "1",
+            "name": "Front updated",
+            "source_url": previewed_source,
+        },
+    )
+    token_match = re.search(
+        r'name="confirmation_token" value="([^"]+)"',
+        preview.text,
+    )
+    assert token_match is not None
+    confirmation_token = token_match.group(1)
+
+    mismatched = client.post(
+        f"{detail_path}/mutations/apply",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "update_source",
+            "expected_revision": "1",
+            "name": "Front updated",
+            "source_url": changed_source,
+            "confirmation_token": confirmation_token,
+        },
+        follow_redirects=False,
+    )
+    applied = client.post(
+        f"{detail_path}/mutations/apply",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "update_source",
+            "expected_revision": "1",
+            "name": "Front updated",
+            "source_url": previewed_source,
+            "confirmation_token": confirmation_token,
+        },
+        follow_redirects=False,
+    )
+
+    assert preview.status_code == 200
+    assert previewed_source not in preview.text
+    assert mismatched.status_code == 409
+    assert applied.status_code == 303
+    camera = store.get_camera(CAMERA_ID)
+    assert camera is not None
+    assert camera.name == "Front updated"
+    assert camera.source_url == previewed_source
+
+
+def test_unoccupied_mutations_apply_immediately_and_enable_is_direct() -> None:
+    catalog = StaticCameraCatalog()
+    mutations = RecordingCameraMutations(occupied=False)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        camera_mutation_control=mutations,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    preview_path = f"{detail_path}/mutations/preview"
+
+    deleted = client.post(
+        preview_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "delete",
+            "expected_revision": "3",
+        },
+        follow_redirects=False,
+    )
+    enabled = client.post(
+        f"{detail_path}/enable",
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN, "expected_revision": "3"},
+        follow_redirects=False,
+    )
+
+    assert deleted.status_code == 303
+    assert deleted.headers["location"] == detail_path
+    assert enabled.status_code == 303
+    assert enabled.headers["location"] == detail_path
+    assert mutations.calls == [
+        ("preview", CAMERA_ID, CameraMutationOperation.DELETE, 3, None, None),
+        ("delete", CAMERA_ID, 3, None),
+    ]
+    assert catalog.enabled_calls == [(CAMERA_ID, True)]
+
+
+def test_dashboard_camera_mutation_rejects_stale_revision_with_safe_diff() -> None:
+    cameras, mutations, store = _domain_camera_mutations(reader_count=0)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cameras,
+        camera_mutation_control=mutations,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/cameras/{CAMERA_ID}"
+    detail = client.get(detail_path, headers=headers)
+    assert 'name="expected_revision" value="1"' in detail.text
+    current = store.update_camera(
+        CAMERA_ID,
+        name="Concurrent rename",
+        source_url="rtsp://camera.internal/main",
+        expected_revision=1,
+    )
+
+    stale = client.post(
+        f"{detail_path}/mutations/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "delete",
+            "expected_revision": "1",
+        },
+    )
+
+    assert current.desired_revision == 2
+    assert stale.status_code == 409
+    assert "Ожидалась revision 1, текущая revision 2" in stale.text
+    assert current.source_url not in stale.text
+    assert store.get_camera(CAMERA_ID).state is CameraState.ENABLED  # type: ignore[union-attr]
+
+
+def test_dashboard_camera_update_uses_domain_name_contract() -> None:
+    cameras, mutations, store = _domain_camera_mutations(reader_count=0)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cameras,
+        camera_mutation_control=mutations,
+        role=OperatorRole.OPERATOR,
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}/mutations/preview"
+
+    response = client.post(
+        path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "operation": "update_source",
+            "expected_revision": "1",
+            "name": "bad\nname",
+            "source_url": "rtsp://camera.internal/new-main",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Некорректное имя камеры" in response.text
+    assert "rtsp://camera.internal/new-main" not in response.text
+    assert store.get_camera(CAMERA_ID).name == "Front entrance"  # type: ignore[union-attr]
+
+
+def test_dashboard_mutation_form_is_bounded_and_requires_control_mutate() -> None:
+    viewer, viewer_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_mutation_control=RecordingCameraMutations(occupied=False),
+    )
+    operator, operator_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_mutation_control=RecordingCameraMutations(occupied=False),
+        role=OperatorRole.OPERATOR,
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}/mutations/preview"
+
+    denied = viewer.post(
+        path,
+        headers=viewer_headers,
+        data={"_csrf": CSRF_TOKEN, "operation": "delete"},
+    )
+    duplicate_csrf = operator.post(
+        path,
+        headers={**operator_headers, "Content-Type": "application/x-www-form-urlencoded"},
+        content=f"_csrf={CSRF_TOKEN}&_csrf={CSRF_TOKEN}&operation=delete",
+    )
+    oversized = operator.post(
+        path,
+        headers=operator_headers,
+        data={"_csrf": CSRF_TOKEN, "operation": "delete", "padding": "x" * 40000},
+    )
+
+    assert denied.status_code == 403
+    assert duplicate_csrf.status_code == 401
+    assert oversized.status_code == 401

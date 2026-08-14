@@ -46,8 +46,18 @@ is tracked outside the foundation boundary: server/node pages passed run
 `31784945654` at commit `808e74e121b5ed56f6626490a20bc919ab8328eb`,
 and the bounded camera catalog passed run `31790262853` at commit
 `3edb3026d1f2ececaebd86ddbdcebda3b32fb877`. The secret-free camera detail page
-with exact `camera:<uuid>` scope and global `server:*` superset is implemented
-locally after those runs. Camera mutations, complete browser
-accessibility/confirmation E2E, the operator rotation drill,
-physical-hardware capacity and the 24-hour soak remain open. Production
+with exact `camera:<uuid>` scope and global `server:*` superset passed run
+`31794353270` at commit `e38af30dc492984956f1bb8f55434ce9430fe127`.
+Server-rendered update/enable/disable/delete forms with bounded CSRF parsing,
+exact submitted-revision CAS and reader-aware confirmation are implemented
+locally after that run. The supplied confirmation token remains mandatory and
+digest/revision-bound even if the observed reader disconnects before apply;
+stale conflicts expose only expected/current revisions. One bounded camera-name
+contract is enforced by UI, domain, in-memory and PostgreSQL adapters. Name
+activation additionally requires the bounded 0015 legacy preflight; it reports
+only non-deleted camera UUIDs and the catalog revalidates visible names
+fail-closed. Immutable deleted rows remain hidden permanent tombstones and do
+not block the migration. Camera move UI,
+complete browser accessibility/confirmation E2E, the operator rotation
+drill, physical-hardware capacity and the 24-hour soak remain open. Production
 therefore remains NO-GO.

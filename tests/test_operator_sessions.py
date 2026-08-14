@@ -574,6 +574,42 @@ def test_mutating_control_endpoint_is_fenced_before_handler() -> None:
     assert denied.headers["cache-control"] == "no-store"
 
 
+def test_camera_scoped_session_reaches_only_its_exact_api_resource() -> None:
+    camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:camera-operator@example.test",
+        display_name="Оператор камеры",
+        roles=frozenset({OperatorRole.OPERATOR}),
+        scopes=frozenset({f"camera:{camera_id}"}),
+        authz_version=1,
+        enabled=True,
+    )
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), operator_sessions=sessions),
+        base_url="https://management.example.test",
+    )
+    cookie = {"Cookie": f"__Host-rtsp_proxy_session={issued.session_token}"}
+
+    own = client.get(f"/api/v1/cameras/{camera_id}/runtime", headers=cookie)
+    cross_camera = client.get(
+        "/api/v1/cameras/dddddddd-dddd-4ddd-8ddd-dddddddddddd/runtime",
+        headers=cookie,
+    )
+    global_catalog = client.get("/api/v1/cameras", headers=cookie)
+
+    assert own.status_code == 503
+    assert own.json() == {"detail": {"code": "camera_runtime_unavailable"}}
+    assert cross_camera.status_code == 403
+    assert global_catalog.status_code == 403
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_sixth_login_revokes_only_the_oldest_active_session(
     persistent: bool,

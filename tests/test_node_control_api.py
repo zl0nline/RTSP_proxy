@@ -33,6 +33,7 @@ from rtsp_proxy.nodes import (
     CameraNotFound,
     EligibleNodeMissing,
     InMemoryNodeStore,
+    InvalidCameraName,
     InvalidCameraSource,
     MediaNode,
     NodeCameraCapacityReached,
@@ -872,6 +873,24 @@ def test_camera_source_credentials_are_rejected_before_persistence() -> None:
     assert client.get("/api/v1/cameras").json()["count"] == 0
 
 
+@pytest.mark.parametrize("name", ("", "x" * 129, "bad\nname", "bad\u200bname"))
+def test_camera_name_is_rejected_before_persistence(name: str) -> None:
+    store = InMemoryNodeStore()
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+    )
+
+    with pytest.raises(InvalidCameraName, match="camera_name_invalid"):
+        control.create_camera(
+            name=name,
+            source_url="rtsp://camera.local/main",
+        )
+
+    assert store.list_cameras() == ()
+
+
 def test_camera_update_and_disable_are_revisioned_desired_state() -> None:
     observed_at = datetime.now(UTC)
     camera_id = UUID("10000000-0000-0000-0000-000000000001")
@@ -1133,8 +1152,99 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_access_policies', 'camera_access_grants')"
             )
         )
-    assert revision == "0014_camera_catalog_projection"
+    assert revision == "0015_camera_name_contract"
     assert table_count == 6
+
+
+def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0014_camera_catalog_projection")
+    engine = create_engine(postgres_database_url)
+    invalid_names = ("", "   ", "bad\nname", "bad\u202ename", "bad\u200bname")
+    camera_ids = tuple(
+        UUID(f"10000000-0000-4000-8000-{index:012d}")
+        for index in range(1, len(invalid_names) + 1)
+    )
+    with engine.begin() as connection:
+        for index, (camera_id, name) in enumerate(
+            zip(camera_ids, invalid_names, strict=True)
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO cameras "
+                    "(id, name, source_url, public_id, state, desired_revision, "
+                    "applied_revision) VALUES "
+                    "(:id, :name, :source_url, :public_id, 'enabled', 1, 0)"
+                ),
+                {
+                    "id": camera_id,
+                    "name": name,
+                    "source_url": f"rtsp://camera-{index}.local/main",
+                    "public_id": chr(ord("a") + index) * 25 + "a",
+                },
+            )
+
+    with pytest.raises(RuntimeError, match="camera_name_contract_preflight_failed:count=5"):
+        command.upgrade(migration, "head")
+
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0014_camera_catalog_projection"
+        )
+    with engine.begin() as connection:
+        for index, camera_id in enumerate(camera_ids, start=1):
+            connection.execute(
+                text("UPDATE cameras SET name=:name WHERE id=:id"),
+                {"id": camera_id, "name": f"Recovered camera {index}"},
+            )
+    command.upgrade(migration, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0015_camera_name_contract"
+        )
+
+
+def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0014_camera_catalog_projection")
+    engine = create_engine(postgres_database_url)
+    camera_id = UUID("10000000-0000-4000-8000-000000000099")
+    public_id = "z" * 25 + "a"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO cameras "
+                "(id, name, source_url, public_id, state, desired_revision, "
+                "applied_revision) VALUES "
+                "(:id, :name, 'rtsp://legacy-camera.local/main', :public_id, "
+                "'deleted', 2, 2)"
+            ),
+            {"id": camera_id, "name": "legacy\nname", "public_id": public_id},
+        )
+        connection.execute(
+            text("INSERT INTO public_id_tombstones (public_id) VALUES (:public_id)"),
+            {"public_id": public_id},
+        )
+
+    command.upgrade(migration, "head")
+
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0015_camera_name_contract"
+        )
+        assert connection.scalar(
+            text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id}
+        ) == "legacy\nname"
+        assert connection.scalar(
+            text("SELECT count(*) FROM public_id_tombstones WHERE public_id=:public_id"),
+            {"public_id": public_id},
+        ) == 1
 
 
 def test_camera_move_safety_migration_rejects_invalid_legacy_source_urls(
@@ -1999,6 +2109,15 @@ def test_postgresql_adapter_rejects_credentialed_source_urls_if_called_directly(
             name="secret",
             source_url="rtsp://operator:never-store-this@camera.local/main",
             public_id=PublicId.parse("a" * 26),
+            node_id=node_id,
+        )
+
+    with pytest.raises(InvalidCameraName, match="camera_name_invalid"):
+        store.place_camera_manually(
+            camera_id=UUID("10000000-0000-0000-0000-000000000002"),
+            name="x" * 129,
+            source_url="rtsp://camera.local/main",
+            public_id=PublicId.parse("b" * 25 + "a"),
             node_id=node_id,
         )
 
@@ -6251,6 +6370,18 @@ def test_disruptive_camera_routes_preview_and_confirm_exact_current_reader() -> 
         ).status_code
         == 422
     )
+    invalid_source_preview = client.post(
+        f"/api/v1/cameras/{camera_id}/mutations/preview",
+        json={
+            "operation": "update_source",
+            "name": "entrance-new",
+            "source_url": "rtsp://user:secret@camera.local/sub",
+        },
+    )
+    assert invalid_source_preview.status_code == 422
+    assert invalid_source_preview.json() == {
+        "detail": {"code": "camera_source_secret_reference_required"}
+    }
     preview = client.post(
         f"/api/v1/cameras/{camera_id}/mutations/preview",
         json={"operation": "disable"},
@@ -6423,22 +6554,34 @@ def test_camera_routes_fail_closed_for_missing_controls_and_domain_errors() -> N
             *,
             name: str,
             source_url: str,
+            expected_revision: int | None = None,
             confirmation_token: str | None,
         ) -> Any:
-            return cameras.update_camera(camera_id, name=name, source_url=source_url)
+            return cameras.update_camera(
+                camera_id,
+                name=name,
+                source_url=source_url,
+                expected_revision=expected_revision,
+            )
 
         def disable(
             self,
             camera_id: UUID,
             *,
+            expected_revision: int | None = None,
             confirmation_token: str | None,
         ) -> Any:
-            return cameras.set_camera_enabled(camera_id, enabled=False)
+            return cameras.set_camera_enabled(
+                camera_id,
+                enabled=False,
+                expected_revision=expected_revision,
+            )
 
         def delete(
             self,
             camera_id: UUID,
             *,
+            expected_revision: int | None = None,
             confirmation_token: str | None,
         ) -> Any:
             return cameras.delete_camera(camera_id)

@@ -1,0 +1,24 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Изменить {{ camera.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a><span aria-hidden="true">/</span><span>Изменить</span>
+  </nav>
+  <div class="page-heading">
+    <div><p class="eyebrow">Без раскрытия текущих credentials</p><h1>Изменить камеру</h1></div>
+  </div>
+  <section class="panel mutation-panel" aria-labelledby="camera-edit-title">
+    <div class="panel-heading"><h2 id="camera-edit-title">Новая конфигурация</h2></div>
+    <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/preview">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="operation" value="update_source">
+      <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
+      <label>Имя камеры<input name="name" required maxlength="128" value="{{ camera.name }}"></label>
+      <label>Новый source URL<input name="source_url" type="password" required maxlength="8192" autocomplete="new-password" spellcheck="false" placeholder="rtsp://camera-host/path"></label>
+      <p>Текущий source URL никогда не возвращается в dashboard. Введите полный новый RTSP URL без userinfo и query; credentials задаются отдельной secret reference.</p>
+      <div class="form-actions"><button type="submit">Проверить изменение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
+    </form>
+  </section>
+</main>
+{% endblock %}

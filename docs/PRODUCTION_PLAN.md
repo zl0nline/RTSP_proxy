@@ -957,23 +957,48 @@ literal search (minimum three characters), indexed node/state filters, a
 two-second WEB database deadline, `control.read` authorization and no
 `source_url` field. The 10k-camera contract asserts the
 search plan can use the catalog index instead of relying on the page `LIMIT`.
-The route is enabled only on exact schema 0014 after canonical read-back of the
-extension and all four indexes; drift fails closed rather than scanning. The
-additive release runs on 0012/0013/0014 so it can be deployed before the bounded
-one-second-lock/30-second catalog migration. After 0014 commits, rollback to an
-application manifest capped at 0013 is explicitly NO-GO; recovery is fix-forward
-or restoration of the pre-migration PostgreSQL backup with the control plane
+Release 0.6.0 originally enabled the route on exact schema 0014 after canonical
+read-back of the extension and all four indexes. Current release 0.7.0 runs
+compatibly on 0012/0013/0014/0015 during rollout but enables catalog/detail only
+on exact 0015. Migration 0015 performs a bounded fail-closed legacy-name
+preflight before installing the shared 1..128/no-control-character contract; it
+reports only a bounded set of non-deleted camera UUIDs, never rejected names or
+source URLs. Operators remediate those rows through the revisioned camera API
+while the DB remains at 0014, then retry. Immutable deleted rows have no
+placement or API remediation seam; they remain permanently tombstoned, are
+excluded from reads and are deliberately exempt from the display-name
+constraint. Index/name drift fails closed rather than scanning or rendering
+unsafe live data. After 0015 commits, rollback to an application
+manifest capped at 0014 is explicitly NO-GO; recovery is fix-forward or
+restoration of the pre-migration PostgreSQL backup with the control plane
 stopped. Collector/worker compatibility across the declared bridge is retained.
-A secret-free camera detail page using the same bounded projection is
-implemented locally and shows only the ordinary `rtsp://` endpoint template,
-placement and revision state. It requires `control.read` plus the exact
+A secret-free camera detail page using the same bounded projection passed all
+six native jobs at commit `e38af30dc492984956f1bb8f55434ce9430fe127`
+([CI run 31794353270](https://github.com/zl0nline/RTSP_proxy/actions/runs/31794353270)).
+It shows only the ordinary `rtsp://` endpoint template, placement and revision
+state. It requires `control.read` plus the exact
 `camera:<uuid>` scope, while `server:*` remains the explicit global superset;
 cross-camera denials are resolved before lookup and expose no existence oracle.
-Mutating/confirmation workflows, complete browser E2E and the operator rotation
+Server-rendered update/enable/disable/delete workflows are implemented locally.
+Unsafe forms use a session-bound hidden CSRF token, a 32 KiB/eight-field/two-second
+parser, exact camera scope and `control.mutate`. An unoccupied path is changed
+immediately after runtime preview, but only through CAS against the revision
+submitted by the rendered form. An occupied one-reader path requires the
+existing short-lived revision/blast-radius confirmation; a supplied token is
+always verified even if that reader disconnects before apply. Stale revisions
+return a redacted 409 showing only expected/current revision. Camera names share
+one 1..128-character, no-control-character contract across UI, domain,
+in-memory and PostgreSQL adapters. Existing rows are admitted only by the
+fail-closed 0015 preflight; catalog projection revalidates them on every read.
+The new source URL is never repeated in confirmation HTML and must be re-entered
+exactly. Camera routes and mutation
+orchestration live in a dedicated controller/router rather than the application
+composition root. Camera move UI, complete browser E2E and the operator rotation
 drill remain pending. No Phase-F completion claim is made yet.
 
-- [~] node/camera pages and actions (read-only server/node overview and bounded
-  camera catalog CI-green; camera detail local; mutations pending);
+- [~] node/camera pages and actions (read-only server/node overview, bounded
+  camera catalog and camera detail CI-green; update/enable/disable/delete local;
+  camera move UI pending);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;

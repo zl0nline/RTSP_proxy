@@ -238,10 +238,33 @@ indexes and the revision commit together, or PostgreSQL leaves the database at
 0013 with no partial catalog indexes. A timeout is an operator-visible failed
 migration: remove the blocking transaction and retry the same packaged command.
 
-The camera page requires exact revision 0014, `pg_trgm`, and exact canonical
-definitions for all four catalog indexes on every request. Missing or drifted
-projection state returns a sanitized unavailable response; it never falls back
-to an unindexed scan. WEB database operations also carry a two-second
+Application release `0.7.0` adds `0015_camera_name_contract`. It remains
+executable on 0012, 0013 and 0014 while processes are rolled, but its camera
+catalog/detail routes deliberately remain unavailable until exact revision 0015.
+Install and smoke 0.7.0 on every control-plane process before advancing the
+database. Established media-node processes and ordinary RTSP/TCP sessions are
+not restarted by this control-plane rollout.
+
+Migration 0015 scans only IDs and names of non-deleted cameras under the same
+one-second lock wait and 30-second statement timeout. It aborts atomically with
+`camera_name_contract_preflight_failed`, a bounded count and at most twenty
+camera UUIDs if an old row is empty, whitespace-only, or contains a Unicode
+control/format character. It never prints `source_url` or the rejected name.
+Keep PostgreSQL at 0014, correct every reported camera through the authenticated
+camera update API using a valid 1..128-character name, the current full source
+URL and `expected_revision`, then retry the packaged migration. Do not repair
+these rows with ad-hoc SQL: the normal API preserves revision/audit/outbox
+semantics. Immutable `deleted` rows have no placement or supported update seam,
+are excluded from every camera read, and retain their permanent public-ID
+tombstone; 0015 deliberately preserves them without applying the display-name
+contract. Migration success adds `ck_cameras_name` for every non-deleted row;
+future application writes also use the stricter Unicode-aware domain validator.
+
+At exact revision 0015 the camera page additionally requires `pg_trgm` and exact
+canonical definitions for all four catalog indexes on every request. Missing or
+drifted projection state, including a name that bypassed the application after
+migration, returns a sanitized unavailable response; it never falls back to an
+unindexed scan. WEB database operations also carry a two-second
 statement/connect/pool deadline. After migration, open the camera catalog and
 verify every WEB and background process is ready before ending the mutation
 window.
@@ -253,6 +276,11 @@ or stop the control plane and restore the pre-migration PostgreSQL backup; an
 Alembic downgrade is not a supported product rollback. Media nodes and ordinary
 `rtsp://` interleaved-TCP sessions are outside this control-plane rollback
 boundary.
+
+Likewise, after revision 0015 commits, rollback to application 0.6.0 (maximum
+schema 0014) is **NO-GO**. Fix forward with verified 0.7.0 artifacts or restore
+the pre-0015 PostgreSQL backup with the control plane stopped. Do not Alembic
+downgrade a live deployment.
 The five WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
 `/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running

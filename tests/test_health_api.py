@@ -1004,6 +1004,7 @@ def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
         "0012_operator_sessions",
         "0013_operator_login",
         "0014_camera_catalog_projection",
+        "0015_camera_name_contract",
     ],
 )
 def test_collector_remains_ready_across_declared_schema_bridge(

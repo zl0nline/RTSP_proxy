@@ -4,6 +4,7 @@ import errno
 import hashlib
 import socket
 import time
+import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -243,6 +244,9 @@ class CameraCatalogItem:
     desired_revision: int
     applied_revision: int
 
+    def __post_init__(self) -> None:
+        validate_camera_name(self.name)
+
 
 @dataclass(frozen=True, slots=True)
 class CameraCatalogQuery:
@@ -376,6 +380,10 @@ class InvalidCameraSource(ValueError):
     """A camera source endpoint is invalid or contains an unencrypted secret."""
 
 
+class InvalidCameraName(ValueError):
+    """A camera display name cannot be represented consistently by all adapters."""
+
+
 class CameraNotFound(LookupError):
     """A requested camera does not exist."""
 
@@ -384,11 +392,21 @@ class CameraLifecycleConflict(RuntimeError):
     """The camera command conflicts with its desired lifecycle state."""
 
 
+class CameraRevisionConflict(CameraLifecycleConflict):
+    """The submitted camera revision is no longer authoritative."""
+
+    def __init__(self, *, expected_revision: int, current_revision: int) -> None:
+        super().__init__("camera_revision_conflict")
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+
+
 class CameraMoveExpired(CameraLifecycleConflict):
     """A prepared move reached its durable switch deadline."""
 
 
 MAX_CAMERA_SOURCE_URL_BYTES = 8192
+MAX_CAMERA_NAME_LENGTH = 128
 
 
 class NodeDisruptionConfirmations(Protocol):
@@ -1020,6 +1038,7 @@ class InMemoryNodeStore:
         public_id: PublicId,
         management_freshness_seconds: int = 30,
     ) -> CameraPlacement:
+        name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
         with self._lock:
             eligible = [
@@ -1069,6 +1088,7 @@ class InMemoryNodeStore:
         node_id: UUID,
         management_freshness_seconds: int = 30,
     ) -> CameraPlacement:
+        name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
         with self._lock:
             selected = next((node for node in self._nodes if node.id == node_id), None)
@@ -1195,6 +1215,7 @@ class InMemoryNodeStore:
         source_url: str,
         expected_revision: int | None = None,
     ) -> CameraPlacement:
+        name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
         with self._lock:
             camera = next(
@@ -1208,7 +1229,10 @@ class InMemoryNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             if expected_revision is not None and camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             self._require_no_active_camera_move(camera_id)
             if self._node_has_prepared_port_change(camera.node_id):
                 raise CameraLifecycleConflict("node_port_change_in_progress")
@@ -1240,7 +1264,10 @@ class InMemoryNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             if expected_revision is not None and camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             self._require_no_active_camera_move(camera_id)
             if self._node_has_prepared_port_change(camera.node_id):
                 raise CameraLifecycleConflict("node_port_change_in_progress")
@@ -1269,7 +1296,10 @@ class InMemoryNodeStore:
             if camera is None or camera.state is CameraState.DELETED:
                 raise CameraNotFound("camera_not_found")
             if expected_revision is not None and camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             if camera.state is CameraState.DELETING:
                 return camera
             self._require_no_active_camera_move(camera_id)
@@ -1310,7 +1340,10 @@ class InMemoryNodeStore:
             if camera.state is not CameraState.ENABLED:
                 raise CameraLifecycleConflict("camera_not_enabled")
             if camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             if camera.node_id == target_node_id:
                 raise CameraLifecycleConflict("camera_already_on_target")
             if target is None:
@@ -2287,13 +2320,14 @@ class CameraControl:
         source_url: str,
         node_id: UUID | None = None,
     ) -> CameraPlacement:
+        validated_name = validate_camera_name(name)
         validated_source_url = validate_camera_source_url(source_url)
         camera_id = self._new_camera_id()
         public_id = PublicId.parse(self._new_public_id())
         if node_id is not None:
             return self._store.place_camera_manually(
                 camera_id=camera_id,
-                name=name,
+                name=validated_name,
                 source_url=validated_source_url,
                 public_id=public_id,
                 node_id=node_id,
@@ -2302,7 +2336,7 @@ class CameraControl:
         try:
             return self._store.place_camera_automatically(
                 camera_id=camera_id,
-                name=name,
+                name=validated_name,
                 source_url=validated_source_url,
                 public_id=public_id,
                 management_freshness_seconds=self._management_freshness_seconds,
@@ -2313,7 +2347,7 @@ class CameraControl:
         self._ensure_automatic_capacity()
         return self._store.place_camera_automatically(
             camera_id=camera_id,
-            name=name,
+            name=validated_name,
             source_url=validated_source_url,
             public_id=public_id,
             management_freshness_seconds=self._management_freshness_seconds,
@@ -2344,11 +2378,13 @@ class CameraControl:
         *,
         name: str,
         source_url: str,
+        expected_revision: int | None = None,
     ) -> CameraPlacement:
         return self._store.update_camera(
             camera_id,
-            name=name,
+            name=validate_camera_name(name),
             source_url=source_url,
+            expected_revision=expected_revision,
         )
 
     def set_camera_enabled(
@@ -2356,8 +2392,13 @@ class CameraControl:
         camera_id: UUID,
         *,
         enabled: bool,
+        expected_revision: int | None = None,
     ) -> CameraPlacement:
-        return self._store.set_camera_enabled(camera_id, enabled=enabled)
+        return self._store.set_camera_enabled(
+            camera_id,
+            enabled=enabled,
+            expected_revision=expected_revision,
+        )
 
     def delete_camera(self, camera_id: UUID) -> CameraPlacement:
         return self._store.request_camera_delete(camera_id)
@@ -2624,6 +2665,17 @@ def validate_camera_source_url(value: str) -> str:
     return value
 
 
+def validate_camera_name(value: str) -> str:
+    if (
+        not value
+        or len(value) > MAX_CAMERA_NAME_LENGTH
+        or value.isspace()
+        or any(unicodedata.category(character).startswith("C") for character in value)
+    ):
+        raise InvalidCameraName("camera_name_invalid")
+    return value
+
+
 class NodeRuntimeSpecLike:
     @staticmethod
     def validate_release(release_id: str, digest: str) -> None:
@@ -2712,7 +2764,7 @@ def _camera_catalog_item(
 ) -> CameraCatalogItem:
     return CameraCatalogItem(
         id=camera.id,
-        name=camera.name,
+        name=validate_camera_name(camera.name),
         public_id=camera.public_id,
         node_id=camera.node_id,
         node_name=node_name,

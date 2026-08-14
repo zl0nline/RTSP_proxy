@@ -20,9 +20,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   sessions, RBAC version fencing, CSRF boundary, browser-bound OIDC Code+PKCE
 >   and audited break-glass password+TOTP login. Authenticated read-only
 >   server/node dashboard pages and a bounded, keyset-paginated, secret-free
->   camera catalog with search/filter are green in native CI. A secret-free camera
->   detail page is implemented locally; mutation workflows, complete browser E2E
->   and the break-glass rotation drill remain pending.
+>   camera catalog with search/filter and a secret-free camera detail page are
+>   green in native CI. Server-rendered update/enable/disable/delete workflows
+>   with bounded form CSRF, optimistic revision fencing and reader-aware
+>   confirmation are implemented locally;
+>   camera move UI, complete browser E2E and the break-glass rotation drill remain pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -296,9 +298,19 @@ Read-only operator dashboard для server/node overview и bounded camera catal
 с keyset pagination, index-backed literal search/filter, отдельным
 `control.read` permission и проекцией без `source_url` прошли native
 amd64/arm64 CI. Secret-free camera detail с exact `camera:<uuid>` scope и
-глобальным `server:*` superset реализован локально; mutation/
-confirmation workflows, полный browser E2E и rotation drill ещё не реализованы,
-поэтому Phase F целиком не завершена. Наличие load harness и
+глобальным `server:*` superset также прошёл native CI. Server-rendered update,
+enable, disable и delete реализованы локально: form body ограничен, CSRF связан
+с сессией, каждое действие связано с показанной `desired_revision`, а занятый
+single-reader stream требует свежий confirmation token. Stale revision
+возвращает безопасный 409 без source URL; имя камеры одинаково ограничено 128
+символами без управляющих знаков в UI, domain и обоих storage adapters. Read
+contract активируется только после fail-closed 0015 preflight; его ошибка
+содержит UUID только доступных для исправления камер, но не имена или source
+URL. Неизменяемые удалённые строки сохраняются лишь как внутренние tombstones и
+не блокируют upgrade. Новый source URL не повторяется в confirmation HTML.
+Camera move UI, полный browser
+E2E и rotation drill ещё не реализованы, поэтому Phase F целиком не завершена.
+Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.
 

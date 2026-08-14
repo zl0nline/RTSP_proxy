@@ -50,6 +50,7 @@ from rtsp_proxy.nodes import (
     CameraMoveState,
     CameraNotFound,
     CameraPlacement,
+    CameraRevisionConflict,
     CameraState,
     EligibleNodeMissing,
     InvalidNodeRuntimeObservation,
@@ -79,6 +80,7 @@ from rtsp_proxy.nodes import (
     camera_placement_fingerprint,
     is_node_eligible,
     select_port_with_bounded_recheck,
+    validate_camera_name,
     validate_camera_source_url,
     validate_runtime_observation,
 )
@@ -152,6 +154,13 @@ cameras = Table(
     Column("state", String(16), nullable=False),
     Column("desired_revision", BigInteger, nullable=False),
     Column("applied_revision", BigInteger, nullable=False),
+    CheckConstraint(
+        "state = 'deleted' OR ("
+        "length(name) BETWEEN 1 AND 128 "
+        "AND btrim(name) <> '' "
+        "AND name !~ '[[:cntrl:]]')",
+        name="ck_cameras_name",
+    ),
     CheckConstraint("public_id ~ '^[a-z2-7]{25}[aeimquy4]$'"),
     CheckConstraint(
         "octet_length(source_url) BETWEEN 1 AND 8192 "
@@ -508,6 +517,7 @@ class PostgresNodeStore:
         if revisions not in (
             ("0012_operator_sessions",),
             ("0013_operator_login",),
+            ("0014_camera_catalog_projection",),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -538,7 +548,11 @@ class PostgresNodeStore:
                 )
         except SQLAlchemyError:
             raise DatabaseSchemaMismatch("database_schema_mismatch") from None
-        return revisions in (("0013_operator_login",), (APPLICATION_SCHEMA,))
+        return revisions in (
+            ("0013_operator_login",),
+            ("0014_camera_catalog_projection",),
+            (APPLICATION_SCHEMA,),
+        )
 
     def assert_camera_catalog_ready(self) -> None:
         try:
@@ -1584,6 +1598,7 @@ class PostgresNodeStore:
         public_id: PublicId,
         management_freshness_seconds: int = 30,
     ) -> CameraPlacement:
+        name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -1644,6 +1659,7 @@ class PostgresNodeStore:
         node_id: UUID,
         management_freshness_seconds: int = 30,
     ) -> CameraPlacement:
+        name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -1883,6 +1899,7 @@ class PostgresNodeStore:
         source_url: str,
         expected_revision: int | None = None,
     ) -> CameraPlacement:
+        name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -1904,7 +1921,10 @@ class PostgresNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             if expected_revision is not None and camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             self._require_no_active_camera_move(connection, camera_id)
             self._require_no_active_port_change(connection, camera.node_id)
             if camera.name == name and camera.source_url == source_url:
@@ -1973,7 +1993,10 @@ class PostgresNodeStore:
             if camera.state is CameraState.DELETING:
                 raise CameraLifecycleConflict("camera_deleting")
             if expected_revision is not None and camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             self._require_no_active_camera_move(connection, camera_id)
             self._require_no_active_port_change(connection, camera.node_id)
             target = CameraState.ENABLED if enabled else CameraState.DISABLED
@@ -2032,7 +2055,10 @@ class PostgresNodeStore:
             if camera.state is CameraState.DELETED:
                 raise CameraNotFound("camera_not_found")
             if expected_revision is not None and camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             if camera.state is CameraState.DELETING:
                 return camera
             self._require_no_active_camera_move(connection, camera_id)
@@ -2096,7 +2122,10 @@ class PostgresNodeStore:
             if camera.state is not CameraState.ENABLED:
                 raise CameraLifecycleConflict("camera_not_enabled")
             if camera.desired_revision != expected_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=expected_revision,
+                    current_revision=camera.desired_revision,
+                )
             if camera.node_id == target_node_id:
                 raise CameraLifecycleConflict("camera_already_on_target")
             target_row = (
@@ -3209,7 +3238,7 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
 def _camera_catalog_item(row: RowMapping) -> CameraCatalogItem:
     return CameraCatalogItem(
         id=_uuid(row["id"]),
-        name=str(row["name"]),
+        name=validate_camera_name(str(row["name"])),
         public_id=PublicId.parse(str(row["public_id"])),
         node_id=_uuid(row["node_id"]),
         node_name=str(row["node_name"]),

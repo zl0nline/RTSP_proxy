@@ -16,6 +16,7 @@ from rtsp_proxy.nodes import (
 )
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import OperatorPrincipal
+from rtsp_proxy.reconcile import CameraMutationPreview
 
 DASHBOARD_CSP: Final = (
     "default-src 'none'; style-src 'self'; base-uri 'none'; "
@@ -113,10 +114,44 @@ def render_camera_detail(
     *,
     camera: CameraCatalogItem,
     principal: OperatorPrincipal,
+    csrf_token: str,
+    can_mutate: bool,
 ) -> str:
     return _environment().get_template("dashboard/camera.html").render(
         camera=camera,
         principal=principal,
+        csrf_token=csrf_token,
+        can_mutate=can_mutate,
+    )
+
+
+def render_camera_edit(
+    *,
+    camera: CameraCatalogItem,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+) -> str:
+    return _environment().get_template("dashboard/camera_edit.html").render(
+        camera=camera,
+        principal=principal,
+        csrf_token=csrf_token,
+    )
+
+
+def render_camera_mutation_confirmation(
+    *,
+    camera: CameraCatalogItem,
+    preview: CameraMutationPreview,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+    name: str | None,
+) -> str:
+    return _environment().get_template("dashboard/camera_mutation_confirmation.html").render(
+        camera=camera,
+        preview=preview,
+        principal=principal,
+        csrf_token=csrf_token,
+        name=name,
     )
 
 

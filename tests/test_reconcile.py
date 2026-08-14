@@ -821,6 +821,97 @@ def test_disruptive_camera_mutation_accepts_exact_current_confirmation() -> None
     assert factory.clients[NODE_A].paths[PUBLIC_A].max_readers == -1
 
 
+def test_supplied_camera_confirmation_remains_mandatory_after_reader_disconnects() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+    CameraReconciler(store=store, media_nodes=factory).reconcile_node(NODE_A)
+    factory.clients[NODE_A].runtime[PUBLIC_A] = (True, 1)
+    confirmations = ConfirmationTokenService(
+        secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+        lifetime_seconds=30,
+    )
+    control = CameraMutationControl(
+        store=store,
+        media_nodes=factory,
+        confirmations=confirmations,
+    )
+    preview = control.preview(CAMERA_A, operation=CameraMutationOperation.DISABLE)
+    factory.clients[NODE_A].runtime[PUBLIC_A] = (False, 0)
+
+    with pytest.raises(
+        CameraDisruptionConfirmationRequired,
+        match="camera_disruption_confirmation_required",
+    ):
+        control.delete(
+            CAMERA_A,
+            expected_revision=preview.desired_revision,
+            confirmation_token=preview.confirmation_token,
+        )
+
+    assert store.get_camera(CAMERA_A).state is CameraState.ENABLED  # type: ignore[union-attr]
+    assert factory.clients[NODE_A].paths[PUBLIC_A].max_readers == 1
+
+
+def test_name_only_update_cannot_ignore_a_supplied_confirmation() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+    CameraReconciler(store=store, media_nodes=factory).reconcile_node(NODE_A)
+    factory.clients[NODE_A].runtime[PUBLIC_A] = (True, 1)
+    control = CameraMutationControl(
+        store=store,
+        media_nodes=factory,
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+    )
+    preview = control.preview(
+        CAMERA_A,
+        operation=CameraMutationOperation.UPDATE_SOURCE,
+        name="Previewed name",
+        source_url="rtsp://camera.invalid/main",
+    )
+    factory.clients[NODE_A].runtime[PUBLIC_A] = (False, 0)
+
+    with pytest.raises(
+        CameraDisruptionConfirmationRequired,
+        match="camera_disruption_confirmation_required",
+    ):
+        control.update(
+            CAMERA_A,
+            name="Altered name",
+            source_url="rtsp://camera.invalid/main",
+            expected_revision=preview.desired_revision,
+            confirmation_token=preview.confirmation_token,
+        )
+
+    assert store.get_camera(CAMERA_A).name == "entrance"  # type: ignore[union-attr]
+    assert factory.clients[NODE_A].paths[PUBLIC_A].max_readers == 1
+
+
+def test_camera_mutation_rejects_stale_expected_revision_before_runtime_change() -> None:
+    store = camera_store()
+    factory = RecordingMediaNodeFactory()
+    CameraReconciler(store=store, media_nodes=factory).reconcile_node(NODE_A)
+    control = CameraMutationControl(
+        store=store,
+        media_nodes=factory,
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+    )
+
+    with pytest.raises(CameraLifecycleConflict, match="camera_revision_conflict"):
+        control.disable(
+            CAMERA_A,
+            expected_revision=999,
+            confirmation_token=None,
+        )
+
+    assert factory.clients[NODE_A].paths[PUBLIC_A].max_readers == 1
+
+
 def test_disruptive_camera_mutation_rejects_revision_changed_after_media_fence() -> None:
     store = camera_store()
     factory = RecordingMediaNodeFactory()

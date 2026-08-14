@@ -31,5 +31,35 @@
       <div><dt>Revision</dt><dd>{{ camera.applied_revision }} / {{ camera.desired_revision }}<small>applied / desired</small></dd></div>
     </dl>
   </section>
+
+  {% if can_mutate and camera.state.value in ["enabled", "disabled"] %}
+  <section class="panel camera-actions" aria-labelledby="camera-actions-title">
+    <div class="panel-heading"><h2 id="camera-actions-title">Управление камерой</h2></div>
+    <div class="action-grid">
+      <a class="button-link" href="/dashboard/cameras/{{ camera.id }}/edit">Изменить имя или source URL</a>
+      {% if camera.state.value == "enabled" %}
+      <form method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/preview">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="operation" value="disable">
+        <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
+        <button type="submit">Отключить</button>
+      </form>
+      {% else %}
+      <form method="post" action="/dashboard/cameras/{{ camera.id }}/enable">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
+        <button type="submit">Включить</button>
+      </form>
+      {% endif %}
+      <form method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/preview">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="operation" value="delete">
+        <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
+        <button class="danger-button" type="submit">Удалить</button>
+      </form>
+    </div>
+    <p class="detail-note">Если поток занят, перед отключением клиента потребуется отдельное подтверждение с актуальным числом читателей.</p>
+  </section>
+  {% endif %}
 </main>
 {% endblock %}

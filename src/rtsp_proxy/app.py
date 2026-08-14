@@ -4,7 +4,6 @@ from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Literal
-from urllib.parse import urlencode
 from uuid import UUID
 
 import anyio
@@ -25,19 +24,19 @@ from rtsp_proxy.access import (
     IssuedAccessGrant,
     PepperVerifier,
 )
+from rtsp_proxy.camera_dashboard import camera_dashboard_router
 from rtsp_proxy.config import Settings
 from rtsp_proxy.dashboard import (
     DASHBOARD_CSP,
     DashboardUnavailable,
     FleetSnapshotFailureReason,
     FleetSnapshotReadFailure,
-    render_camera_catalog,
-    render_camera_detail,
     render_node_detail,
     render_overview,
     render_unavailable,
     require_fresh_snapshot,
 )
+from rtsp_proxy.dashboard_forms import DashboardFormInvalid, read_dashboard_form
 from rtsp_proxy.health import (
     MissingReadinessProvider,
     ReadinessProvider,
@@ -46,14 +45,13 @@ from rtsp_proxy.health import (
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.nodes import (
-    CameraCatalogQuery,
-    CameraCatalogUnavailable,
     CameraControl,
     CameraLifecycleConflict,
     CameraMove,
     CameraNotFound,
-    CameraState,
+    CameraRevisionConflict,
     EligibleNodeMissing,
+    InvalidCameraName,
     InvalidCameraSource,
     MaximumNodesReached,
     NodeCameraCapacityReached,
@@ -107,6 +105,17 @@ def _lifecycle_busy() -> HTTPException:
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail={"code": "node_lifecycle_busy"},
         headers={"Retry-After": "1"},
+    )
+
+
+def _camera_revision_conflict(error: CameraRevisionConflict) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "camera_revision_conflict",
+            "expected_revision": error.expected_revision,
+            "current_revision": error.current_revision,
+        },
     )
 
 
@@ -240,24 +249,27 @@ class BreakGlassLoginRequest(BaseModel):
 
 
 class CameraCreateRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=128)
     source_url: str
     node_id: UUID | None = None
 
 
 class CameraUpdateRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=128)
     source_url: str
+    expected_revision: int | None = Field(default=None, ge=1)
     confirmation_token: str | None = Field(default=None, max_length=4096)
 
 
 class CameraDisruptionRequest(BaseModel):
+    expected_revision: int | None = Field(default=None, ge=1)
     confirmation_token: str | None = Field(default=None, max_length=4096)
 
 
 class CameraMutationPreviewRequest(BaseModel):
     operation: CameraMutationOperation
-    name: str | None = None
+    expected_revision: int | None = Field(default=None, ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=128)
     source_url: str | None = None
 
 
@@ -710,17 +722,22 @@ def create_app(
             permission = _operator_permission_for_request(request)
             required_scope = _operator_scope_for_request(request)
             try:
+                csrf_token = request.headers.get("X-CSRF-Token")
+                if require_csrf and request.url.path.startswith("/dashboard/"):
+                    dashboard_form = await read_dashboard_form(request)
+                    request.state.dashboard_form = dashboard_form
+                    csrf_token = dashboard_form.csrf_token
                 principal = await anyio.to_thread.run_sync(
                     lambda: operator_sessions.authenticate(
                         session_token=session_token,
                         permission=permission,
-                        csrf_token=request.headers.get("X-CSRF-Token"),
+                        csrf_token=csrf_token,
                         require_csrf=require_csrf,
                         required_scope=required_scope,
                     ),
                     abandon_on_cancel=True,
                 )
-            except OperatorAuthenticationRequired:
+            except (DashboardFormInvalid, OperatorAuthenticationRequired):
                 if request.url.path.startswith("/dashboard"):
                     return _dashboard_unavailable_response(
                         DashboardUnavailable(
@@ -802,70 +819,12 @@ def create_app(
             render_overview(snapshot=snapshot_response, principal=principal)
         )
 
-    @app.get(
-        "/dashboard/cameras",
-        response_class=HTMLResponse,
-        include_in_schema=False,
-    )
-    def dashboard_camera_catalog(request: Request) -> Response:
-        principal = _dashboard_principal(request, operator_sessions)
-        if isinstance(principal, Response):
-            return principal
-        if camera_control is None:
-            return _camera_catalog_unavailable_response(principal)
-        try:
-            query = _camera_catalog_query(request)
-        except ValueError:
-            return _dashboard_unavailable_response(
-                DashboardUnavailable(
-                    title="Некорректный запрос каталога",
-                    message="Проверьте фильтры, курсор и размер страницы.",
-                ),
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                principal=principal,
-            )
-        try:
-            page = camera_control.catalog(query)
-        except CameraCatalogUnavailable:
-            return _camera_catalog_unavailable_response(principal)
-        return _dashboard_html_response(
-            render_camera_catalog(
-                page=page,
-                query=query,
-                next_url=_camera_catalog_next_url(query, page.next_after),
-                principal=principal,
-            )
+    app.include_router(
+        camera_dashboard_router(
+            camera_control=camera_control,
+            camera_mutation_control=camera_mutation_control,
         )
-
-    @app.get(
-        "/dashboard/cameras/{camera_id}",
-        response_class=HTMLResponse,
-        include_in_schema=False,
     )
-    def dashboard_camera_page(request: Request, camera_id: UUID) -> Response:
-        principal = _dashboard_principal(request, operator_sessions)
-        if isinstance(principal, Response):
-            return principal
-        if camera_control is None:
-            return _camera_catalog_unavailable_response(principal)
-        try:
-            camera = camera_control.detail(camera_id)
-        except CameraCatalogUnavailable:
-            return _camera_catalog_unavailable_response(principal)
-        if camera is None:
-            return _dashboard_unavailable_response(
-                DashboardUnavailable(
-                    title="Камера не найдена",
-                    message=(
-                        "Камеры с таким идентификатором нет в текущем каталоге."  # noqa: RUF001
-                    ),
-                ),
-                status_code=status.HTTP_404_NOT_FOUND,
-                principal=principal,
-            )
-        return _dashboard_html_response(
-            render_camera_detail(camera=camera, principal=principal)
-        )
 
     @app.get(
         "/dashboard/nodes/{node_id}",
@@ -1683,7 +1642,7 @@ def create_app(
             ) from None
         except NodeLifecycleBusy:
             raise _lifecycle_busy() from None
-        except InvalidCameraSource as error:
+        except (InvalidCameraName, InvalidCameraSource) as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": str(error)},
@@ -1708,6 +1667,7 @@ def create_app(
                 camera_id,
                 name=request.name,
                 source_url=request.source_url,
+                expected_revision=request.expected_revision,
                 confirmation_token=request.confirmation_token,
             )
         except CameraNotFound:
@@ -1715,12 +1675,14 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
+        except CameraRevisionConflict as error:
+            raise _camera_revision_conflict(error) from None
         except CameraLifecycleConflict as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": str(error)},
             ) from None
-        except InvalidCameraSource as error:
+        except (InvalidCameraName, InvalidCameraSource) as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": str(error)},
@@ -1736,6 +1698,7 @@ def create_app(
         camera_id: UUID,
         *,
         enabled: bool,
+        expected_revision: int | None = None,
         confirmation_token: str | None = None,
     ) -> CameraResponse:
         control = _require_camera_control(camera_control)
@@ -1746,11 +1709,16 @@ def create_app(
             )
         try:
             if enabled:
-                camera = control.set_camera_enabled(camera_id, enabled=True)
+                camera = control.set_camera_enabled(
+                    camera_id,
+                    enabled=True,
+                    expected_revision=expected_revision,
+                )
             else:
                 assert camera_mutation_control is not None
                 camera = camera_mutation_control.disable(
                     camera_id,
+                    expected_revision=expected_revision,
                     confirmation_token=confirmation_token,
                 )
         except CameraNotFound:
@@ -1758,6 +1726,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
+        except CameraRevisionConflict as error:
+            raise _camera_revision_conflict(error) from None
         except CameraLifecycleConflict as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1771,8 +1741,15 @@ def create_app(
         return _camera_response(camera)
 
     @app.post("/api/v1/cameras/{camera_id}/enable", response_model=CameraResponse)
-    def enable_camera(camera_id: UUID) -> CameraResponse:
-        return set_camera_enabled(camera_id, enabled=True)
+    def enable_camera(
+        camera_id: UUID,
+        request: CameraDisruptionRequest | None = None,
+    ) -> CameraResponse:
+        return set_camera_enabled(
+            camera_id,
+            enabled=True,
+            expected_revision=(None if request is None else request.expected_revision),
+        )
 
     @app.post("/api/v1/cameras/{camera_id}/disable", response_model=CameraResponse)
     def disable_camera(
@@ -1782,6 +1759,7 @@ def create_app(
         return set_camera_enabled(
             camera_id,
             enabled=False,
+            expected_revision=(None if request is None else request.expected_revision),
             confirmation_token=(None if request is None else request.confirmation_token),
         )
 
@@ -1804,6 +1782,7 @@ def create_app(
             return _camera_response(
                 camera_mutation_control.delete(
                     camera_id,
+                    expected_revision=(None if request is None else request.expected_revision),
                     confirmation_token=(None if request is None else request.confirmation_token),
                 )
             )
@@ -1812,6 +1791,8 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
+        except CameraRevisionConflict as error:
+            raise _camera_revision_conflict(error) from None
         except CameraLifecycleConflict as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1847,6 +1828,7 @@ def create_app(
             preview = camera_mutation_control.preview(
                 camera_id,
                 operation=request.operation,
+                expected_revision=request.expected_revision,
                 name=request.name,
                 source_url=request.source_url,
             )
@@ -1859,6 +1841,13 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "camera_reader_limit_violated"},
+            ) from None
+        except CameraRevisionConflict as error:
+            raise _camera_revision_conflict(error) from None
+        except (InvalidCameraName, InvalidCameraSource) as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": str(error)},
             ) from None
         return CameraMutationPreviewResponse(
             camera_id=str(preview.camera_id),
@@ -2370,6 +2359,8 @@ def _retryable_service_response(code: str) -> JSONResponse:
 def _operator_permission_for_request(request: Request) -> OperatorPermission:
     path = request.url.path
     if path == "/dashboard/cameras" or path.startswith("/dashboard/cameras/"):
+        if path.endswith("/edit"):
+            return OperatorPermission.CONTROL_MUTATE
         return (
             OperatorPermission.CONTROL_READ
             if request.method in {"GET", "HEAD", "OPTIONS"}
@@ -2402,18 +2393,17 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
 
 
 def _operator_scope_for_request(request: Request) -> str:
-    camera_detail_prefix = "/dashboard/cameras/"
-    if request.method in {"GET", "HEAD", "OPTIONS"} and request.url.path.startswith(
-        camera_detail_prefix
-    ):
-        resource = request.url.path.removeprefix(camera_detail_prefix)
-        if resource and "/" not in resource:
-            try:
-                camera_id = UUID(resource)
-            except ValueError:
-                pass
-            else:
-                return f"camera:{camera_id}"
+    for camera_resource_prefix in ("/dashboard/cameras/", "/api/v1/cameras/"):
+        if request.url.path.startswith(camera_resource_prefix):
+            resource = request.url.path.removeprefix(camera_resource_prefix)
+            camera_resource = resource.partition("/")[0]
+            if camera_resource:
+                try:
+                    camera_id = UUID(camera_resource)
+                except ValueError:
+                    pass
+                else:
+                    return f"camera:{camera_id}"
     return "server:*"
 
 
@@ -2508,62 +2498,6 @@ def _dashboard_unavailable_response(
         status_code=status_code,
         retry_after="5" if status_code == status.HTTP_503_SERVICE_UNAVAILABLE else None,
     )
-
-
-def _camera_catalog_unavailable_response(principal: OperatorPrincipal) -> HTMLResponse:
-    return _dashboard_unavailable_response(
-        DashboardUnavailable(
-            title="Каталог камер недоступен",
-            message="Безопасно прочитать список камер сейчас невозможно.",
-        ),
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        principal=principal,
-    )
-
-
-def _camera_catalog_query(request: Request) -> CameraCatalogQuery:
-    allowed = {"after", "limit", "q", "node_id", "state"}
-    values: dict[str, str] = {}
-    for key, value in request.query_params.multi_items():
-        if key not in allowed or key in values:
-            raise ValueError("camera_catalog_query_invalid")
-        values[key] = value
-    after_value = values.get("after")
-    node_id_value = values.get("node_id")
-    state_raw = values.get("state")
-    try:
-        limit = int(values.get("limit", "50"))
-        after = UUID(after_value) if after_value else None
-        node_id = UUID(node_id_value) if node_id_value else None
-        state_value = CameraState(state_raw) if state_raw else None
-    except (TypeError, ValueError):
-        raise ValueError("camera_catalog_query_invalid") from None
-    if state_value is CameraState.DELETED:
-        raise ValueError("camera_catalog_query_invalid")
-    return CameraCatalogQuery(
-        after=after,
-        limit=limit,
-        search=values.get("q") or None,
-        node_id=node_id,
-        state=state_value,
-    )
-
-
-def _camera_catalog_next_url(
-    query: CameraCatalogQuery,
-    next_after: UUID | None,
-) -> str | None:
-    if next_after is None:
-        return None
-    parameters: list[tuple[str, str]] = [("limit", str(query.limit))]
-    if query.search is not None:
-        parameters.append(("q", query.search))
-    if query.node_id is not None:
-        parameters.append(("node_id", str(query.node_id)))
-    if query.state is not None:
-        parameters.append(("state", query.state.value))
-    parameters.append(("after", str(next_after)))
-    return f"/dashboard/cameras?{urlencode(parameters)}"
 
 
 def _operator_error_response(status_code: int, code: str) -> JSONResponse:

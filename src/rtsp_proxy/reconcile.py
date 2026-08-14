@@ -22,6 +22,7 @@ from rtsp_proxy.nodes import (
     CameraMoveStore,
     CameraNotFound,
     CameraPlacement,
+    CameraRevisionConflict,
     CameraState,
     EligibleNodeMissing,
     MediaNode,
@@ -31,6 +32,8 @@ from rtsp_proxy.nodes import (
     NodeState,
     ReconcileStore,
     is_node_eligible,
+    validate_camera_name,
+    validate_camera_source_url,
 )
 
 
@@ -679,10 +682,16 @@ class CameraMutationControl:
         camera_id: UUID,
         *,
         operation: CameraMutationOperation,
+        expected_revision: int | None = None,
         name: str | None = None,
         source_url: str | None = None,
     ) -> CameraMutationPreview:
-        camera = self._camera(camera_id)
+        camera = self._camera(camera_id, expected_revision=expected_revision)
+        if operation is CameraMutationOperation.UPDATE_SOURCE:
+            if name is None or source_url is None:
+                raise ValueError("camera_mutation_payload_required")
+            validate_camera_name(name)
+            validate_camera_source_url(source_url)
         mutation_sha256 = self._mutation_sha256(
             operation=operation,
             name=name,
@@ -719,10 +728,12 @@ class CameraMutationControl:
         *,
         name: str,
         source_url: str,
+        expected_revision: int | None = None,
         confirmation_token: str | None,
     ) -> CameraPlacement:
-        camera = self._camera(camera_id)
-        if camera.source_url == source_url:
+        name = validate_camera_name(name)
+        camera = self._camera(camera_id, expected_revision=expected_revision)
+        if camera.source_url == source_url and confirmation_token is None:
             return self._store.update_camera(
                 camera_id,
                 name=name,
@@ -747,9 +758,10 @@ class CameraMutationControl:
         self,
         camera_id: UUID,
         *,
+        expected_revision: int | None = None,
         confirmation_token: str | None,
     ) -> CameraPlacement:
-        camera = self._camera(camera_id)
+        camera = self._camera(camera_id, expected_revision=expected_revision)
         if camera.state is CameraState.DISABLED:
             return camera
         with self._fence(
@@ -769,9 +781,10 @@ class CameraMutationControl:
         self,
         camera_id: UUID,
         *,
+        expected_revision: int | None = None,
         confirmation_token: str | None,
     ) -> CameraPlacement:
-        camera = self._camera(camera_id)
+        camera = self._camera(camera_id, expected_revision=expected_revision)
         with self._fence(
             camera,
             operation=CameraMutationOperation.DELETE,
@@ -802,7 +815,10 @@ class CameraMutationControl:
         with self._store.reconcile_guard(camera.node_id):
             current = self._camera(camera.id)
             if current.desired_revision != camera.desired_revision:
-                raise CameraLifecycleConflict("camera_revision_conflict")
+                raise CameraRevisionConflict(
+                    expected_revision=camera.desired_revision,
+                    current_revision=current.desired_revision,
+                )
             node = self._store.get_node(current.node_id)
             if node is None:
                 raise ReconcileRetry("camera_runtime_node_missing")
@@ -819,17 +835,17 @@ class CameraMutationControl:
             readers = 0 if status is None else status[1]
             if readers > 1:
                 raise CameraReaderInvariantViolation("camera_reader_limit_violated")
-            if readers == 1 and (
-                confirmation_token is None
-                or not self._confirmations.verify_camera_mutation(
+            confirmation_invalid = confirmation_token is not None and not (
+                self._confirmations.verify_camera_mutation(
                     confirmation_token,
                     camera_id=current.id,
                     operation=operation,
                     desired_revision=current.desired_revision,
-                    disconnect_readers=readers,
+                    disconnect_readers=1,
                     mutation_sha256=mutation_sha256,
                 )
-            ):
+            )
+            if confirmation_invalid or (readers == 1 and confirmation_token is None):
                 client.put_path(
                     MediaPathConfig(name=current.public_id, source_url=current.source_url)
                 )
@@ -844,10 +860,20 @@ class CameraMutationControl:
                 )
                 raise
 
-    def _camera(self, camera_id: UUID) -> CameraPlacement:
+    def _camera(
+        self,
+        camera_id: UUID,
+        *,
+        expected_revision: int | None = None,
+    ) -> CameraPlacement:
         camera = self._store.get_camera(camera_id)
         if camera is None:
             raise CameraNotFound("camera_not_found")
+        if expected_revision is not None and camera.desired_revision != expected_revision:
+            raise CameraRevisionConflict(
+                expected_revision=expected_revision,
+                current_revision=camera.desired_revision,
+            )
         return camera
 
     def _status(self, camera: CameraPlacement) -> tuple[bool, int] | None:

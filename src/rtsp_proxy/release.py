@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
-APPLICATION_SCHEMA = "0014_camera_catalog_projection"
+APPLICATION_SCHEMA = "0015_camera_name_contract"
 MINIMUM_APPLICATION_SCHEMA = "0012_operator_sessions"
 CONFIG_SCHEMA_VERSION = 1
 

@@ -70,6 +70,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0014_camera_catalog_projection.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0015_camera_name_contract.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -133,7 +138,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         },
         "schema_compatibility": {
             "minimum": "0012_operator_sessions",
-            "maximum": "0014_camera_catalog_projection",
+            "maximum": "0015_camera_name_contract",
         },
         "config_schema_version": 1,
     }
@@ -338,16 +343,16 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert {manifest.release_id for manifest in manifests} == {"0.6.0"}
+    assert {manifest.release_id for manifest in manifests} == {"0.7.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
 
 
-def test_previous_application_manifest_is_not_claimed_as_rollback_after_0014(
+def test_previous_application_manifest_is_not_claimed_as_rollback_after_0015(
     tmp_path: Path,
 ) -> None:
     manifest_path = write_release(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["schema_compatibility"]["maximum"] = "0013_operator_login"
+    manifest["schema_compatibility"]["maximum"] = "0014_camera_catalog_projection"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ReleaseVerificationError, match="database_schema_mismatch"):

@@ -82,7 +82,7 @@ jobs:
           createdb --host 127.0.0.1 --port "$migration_port" --username postgres rtsp_proxy_migration_test
           RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
             .artifacts/clean-venv/bin/rtsp-proxy-migrate
-          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0014_camera_catalog_projection"
+          test "$(psql --host 127.0.0.1 --port "$migration_port" --username postgres --dbname rtsp_proxy_migration_test --tuples-only --no-align --command 'SELECT version_num FROM alembic_version')" = "0015_camera_name_contract"
           RTSP_PROXY_DATABASE_URL="postgresql+psycopg://postgres@127.0.0.1:$migration_port/rtsp_proxy_migration_test" \
             .artifacts/clean-venv/bin/python -c 'import os; from rtsp_proxy.database import PostgresNodeStore; store = PostgresNodeStore(os.environ["RTSP_PROXY_DATABASE_URL"]); store.assert_camera_catalog_ready(); store.close()'
 

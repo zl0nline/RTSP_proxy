@@ -202,6 +202,9 @@ class OperatorPrincipal:
     authz_version: int
     mfa_verified_at: datetime | None
 
+    def allows(self, permission: OperatorPermission) -> bool:
+        return any(permission in _ROLE_PERMISSIONS[role] for role in self.roles)
+
 
 @dataclass(frozen=True, slots=True)
 class IssuedOperatorSession:

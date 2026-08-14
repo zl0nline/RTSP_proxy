@@ -294,6 +294,31 @@ def test_postgres_camera_catalog_uses_indexed_projection_at_10k_rows(
         store.close()
 
 
+def test_postgres_camera_catalog_fails_closed_on_post_migration_name_drift(
+    postgres_database_url: str,
+) -> None:
+    camera_control, store = _catalog(
+        persistent=True,
+        postgres_database_url=postgres_database_url,
+    )
+    assert isinstance(store, PostgresNodeStore)
+    engine = create_engine(postgres_database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE cameras SET name=:name WHERE id=:camera_id"),
+                {"camera_id": CAMERA_IDS[0], "name": "unsafe\u202ename"},
+            )
+
+        with pytest.raises(CameraCatalogUnavailable, match="camera_catalog_unavailable"):
+            camera_control.detail(CAMERA_IDS[0])
+        with pytest.raises(CameraCatalogUnavailable, match="camera_catalog_unavailable"):
+            camera_control.catalog(CameraCatalogQuery())
+    finally:
+        engine.dispose()
+        store.close()
+
+
 def test_camera_catalog_requires_current_exact_projection(
     postgres_database_url: str,
 ) -> None:
