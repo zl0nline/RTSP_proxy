@@ -105,7 +105,7 @@ jobs:
           sudo touch /etc/rtsp-proxy/control-plane/smtp-password
           sudo touch /etc/rtsp-proxy/mediamtx/mediamtx.yml
           sudo touch /etc/rtsp-proxy/node-runtime.env
-          systemd-analyze verify deploy/systemd/*
+          systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.socket
 
       - name: Validate owned nftables policy
         run: |
