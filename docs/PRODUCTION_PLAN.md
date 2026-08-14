@@ -944,10 +944,14 @@ The foundation passed independent Spec/Standards review and all six native
 amd64/arm64 CI jobs at commit `292a0302590838451e4f454322930804271b4d71`;
 the exact evidence boundary is recorded in
 [`docs/evidence/phase-f-operator-observability-foundation.md`](evidence/phase-f-operator-observability-foundation.md).
-Browser UI, complete browser workflows and the operator rotation drill remain
-pending. No Phase-F completion claim is made yet.
+The authenticated server-rendered server/node overview and node-detail pages
+are implemented locally with fail-closed snapshot freshness, semantic tables,
+keyboard focus, local assets and strict browser security headers. Camera pages,
+mutating/confirmation workflows, complete browser E2E and the operator rotation
+drill remain pending. No Phase-F completion claim is made yet.
 
-- [ ] node/camera pages and actions;
+- [~] node/camera pages and actions (read-only server/node overview complete;
+  camera catalog and mutations pending);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;

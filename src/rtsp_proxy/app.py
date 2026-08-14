@@ -9,7 +9,7 @@ from uuid import UUID
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -25,6 +25,16 @@ from rtsp_proxy.access import (
     PepperVerifier,
 )
 from rtsp_proxy.config import Settings
+from rtsp_proxy.dashboard import (
+    DASHBOARD_CSP,
+    DashboardUnavailable,
+    FleetSnapshotFailureReason,
+    FleetSnapshotReadFailure,
+    render_node_detail,
+    render_overview,
+    render_unavailable,
+    require_fresh_snapshot,
+)
 from rtsp_proxy.health import (
     MissingReadinessProvider,
     ReadinessProvider,
@@ -56,7 +66,7 @@ from rtsp_proxy.nodes import (
     NodeRuntimeUnavailable,
     NodeState,
 )
-from rtsp_proxy.observability import SnapshotReader
+from rtsp_proxy.observability import FleetSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import (
     IssuedOperatorSession,
     OperatorAuthenticationRequired,
@@ -685,7 +695,7 @@ def create_app(
             request: Request,
             call_next: Callable[[Request], Awaitable[Response]],
         ) -> Response:
-            if not request.url.path.startswith("/api/v1/"):
+            if not _operator_protected_path(request.url.path):
                 result = await call_next(request)
                 assert isinstance(result, Response)
                 return result
@@ -703,16 +713,42 @@ def create_app(
                     abandon_on_cancel=True,
                 )
             except OperatorAuthenticationRequired:
+                if request.url.path.startswith("/dashboard"):
+                    return _dashboard_unavailable_response(
+                        DashboardUnavailable(
+                            title="Требуется вход оператора",
+                            message="Откройте защищённую сессию, чтобы увидеть состояние сервера.",
+                        ),
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                    )
                 return _operator_error_response(
                     status.HTTP_401_UNAUTHORIZED,
                     "operator_authentication_required",
                 )
             except OperatorAuthorizationDenied:
+                if request.url.path.startswith("/dashboard"):
+                    return _dashboard_unavailable_response(
+                        DashboardUnavailable(
+                            title="Недостаточно прав",
+                            message=(
+                                "У этой операторской сессии нет доступа к дашборду."  # noqa: RUF001
+                            ),
+                        ),
+                        status_code=status.HTTP_403_FORBIDDEN,
+                    )
                 return _operator_error_response(
                     status.HTTP_403_FORBIDDEN,
                     "operator_permission_denied",
                 )
             except OperatorSessionUnavailable:
+                if request.url.path.startswith("/dashboard"):
+                    return _dashboard_unavailable_response(
+                        DashboardUnavailable(
+                            title="Сессия временно недоступна",
+                            message="Проверить операторскую сессию сейчас невозможно.",
+                        ),
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={"detail": {"code": "operator_session_unavailable"}},
@@ -723,6 +759,73 @@ def create_app(
             assert isinstance(result, Response)
             result.headers["Cache-Control"] = "no-store"
             return result
+
+    @app.get("/", include_in_schema=False)
+    def application_root() -> Response:
+        return RedirectResponse("/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.get("/assets/dashboard.css", include_in_schema=False)
+    def dashboard_stylesheet() -> Response:
+        from importlib.resources import files
+
+        stylesheet = files("rtsp_proxy").joinpath("assets/dashboard.css").read_text(
+            encoding="utf-8"
+        )
+        return PlainTextResponse(
+            stylesheet,
+            media_type="text/css",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_page(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        snapshot_response = _dashboard_snapshot_or_response(
+            fleet_snapshots=fleet_snapshots,
+            max_age_seconds=fleet_snapshot_max_age_seconds,
+            now=clock(),
+            principal=principal,
+        )
+        if isinstance(snapshot_response, Response):
+            return snapshot_response
+        return _dashboard_html_response(
+            render_overview(snapshot=snapshot_response, principal=principal)
+        )
+
+    @app.get(
+        "/dashboard/nodes/{node_id}",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def dashboard_node_page(request: Request, node_id: UUID) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        snapshot_response = _dashboard_snapshot_or_response(
+            fleet_snapshots=fleet_snapshots,
+            max_age_seconds=fleet_snapshot_max_age_seconds,
+            now=clock(),
+            principal=principal,
+        )
+        if isinstance(snapshot_response, Response):
+            return snapshot_response
+        node = next((item for item in snapshot_response.nodes if item.node_id == node_id), None)
+        if node is None:
+            return _dashboard_unavailable_response(
+                DashboardUnavailable(
+                    title="Нода не найдена",
+                    message=(
+                        "В текущем снимке сервера нет ноды с таким идентификатором."  # noqa: RUF001
+                    ),
+                ),
+                status_code=status.HTTP_404_NOT_FOUND,
+                principal=principal,
+            )
+        return _dashboard_html_response(
+            render_node_detail(snapshot=snapshot_response, node=node, principal=principal)
+        )
 
     @app.exception_handler(NodeLifecycleBusy)
     async def node_lifecycle_busy_handler(
@@ -785,22 +888,17 @@ def create_app(
 
     @app.get("/api/v1/dashboard/snapshot", response_model=FleetSnapshotResponse)
     def dashboard_snapshot() -> FleetSnapshotResponse:
-        if fleet_snapshots is None:
+        try:
+            snapshot = require_fresh_snapshot(
+                fleet_snapshots,
+                now=clock(),
+                max_age_seconds=fleet_snapshot_max_age_seconds,
+            )
+        except FleetSnapshotReadFailure as error:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "fleet_snapshot_unavailable"},
-            )
-        snapshot = fleet_snapshots.current_snapshot()
-        if snapshot is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "fleet_snapshot_pending"},
-            )
-        if snapshot.generated_at < clock() - timedelta(seconds=fleet_snapshot_max_age_seconds):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "fleet_snapshot_stale"},
-            )
+                detail={"code": error.reason.value},
+            ) from None
         return FleetSnapshotResponse(
             generated_at=snapshot.generated_at,
             configured_nodes=snapshot.configured_nodes,
@@ -2198,7 +2296,7 @@ def _retryable_service_response(code: str) -> JSONResponse:
 
 def _operator_permission_for_request(request: Request) -> OperatorPermission:
     path = request.url.path
-    if request.url.path in {
+    if path.startswith("/dashboard") or request.url.path in {
         "/api/v1/operator/session",
         "/api/v1/dashboard/snapshot",
     }:
@@ -2222,6 +2320,99 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return OperatorPermission.CONTROL_READ
     return OperatorPermission.CONTROL_MUTATE
+
+
+def _operator_protected_path(path: str) -> bool:
+    return path.startswith("/api/v1/") or path == "/dashboard" or path.startswith(
+        "/dashboard/"
+    )
+
+
+def _dashboard_principal(
+    request: Request,
+    operator_sessions: OperatorSessionControl | None,
+) -> OperatorPrincipal | Response:
+    if operator_sessions is None:
+        return _dashboard_unavailable_response(
+            DashboardUnavailable(
+                title="Сессии операторов не настроены",
+                message="Дашборд закрыт до подключения авторизации операторов.",
+            ),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return _operator_principal(request)
+
+
+def _dashboard_snapshot_or_response(
+    *,
+    fleet_snapshots: SnapshotReader | None,
+    max_age_seconds: float,
+    now: datetime,
+    principal: OperatorPrincipal,
+) -> FleetSnapshot | Response:
+    try:
+        return require_fresh_snapshot(
+            fleet_snapshots,
+            now=now,
+            max_age_seconds=max_age_seconds,
+        )
+    except FleetSnapshotReadFailure as error:
+        unavailable = _dashboard_snapshot_failure(error.reason)
+        return _dashboard_unavailable_response(
+            unavailable,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            principal=principal,
+        )
+
+
+def _dashboard_snapshot_failure(reason: FleetSnapshotFailureReason) -> DashboardUnavailable:
+    if reason is FleetSnapshotFailureReason.PENDING:
+        return DashboardUnavailable(
+            title="Снимок состояния ещё не сформирован",
+            message=(
+                "Коллектор ещё не завершил первый цикл. "
+                "Повторите попытку через несколько секунд."
+            ),
+        )
+    if reason is FleetSnapshotFailureReason.STALE:
+        return DashboardUnavailable(
+            title="Снимок состояния устарел",
+            message="Данные не показаны, потому что их свежесть нельзя подтвердить.",
+        )
+    return DashboardUnavailable(
+        title="Наблюдение недоступно",
+        message="Хранилище снимков состояния сейчас недоступно.",
+    )
+
+
+def _dashboard_html_response(
+    content: str,
+    *,
+    status_code: int = status.HTTP_200_OK,
+    retry_after: str | None = None,
+) -> HTMLResponse:
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": DASHBOARD_CSP,
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return HTMLResponse(content, status_code=status_code, headers=headers)
+
+
+def _dashboard_unavailable_response(
+    unavailable: DashboardUnavailable,
+    *,
+    status_code: int,
+    principal: OperatorPrincipal | None = None,
+) -> HTMLResponse:
+    return _dashboard_html_response(
+        render_unavailable(unavailable, principal=principal),
+        status_code=status_code,
+        retry_after="5" if status_code == status.HTTP_503_SERVICE_UNAVAILABLE else None,
+    )
 
 
 def _operator_error_response(status_code: int, code: str) -> JSONResponse:

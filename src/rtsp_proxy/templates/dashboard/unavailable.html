@@ -1,0 +1,11 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Дашборд недоступен — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content" class="centered-state">
+  <section class="state-card" role="alert" aria-live="polite">
+    <p class="eyebrow">Дашборд недоступен</p>
+    <h1>{{ unavailable.title }}</h1>
+    <p>{{ unavailable.message }}</p>
+  </section>
+</main>
+{% endblock %}

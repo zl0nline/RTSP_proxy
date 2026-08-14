@@ -1,0 +1,88 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Обзор сервера — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Один Linux-сервер</p>
+      <h1>Состояние RTSP-нод</h1>
+    </div>
+    <p class="updated">Снимок: <time datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
+  </div>
+
+  <section class="summary-grid" aria-label="Сводка сервера">
+    <article class="summary-card">
+      <span>Ноды</span>
+      <strong>{{ snapshot.configured_nodes }} / {{ snapshot.max_nodes }}</strong>
+      <small>настроено / максимум</small>
+    </article>
+    <article class="summary-card">
+      <span>Камеры</span>
+      <strong>{{ snapshot.registered_cameras }} / {{ snapshot.nodes | sum(attribute='camera_capacity') }}</strong>
+      <small>зарегистрировано / ёмкость</small>
+    </article>
+    <article class="summary-card">
+      <span>Внешние порты</span>
+      <strong>{{ snapshot.external_ports_used }}</strong>
+      <small>свободно {{ snapshot.external_ports_free }}</small>
+    </article>
+  </section>
+
+  <section class="panel" aria-labelledby="nodes-title">
+    <div class="panel-heading">
+      <div>
+        <p class="eyebrow">Media plane</p>
+        <h2 id="nodes-title">Ноды сервера</h2>
+      </div>
+      <span class="count">{{ snapshot.configured_nodes }}</span>
+    </div>
+    {% if snapshot.nodes %}
+    <div class="table-scroll" tabindex="0" aria-label="Прокручиваемая таблица нод">
+      <table aria-label="Ноды сервера">
+        <thead>
+          <tr>
+            <th scope="col">Нода</th>
+            <th scope="col">Порт</th>
+            <th scope="col">Состояние</th>
+            <th scope="col">Камеры</th>
+            <th scope="col">Источники</th>
+            <th scope="col">Заняты</th>
+            <th scope="col">Вход</th>
+            <th scope="col">Выход</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for node in snapshot.nodes %}
+          <tr>
+            <th scope="row">
+              <a href="/dashboard/nodes/{{ node.node_id }}">{{ node.name }}</a>
+              <small class="node-id">{{ node.node_id }}</small>
+            </th>
+            <td><code>{{ node.external_port }}</code></td>
+            <td>
+              <span class="status status-{{ node.health.value }}">{{ node.health.value }}</span>
+              <small>{{ node.runtime_state.value }} · {{ node.scrape_status.value }}</small>
+              {% if node.metric_observed_at %}
+              <small>
+                {% if node.scrape_status.value == 'stale' %}Метрики устарели · {% else %}Метрики · {% endif %}
+                <time datetime="{{ node.metric_observed_at.isoformat() }}">{{ node.metric_observed_at | dashboard_time }}</time>
+              </small>
+              {% endif %}
+            </td>
+            <td>{{ node.registered_cameras }} / {{ node.camera_capacity }}</td>
+            {% set metrics_fresh = node.metrics and node.scrape_status.value in ['fresh', 'idle'] %}
+            <td>{{ node.metrics.active_sources if metrics_fresh else '—' }}</td>
+            <td>{{ node.metrics.occupied_streams if metrics_fresh else '—' }}</td>
+            <td>{{ node.received_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</td>
+            <td>{{ node.sent_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="empty-state">Ноды пока не зарегистрированы.</p>
+    {% endif %}
+  </section>
+</main>
+{% endblock %}

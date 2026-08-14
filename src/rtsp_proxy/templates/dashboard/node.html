@@ -1,0 +1,35 @@
+{% extends "dashboard/base.html" %}
+{% block title %}{{ node.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard">Обзор</a><span aria-hidden="true">/</span><span>{{ node.name }}</span>
+  </nav>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Нода · порт {{ node.external_port }}</p>
+      <h1>{{ node.name }}</h1>
+    </div>
+    <span class="status status-{{ node.health.value }}">{{ node.health.value }}</span>
+  </div>
+  <p class="updated">Снимок сервера: <time datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
+  {% set metrics_fresh = node.metrics and node.scrape_status.value in ['fresh', 'idle'] %}
+  <section class="summary-grid" aria-label="Сводка ноды">
+    <article class="summary-card"><span>Камеры</span><strong>{{ node.registered_cameras }} / {{ node.camera_capacity }}</strong><small>зарегистрировано / максимум</small></article>
+    <article class="summary-card"><span>Активные источники</span><strong>{{ node.metrics.active_sources if metrics_fresh else '—' }}</strong><small>по свежим метрикам</small></article>
+    <article class="summary-card"><span>Занятые потоки</span><strong>{{ node.metrics.occupied_streams if metrics_fresh else '—' }}</strong><small>один downstream на камеру</small></article>
+  </section>
+  <section class="panel" aria-labelledby="runtime-title">
+    <div class="panel-heading"><h2 id="runtime-title">Runtime</h2></div>
+    <dl class="detail-list">
+      <div><dt>Desired state</dt><dd>{{ node.desired_state.value }}</dd></div>
+      <div><dt>Runtime state</dt><dd>{{ node.runtime_state.value }}</dd></div>
+      <div><dt>Metrics</dt><dd>{{ node.scrape_status.value }}</dd></div>
+      <div><dt>Наблюдение метрик</dt><dd>{% if node.metric_observed_at %}<time datetime="{{ node.metric_observed_at.isoformat() }}">{{ node.metric_observed_at | dashboard_time }}</time>{% else %}—{% endif %}</dd></div>
+      <div><dt>Входящий bitrate</dt><dd>{{ node.received_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</dd></div>
+      <div><dt>Исходящий bitrate</dt><dd>{{ node.sent_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</dd></div>
+      <div><dt>Revision</dt><dd>{{ node.applied_revision }} / {{ node.desired_revision }}</dd></div>
+    </dl>
+  </section>
+</main>
+{% endblock %}

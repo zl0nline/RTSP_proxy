@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}RTSP Proxy{% endblock %}</title>
+    <link rel="stylesheet" href="/assets/dashboard.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">К основному содержимому</a>
+    <header class="site-header">
+      <a class="brand" href="/dashboard" aria-label="RTSP Proxy — обзор">RTSP Proxy</a>
+      {% if principal %}
+      <div class="operator" aria-label="Текущий оператор">
+        <span>{{ principal.display_name }}</span>
+        <span class="operator-role">{{ principal.roles | map(attribute='value') | sort | join(', ') }}</span>
+      </div>
+      {% endif %}
+    </header>
+    {% block content %}{% endblock %}
+  </body>
+</html>
