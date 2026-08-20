@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from io import BytesIO
+from threading import Event
 from types import TracebackType
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -43,8 +44,10 @@ from rtsp_proxy.operator_access import (
     OperatorRole,
     OperatorSessionControl,
     OperatorSessionUnavailable,
+    PostgresOperatorSessionStore,
 )
 from rtsp_proxy.operator_identity import (
+    BreakGlassAuthentication,
     BreakGlassControl,
     BreakGlassCredentials,
     HttpsOidcDiscoveryEndpoint,
@@ -1276,7 +1279,7 @@ def test_postgres_break_glass_consumes_totp_and_appends_security_event_atomicall
     store.assert_ready()
     code = TOTP(totp_secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
 
-    account_id = store.authenticate(
+    authentication = store.authenticate(
         username="emergency-admin",
         password="correct horse battery staple",
         totp=code,
@@ -1284,7 +1287,7 @@ def test_postgres_break_glass_consumes_totp_and_appends_security_event_atomicall
         now=NOW,
     )
 
-    assert account_id == ACCOUNT_ID
+    assert authentication == BreakGlassAuthentication(ACCOUNT_ID, 1)
     engine = create_engine(postgres_database_url, hide_parameters=True)
     with engine.connect() as connection:
         row = connection.execute(
@@ -1511,7 +1514,7 @@ def test_break_glass_cli_provisions_exact_identity_without_exposing_secrets(
     assert exit_code == 0
     output = capsys.readouterr()
     assert output.err == ""
-    assert output.out == f"provisioned break-glass account {ACCOUNT_ID}\n"
+    assert output.out == f"provisioned break-glass account {ACCOUNT_ID} at revision 3\n"
     assert "correct horse" not in output.out
     engine = create_engine(postgres_database_url, hide_parameters=True)
     with engine.connect() as connection:
@@ -1586,6 +1589,344 @@ def test_break_glass_cli_provisions_exact_identity_without_exposing_secrets(
     )
 
 
+def test_break_glass_cli_rotates_with_revision_fence_and_revokes_sessions(
+    postgres_database_url: str,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upgrade_database(postgres_database_url)
+    capsys.readouterr()
+    initial = PostgresBreakGlassStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    initial.provision(
+        account=OperatorAccount(
+            identity_source=OperatorIdentitySource.BREAK_GLASS,
+            id=ACCOUNT_ID,
+            subject="local:emergency-admin",
+            display_name="Emergency administrator",
+            roles=frozenset({OperatorRole.BREAK_GLASS}),
+            scopes=frozenset({"server:*"}),
+            authz_version=1,
+            enabled=True,
+        ),
+        password_scrypt=BreakGlassCredentials.hash_password(
+            "old correct horse battery staple",
+            salt=b"S" * 16,
+        ),
+        totp_secret=b"B" * 20,
+        context=TEST_MUTATION_CONTEXT,
+    )
+    initial.close()
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operator_sessions "
+                "(id, account_id, token_sha256, csrf_sha256, authz_version, issued_at, "
+                "last_seen_at, idle_expires_at, absolute_expires_at, mfa_verified_at) "
+                "VALUES (:id, :account_id, :token, :csrf, 1, clock_timestamp(), "
+                "clock_timestamp(), clock_timestamp() + interval '30 minutes', "
+                "clock_timestamp() + interval '12 hours', clock_timestamp())"
+            ),
+            {
+                "id": UUID("80000000-0000-4000-8000-000000000008"),
+                "account_id": ACCOUNT_ID,
+                "token": "a" * 64,
+                "csrf": "b" * 64,
+            },
+        )
+    encryption_key_file = tmp_path / "break-glass-encryption-key"
+    totp_file = tmp_path / "break-glass-totp"
+    encryption_key_file.write_bytes(base64.urlsafe_b64encode(b"K" * 32))
+    totp_file.write_bytes(base64.urlsafe_b64encode(b"C" * 20))
+    encryption_key_file.chmod(0o600)
+    totp_file.chmod(0o600)
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    monkeypatch.setenv(
+        "RTSP_PROXY_BREAK_GLASS_ENCRYPTION_KEY_FILE",
+        str(encryption_key_file),
+    )
+    monkeypatch.setenv("RTSP_PROXY_BREAK_GLASS_TOTP_FILE", str(totp_file))
+    passwords = iter(("new correct horse battery staple",) * 2)
+
+    assert (
+        break_glass_cli_main(
+            [
+                "--account-id",
+                str(ACCOUNT_ID),
+                "--username",
+                "emergency-admin",
+                "--actor",
+                "operator:alice",
+                "--reason",
+                "scheduled emergency credential rotation",
+                "--rotate",
+                "--expected-authz-version",
+                "1",
+            ],
+            password_reader=lambda _prompt: next(passwords),
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert output.out == f"rotated break-glass account {ACCOUNT_ID} to revision 2\n"
+    assert "correct horse" not in output.out
+    with engine.connect() as connection:
+        account = connection.execute(
+            text(
+                "SELECT authz_version, enabled FROM operator_accounts WHERE id = :id"
+            ),
+            {"id": ACCOUNT_ID},
+        ).one()
+        revoked_at = connection.scalar(
+            text("SELECT revoked_at FROM operator_sessions WHERE account_id = :id"),
+            {"id": ACCOUNT_ID},
+        )
+        audit = connection.execute(
+            text(
+                "SELECT id, aggregate_revision, payload FROM audit_events "
+                "WHERE event_type = 'operator.break_glass_rotated'"
+            )
+        ).one()
+        outbox = connection.execute(
+            text(
+                "SELECT id, aggregate_revision, payload FROM outbox_messages "
+                "WHERE event_type = 'operator.break_glass_rotated'"
+            )
+        ).one()
+    assert account == (2, True)
+    assert revoked_at is not None
+    assert audit == outbox
+    assert audit.aggregate_revision == 2
+    assert audit.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "action": "operator.break_glass_rotate",
+        "actor": "operator:alice",
+        "after": {"authz_version": 2, "enabled": True},
+        "auth_method": "privileged_local_cli",
+        "before": {"authz_version": 1, "enabled": True},
+        "identity_source": "break_glass",
+        "object_type": "operator_account",
+        "outcome": "rotated",
+        "reason": "scheduled emergency credential rotation",
+        "revoked_sessions": 1,
+    }
+    stale_passwords = iter(("stale replacement password",) * 2)
+    assert (
+        break_glass_cli_main(
+            [
+                "--account-id",
+                str(ACCOUNT_ID),
+                "--username",
+                "emergency-admin",
+                "--actor",
+                "operator:alice",
+                "--reason",
+                "stale retry",
+                "--rotate",
+                "--expected-authz-version",
+                "1",
+            ],
+            password_reader=lambda _prompt: next(stale_passwords),
+        )
+        == 1
+    )
+    stale_output = capsys.readouterr()
+    assert stale_output.out == ""
+    assert stale_output.err == (
+        "break-glass provisioning failed: break_glass_account_conflict\n"
+    )
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE event_type = 'operator.break_glass_rotated'"
+                )
+            )
+            == 1
+        )
+        rejection = connection.execute(
+            text(
+                "SELECT payload FROM audit_events "
+                "WHERE event_type = 'operator.break_glass_rotation_rejected'"
+            )
+        ).one()
+        rejection_outbox = connection.execute(
+            text(
+                "SELECT payload FROM outbox_messages "
+                "WHERE event_type = 'operator.break_glass_rotation_rejected'"
+            )
+        ).one()
+    assert rejection == rejection_outbox
+    assert rejection.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "action": "operator.break_glass_rotate",
+        "actor": "operator:alice",
+        "auth_method": "privileged_local_cli",
+        "expected_authz_version": 1,
+        "identity_source": "break_glass",
+        "object_type": "operator_account",
+        "outcome": "rejected",
+        "reason": "stale retry",
+        "reason_code": "identity_or_revision_conflict",
+        "requested_account_id": str(ACCOUNT_ID),
+    }
+    rotated = PostgresBreakGlassStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    old_code = TOTP(b"B" * 20, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode()
+    with pytest.raises(OidcLoginInvalid, match="break_glass_login_failed"):
+        rotated.authenticate(
+            username="emergency-admin",
+            password="old correct horse battery staple",
+            totp=old_code,
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+    new_code = TOTP(b"C" * 20, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode()
+    assert (
+        rotated.authenticate(
+            username="emergency-admin",
+            password="new correct horse battery staple",
+            totp=new_code,
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+        == BreakGlassAuthentication(ACCOUNT_ID, 2)
+    )
+    observability = PostgresObservabilityStore(postgres_database_url)
+
+    class RecordingSecurityTransport:
+        def __init__(self) -> None:
+            self.outcomes: list[str] = []
+
+        def send(self, message: Any) -> None:
+            self.outcomes.append(message.outcome)
+
+    transport = RecordingSecurityTransport()
+    dispatcher = OperatorSecurityAlertDispatcher(
+        store=observability,
+        transport=transport,
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+    )
+    assert dispatcher.run_once() is not None
+    assert dispatcher.run_once() is not None
+    assert dispatcher.run_once() is None
+    assert transport.outcomes == ["rejected", "accepted"]
+    observability.close()
+    rotated.close()
+    engine.dispose()
+
+
+def test_break_glass_cli_audits_rotation_with_wrong_account_id(
+    postgres_database_url: str,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upgrade_database(postgres_database_url)
+    capsys.readouterr()
+    existing = PostgresBreakGlassStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    existing.provision(
+        account=OperatorAccount(
+            identity_source=OperatorIdentitySource.BREAK_GLASS,
+            id=ACCOUNT_ID,
+            subject="local:emergency-admin",
+            display_name="Emergency administrator",
+            roles=frozenset({OperatorRole.BREAK_GLASS}),
+            scopes=frozenset({"server:*"}),
+            authz_version=1,
+            enabled=True,
+        ),
+        password_scrypt=BreakGlassCredentials.hash_password(
+            "old correct horse battery staple",
+            salt=b"S" * 16,
+        ),
+        totp_secret=b"B" * 20,
+        context=TEST_MUTATION_CONTEXT,
+    )
+    existing.close()
+    encryption_key_file = tmp_path / "break-glass-encryption-key"
+    totp_file = tmp_path / "break-glass-totp"
+    encryption_key_file.write_bytes(base64.urlsafe_b64encode(b"K" * 32))
+    totp_file.write_bytes(base64.urlsafe_b64encode(b"C" * 20))
+    encryption_key_file.chmod(0o600)
+    totp_file.chmod(0o600)
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    monkeypatch.setenv(
+        "RTSP_PROXY_BREAK_GLASS_ENCRYPTION_KEY_FILE",
+        str(encryption_key_file),
+    )
+    monkeypatch.setenv("RTSP_PROXY_BREAK_GLASS_TOTP_FILE", str(totp_file))
+    wrong_account_id = UUID("90000000-0000-4000-8000-000000000009")
+    passwords = iter(("new correct horse battery staple",) * 2)
+
+    assert (
+        break_glass_cli_main(
+            [
+                "--account-id",
+                str(wrong_account_id),
+                "--username",
+                "emergency-admin",
+                "--actor",
+                "operator:alice",
+                "--reason",
+                "wrong account retry",
+                "--rotate",
+                "--expected-authz-version",
+                "1",
+            ],
+            password_reader=lambda _prompt: next(passwords),
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == (
+        "break-glass provisioning failed: break_glass_account_conflict\n"
+    )
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                "SELECT aggregate_id, aggregate_revision, payload FROM audit_events "
+                "WHERE event_type = 'operator.break_glass_rotation_rejected'"
+            )
+        ).one()
+        outbox = connection.execute(
+            text(
+                "SELECT aggregate_id, aggregate_revision, payload FROM outbox_messages "
+                "WHERE event_type = 'operator.break_glass_rotation_rejected'"
+            )
+        ).one()
+    assert audit == outbox
+    assert audit.aggregate_id == ACCOUNT_ID
+    assert audit.aggregate_revision == 1
+    assert audit.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "action": "operator.break_glass_rotate",
+        "actor": "operator:alice",
+        "auth_method": "privileged_local_cli",
+        "expected_authz_version": 1,
+        "identity_source": "break_glass",
+        "object_type": "operator_account",
+        "outcome": "rejected",
+        "reason": "wrong account retry",
+        "reason_code": "identity_or_revision_conflict",
+        "requested_account_id": str(wrong_account_id),
+    }
+    engine.dispose()
+
+
 def test_break_glass_cli_rejects_noncanonical_secrets_and_bad_database_url(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -1631,6 +1972,221 @@ def test_break_glass_cli_rejects_noncanonical_secrets_and_bad_database_url(
     second_error = capsys.readouterr().err
     assert second_error == "break-glass provisioning failed: break_glass_configuration_invalid\n"
     assert "Traceback" not in second_error
+
+
+def test_break_glass_rotation_compare_and_swap_allows_one_concurrent_writer(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    first = PostgresBreakGlassStore(postgres_database_url, encryption_key=b"K" * 32)
+    second = PostgresBreakGlassStore(postgres_database_url, encryption_key=b"K" * 32)
+    first.provision(
+        account=OperatorAccount(
+            identity_source=OperatorIdentitySource.BREAK_GLASS,
+            id=ACCOUNT_ID,
+            subject="local:emergency-admin",
+            display_name="Emergency administrator",
+            roles=frozenset({OperatorRole.BREAK_GLASS}),
+            scopes=frozenset({"server:*"}),
+            authz_version=1,
+            enabled=True,
+        ),
+        password_scrypt=BreakGlassCredentials.hash_password(
+            "old correct horse battery staple",
+            salt=b"S" * 16,
+        ),
+        totp_secret=b"B" * 20,
+        context=TEST_MUTATION_CONTEXT,
+    )
+
+    def rotate(store: PostgresBreakGlassStore, marker: bytes) -> int | str:
+        try:
+            return store.rotate(
+                account_id=ACCOUNT_ID,
+                subject="local:emergency-admin",
+                expected_authz_version=1,
+                password_scrypt=BreakGlassCredentials.hash_password(
+                    "new correct horse battery staple",
+                    salt=marker * 16,
+                ),
+                totp_secret=marker * 20,
+                context=OperatorMutationContext(
+                    actor="operator:alice",
+                    reason=f"concurrent rotation {marker.decode()}",
+                ),
+            )
+        except OidcLoginInvalid as error:
+            return str(error)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(
+            pool.map(
+                lambda arguments: rotate(*arguments),
+                ((first, b"C"), (second, b"D")),
+            )
+        )
+
+    assert sorted(outcomes, key=str) == [2, "break_glass_account_conflict"]
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        counts = {
+            str(row[0]): int(row[1])
+            for row in connection.execute(
+                text(
+                    "SELECT event_type, count(*) FROM audit_events "
+                    "WHERE event_type IN ('operator.break_glass_rotated', "
+                    "'operator.break_glass_rotation_rejected') GROUP BY event_type"
+                )
+            ).all()
+        }
+        assert counts == {
+            "operator.break_glass_rotated": 1,
+            "operator.break_glass_rotation_rejected": 1,
+        }
+        assert connection.scalar(
+            text("SELECT authz_version FROM operator_accounts WHERE id = :id"),
+            {"id": ACCOUNT_ID},
+        ) == 2
+    engine.dispose()
+    second.close()
+    first.close()
+
+
+def test_break_glass_rotation_fences_session_issuance_after_old_authentication(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    break_glass = PostgresBreakGlassStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    break_glass.provision(
+        account=OperatorAccount(
+            identity_source=OperatorIdentitySource.BREAK_GLASS,
+            id=ACCOUNT_ID,
+            subject="local:emergency-admin",
+            display_name="Emergency administrator",
+            roles=frozenset({OperatorRole.BREAK_GLASS}),
+            scopes=frozenset({"server:*"}),
+            authz_version=1,
+            enabled=True,
+        ),
+        password_scrypt=BreakGlassCredentials.hash_password(
+            "old correct horse battery staple",
+            salt=b"S" * 16,
+        ),
+        totp_secret=b"B" * 20,
+        context=TEST_MUTATION_CONTEXT,
+    )
+    authenticated = Event()
+    release = Event()
+
+    class PausingAuthenticator:
+        def authenticate(
+            self,
+            *,
+            username: str,
+            password: str,
+            totp: str,
+            source_ip: str,
+            now: datetime,
+        ) -> BreakGlassAuthentication:
+            result = break_glass.authenticate(
+                username=username,
+                password=password,
+                totp=totp,
+                source_ip=source_ip,
+                now=now,
+            )
+            authenticated.set()
+            assert release.wait(timeout=5)
+            return result
+
+    sessions_store = PostgresOperatorSessionStore(postgres_database_url)
+    control = BreakGlassControl(
+        store=PausingAuthenticator(),
+        sessions=OperatorSessionControl(
+            store=sessions_store,
+            token_factory=iter(("T" * 43, "C" * 43)).__next__,
+        ),
+        clock=lambda: NOW,
+    )
+    code = TOTP(b"B" * 20, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        login = pool.submit(
+            control.login,
+            username="emergency-admin",
+            password="old correct horse battery staple",
+            totp=code,
+            source_ip="192.0.2.10",
+        )
+        assert authenticated.wait(timeout=5)
+        assert (
+            break_glass.rotate(
+                account_id=ACCOUNT_ID,
+                subject="local:emergency-admin",
+                expected_authz_version=1,
+                password_scrypt=BreakGlassCredentials.hash_password(
+                    "new correct horse battery staple",
+                    salt=b"N" * 16,
+                ),
+                totp_secret=b"C" * 20,
+                context=OperatorMutationContext(
+                    actor="operator:alice",
+                    reason="race regression",
+                ),
+            )
+            == 2
+        )
+        release.set()
+        with pytest.raises(OidcLoginInvalid, match="break_glass_login_failed"):
+            login.result(timeout=5)
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM operator_sessions")) == 0
+    engine.dispose()
+    sessions_store.close()
+    break_glass.close()
+
+
+@pytest.mark.parametrize(
+    "extra_arguments",
+    (
+        ("--rotate",),
+        ("--expected-authz-version", "1"),
+        ("--rotate", "--expected-authz-version", str((1 << 63) - 1)),
+    ),
+)
+def test_break_glass_cli_requires_revision_only_for_explicit_rotation(
+    extra_arguments: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prompted = False
+
+    def password_reader(_prompt: str) -> str:
+        nonlocal prompted
+        prompted = True
+        return "should not be read"
+
+    assert (
+        break_glass_cli_main(
+            [
+                "--account-id",
+                str(ACCOUNT_ID),
+                "--actor",
+                "operator:alice",
+                "--reason",
+                "invalid mode",
+                *extra_arguments,
+            ],
+            password_reader=password_reader,
+        )
+        == 1
+    )
+    assert not prompted
+    assert capsys.readouterr().err == (
+        "break-glass provisioning failed: break_glass_configuration_invalid\n"
+    )
 
 
 def test_break_glass_alert_is_claimed_once_and_completed_by_notification_worker(
@@ -1780,7 +2336,7 @@ def test_break_glass_progressive_limit_is_durable_and_counts_only_failures(
                 now=NOW,
             )
 
-    account_id = store.authenticate(
+    authentication = store.authenticate(
         username="emergency-admin",
         password="correct horse battery staple",
         totp=code,
@@ -1788,7 +2344,7 @@ def test_break_glass_progressive_limit_is_durable_and_counts_only_failures(
         now=NOW,
     )
 
-    assert account_id == ACCOUNT_ID
+    assert authentication == BreakGlassAuthentication(ACCOUNT_ID, 1)
     engine = create_engine(postgres_database_url, hide_parameters=True)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM operator_login_attempts")) == 0
@@ -1839,7 +2395,7 @@ def test_break_glass_failures_do_not_globally_lock_the_emergency_account(
                 now=NOW,
             )
 
-    account_id = store.authenticate(
+    authentication = store.authenticate(
         username="emergency-admin",
         password="correct horse battery staple",
         totp=code,
@@ -1847,7 +2403,7 @@ def test_break_glass_failures_do_not_globally_lock_the_emergency_account(
         now=NOW,
     )
 
-    assert account_id == ACCOUNT_ID
+    assert authentication == BreakGlassAuthentication(ACCOUNT_ID, 1)
     store.close()
 
 

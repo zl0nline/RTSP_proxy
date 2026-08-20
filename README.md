@@ -25,8 +25,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   with bounded form CSRF, optimistic revision fencing and reader-aware
 >   confirmation are also green in native amd64/arm64 CI;
 >   revision-fenced camera move UI is also green in native amd64/arm64 CI;
->   complete automated
->   browser E2E and the break-glass rotation drill remain pending.
+>   a revision-fenced break-glass rotation CLI and accepted/rejected delivery
+>   drill are implemented locally. Complete automated browser E2E remains
+>   pending, and the rotation slice still requires review/native CI.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -322,8 +323,10 @@ confirmation, связанный с точным target и числом чита
 меняется, новый внешний URL отличается портом; source URL не попадает в HTML.
 После POST dashboard открывает camera-scoped status по persisted `move_id` и
 показывает фактический state saga, а не доверяет query-параметру.
-Полный автоматизированный browser E2E и rotation drill ещё не реализованы,
-поэтому Phase F целиком не завершена.
+Revision-fenced break-glass rotation и accepted/rejected notification drill
+реализованы локально и ожидают независимый review/native CI. Полный
+автоматизированный browser E2E ещё не реализован, поэтому Phase F целиком не
+завершена.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.

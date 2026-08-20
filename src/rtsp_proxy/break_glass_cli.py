@@ -42,19 +42,32 @@ def main(
     parser.add_argument("--username", default="emergency-admin")
     parser.add_argument("--actor", required=True)
     parser.add_argument("--reason", required=True)
+    parser.add_argument("--rotate", action="store_true")
+    parser.add_argument("--expected-authz-version", type=int)
     arguments = parser.parse_args(argv)
     try:
-        provision_from_environment(
+        authz_version = provision_from_environment(
             account_id=arguments.account_id,
             username=arguments.username,
             actor=arguments.actor,
             reason=arguments.reason,
+            rotate=arguments.rotate,
+            expected_authz_version=arguments.expected_authz_version,
             password_reader=password_reader,
         )
     except (BreakGlassProvisionError, OidcLoginInvalid, OidcLoginUnavailable) as error:
         print(f"break-glass provisioning failed: {error}", file=sys.stderr)
         return 1
-    print(f"provisioned break-glass account {arguments.account_id}")
+    if arguments.rotate:
+        print(
+            f"rotated break-glass account {arguments.account_id} "
+            f"to revision {authz_version}"
+        )
+    else:
+        print(
+            f"provisioned break-glass account {arguments.account_id} "
+            f"at revision {authz_version}"
+        )
     return 0
 
 
@@ -64,8 +77,10 @@ def provision_from_environment(
     username: str,
     actor: str,
     reason: str,
+    rotate: bool = False,
+    expected_authz_version: int | None = None,
     password_reader: Callable[[str], str] = getpass.getpass,
-) -> None:
+) -> int:
     database_url = os.environ.get("RTSP_PROXY_DATABASE_URL", "")
     key_file_value = os.environ.get("RTSP_PROXY_BREAK_GLASS_ENCRYPTION_KEY_FILE", "")
     totp_file_value = os.environ.get("RTSP_PROXY_BREAK_GLASS_TOTP_FILE", "")
@@ -76,6 +91,14 @@ def provision_from_environment(
         or not 1 <= len(username) <= 256
         or username.startswith("local:")
         or any(character.isspace() for character in username)
+        or (
+            rotate
+            and (
+                expected_authz_version is None
+                or not 1 <= expected_authz_version < (1 << 63) - 1
+            )
+        )
+        or (not rotate and expected_authz_version is not None)
     ):
         raise BreakGlassProvisionError("break_glass_configuration_invalid")
     password = password_reader("Break-glass password: ")
@@ -100,10 +123,23 @@ def provision_from_environment(
     except (SQLAlchemyError, ValueError):
         raise BreakGlassProvisionError("break_glass_configuration_invalid") from None
     try:
-        existing_account_id = store.existing_break_glass_account_id()
-        if existing_account_id is not None and existing_account_id != account_id:
-            raise OidcLoginInvalid("break_glass_account_conflict")
-        store.provision(
+        if not rotate:
+            existing_account_id = store.existing_break_glass_account_id()
+            if existing_account_id is not None and existing_account_id != account_id:
+                raise OidcLoginInvalid("break_glass_account_conflict")
+        password_scrypt = BreakGlassCredentials.hash_password(password)
+        if rotate:
+            if expected_authz_version is None:
+                raise BreakGlassProvisionError("break_glass_configuration_invalid")
+            return store.rotate(
+                account_id=account_id,
+                subject=f"local:{username}",
+                expected_authz_version=expected_authz_version,
+                password_scrypt=password_scrypt,
+                totp_secret=totp_secret,
+                context=context,
+            )
+        return store.provision(
             account=OperatorAccount(
                 id=account_id,
                 identity_source=OperatorIdentitySource.BREAK_GLASS,
@@ -114,7 +150,7 @@ def provision_from_environment(
                 authz_version=1,
                 enabled=True,
             ),
-            password_scrypt=BreakGlassCredentials.hash_password(password),
+            password_scrypt=password_scrypt,
             totp_secret=totp_secret,
             context=context,
         )

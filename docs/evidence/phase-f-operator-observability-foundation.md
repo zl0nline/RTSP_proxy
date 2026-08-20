@@ -71,6 +71,8 @@ excludes prepared port changes; the transactional switch still rechecks it.
 The camera-scoped status route binds a persisted `move_id`, shows its actual
 state and does not claim completion early. The public path is unchanged and no
 source URL is rendered. Complete automated
-browser accessibility/confirmation E2E, the operator rotation
-drill, physical-hardware capacity and the 24-hour soak remain open. Production
-therefore remains NO-GO.
+browser accessibility/confirmation E2E, physical-hardware capacity and the
+24-hour soak remain open. Revision-fenced break-glass rotation with atomic
+session revocation and an accepted/rejected notification drill is implemented
+locally but remains outside this evidence boundary until review/native CI.
+Production therefore remains NO-GO.

@@ -1007,13 +1007,15 @@ enumeration uses the store's DB-clock eligibility projection and excludes
 prepared source/target port changes, while the switch transaction rechecks all
 conditions. The ordinary public path stays immutable while the node port
 changes. Complete automated
-browser E2E and the operator rotation drill remain pending. No Phase-F
-completion claim is made yet.
+browser E2E remains pending. A revision-fenced break-glass rotation CLI and
+accepted/rejected notification drill are implemented locally and still require
+independent review/native CI. No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green;
   camera move UI CI-green);
-- [~] RBAC/CSRF/OIDC/break-glass foundation (rotation drill and complete denial/logout audit matrix pending);
+- [~] RBAC/CSRF/OIDC/break-glass foundation (revision-fenced rotation/drill
+  implemented locally; review/native CI and complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

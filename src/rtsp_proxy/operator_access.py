@@ -245,6 +245,7 @@ class OperatorSessionStore(Protocol):
         idle_timeout: timedelta,
         absolute_timeout: timedelta,
         mfa_verified: bool,
+        expected_authz_version: int | None = None,
     ) -> OperatorSession: ...
 
     def read_session(
@@ -343,10 +344,18 @@ class InMemoryOperatorSessionStore:
         idle_timeout: timedelta,
         absolute_timeout: timedelta,
         mfa_verified: bool,
+        expected_authz_version: int | None = None,
     ) -> OperatorSession:
         with self._lock:
             account = self._accounts.get(account_id)
-            if account is None or not account.enabled:
+            if (
+                account is None
+                or not account.enabled
+                or (
+                    expected_authz_version is not None
+                    and account.authz_version != expected_authz_version
+                )
+            ):
                 raise OperatorAuthenticationRequired("operator_account_unavailable")
             if any(existing.token_sha256 == token_sha256 for existing in self._sessions.values()):
                 raise ValueError("operator_session_token_conflict")
@@ -663,6 +672,7 @@ class PostgresOperatorSessionStore:
         idle_timeout: timedelta,
         absolute_timeout: timedelta,
         mfa_verified: bool,
+        expected_authz_version: int | None = None,
     ) -> OperatorSession:
         try:
             with self._engine.begin() as connection:
@@ -672,7 +682,9 @@ class PostgresOperatorSessionStore:
                         text(
                             "WITH account AS ("
                             "SELECT id, authz_version FROM operator_accounts "
-                            "WHERE id = :account_id AND enabled FOR UPDATE"
+                            "WHERE id = :account_id AND enabled AND "
+                            "(CAST(:expected_authz_version AS bigint) IS NULL OR "
+                            "authz_version = :expected_authz_version) FOR UPDATE"
                             ") INSERT INTO operator_sessions "
                             "(id, account_id, token_sha256, csrf_sha256, authz_version, "
                             "issued_at, last_seen_at, idle_expires_at, absolute_expires_at, "
@@ -692,6 +704,7 @@ class PostgresOperatorSessionStore:
                             "idle_timeout": idle_timeout,
                             "absolute_timeout": absolute_timeout,
                             "mfa_verified": mfa_verified,
+                            "expected_authz_version": expected_authz_version,
                         },
                     )
                     .mappings()
@@ -884,7 +897,13 @@ class OperatorSessionControl:
         self._idle_timeout = idle_timeout
         self._absolute_timeout = absolute_timeout
 
-    def issue(self, *, account_id: UUID, mfa_verified: bool) -> IssuedOperatorSession:
+    def issue(
+        self,
+        *,
+        account_id: UUID,
+        mfa_verified: bool,
+        expected_authz_version: int | None = None,
+    ) -> IssuedOperatorSession:
         if not mfa_verified:
             raise OperatorAuthenticationRequired("operator_mfa_required")
         session_token = self._token()
@@ -897,6 +916,7 @@ class OperatorSessionControl:
             idle_timeout=self._idle_timeout,
             absolute_timeout=self._absolute_timeout,
             mfa_verified=mfa_verified,
+            expected_authz_version=expected_authz_version,
         )
         return IssuedOperatorSession(session_token, csrf_token, session)
 

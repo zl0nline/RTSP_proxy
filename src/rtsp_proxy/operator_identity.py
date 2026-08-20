@@ -37,6 +37,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from rtsp_proxy.operator_access import (
     IssuedOperatorSession,
     OperatorAccount,
+    OperatorAuthenticationRequired,
     OperatorMutationContext,
     OperatorRole,
     OperatorSessionControl,
@@ -109,6 +110,16 @@ class BreakGlassCredentials:
         return True
 
 
+@dataclass(frozen=True, slots=True)
+class BreakGlassAuthentication:
+    account_id: UUID
+    authz_version: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.authz_version < (1 << 63):
+            raise ValueError("break_glass_authentication_invalid")
+
+
 class InMemoryBreakGlassStore:
     def __init__(
         self,
@@ -131,7 +142,7 @@ class InMemoryBreakGlassStore:
         totp: str,
         source_ip: str,
         now: datetime,
-    ) -> UUID:
+    ) -> BreakGlassAuthentication:
         with self._lock:
             expected_username = self._account.subject.removeprefix("local:")
             step = int(now.timestamp()) // 30
@@ -169,7 +180,10 @@ class InMemoryBreakGlassStore:
             if rejected:
                 raise OidcLoginInvalid("break_glass_login_failed")
             self._credentials = replace(self._credentials, last_totp_step=step)
-            return self._account.id
+            return BreakGlassAuthentication(
+                account_id=self._account.id,
+                authz_version=self._account.authz_version,
+            )
 
     def last_totp_step(self) -> int | None:
         with self._lock:
@@ -217,6 +231,143 @@ class PostgresBreakGlassStore:
         except SQLAlchemyError:
             raise OidcLoginUnavailable("break_glass_store_unavailable") from None
         return None if account_id is None else UUID(str(account_id))
+
+    def rotate(
+        self,
+        *,
+        account_id: UUID,
+        subject: str,
+        expected_authz_version: int,
+        password_scrypt: bytes,
+        totp_secret: bytes,
+        context: OperatorMutationContext,
+    ) -> int:
+        credentials = BreakGlassCredentials(
+            password_scrypt=password_scrypt,
+            totp_secret=totp_secret,
+            last_totp_step=None,
+        )
+        username = subject.removeprefix("local:")
+        if (
+            not subject.startswith("local:")
+            or not 1 <= len(username) <= 256
+            or any(character.isspace() for character in username)
+            or not 1 <= expected_authz_version < (1 << 63) - 1
+        ):
+            raise ValueError("break_glass_rotation_invalid")
+        nonce = secrets.token_bytes(12)
+        encrypted_secret = nonce + AESGCM(self._key).encrypt(
+            nonce,
+            credentials.totp_secret,
+            account_id.bytes,
+        )
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                current = (
+                    connection.execute(
+                        text(
+                            "SELECT id, subject, enabled, authz_version, "
+                            "break_glass_password_scrypt, break_glass_totp_secret "
+                            "FROM operator_accounts WHERE identity_source = 'break_glass' "
+                            "FOR UPDATE"
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if (
+                    current is None
+                    or UUID(str(current["id"])) != account_id
+                    or str(current["subject"]) != subject
+                    or not bool(current["enabled"])
+                    or current["break_glass_password_scrypt"] is None
+                    or current["break_glass_totp_secret"] is None
+                    or int(current["authz_version"]) != expected_authz_version
+                ):
+                    raise OidcLoginInvalid("break_glass_account_conflict")
+                authz_version = expected_authz_version + 1
+                connection.execute(
+                    text(
+                        "UPDATE operator_accounts SET authz_version = :authz_version, "
+                        "break_glass_password_scrypt = :password_scrypt, "
+                        "break_glass_totp_secret = :totp_secret, "
+                        "break_glass_last_totp_step = NULL, updated_at = clock_timestamp() "
+                        "WHERE id = :id AND authz_version = :expected_authz_version"
+                    ),
+                    {
+                        "id": account_id,
+                        "expected_authz_version": expected_authz_version,
+                        "authz_version": authz_version,
+                        "password_scrypt": credentials.password_scrypt,
+                        "totp_secret": encrypted_secret,
+                    },
+                )
+                revoked_sessions = len(
+                    connection.execute(
+                        text(
+                            "UPDATE operator_sessions SET revoked_at = clock_timestamp() "
+                            "WHERE account_id = :account_id AND revoked_at IS NULL "
+                            "RETURNING id"
+                        ),
+                        {"account_id": account_id},
+                    ).all()
+                )
+                _record_break_glass_rotation_event(
+                    connection,
+                    account_id=account_id,
+                    before_authz_version=expected_authz_version,
+                    after_authz_version=authz_version,
+                    revoked_sessions=revoked_sessions,
+                    context=context,
+                )
+                return authz_version
+        except OidcLoginInvalid:
+            self._record_rotation_rejection(
+                account_id=account_id,
+                expected_authz_version=expected_authz_version,
+                context=context,
+            )
+            raise
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("break_glass_store_unavailable") from None
+
+    def _record_rotation_rejection(
+        self,
+        *,
+        account_id: UUID,
+        expected_authz_version: int,
+        context: OperatorMutationContext,
+    ) -> None:
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                current = (
+                    connection.execute(
+                        text(
+                            "SELECT id, authz_version FROM operator_accounts "
+                            "WHERE identity_source = 'break_glass'"
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                _record_break_glass_rotation_rejection_event(
+                    connection,
+                    account_id=(
+                        account_id if current is None else UUID(str(current["id"]))
+                    ),
+                    requested_account_id=account_id,
+                    aggregate_revision=(
+                        expected_authz_version
+                        if current is None
+                        else int(current["authz_version"])
+                    ),
+                    expected_authz_version=expected_authz_version,
+                    context=context,
+                )
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("break_glass_store_unavailable") from None
 
     def record_claim_contract_health(self, *, healthy: bool) -> None:
         """Persist only health transitions and enqueue one failure/recovery alert."""
@@ -345,7 +496,7 @@ class PostgresBreakGlassStore:
         password_scrypt: bytes,
         totp_secret: bytes,
         context: OperatorMutationContext,
-    ) -> None:
+    ) -> int:
         if account.identity_source.value != "break_glass":
             raise ValueError("break_glass_account_invalid")
         credentials = BreakGlassCredentials(
@@ -448,6 +599,7 @@ class PostgresBreakGlassStore:
                     after_scopes=sorted(account.scopes),
                     context=context,
                 )
+                return authz_version
         except OidcLoginInvalid:
             raise
         except SQLAlchemyError:
@@ -461,7 +613,7 @@ class PostgresBreakGlassStore:
         totp: str,
         source_ip: str,
         now: datetime,
-    ) -> UUID:
+    ) -> BreakGlassAuthentication:
         if not self._admission.acquire(blocking=False):
             self._record_admission_rejection(source_ip=source_ip)
             raise OidcLoginRateLimited(1)
@@ -561,7 +713,10 @@ class PostgresBreakGlassStore:
             if rejected:
                 raise OidcLoginInvalid("break_glass_login_failed")
             assert account_id is not None
-            return account_id
+            return BreakGlassAuthentication(
+                account_id=account_id,
+                authz_version=int(row["authz_version"]),
+            )
         except (OidcLoginInvalid, OidcLoginRateLimited):
             raise
         except SQLAlchemyError:
@@ -630,7 +785,7 @@ class BreakGlassAuthenticator(Protocol):
         totp: str,
         source_ip: str,
         now: datetime,
-    ) -> UUID: ...
+    ) -> BreakGlassAuthentication: ...
 
 
 class BreakGlassControl:
@@ -656,14 +811,21 @@ class BreakGlassControl:
         now = self._clock()
         if now.tzinfo is None:
             raise OidcLoginInvalid("break_glass_login_failed")
-        account_id = self._store.authenticate(
+        authentication = self._store.authenticate(
             username=username,
             password=password,
             totp=totp,
             source_ip=source_ip,
             now=now,
         )
-        return self._sessions.issue(account_id=account_id, mfa_verified=True)
+        try:
+            return self._sessions.issue(
+                account_id=authentication.account_id,
+                mfa_verified=True,
+                expected_authz_version=authentication.authz_version,
+            )
+        except OperatorAuthenticationRequired:
+            raise OidcLoginInvalid("break_glass_login_failed") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1886,6 +2048,103 @@ def _record_break_glass_provision_event(
                 "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
                 "VALUES (:id, 'operator_account', :aggregate_id, "
                 "'operator.break_glass_provisioned', :aggregate_revision, "
+                "CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
+
+
+def _record_break_glass_rotation_event(
+    connection: Connection,
+    *,
+    account_id: UUID,
+    before_authz_version: int,
+    after_authz_version: int,
+    revoked_sessions: int,
+    context: OperatorMutationContext,
+) -> None:
+    payload = json.dumps(
+        {
+            "account_id": str(account_id),
+            "identity_source": "break_glass",
+            "actor": context.actor,
+            "auth_method": "privileged_local_cli",
+            "action": "operator.break_glass_rotate",
+            "object_type": "operator_account",
+            "outcome": "rotated",
+            "reason": context.reason,
+            "before": {
+                "authz_version": before_authz_version,
+                "enabled": True,
+            },
+            "after": {
+                "authz_version": after_authz_version,
+                "enabled": True,
+            },
+            "revoked_sessions": revoked_sessions,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account_id,
+        "aggregate_revision": after_authz_version,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, "
+                "'operator.break_glass_rotated', :aggregate_revision, CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
+
+
+def _record_break_glass_rotation_rejection_event(
+    connection: Connection,
+    *,
+    account_id: UUID,
+    requested_account_id: UUID,
+    aggregate_revision: int,
+    expected_authz_version: int,
+    context: OperatorMutationContext,
+) -> None:
+    payload = json.dumps(
+        {
+            "account_id": str(account_id),
+            "requested_account_id": str(requested_account_id),
+            "identity_source": "break_glass",
+            "actor": context.actor,
+            "auth_method": "privileged_local_cli",
+            "action": "operator.break_glass_rotate",
+            "object_type": "operator_account",
+            "outcome": "rejected",
+            "reason": context.reason,
+            "reason_code": "identity_or_revision_conflict",
+            "expected_authz_version": expected_authz_version,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account_id,
+        "aggregate_revision": aggregate_revision,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, "
+                "'operator.break_glass_rotation_rejected', :aggregate_revision, "
                 "CAST(:payload AS jsonb))"
             ),
             parameters,

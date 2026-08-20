@@ -318,7 +318,7 @@ export RTSP_PROXY_BREAK_GLASS_TOTP_FILE=/root/rtsp-proxy-break-glass.totp
   --account-id 11111111-2222-4333-8444-555555555555 \
   --username emergency-admin \
   --actor operator:alice \
-  --reason 'scheduled emergency credential rotation'
+  --reason 'initial emergency credential provisioning'
 ```
 
 Run the command as root with the shown `/root` inputs, or as the dedicated
@@ -326,9 +326,40 @@ service UID with equivalently protected files it owns. The command writes the
 credential material and a sanitized
 `operator.break_glass_provisioned` audit/outbox pair in one synchronous
 transaction. It refuses a different UUID for an existing subject and refuses
-to overwrite an enabled account. Remove the one-use TOTP input file after a
-successful enrollment, then restart WEB and complete both accepted and
-rejected SMTP drills before declaring readiness.
+to overwrite an enabled account. Its success output includes the committed
+`authz_version`; retain that non-secret revision in the operator evidence.
+Remove the one-use TOTP input file after a successful enrollment, then restart
+WEB and complete both accepted and rejected SMTP drills before declaring
+readiness.
+
+Scheduled rotation is a separate explicit compare-and-swap operation. Prepare
+a new TOTP file through the same offline channel, use the same immutable account
+UUID and username, and supply the last committed revision printed by the prior
+provision/rotation command:
+
+```sh
+/opt/rtsp-proxy/releases/<release-id>/.venv/bin/rtsp-proxy-break-glass \
+  --account-id 11111111-2222-4333-8444-555555555555 \
+  --username emergency-admin \
+  --actor operator:alice \
+  --reason 'scheduled emergency credential rotation' \
+  --rotate \
+  --expected-authz-version 3
+```
+
+Rotation synchronously replaces only the password/TOTP verifier material,
+increments the authoritative revision, resets TOTP replay state, revokes every
+active session for the account and writes one identical
+`operator.break_glass_rotated` audit/outbox event without either secret. A stale
+revision, changed UUID/username, disabled account or concurrent winner aborts
+the credential mutation and writes a separate sanitized
+`operator.break_glass_rotation_rejected` audit/outbox event. Record the newly
+printed revision and remove the input TOTP file. Then, from the approved
+management path, make exactly one deliberate
+old/invalid login and require its rejected security email; make one login with
+the new password/TOTP and require its accepted email, then log out. Do not
+declare the drill complete if either message is missing/duplicated, the old
+session remains usable, or readiness is red.
 Exactly one WEB health monitor performs the external discovery/token and local
 store probes at startup and every 30 seconds. HTTP `/health/ready` only reads
 its immutable synchronized result; requests cannot fan out IdP/DB work or race
