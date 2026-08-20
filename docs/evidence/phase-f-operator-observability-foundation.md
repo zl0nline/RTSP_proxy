@@ -1,6 +1,6 @@
 # Phase F operator and observability foundation
 
-- Last reviewed: 2026-08-14
+- Last reviewed: 2026-08-21
 - Status: foundation complete; Phase F remains in progress
 - CI: https://github.com/zl0nline/RTSP_proxy/actions/runs/31782530517
 - Commit: `292a0302590838451e4f454322930804271b4d71`
@@ -73,7 +73,11 @@ state and does not claim completion early. The public path is unchanged and no
 source URL is rendered. Complete automated
 browser accessibility/confirmation E2E, physical-hardware capacity and the
 24-hour soak remain open. Revision-fenced break-glass rotation with atomic
-session revocation and an accepted/rejected notification drill is implemented
-and independently reviewed, but remains outside this evidence boundary until a
-clean native CI rerun passes the remediated coverage gate.
+session revocation and an accepted/rejected notification drill passed
+independent Spec/Standards review and all six native amd64/arm64 jobs at commit
+`df35a2c0089564d1833c62fb65d256f09864fbde`
+([CI run 32428149162](https://github.com/zl0nline/RTSP_proxy/actions/runs/32428149162)).
+The rotation contract rejects stale revision, identity and concurrent attempts
+through the same secret-free audit/outbox seam, and fences session issuance
+against credentials authenticated immediately before a successful rotation.
 Production therefore remains NO-GO.

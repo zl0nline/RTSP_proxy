@@ -26,8 +26,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   confirmation are also green in native amd64/arm64 CI;
 >   revision-fenced camera move UI is also green in native amd64/arm64 CI;
 >   a revision-fenced break-glass rotation CLI and accepted/rejected delivery
->   drill are implemented locally. Complete automated browser E2E remains
->   pending, and the rotation slice still requires a clean native CI rerun.
+>   drill are independently reviewed and green in native amd64/arm64 CI.
+>   Complete automated browser E2E remains pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -324,8 +324,9 @@ confirmation, связанный с точным target и числом чита
 После POST dashboard открывает camera-scoped status по persisted `move_id` и
 показывает фактический state saga, а не доверяет query-параметру.
 Revision-fenced break-glass rotation и accepted/rejected notification drill
-прошли независимый review; clean native CI rerun после исправления coverage gate
-ещё ожидается. Полный
+прошли независимый review и все шесть native amd64/arm64 jobs в
+[run 32428149162](https://github.com/zl0nline/RTSP_proxy/actions/runs/32428149162)
+на commit `df35a2c0089564d1833c62fb65d256f09864fbde`. Полный
 автоматизированный browser E2E ещё не реализован, поэтому Phase F целиком не
 завершена.
 Наличие load harness и

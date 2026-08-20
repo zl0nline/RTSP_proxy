@@ -1008,15 +1008,17 @@ prepared source/target port changes, while the switch transaction rechecks all
 conditions. The ordinary public path stays immutable while the node port
 changes. Complete automated
 browser E2E remains pending. A revision-fenced break-glass rotation CLI and
-accepted/rejected notification drill passed independent Spec/Standards review;
-a clean native CI rerun after coverage-gate remediation is still pending. No
-Phase-F completion claim is made yet.
+accepted/rejected notification drill passed independent Spec/Standards review
+and all six native amd64/arm64 jobs at commit
+`df35a2c0089564d1833c62fb65d256f09864fbde`
+([CI run 32428149162](https://github.com/zl0nline/RTSP_proxy/actions/runs/32428149162)).
+No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green;
   camera move UI CI-green);
 - [~] RBAC/CSRF/OIDC/break-glass foundation (revision-fenced rotation/drill
-  independently reviewed; clean native CI and complete denial/logout audit matrix pending);
+  CI-green; complete denial/logout audit matrix pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
