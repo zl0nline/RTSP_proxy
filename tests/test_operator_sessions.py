@@ -369,6 +369,13 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
         session_id_factory=lambda: UUID("70000000-0000-0000-0000-000000000007"),
     ).issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    first_store.record_request_security_event(
+        account_id=ACCOUNT_ID,
+        session_id=issued.session.id,
+        authz_version=1,
+        event_type="operator.authorization_denied",
+        reason_code="operator_permission_denied",
+    )
     first_store.close()
 
     engine = create_engine(postgres_database_url, hide_parameters=True)
@@ -393,6 +400,18 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
                 "WHERE event_type = 'operator.session_issued'"
             )
         ).one()
+        denial_audit = connection.execute(
+            text(
+                "SELECT id, event_type, payload FROM audit_events "
+                "WHERE event_type = 'operator.authorization_denied'"
+            )
+        ).one()
+        denial_outbox = connection.execute(
+            text(
+                "SELECT id, event_type, payload FROM outbox_messages "
+                "WHERE event_type = 'operator.authorization_denied'"
+            )
+        ).one()
     engine.dispose()
     assert row.token_sha256 != issued.session_token
     assert row.csrf_sha256 != issued.csrf_token
@@ -401,6 +420,13 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
     assert session_audit == session_outbox
     assert session_audit.payload["account_id"] == str(ACCOUNT_ID)
     assert session_audit.payload["mfa_verified"] is True
+    assert denial_audit == denial_outbox
+    assert denial_audit.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "outcome": "rejected",
+        "reason_code": "operator_permission_denied",
+        "session_id": str(issued.session.id),
+    }
 
     reopened = PostgresOperatorSessionStore(postgres_database_url)
     principal = OperatorSessionControl(

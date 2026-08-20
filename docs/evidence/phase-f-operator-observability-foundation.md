@@ -74,5 +74,6 @@ source URL is rendered. Complete automated
 browser accessibility/confirmation E2E, physical-hardware capacity and the
 24-hour soak remain open. Revision-fenced break-glass rotation with atomic
 session revocation and an accepted/rejected notification drill is implemented
-locally but remains outside this evidence boundary until review/native CI.
+and independently reviewed, but remains outside this evidence boundary until a
+clean native CI rerun passes the remediated coverage gate.
 Production therefore remains NO-GO.

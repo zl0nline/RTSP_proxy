@@ -328,6 +328,17 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
     assert "uv run rtsp-proxy-verify-release --manifest" in workflow
 
 
+def test_native_ci_enforces_coverage_with_an_independent_exit_gate() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    coverage_step = workflow.split("- name: Test with coverage", 1)[1].split(
+        "- name: Lint",
+        1,
+    )[0]
+
+    assert "uv run pytest --cov=rtsp_proxy --cov-report=term-missing" in coverage_step
+    assert "uv run coverage report --precision=2 --fail-under=90" in coverage_step
+
+
 def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     media = catalog["mediamtx"]

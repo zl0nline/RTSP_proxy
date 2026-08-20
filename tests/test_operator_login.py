@@ -1345,6 +1345,90 @@ def test_postgres_break_glass_consumes_totp_and_appends_security_event_atomicall
     store.close()
 
 
+def test_postgres_break_glass_corrupt_secret_fails_closed_and_audits_rejection(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresBreakGlassStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    store.provision(
+        account=OperatorAccount(
+            identity_source=OperatorIdentitySource.BREAK_GLASS,
+            id=ACCOUNT_ID,
+            subject="local:emergency-admin",
+            display_name="Emergency administrator",
+            roles=frozenset({OperatorRole.BREAK_GLASS}),
+            scopes=frozenset({"server:*"}),
+            authz_version=1,
+            enabled=True,
+        ),
+        password_scrypt=BreakGlassCredentials.hash_password(
+            "correct horse battery staple",
+            salt=b"S" * 16,
+        ),
+        totp_secret=b"B" * 20,
+        context=TEST_MUTATION_CONTEXT,
+    )
+    with pytest.raises(ValueError, match="break_glass_rotation_invalid"):
+        store.rotate(
+            account_id=ACCOUNT_ID,
+            subject="emergency-admin",
+            expected_authz_version=1,
+            password_scrypt=BreakGlassCredentials.hash_password(
+                "replacement horse battery staple",
+                salt=b"R" * 16,
+            ),
+            totp_secret=b"C" * 20,
+            context=TEST_MUTATION_CONTEXT,
+        )
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE operator_accounts SET break_glass_totp_secret = :secret "
+                "WHERE id = :id"
+            ),
+            {"id": ACCOUNT_ID, "secret": b"X" * 28},
+        )
+    code = TOTP(b"B" * 20, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode()
+
+    with pytest.raises(OidcLoginInvalid, match="break_glass_login_failed"):
+        store.authenticate(
+            username="emergency-admin",
+            password="correct horse battery staple",
+            totp=code,
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                "SELECT id, aggregate_revision, payload FROM audit_events "
+                "WHERE event_type = 'operator.break_glass_login'"
+            )
+        ).one()
+        outbox = connection.execute(
+            text(
+                "SELECT id, aggregate_revision, payload FROM outbox_messages "
+                "WHERE event_type = 'operator.break_glass_login'"
+            )
+        ).one()
+    assert audit == outbox
+    assert audit.aggregate_revision == 1
+    assert audit.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "auth_method": "break_glass_password_totp",
+        "outcome": "rejected",
+        "reason_code": "invalid_credentials",
+        "severity": "critical",
+    }
+    engine.dispose()
+    store.close()
+
+
 def test_operator_identity_public_models_and_controls_reject_invalid_boundaries() -> None:
     verifier = BreakGlassCredentials.hash_password(
         "correct horse battery staple",
@@ -1377,6 +1461,9 @@ def test_operator_identity_public_models_and_controls_reject_invalid_boundaries(
     for invalid in invalid_credentials:
         with pytest.raises(ValueError, match="break_glass_credentials_invalid"):
             BreakGlassCredentials(**invalid)
+    for authz_version in (0, 1 << 63):
+        with pytest.raises(ValueError, match="break_glass_authentication_invalid"):
+            BreakGlassAuthentication(ACCOUNT_ID, authz_version)
     for password, salt in (("short", b"S" * 16), ("valid password length", b"short")):
         with pytest.raises(ValueError, match="break_glass_password_invalid"):
             BreakGlassCredentials.hash_password(password, salt=salt)
@@ -1950,6 +2037,48 @@ def test_break_glass_cli_rejects_noncanonical_secrets_and_bad_database_url(
         "scheduled rotation",
     ]
 
+    mismatched_passwords = iter(
+        ("correct horse battery staple", "different horse battery staple")
+    )
+    assert (
+        break_glass_cli_main(
+            arguments,
+            password_reader=lambda _prompt: next(mismatched_passwords),
+        )
+        == 1
+    )
+    assert capsys.readouterr().err == (
+        "break-glass provisioning failed: break_glass_password_confirmation_failed\n"
+    )
+
+    key_file.write_bytes(base64.urlsafe_b64encode(b"K" * 32))
+    key_file.chmod(0o644)
+    assert (
+        break_glass_cli_main(
+            arguments,
+            password_reader=lambda _prompt: "correct horse battery staple",
+        )
+        == 1
+    )
+    assert capsys.readouterr().err == (
+        "break-glass provisioning failed: break_glass_secret_file_unsafe\n"
+    )
+    key_file.chmod(0o600)
+
+    for invalid_payload in (b"A", base64.urlsafe_b64encode(b"short")):
+        key_file.write_bytes(invalid_payload)
+        assert (
+            break_glass_cli_main(
+                arguments,
+                password_reader=lambda _prompt: "correct horse battery staple",
+            )
+            == 1
+        )
+        assert capsys.readouterr().err == (
+            "break-glass provisioning failed: break_glass_secret_invalid\n"
+        )
+
+    key_file.write_bytes(b"!" + base64.urlsafe_b64encode(b"K" * 32))
     assert (
         break_glass_cli_main(
             arguments,
@@ -1972,6 +2101,29 @@ def test_break_glass_cli_rejects_noncanonical_secrets_and_bad_database_url(
     second_error = capsys.readouterr().err
     assert second_error == "break-glass provisioning failed: break_glass_configuration_invalid\n"
     assert "Traceback" not in second_error
+
+
+def test_break_glass_rotation_maps_database_unavailability() -> None:
+    store = PostgresBreakGlassStore(
+        "postgresql+psycopg://postgres@127.0.0.1:1/missing",
+        encryption_key=b"K" * 32,
+        statement_timeout_ms=100,
+    )
+    try:
+        with pytest.raises(OidcLoginUnavailable, match="break_glass_store_unavailable"):
+            store.rotate(
+                account_id=ACCOUNT_ID,
+                subject="local:emergency-admin",
+                expected_authz_version=1,
+                password_scrypt=BreakGlassCredentials.hash_password(
+                    "replacement horse battery staple",
+                    salt=b"R" * 16,
+                ),
+                totp_secret=b"C" * 20,
+                context=TEST_MUTATION_CONTEXT,
+            )
+    finally:
+        store.close()
 
 
 def test_break_glass_rotation_compare_and_swap_allows_one_concurrent_writer(
