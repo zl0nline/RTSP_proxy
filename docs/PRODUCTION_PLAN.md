@@ -1009,6 +1009,10 @@ conditions. The ordinary public path stays immutable while the node port
 changes. Real-browser OIDC/login, keyboard focus, occupied-reader confirmation
 and CSRF-protected logout E2E is implemented and green locally and on an
 isolated Linux amd64 stand; independent review and dedicated CI remain pending.
+The real-Chromium job is an external-management-client gate and runs on amd64
+because the pinned driver has no Linux arm64 browser bundle. Server-side
+templates, OIDC/session, CSRF and logout contracts remain in the identical
+amd64/arm64 application test matrix; this does not weaken Linux server parity.
 A revision-fenced break-glass rotation CLI and
 accepted/rejected notification drill passed independent Spec/Standards review
 and all six native amd64/arm64 jobs at commit
@@ -1025,7 +1029,8 @@ No Phase-F completion claim is made yet.
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
 - [~] browser E2E for OIDC/login, confirmations, keyboard accessibility and
-  logout (local/Linux-amd64 stand green; independent review and CI pending).
+  logout (external Chromium client on amd64; server contract in amd64/arm64
+  application jobs; independent review and CI pending).
 
 Collector helper/DB operations and notification DB operations have hard
 deadlines. The collector shutdown budget remains below its 30-second systemd

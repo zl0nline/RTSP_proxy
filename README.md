@@ -30,6 +30,10 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   Real-browser OIDC/login, keyboard focus, occupied-reader confirmation and
 >   CSRF-protected logout E2E is implemented and green locally and on an
 >   isolated Linux amd64 stand; independent review and dedicated CI are pending.
+>   The browser is an external management client, so the real-Chromium job runs
+>   on amd64 because the pinned driver has no Linux arm64 browser bundle;
+>   server-side templates/OIDC/session/CSRF/logout tests remain identical in the
+>   amd64 and arm64 application jobs.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -331,7 +335,10 @@ Revision-fenced break-glass rotation и accepted/rejected notification drill
 на commit `df35a2c0089564d1833c62fb65d256f09864fbde`. Real-browser E2E для
 OIDC/login, клавиатурного focus, occupied-reader confirmation и защищённого
 logout реализован и локально прошёл на Linux amd64; dedicated CI и независимый
-review ещё не завершены. Phase F целиком также ждёт denial/logout audit matrix.
+review ещё не завершены. Real Chromium проверяется как внешний management
+client на amd64; одинаковый server-side auth/template/CSRF/logout contract
+исполняется application CI на amd64 и arm64. Phase F целиком также ждёт
+denial/logout audit matrix.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.
