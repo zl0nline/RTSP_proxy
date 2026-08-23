@@ -128,8 +128,16 @@ jobs:
           sudo nft delete table inet rtsp_proxy
 
   browser-e2e:
-    name: browser-e2e (amd64)
-    runs-on: ubuntu-24.04
+    name: browser-e2e (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     steps:
       - name: Check out source
@@ -163,7 +171,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: dashboard-browser-e2e-amd64
+          name: dashboard-browser-e2e-${{ matrix.arch }}
           path: .artifacts/browser-e2e
           if-no-files-found: error
 

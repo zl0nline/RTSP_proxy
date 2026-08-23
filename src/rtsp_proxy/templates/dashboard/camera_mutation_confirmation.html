@@ -6,9 +6,9 @@
     <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a><span aria-hidden="true">/</span><span>Подтверждение</span>
   </nav>
   <div class="page-heading">
-    <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1>Подтвердите действие</h1></div>
+    <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1 tabindex="-1" autofocus>Подтвердите действие</h1></div>
   </div>
-  <section class="panel mutation-panel" aria-labelledby="confirmation-title">
+  <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="confirmation-title">
     <div class="panel-heading"><h2 id="confirmation-title">Будет отключён {{ preview.disconnect_readers }} downstream-клиент</h2></div>
     <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/apply">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">

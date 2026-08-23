@@ -951,6 +951,8 @@ def test_camera_dashboard_forms_require_bound_csrf_and_confirm_occupied_disable(
     assert wrong_csrf.status_code == 401
     assert preview.status_code == 200
     assert "Будет отключён 1 downstream-клиент" in preview.text
+    assert 'role="alert" aria-live="assertive"' in preview.text
+    assert '<h1 tabindex="-1" autofocus>Подтвердите действие</h1>' in preview.text
     assert 'value="confirmation-token"' in preview.text
     assert applied.status_code == 303
     assert applied.headers["location"] == detail_path
@@ -1294,6 +1296,8 @@ def test_occupied_camera_move_requires_exact_blast_radius_confirmation() -> None
 
     assert preview.status_code == 200
     assert "Будет отключён 1 downstream-клиент" in preview.text
+    assert 'role="alert" aria-live="assertive"' in preview.text
+    assert '<h1 tabindex="-1" autofocus>Подтвердите перемещение</h1>' in preview.text
     assert "rtsp://&lt;server-address&gt;:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa" in preview.text
     assert "rtsp://&lt;server-address&gt;:10544/aaaaaaaaaaaaaaaaaaaaaaaaaa" in preview.text
     assert 'value="move-confirmation-token"' in preview.text

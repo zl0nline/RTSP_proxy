@@ -48,6 +48,7 @@ from rtsp_proxy.reconcile import CameraMutationControl, ConfirmationTokenService
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+SOURCE_SECRET_CANARY = "rtsp://source-secret-canary.invalid/private"
 
 
 class _LabTokenEndpoint:
@@ -124,7 +125,7 @@ def build_lab_app(*, origin: str) -> Any:
     )
     camera = cameras.create_camera(
         name="Front entrance",
-        source_url="rtsp://camera.internal/main",
+        source_url=SOURCE_SECRET_CANARY,
         node_id=NODE_ID,
     )
     mutations = CameraMutationControl(
