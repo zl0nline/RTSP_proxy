@@ -1006,8 +1006,10 @@ status page reads its actual state and reports accepted—not completed. Target
 enumeration uses the store's DB-clock eligibility projection and excludes
 prepared source/target port changes, while the switch transaction rechecks all
 conditions. The ordinary public path stays immutable while the node port
-changes. Complete automated
-browser E2E remains pending. A revision-fenced break-glass rotation CLI and
+changes. Real-browser OIDC/login, keyboard focus, occupied-reader confirmation
+and CSRF-protected logout E2E is implemented and green locally and on an
+isolated Linux amd64 stand; independent review and dedicated CI remain pending.
+A revision-fenced break-glass rotation CLI and
 accepted/rejected notification drill passed independent Spec/Standards review
 and all six native amd64/arm64 jobs at commit
 `df35a2c0089564d1833c62fb65d256f09864fbde`
@@ -1022,7 +1024,8 @@ No Phase-F completion claim is made yet.
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
-- [ ] browser E2E for confirmations and accessibility.
+- [~] browser E2E for OIDC/login, confirmations, keyboard accessibility and
+  logout (local/Linux-amd64 stand green; independent review and CI pending).
 
 Collector helper/DB operations and notification DB operations have hard
 deadlines. The collector shutdown budget remains below its 30-second systemd

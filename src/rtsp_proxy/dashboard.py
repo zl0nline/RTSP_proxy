@@ -33,6 +33,7 @@ DASHBOARD_CSP: Final = (
 class DashboardUnavailable:
     title: str
     message: str
+    login_href: str | None = None
 
 
 class FleetSnapshotFailureReason(StrEnum):
@@ -215,6 +216,13 @@ def render_unavailable(
     return _environment().get_template("dashboard/unavailable.html").render(
         unavailable=unavailable,
         principal=principal,
+    )
+
+
+def render_logout(*, principal: OperatorPrincipal, csrf_token: str) -> str:
+    return _environment().get_template("dashboard/logout.html").render(
+        principal=principal,
+        csrf_token=csrf_token,
     )
 
 

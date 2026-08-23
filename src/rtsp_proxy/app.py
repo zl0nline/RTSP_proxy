@@ -31,6 +31,7 @@ from rtsp_proxy.dashboard import (
     DashboardUnavailable,
     FleetSnapshotFailureReason,
     FleetSnapshotReadFailure,
+    render_logout,
     render_node_detail,
     render_overview,
     render_unavailable,
@@ -743,6 +744,9 @@ def create_app(
                         DashboardUnavailable(
                             title="Требуется вход оператора",
                             message="Откройте защищённую сессию, чтобы увидеть состояние сервера.",
+                            login_href=(
+                                "/auth/oidc/login" if operator_login is not None else None
+                            ),
                         ),
                         status_code=status.HTTP_401_UNAUTHORIZED,
                     )
@@ -818,6 +822,32 @@ def create_app(
         return _dashboard_html_response(
             render_overview(snapshot=snapshot_response, principal=principal)
         )
+
+    @app.get("/dashboard/logout", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_logout_page(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        return _dashboard_html_response(
+            render_logout(
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+            )
+        )
+
+    @app.post("/dashboard/logout", include_in_schema=False)
+    def dashboard_logout(request: Request) -> Response:
+        assert operator_sessions is not None
+        operator_sessions.revoke(
+            request.cookies.get("__Host-rtsp_proxy_session", "")
+        )
+        response = RedirectResponse(
+            "/dashboard",
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Cache-Control": "no-store"},
+        )
+        _clear_operator_session_cookies(response)
+        return response
 
     app.include_router(
         camera_dashboard_router(
@@ -990,20 +1020,7 @@ def create_app(
         assert operator_sessions is not None
         token = request.cookies.get("__Host-rtsp_proxy_session", "")
         operator_sessions.revoke(token)
-        response.delete_cookie(
-            "__Host-rtsp_proxy_session",
-            path="/",
-            secure=True,
-            httponly=True,
-            samesite="strict",
-        )
-        response.delete_cookie(
-            "__Host-rtsp_proxy_csrf",
-            path="/",
-            secure=True,
-            httponly=False,
-            samesite="strict",
-        )
+        _clear_operator_session_cookies(response)
 
     @app.post("/api/v1/nodes", response_model=NodeResponse, status_code=201)
     def create_node(request: NodeCreateRequest, response: Response) -> NodeResponse:
@@ -2551,6 +2568,23 @@ def _set_operator_session_cookies(
         httponly=False,
         samesite="strict",
         path="/",
+    )
+
+
+def _clear_operator_session_cookies(response: Response) -> None:
+    response.delete_cookie(
+        "__Host-rtsp_proxy_session",
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+    response.delete_cookie(
+        "__Host-rtsp_proxy_csrf",
+        path="/",
+        secure=True,
+        httponly=False,
+        samesite="strict",
     )
 
 

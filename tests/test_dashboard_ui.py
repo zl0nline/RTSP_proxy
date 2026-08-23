@@ -506,6 +506,73 @@ def test_dashboard_requires_operator_session_and_never_caches() -> None:
     assert "Требуется вход оператора" in response.text
 
 
+def test_dashboard_authentication_failure_offers_oidc_login_when_configured() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:viewer@example.test",
+        display_name="Дежурный",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            operator_sessions=sessions,
+            operator_login=cast(Any, object()),
+        ),
+        base_url="https://management.example.test",
+    )
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 401
+    assert '<a class="button-link" href="/auth/oidc/login">Войти через OIDC</a>' in (
+        response.text
+    )
+
+
+def test_dashboard_exposes_csrf_protected_browser_logout() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    client, headers = _authenticated_dashboard(observations=observations)
+
+    dashboard = client.get("/dashboard", headers=headers)
+    logout_page = client.get("/dashboard/logout", headers=headers)
+    missing_csrf = client.post(
+        "/dashboard/logout",
+        headers=headers,
+        follow_redirects=False,
+    )
+    logged_out = client.post(
+        "/dashboard/logout",
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN},
+        follow_redirects=False,
+    )
+    replayed = client.get("/dashboard", headers=headers)
+
+    assert dashboard.status_code == 200
+    assert '<a href="/dashboard/logout">Выйти</a>' in dashboard.text
+    assert logout_page.status_code == 200
+    assert '<form method="post" action="/dashboard/logout">' in logout_page.text
+    assert 'name="_csrf" value="ccccccccccccccccccccccccccccccccccccccccccc"' in (
+        logout_page.text
+    )
+    assert missing_csrf.status_code == 401
+    assert logged_out.status_code == 303
+    assert logged_out.headers["location"] == "/dashboard"
+    assert '__Host-rtsp_proxy_session=""' in logged_out.headers["set-cookie"]
+    assert "Max-Age=0" in logged_out.headers["set-cookie"]
+    assert replayed.status_code == 401
+
+
 def test_dashboard_renders_bounded_fleet_snapshot_with_semantic_security_contract() -> None:
     observations = InMemoryObservabilityStore()
     observations.save_snapshot(_snapshot())

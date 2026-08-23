@@ -127,6 +127,46 @@ jobs:
             jq --exit-status '.nftables[] | select(.table.comment == "rtsp-proxy-owned:v1")'
           sudo nft delete table inet rtsp_proxy
 
+  browser-e2e:
+    name: browser-e2e (amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Install pinned browser driver and Chromium
+        run: |
+          npm install --global agent-browser@0.26.0
+          test "$(agent-browser --version)" = "agent-browser 0.26.0"
+          agent-browser install
+
+      - name: Verify dashboard in a real browser
+        env:
+          RTSP_PROXY_RUN_BROWSER_E2E: "1"
+          RTSP_PROXY_BROWSER_ARTIFACT_DIR: .artifacts/browser-e2e
+          # GitHub's disposable Ubuntu runner blocks Chromium user namespaces.
+          RTSP_PROXY_BROWSER_NO_SANDBOX: "1"
+        run: uv run pytest -q tests/browser/test_dashboard_browser.py
+
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dashboard-browser-e2e-amd64
+          path: .artifacts/browser-e2e
+          if-no-files-found: error
+
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})
     strategy:

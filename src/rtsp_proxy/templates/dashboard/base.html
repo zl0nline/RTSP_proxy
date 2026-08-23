@@ -20,6 +20,7 @@
       <div class="operator" aria-label="Текущий оператор">
         <span>{{ principal.display_name }}</span>
         <span class="operator-role">{{ principal.roles | map(attribute='value') | sort | join(', ') }}</span>
+        <a href="/dashboard/logout">Выйти</a>
       </div>
       {% endif %}
     </header>

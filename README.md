@@ -27,7 +27,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   revision-fenced camera move UI is also green in native amd64/arm64 CI;
 >   a revision-fenced break-glass rotation CLI and accepted/rejected delivery
 >   drill are independently reviewed and green in native amd64/arm64 CI.
->   Complete automated browser E2E remains pending.
+>   Real-browser OIDC/login, keyboard focus, occupied-reader confirmation and
+>   CSRF-protected logout E2E is implemented and green locally and on an
+>   isolated Linux amd64 stand; independent review and dedicated CI are pending.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -326,9 +328,10 @@ confirmation, связанный с точным target и числом чита
 Revision-fenced break-glass rotation и accepted/rejected notification drill
 прошли независимый review и все шесть native amd64/arm64 jobs в
 [run 32428149162](https://github.com/zl0nline/RTSP_proxy/actions/runs/32428149162)
-на commit `df35a2c0089564d1833c62fb65d256f09864fbde`. Полный
-автоматизированный browser E2E ещё не реализован, поэтому Phase F целиком не
-завершена.
+на commit `df35a2c0089564d1833c62fb65d256f09864fbde`. Real-browser E2E для
+OIDC/login, клавиатурного focus, occupied-reader confirmation и защищённого
+logout реализован и локально прошёл на Linux amd64; dedicated CI и независимый
+review ещё не завершены. Phase F целиком также ждёт denial/logout audit matrix.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.

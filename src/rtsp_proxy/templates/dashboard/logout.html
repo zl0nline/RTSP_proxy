@@ -1,0 +1,18 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Выход — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content" class="centered-state">
+  <section class="state-card" aria-labelledby="logout-title">
+    <p class="eyebrow">Операторская сессия</p>
+    <h1 id="logout-title">Завершить сеанс?</h1>
+    <p>Текущая browser-сессия будет немедленно отозвана.</p>
+    <form method="post" action="/dashboard/logout">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-actions">
+        <button class="danger-button" type="submit">Выйти</button>
+        <a href="/dashboard">Отмена</a>
+      </div>
+    </form>
+  </section>
+</main>
+{% endblock %}

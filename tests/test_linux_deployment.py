@@ -420,3 +420,21 @@ def test_load_fixture_builder_has_valid_bash_syntax() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_browser_e2e_cleanup_preserves_an_early_failure(tmp_path: Path) -> None:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": str(tmp_path),
+    }
+    result = subprocess.run(
+        ["bash", "tools/e2e/dashboard_browser.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "agent-browser" in result.stderr
+    assert list(tmp_path.iterdir()) == []

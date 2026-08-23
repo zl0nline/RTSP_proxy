@@ -51,6 +51,7 @@ packages = ["src/rtsp_proxy"]
 addopts = "-ra --strict-markers --strict-config"
 testpaths = ["tests"]
 markers = [
+  "browser: real Chromium browser contract (opt-in outside the dedicated CI job)",
   "contract: black-box contract against pinned external binaries",
 ]
 
