@@ -40,10 +40,13 @@ from rtsp_proxy.nodes import (
     CameraMoveState,
     CameraNotFound,
     CameraRegistrationIdempotency,
+    CameraRevisionConflict,
     CameraState,
+    EligibleNodeMissing,
     InMemoryNodeStore,
     MaximumNodesReached,
     MediaNode,
+    NodeCameraCapacityReached,
     NodeCommandFence,
     NodeControl,
     NodeDisruptionConfirmationContext,
@@ -2512,6 +2515,111 @@ def test_authenticated_camera_api_requires_and_replays_idempotency_key() -> None
     assert len(control.list_cameras()) == 1
 
 
+def test_in_memory_camera_registration_ledger_tracks_pending_replay_and_deleted_target() -> None:
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=NODE_ID,
+                name="ledger-node",
+                external_port=10543,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=datetime.now(UTC),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    idempotency = CameraRegistrationIdempotency(
+        key=UUID(IDEMPOTENCY_KEY),
+        actor_account_id=ACCOUNT_ID,
+        actor_session_id=UUID("99999999-9999-4999-8999-999999999999"),
+        request_sha256="a" * 64,
+    )
+
+    assert store.lookup_camera_registration(idempotency) is None
+    assert store.reserve_camera_registration(idempotency) is None
+    assert store.reserve_camera_registration(idempotency) is None
+    assert store.lookup_camera_registration(idempotency) is None
+
+    created = store.place_camera_idempotently(
+        camera_id=CAMERA_ID,
+        name="Ledger camera",
+        source_url="rtsp://camera.internal/ledger",
+        public_id=PublicId.parse("a" * 26),
+        node_id=NODE_ID,
+        idempotency=idempotency,
+    )
+    replay = store.lookup_camera_registration(idempotency)
+    reserved_replay = store.reserve_camera_registration(idempotency)
+    direct_replay = store.place_camera_idempotently(
+        camera_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        name="Ignored retry",
+        source_url="rtsp://camera.internal/ignored",
+        public_id=PublicId.parse("b" * 25 + "e"),
+        node_id=NODE_ID,
+        idempotency=idempotency,
+    )
+
+    assert created.replayed is False
+    assert replay is not None and replay.replayed is True
+    assert reserved_replay is not None and reserved_replay.camera.id == CAMERA_ID
+    assert direct_replay.replayed is True
+    assert len(store.list_cameras()) == 1
+
+    fresh_idempotency = replace(
+        idempotency,
+        key=UUID("55555555-5555-4555-8555-555555555555"),
+        request_sha256="c" * 64,
+    )
+    with pytest.raises(
+        NodeRuntimeUnavailable,
+        match="camera_registration_reservation_missing",
+    ):
+        store.place_camera_idempotently(
+            camera_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            name="Fresh direct camera",
+            source_url="rtsp://camera.internal/fresh",
+            public_id=PublicId.parse("b" * 25 + "e"),
+            node_id=NODE_ID,
+            idempotency=fresh_idempotency,
+        )
+
+    with pytest.raises(CameraLifecycleConflict, match="camera_idempotency_conflict"):
+        store.lookup_camera_registration(
+            replace(idempotency, request_sha256="b" * 64)
+        )
+    with pytest.raises(ValueError, match="camera_registration_idempotency_invalid"):
+        replace(idempotency, request_sha256="not-a-digest")
+    with pytest.raises(CameraRevisionConflict):
+        store.request_camera_delete(CAMERA_ID, expected_revision=99)
+
+    deleting = store.request_camera_delete(CAMERA_ID)
+    assert store.request_camera_delete(CAMERA_ID) == deleting
+    assert store.mark_camera_applied(
+        camera_id=CAMERA_ID,
+        node_id=NODE_ID,
+        placement_generation=deleting.placement_generation,
+        desired_revision=deleting.desired_revision,
+    )
+    with pytest.raises(CameraLifecycleConflict, match="camera_idempotency_target_missing"):
+        store.lookup_camera_registration(idempotency)
+    with pytest.raises(CameraLifecycleConflict, match="camera_idempotency_target_missing"):
+        store.reserve_camera_registration(idempotency)
+    with pytest.raises(CameraLifecycleConflict, match="camera_idempotency_target_missing"):
+        store.place_camera_idempotently(
+            camera_id=CAMERA_ID,
+            name="Deleted retry",
+            source_url="rtsp://camera.internal/deleted",
+            public_id=PublicId.parse("a" * 26),
+            node_id=NODE_ID,
+            idempotency=idempotency,
+        )
+
+
 def test_camera_registration_idempotency_rejections_are_audited_or_fail_closed(
     postgres_database_url: str,
 ) -> None:
@@ -2763,6 +2871,59 @@ def test_dashboard_camera_registration_requires_mutation_permission_and_control(
 
 
 @pytest.mark.parametrize(
+    ("placement_error", "expected_message"),
+    (
+        (
+            NodePortRangeExhausted("node_port_range_exhausted"),
+            "нет свободных портов для регистрации новой ноды",
+        ),
+        (
+            NodeManagementPortRangeExhausted("node_management_port_range_exhausted"),
+            "Нет свободной пары loopback API/metrics портов.",
+        ),
+        (MaximumNodesReached("max_nodes_reached"), "максимальное количество нод"),
+        (
+            NodeCameraCapacityReached("node_camera_capacity_reached"),
+            "100 зарегистрированных камер",
+        ),
+        (EligibleNodeMissing("eligible_node_missing"), "Нет доступной ноды"),
+    ),
+)
+def test_dashboard_camera_registration_explains_placement_failures(
+    placement_error: Exception,
+    expected_message: str,
+) -> None:
+    class FailedPlacement:
+        def creation_targets(self) -> tuple[MediaNode, ...]:
+            return ()
+
+        def create_camera(self, **_kwargs: object) -> None:
+            raise placement_error
+
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, FailedPlacement()),
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "Unplaced camera",
+            "source_url": "rtsp://camera.internal/unplaced",
+            "placement_mode": "automatic",
+            "node_id": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+
+    assert response.status_code == 409
+    assert expected_message in response.text
+
+
+@pytest.mark.parametrize(
     ("overrides", "expected_message"),
     (
         ({"placement_mode": "manual", "node_id": "not-a-uuid"}, "Некорректная форма"),
@@ -2904,7 +3065,7 @@ def test_postgres_dashboard_camera_registration_persists_operator_attribution(
         )
         audit_engine = create_engine(postgres_database_url)
         try:
-            with audit_engine.begin() as connection:
+            with audit_engine.connect() as connection:
                 payload = connection.execute(
                     text(
                         "SELECT payload FROM audit_events "
@@ -2915,12 +3076,49 @@ def test_postgres_dashboard_camera_registration_persists_operator_attribution(
                 ledger_count = connection.scalar(
                     text("SELECT count(*) FROM camera_registration_requests")
                 )
+                ledger = connection.execute(
+                    text(
+                        "SELECT actor_session_id, actor_account_id, request_sha256 "
+                        "FROM camera_registration_requests "
+                        "WHERE idempotency_key=:idempotency_key"
+                    ),
+                    {"idempotency_key": UUID(IDEMPOTENCY_KEY)},
+                ).mappings().one()
+        finally:
+            audit_engine.dispose()
+        idempotency = CameraRegistrationIdempotency(
+            key=UUID(IDEMPOTENCY_KEY),
+            actor_account_id=ledger.actor_account_id,
+            actor_session_id=ledger.actor_session_id,
+            request_sha256=ledger.request_sha256,
+        )
+        stored_replay = store.lookup_camera_registration(idempotency)
+        unseen = replace(
+            idempotency,
+            key=UUID("44444444-4444-4444-8444-444444444444"),
+        )
+        assert store.lookup_camera_registration(unseen) is None
+        assert store.reserve_camera_registration(unseen) is None
+        assert store.lookup_camera_registration(unseen) is None
+        with pytest.raises(CameraLifecycleConflict, match="camera_idempotency_conflict"):
+            store.lookup_camera_registration(
+                replace(idempotency, request_sha256="f" * 64)
+            )
+
+        audit_engine = create_engine(postgres_database_url)
+        try:
+            with audit_engine.begin() as connection:
                 connection.execute(
                     text("UPDATE cameras SET state='deleted' WHERE id=:camera_id"),
                     {"camera_id": CAMERA_ID},
                 )
         finally:
             audit_engine.dispose()
+        with pytest.raises(
+            CameraLifecycleConflict,
+            match="camera_idempotency_target_missing",
+        ):
+            store.lookup_camera_registration(idempotency)
         missing_target = client.post(
             "/dashboard/cameras",
             headers=headers,
@@ -2943,6 +3141,9 @@ def test_postgres_dashboard_camera_registration_persists_operator_attribution(
         assert conflict.status_code == 409
         assert missing_target.status_code == 409
         assert ledger_count == 1
+        assert stored_replay is not None
+        assert stored_replay.replayed is True
+        assert stored_replay.camera.id == CAMERA_ID
         assert payload["operator"]["action"] == "camera.create"
         assert payload["operator"]["resource_type"] == "camera"
         assert payload["operator"]["resource_id"] == "collection"

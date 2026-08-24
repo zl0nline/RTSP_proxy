@@ -1599,17 +1599,11 @@ class InMemoryNodeStore:
             key = (idempotency.actor_session_id, idempotency.key)
             previous = self._camera_registration_requests.get(key)
             if previous is None:
-                self._camera_registration_requests[key] = (
-                    idempotency.actor_account_id,
-                    idempotency.request_sha256,
-                    None,
-                )
-                previous_camera_id = None
-            else:
-                previous_camera_id = self._camera_registration_target_id(
-                    previous,
-                    idempotency,
-                )
+                raise NodeRuntimeUnavailable("camera_registration_reservation_missing")
+            previous_camera_id = self._camera_registration_target_id(
+                previous,
+                idempotency,
+            )
             if previous_camera_id is not None:
                 camera = next(
                     (

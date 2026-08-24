@@ -25,22 +25,22 @@
     }
   },
   "ffmpeg": {
-    "version": "n8.1.2-34-g9b6c8969e0-20260810",
-    "release_tag": "autobuild-2026-08-10-13-17",
+    "version": "n8.1.2-34-g9b6c8969e0-20260731",
+    "release_tag": "autobuild-2026-07-31-14-10",
     "source_repository": "https://github.com/BtbN/FFmpeg-Builds",
     "provenance": "archive SHA-256 published by GitHub; artifact attestation unavailable",
     "architectures": {
       "amd64": {
-        "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-10-13-17/ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1.tar.xz",
-        "archive_sha256": "7b0c2ad593860d8bb157e346777ac7d741b5bf25b456382051138aaa8256f92d",
-        "ffmpeg_sha256": "48a805177021feaa26ebaa2d0a9e31d7139b6bcfe1a180af17a98ca786a3c668",
-        "ffprobe_sha256": "0f7a6c43858e8123f09b2f2236e7084165d76642e618d8d0ec9304cff3135d95"
+        "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1.tar.xz",
+        "archive_sha256": "09fc77be269c7053e438b7e96548e4af97604faf96a42c4a3c56a1ad74c22c0a",
+        "ffmpeg_sha256": "0601ac6dc6960c6c3a6e00a16291816b30c5e105d483467803aa08d60d1a034b",
+        "ffprobe_sha256": "b6a850d877c550e1f593b9c903861873a11b90b341aee89dabf522a444a7319a"
       },
       "arm64": {
-        "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-10-13-17/ffmpeg-n8.1.2-34-g9b6c8969e0-linuxarm64-gpl-8.1.tar.xz",
-        "archive_sha256": "4de38246590f87a959275ed359d9378acb46295b56851968b239763b4d481f3a",
-        "ffmpeg_sha256": "fa909ba4ebe3bc0c4d0476f39c036afb1fb6642febea0e154b403ba8410df8be",
-        "ffprobe_sha256": "974d21d84c3e8190223c9a5139298eb36e149506a48a1b82a83f5a6bc73933df"
+        "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n8.1.2-34-g9b6c8969e0-linuxarm64-gpl-8.1.tar.xz",
+        "archive_sha256": "177e40c91564dec3840096f3bf1ffe696b94330585972462cfc739fa29fe0e1a",
+        "ffmpeg_sha256": "9b889f62901440bbcd5b7a555af20bdd14a0ea03f2a91c1fed17c1b1ce0d5e05",
+        "ffprobe_sha256": "c856b07b94c2f8d4ff5157cb069dc7af1067ea7045d6de42408d1fecd221ab24"
       }
     }
   }

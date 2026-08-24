@@ -17,11 +17,11 @@
     "binary_sha256": "3637b2e96e24428d35dadbe2578ed9b3be6943b71c4f898ea8feab33577c87c3"
   },
   "ffmpeg": {
-    "version": "n8.1.2-34-g9b6c8969e0-20260810",
+    "version": "n8.1.2-34-g9b6c8969e0-20260731",
     "binary": "bin/ffmpeg",
-    "binary_sha256": "fa909ba4ebe3bc0c4d0476f39c036afb1fb6642febea0e154b403ba8410df8be",
+    "binary_sha256": "9b889f62901440bbcd5b7a555af20bdd14a0ea03f2a91c1fed17c1b1ce0d5e05",
     "ffprobe_binary": "bin/ffprobe",
-    "ffprobe_sha256": "974d21d84c3e8190223c9a5139298eb36e149506a48a1b82a83f5a6bc73933df"
+    "ffprobe_sha256": "c856b07b94c2f8d4ff5157cb069dc7af1067ea7045d6de42408d1fecd221ab24"
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",
