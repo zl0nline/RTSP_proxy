@@ -1007,8 +1007,12 @@ enumeration uses the store's DB-clock eligibility projection and excludes
 prepared source/target port changes, while the switch transaction rechecks all
 conditions. The ordinary public path stays immutable while the node port
 changes. Real-browser OIDC/login, keyboard focus, occupied-reader confirmation
-and CSRF-protected logout E2E is implemented and green locally and on an
-isolated Linux amd64 stand; independent review and dedicated CI remain pending.
+and CSRF-protected logout E2E passed independent Spec/Standards review and the
+dedicated external-client job at commit
+`a6166e3aa6a6a3c6d87991d509ea126e0d48bd09`
+([CI run 32676065004](https://github.com/zl0nline/RTSP_proxy/actions/runs/32676065004));
+the exact evidence boundary is recorded in
+[`docs/evidence/phase-f-dashboard-browser-contract.md`](evidence/phase-f-dashboard-browser-contract.md).
 The real-Chromium job is an external-management-client gate and runs on amd64
 because the pinned driver has no Linux arm64 browser bundle. Server-side
 templates, OIDC/session, CSRF and logout contracts remain in the identical
@@ -1028,9 +1032,9 @@ No Phase-F completion claim is made yet.
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
-- [~] browser E2E for OIDC/login, confirmations, keyboard accessibility and
+- [x] browser E2E for OIDC/login, confirmations, keyboard accessibility and
   logout (external Chromium client on amd64; server contract in amd64/arm64
-  application jobs; independent review and CI pending).
+  application jobs; independent review and dedicated CI green).
 
 Collector helper/DB operations and notification DB operations have hard
 deadlines. The collector shutdown budget remains below its 30-second systemd

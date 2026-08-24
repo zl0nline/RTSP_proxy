@@ -70,9 +70,11 @@ an occupied path. Candidate enumeration is a DB-clock store projection that
 excludes prepared port changes; the transactional switch still rechecks it.
 The camera-scoped status route binds a persisted `move_id`, shows its actual
 state and does not claim completion early. The public path is unchanged and no
-source URL is rendered. Complete automated
-browser accessibility/confirmation E2E, physical-hardware capacity and the
-24-hour soak remain open. Revision-fenced break-glass rotation with atomic
+source URL is rendered. Automated real-browser accessibility, confirmation,
+OIDC and logout evidence is recorded separately in
+[`phase-f-dashboard-browser-contract.md`](phase-f-dashboard-browser-contract.md).
+Physical-hardware capacity and the 24-hour soak remain open. Revision-fenced
+break-glass rotation with atomic
 session revocation and an accepted/rejected notification drill passed
 independent Spec/Standards review and all six native amd64/arm64 jobs at commit
 `df35a2c0089564d1833c62fb65d256f09864fbde`

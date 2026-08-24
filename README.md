@@ -4,7 +4,7 @@
 на независимые bounded nodes: каждая node — отдельный MediaMTX process/systemd
 instance, один внешний RTSP port и не более 100 зарегистрированных камер.
 
-> **Статус на 14 августа 2026**
+> **Статус на 24 августа 2026**
 >
 > - Bounded-node architecture: **согласована**, issues #1–#14 обновлены.
 > - Phase 0A MediaMTX/ordinary-RTSP compatibility: **complete** на native
@@ -28,8 +28,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   a revision-fenced break-glass rotation CLI and accepted/rejected delivery
 >   drill are independently reviewed and green in native amd64/arm64 CI.
 >   Real-browser OIDC/login, keyboard focus, occupied-reader confirmation and
->   CSRF-protected logout E2E is implemented and green locally and on an
->   isolated Linux amd64 stand; independent review and dedicated CI are pending.
+>   CSRF-protected logout E2E прошёл independent Spec/Standards review,
+>   isolated Linux amd64 stand и dedicated CI с browser evidence artifact.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
 >   server-side templates/OIDC/session/CSRF/logout tests remain identical in the
@@ -334,11 +334,14 @@ Revision-fenced break-glass rotation и accepted/rejected notification drill
 [run 32428149162](https://github.com/zl0nline/RTSP_proxy/actions/runs/32428149162)
 на commit `df35a2c0089564d1833c62fb65d256f09864fbde`. Real-browser E2E для
 OIDC/login, клавиатурного focus, occupied-reader confirmation и защищённого
-logout реализован и локально прошёл на Linux amd64; dedicated CI и независимый
-review ещё не завершены. Real Chromium проверяется как внешний management
-client на amd64; одинаковый server-side auth/template/CSRF/logout contract
-исполняется application CI на amd64 и arm64. Phase F целиком также ждёт
-denial/logout audit matrix.
+logout прошёл independent Spec/Standards review и dedicated CI в commit
+`a6166e3aa6a6a3c6d87991d509ea126e0d48bd09`
+([run 32676065004](https://github.com/zl0nline/RTSP_proxy/actions/runs/32676065004));
+точная evidence boundary записана в
+[`docs/evidence/phase-f-dashboard-browser-contract.md`](docs/evidence/phase-f-dashboard-browser-contract.md).
+Real Chromium проверяется как внешний management client на amd64; одинаковый
+server-side auth/template/CSRF/logout contract исполняется application CI на
+amd64 и arm64. Phase F целиком также ждёт denial/logout audit matrix.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.
