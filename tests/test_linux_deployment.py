@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from rtsp_proxy.nft_reconcile import NftReconcileError, validate_owned_table
-from rtsp_proxy.release import trusted_mediamtx_identity
+from rtsp_proxy.release import APPLICATION_SCHEMA, trusted_mediamtx_identity
 
 
 class CaseSensitiveConfigParser(ConfigParser):
@@ -338,6 +338,16 @@ def test_native_ci_enforces_coverage_with_an_independent_exit_gate() -> None:
 
     assert "uv run pytest --cov=rtsp_proxy --cov-report=term-missing" in coverage_step
     assert "uv run coverage report --precision=2 --fail-under=90" in coverage_step
+
+
+def test_packaged_migration_ci_asserts_the_current_application_schema() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    migration_step = workflow.split(
+        "- name: Verify packaged migrations against native PostgreSQL",
+        1,
+    )[1].split("- name: Validate systemd units", 1)[0]
+
+    assert f'= "{APPLICATION_SCHEMA}"' in migration_step
 
 
 def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
