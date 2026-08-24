@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import sys
 from configparser import ConfigParser
 from pathlib import Path
 
@@ -438,3 +439,53 @@ def test_browser_e2e_cleanup_preserves_an_early_failure(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "agent-browser" in result.stderr
     assert list(tmp_path.iterdir()) == []
+
+
+def test_browser_e2e_evidence_verifier_requires_exact_nonempty_artifacts(
+    tmp_path: Path,
+) -> None:
+    expected_text = (
+        "01-anonymous.snapshot.txt",
+        "02-dashboard.snapshot.txt",
+        "03-confirmation.snapshot.txt",
+        "04-logged-out.snapshot.txt",
+    )
+    expected_png = (
+        "02-dashboard.png",
+        "03-confirmation.png",
+        "04-logged-out.png",
+    )
+    for name in expected_text:
+        (tmp_path / name).write_text("semantic snapshot\n", encoding="utf-8")
+    for name in expected_png:
+        (tmp_path / name).write_bytes(b"\x89PNG\r\n\x1a\nimage")
+
+    verifier = Path("tools/e2e/verify_dashboard_browser_artifacts.py")
+    valid = subprocess.run(
+        [sys.executable, str(verifier), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert valid.returncode == 0, valid.stderr
+
+    (tmp_path / "03-confirmation.png").write_bytes(b"not-a-png")
+    invalid_png = subprocess.run(
+        [sys.executable, str(verifier), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_png.returncode != 0
+    assert "browser_evidence_png_invalid" in invalid_png.stderr
+
+    (tmp_path / "03-confirmation.png").write_bytes(b"\x89PNG\r\n\x1a\nimage")
+    (tmp_path / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+    unexpected = subprocess.run(
+        [sys.executable, str(verifier), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert unexpected.returncode != 0
+    assert "browser_evidence_file_set_invalid" in unexpected.stderr

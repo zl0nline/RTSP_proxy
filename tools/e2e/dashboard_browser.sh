@@ -32,6 +32,7 @@ if ! command -v openssl >/dev/null; then
   exit 127
 fi
 mkdir -p "$artifact_dir"
+artifact_dir=$(cd "$artifact_dir" && pwd -P)
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$work_dir/tls.key" \
@@ -268,5 +269,7 @@ if grep -R -F --binary-files=text \
   printf 'source secret canary leaked into browser evidence artifacts\n' >&2
   exit 1
 fi
+uv run python "$repo_root/tools/e2e/verify_dashboard_browser_artifacts.py" \
+  "$artifact_dir"
 
 printf 'browser E2E passed: OIDC, keyboard focus, occupied confirmation, logout\n'

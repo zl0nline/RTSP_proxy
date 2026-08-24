@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.identifiers import PublicId
-from rtsp_proxy.media import MediaPathConfig
+from rtsp_proxy.media import MediaPathConfig, MediaPathInventory
 from rtsp_proxy.nodes import (
     CameraControl,
     InMemoryNodeStore,
@@ -87,6 +87,16 @@ class _LabMediaNode:
 
     def get_path(self, name: PublicId) -> MediaPathConfig | None:
         return self._paths.get(name)
+
+    def inventory_paths(self) -> MediaPathInventory:
+        return MediaPathInventory(
+            camera_ids=tuple(sorted(self._paths, key=str)),
+            no_oracle_matcher_present=True,
+        )
+
+    def delete_path(self, name: PublicId) -> None:
+        self._paths.pop(name, None)
+        self._runtime.pop(name, None)
 
     def path_runtime_status(self, name: PublicId) -> tuple[bool, int] | None:
         return self._runtime.get(name)
