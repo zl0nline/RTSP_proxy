@@ -1107,16 +1107,19 @@ No Phase-F completion claim is made yet.
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
 - [x] recursively generated route-method negative matrix (current 63-route
-  node-operation surface published and CI-green; current 70-route access
-  surface locally green and awaiting independent review/native CI);
+  node-operation surface and current 70-route access surface independently
+  reviewed, published and CI-green);
   future export/SSE/bulk routes must extend it before activation;
 - [x] camera-scoped access dashboard/API list, two-level ACL edit and
   recent-MFA grant issue/rotate/revoke with one-time no-store secret output,
   30-second auto-clear, durable sensitive-read audit, separate action-rate
   buckets, exact revision fencing, session-bound idempotency and fail-closed
   durable rejection audit
-  (local/direct-Linux implementation green; independent review/native CI
-  pending);
+  (local/direct-Linux validation and independent review green; application and
+  patched MediaMTX/load jobs passed on amd64 and arm64, while the external
+  Chromium job passed on amd64, at commit
+  `9b0695605e7bf9efe00db0760d90f9906da85579` in
+  [CI run 32730353917](https://github.com/zl0nline/RTSP_proxy/actions/runs/32730353917));
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

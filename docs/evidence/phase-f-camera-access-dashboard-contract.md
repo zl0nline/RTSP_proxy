@@ -1,7 +1,7 @@
 # Phase F camera access dashboard contract
 
 - Last reviewed: 2026-08-24
-- Status: implementation and direct-Linux validation complete; independent review/CI pending
+- Status: implementation, direct-Linux validation, independent review and native CI complete
 - Server contract: identical direct-Linux amd64/arm64 application code, no Docker
 - Production status: NO-GO
 
@@ -87,11 +87,15 @@ user namespaces through AppArmor, so only this disposable external browser
 used the repository's explicit `RTSP_PROXY_BROWSER_NO_SANDBOX=1` switch. The
 server and production deployment never launch Chromium. No `sudo` was used.
 
-## Remaining gates
+## Published review and CI
 
-Independent Spec and Standards reviews must pass on one frozen tree. The exact
-commit must then pass the repository's native amd64/arm64 application,
-PostgreSQL migration, MediaMTX/load and external-browser CI jobs. Until that is
-published, this document is local evidence only. Other unfinished Phase-F
-operator workflows, Phase-G hardware/WAN/fault/24-hour evidence and Phase-H
-pilot rollout also remain open; Production remains **NO-GO**.
+The frozen implementation passed independent Spec and Standards review. Commit
+`9b0695605e7bf9efe00db0760d90f9906da85579` then passed all seven jobs in
+[CI run 32730353917](https://github.com/zl0nline/RTSP_proxy/actions/runs/32730353917):
+application/PostgreSQL/package/systemd/nftables on amd64 and arm64, patched
+MediaMTX binaries on both architectures, native load/RTSP-TCP isolation on both
+architectures, and the external Chromium dashboard workflow.
+
+This closes only the camera-access administration slice. Other unfinished
+Phase-F operator workflows, Phase-G hardware/WAN/fault/24-hour evidence and
+Phase-H pilot rollout remain open; Production remains **NO-GO**.

@@ -424,8 +424,11 @@ sanitized audit/outbox pair after rollback and fail closed if that journal is
 unavailable. Exact
 local and direct-Linux evidence is recorded in
 [`docs/evidence/phase-f-camera-access-dashboard-contract.md`](docs/evidence/phase-f-camera-access-dashboard-contract.md).
-Independent review and native CI publication are still pending, so Phase F
-остаётся в работе до завершения остальных операторских workflows.
+Independent Spec/Standards review passed. Application, packaged PostgreSQL and
+patched MediaMTX/load jobs passed on both amd64 and arm64; the external Chromium
+job passed on amd64 at commit `9b0695605e7bf9efe00db0760d90f9906da85579` in
+[CI run 32730353917](https://github.com/zl0nline/RTSP_proxy/actions/runs/32730353917).
+Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.
