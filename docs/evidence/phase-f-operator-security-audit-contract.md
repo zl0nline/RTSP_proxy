@@ -3,9 +3,11 @@
 - Last reviewed: 2026-08-24
 - Status: current protected route-method matrix complete; Phase F remains in progress
 - Commits: denial/logout implementation `ef0e1f3fdfb74c174ac0dffa9f88213291ab19b5`;
-  generated matrix `39b29814d726d9020c1d19100521b4dfe729b91e`
+  generated matrix `39b29814d726d9020c1d19100521b4dfe729b91e`;
+  current 63-pair matrix `466e72feb6c5401dd4b281baabc07095b7173669`
 - CI: [run 32678955187](https://github.com/zl0nline/RTSP_proxy/actions/runs/32678955187)
-  and [run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)
+  [run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)
+  and [run 32708863738](https://github.com/zl0nline/RTSP_proxy/actions/runs/32708863738)
 
 ## Evidence boundary
 
@@ -69,11 +71,12 @@ CI run 32680412385 executed the generated matrix commit `39b2981`. All seven
 jobs passed again: application/PostgreSQL, patched MediaMTX and RTSP/load
 contracts on Linux amd64 and arm64, plus the external Chromium client on amd64.
 The first node-action router expanded the published inventory to 57 pairs;
-that delta is tracked separately in
+that historical delta is tracked separately in
 [`phase-f-node-operations-contract.md`](phase-f-node-operations-contract.md)
-and is not retroactively attributed to the 48-route CI run. The current
-disruptive-node implementation expands it to 63 pairs; its review/Linux status
-and pending publication gate are recorded in
+and is not retroactively attributed to the 48-route CI run. The disruptive-node
+implementation expanded the current inventory to 63 pairs. CI run 32708863738
+executed that exact commit and all seven jobs passed; its review and Linux
+evidence are recorded in
 [`phase-f-node-disruption-contract.md`](phase-f-node-disruption-contract.md).
 
 ## Remaining gates

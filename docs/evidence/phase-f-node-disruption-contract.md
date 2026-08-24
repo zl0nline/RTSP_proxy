@@ -1,7 +1,9 @@
 # Phase F disruptive node-operation contract
 
 - Last reviewed: 2026-08-24 (Spec/Standards PASS)
-- Status: implementation and direct-Linux validation complete; native CI pending
+- Status: implementation, independent review, direct-Linux validation and native CI complete
+- Commit: `466e72feb6c5401dd4b281baabc07095b7173669`
+- CI: [run 32708863738](https://github.com/zl0nline/RTSP_proxy/actions/runs/32708863738)
 - Architectures: one identical Linux amd64/arm64 server contract
 - Deployment: direct Linux/systemd, no Docker
 
@@ -84,8 +86,15 @@ production deployment never launch Chromium. No Docker or `sudo` was used.
 
 The macOS application run excluding the three separately executed browser
 tests passed `849 passed, 18 skipped` at 90.00% coverage; both POSIX browser
-process-group cleanup regressions then passed separately. Native amd64/arm64 CI
-remains the publication gate.
+process-group cleanup regressions then passed separately.
+
+CI run 32708863738 executed the exact implementation commit above. All seven
+jobs passed: application/PostgreSQL, packaged migrations, systemd/nftables,
+patched MediaMTX and RTSP/load contracts on Linux amd64 and arm64, plus the
+external-management-client Chromium job on amd64. The generated protected
+HTTP inventory in that run contains all 63 current route-method pairs. The
+real browser remains an external client; the server contract is identical on
+amd64 and arm64.
 
 ## Remaining gates
 

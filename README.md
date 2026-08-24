@@ -51,8 +51,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   all seven jobs passed in [CI run 32693949200](https://github.com/zl0nline/RTSP_proxy/actions/runs/32693949200)
 >   on commit `2f6b012d91ab4de2ad07d631f4cdfa46b2422255`.
 > - Phase-F disruptive node workflows: **implemented, independently reviewed
->   and validated on direct Linux; native amd64/arm64 CI pending**. Port change,
->   and DRAINING reconfigure/restart require recent MFA and an exact
+>   and green in direct-Linux plus native amd64/arm64 CI**. Port change and
+>   DRAINING reconfigure/restart require recent MFA and an exact
 >   camera/reader confirmation; a running process is also generation-bound.
 >   Empty-node restart remains the ordinary revision/state-fenced action.
 >   Admission remains fenced through the bounded runtime action;
@@ -380,7 +380,7 @@ including nested included-router prefixes, прошла оба независи�
 семь jobs в commit `39b29814d726d9020c1d19100521b4dfe729b91e`
 ([run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
 Будущие export/SSE/bulk routes должны расширить эту матрицу до активации.
-The last published inventory contains 57 protected route-method pairs after
+The prior published inventory contained 57 protected route-method pairs after
 the first node-action UI slice; it passed both independent reviews and all seven
 jobs in [run 32693949200](https://github.com/zl0nline/RTSP_proxy/actions/runs/32693949200).
 Dashboard node registration supports automatic random allocation or an exact
@@ -394,7 +394,7 @@ outbox. Reusing the key for another payload is a 409, and deleting the target
 node does not make the old key reusable. The complete slice is published at
 commit `2f6b012d91ab4de2ad07d631f4cdfa46b2422255` with native amd64/arm64,
 packaged PostgreSQL migration, MediaMTX/load and real-browser jobs green.
-The current implementation inventory contains 63 protected route-method pairs
+The current published inventory contains 63 protected route-method pairs
 after adding port-change and reconfigure preview/apply. These disruptive forms
 require recent MFA (300 seconds by default), bind the exact registered-camera
 and active-reader lists, and bind the MediaMTX generation when a process is
@@ -403,7 +403,9 @@ RUNNING-node restart uses the ordinary revision/state fence because its camera
 blast radius is zero. The admission fence remains held through one absolute
 runtime/rollback deadline. Exact review and direct-Linux evidence is recorded in
 [`docs/evidence/phase-f-node-disruption-contract.md`](docs/evidence/phase-f-node-disruption-contract.md);
-native amd64/arm64 publication CI is still pending.
+all seven native amd64/arm64 and external-browser jobs passed at commit
+`466e72feb6c5401dd4b281baabc07095b7173669` in
+[CI run 32708863738](https://github.com/zl0nline/RTSP_proxy/actions/runs/32708863738).
 Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не
