@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
@@ -72,6 +74,45 @@ LOGIN_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
     source_ip="198.51.100.10",
     user_agent="security-audit-test/1.0",
 )
+
+
+def _protected_route_method_matrix(
+    routes: Iterable[object],
+    *,
+    prefix: str = "",
+) -> tuple[tuple[str, str], ...]:
+    route_methods: list[tuple[str, str]] = []
+    for route in routes:
+        original_router = getattr(route, "original_router", None)
+        if original_router is not None:
+            include_context = getattr(route, "include_context", None)
+            included_prefix = getattr(include_context, "prefix", None)
+            nested_routes = getattr(original_router, "routes", None)
+            assert isinstance(included_prefix, str)
+            assert isinstance(nested_routes, list)
+            route_methods.extend(
+                _protected_route_method_matrix(
+                    nested_routes,
+                    prefix=f"{prefix}{included_prefix}",
+                )
+            )
+            continue
+
+        path = getattr(route, "path", "")
+        if not isinstance(path, str):
+            continue
+        effective_path = f"{prefix}{path}"
+        if not (
+            effective_path.startswith("/api/v1/")
+            or effective_path == "/dashboard"
+            or effective_path.startswith("/dashboard/")
+        ):
+            continue
+        route_methods.extend(
+            (method, effective_path)
+            for method in sorted(getattr(route, "methods", set()))
+        )
+    return tuple(route_methods)
 
 
 def test_operator_request_audit_context_is_bounded_and_secret_free() -> None:
@@ -1231,6 +1272,132 @@ def test_unsupported_operator_http_methods_are_normalized_and_audited(method: st
     assert event.audit_context.action == "request.unsupported"
     assert event.audit_context.http_method == "OTHER"
     assert event.reason_code == "operator_session_invalid"
+
+
+def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -> None:
+    anonymous_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    anonymous_app = create_app(
+        Settings(role=RuntimeRole.WEB),
+        operator_sessions=OperatorSessionControl(
+            store=anonymous_store,
+            token_factory=lambda: "x" * 43,
+        ),
+    )
+    route_methods = _protected_route_method_matrix(anonymous_app.routes)
+    assert len(route_methods) == 48
+
+    node_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    move_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    grant_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+
+    def concrete_path(template: str) -> str:
+        return (
+            template.replace("{node_id}", str(node_id))
+            .replace("{camera_id}", str(camera_id))
+            .replace("{move_id}", str(move_id))
+            .replace("{grant_id}", str(grant_id))
+        )
+
+    anonymous_client = TestClient(
+        anonymous_app,
+        base_url="https://management.example.test",
+    )
+    for method, template in route_methods:
+        before = len(anonymous_store.request_security_events())
+        response = anonymous_client.request(
+            method,
+            concrete_path(template),
+            follow_redirects=False,
+        )
+        assert response.status_code == 401, (method, template, response.text)
+        events = anonymous_store.request_security_events()
+        assert len(events) == before + 1, (method, template)
+        event = events[-1]
+        assert response.headers["x-request-id"] == str(event.audit_context.request_id)
+        assert event.audit_context.action != "request.unsupported", (method, template)
+        assert event.audit_context.resource_id != "invalid", (method, template)
+        assert event.reason_code == "operator_session_invalid"
+
+    scoped_account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:matrix-viewer@example.test",
+        display_name="Matrix viewer",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"camera:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+        authz_version=1,
+        enabled=True,
+    )
+    scoped_store = InMemoryOperatorSessionStore(
+        accounts=(scoped_account,),
+        clock=lambda: NOW,
+    )
+    scoped_control = OperatorSessionControl(
+        store=scoped_store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = scoped_control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    scoped_client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), operator_sessions=scoped_control),
+        base_url="https://management.example.test",
+    )
+    self_routes = {
+        ("GET", "/dashboard/logout"),
+        ("POST", "/dashboard/logout"),
+        ("GET", "/api/v1/operator/session"),
+        ("DELETE", "/api/v1/operator/session"),
+    }
+    for method, template in route_methods:
+        if (method, template) in self_routes:
+            continue
+        headers = {
+            "Cookie": f"__Host-rtsp_proxy_session={issued.session_token}",
+            "X-CSRF-Token": issued.csrf_token,
+        }
+        before = len(scoped_store.request_security_events())
+        if method == "POST" and template.startswith("/dashboard/"):
+            response = scoped_client.request(
+                method,
+                concrete_path(template),
+                headers=headers,
+                data={"_csrf": issued.csrf_token},
+                follow_redirects=False,
+            )
+        else:
+            response = scoped_client.request(
+                method,
+                concrete_path(template),
+                headers=headers,
+                follow_redirects=False,
+            )
+        assert response.status_code == 403, (method, template, response.text)
+        events = scoped_store.request_security_events()
+        assert len(events) == before + 1, (method, template)
+        event = events[-1]
+        assert event.reason_code in {
+            "operator_permission_denied",
+            "operator_scope_denied",
+        }
+        assert event.audit_context.action != "request.unsupported", (method, template)
+        assert response.headers["x-request-id"] == str(event.audit_context.request_id)
+
+
+def test_protected_route_method_matrix_composes_nested_router_prefixes() -> None:
+    nested_router = APIRouter()
+
+    @nested_router.get("/future")
+    def future_route() -> None:
+        return None
+
+    parent_router = APIRouter()
+    parent_router.include_router(nested_router, prefix="/nested")
+    app = FastAPI()
+    app.include_router(parent_router, prefix="/api/v1")
+
+    assert _protected_route_method_matrix(app.routes) == (
+        ("GET", "/api/v1/nested/future"),
+    )
 
 
 def test_dashboard_form_and_move_status_denials_keep_exact_semantic_targets() -> None:
