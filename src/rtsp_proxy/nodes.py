@@ -12,8 +12,8 @@ from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from threading import Lock, RLock
-from typing import Protocol
+from threading import BoundedSemaphore, Lock, RLock
+from typing import Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -66,6 +66,52 @@ class NodeCommandFence:
 
 
 @dataclass(frozen=True, slots=True)
+class NodeDisruptionAuditContext:
+    """Sanitized proof bound to one confirmed disruptive node mutation."""
+
+    mfa_verified_at_unix_ms: int
+    reader_observed_at_unix_ms: int
+    reader_blast_radius_sha256: str
+    active_readers: int
+    runtime_state: NodeState
+    release_id: str
+    process_id: int | None = None
+    process_start_ticks: int | None = None
+    process_boot_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        process_values = (self.process_id, self.process_start_ticks, self.process_boot_id)
+        if (
+            self.mfa_verified_at_unix_ms < 1
+            or self.reader_observed_at_unix_ms < 1
+            or len(self.reader_blast_radius_sha256) != 64
+            or set(self.reader_blast_radius_sha256) - set("0123456789abcdef")
+            or not 0 <= self.active_readers <= 100
+            or not self.release_id
+            or any(value is None for value in process_values)
+            != all(value is None for value in process_values)
+            or (self.process_id is not None and self.process_id < 1)
+            or (self.process_start_ticks is not None and self.process_start_ticks < 1)
+        ):
+            raise ValueError("node_disruption_audit_context_invalid")
+
+    def event_payload(self) -> dict[str, object]:
+        return {
+            "mfa_verified_at_unix_ms": self.mfa_verified_at_unix_ms,
+            "reader_observed_at_unix_ms": self.reader_observed_at_unix_ms,
+            "reader_blast_radius_sha256": self.reader_blast_radius_sha256,
+            "active_readers": self.active_readers,
+            "runtime_state": self.runtime_state.value,
+            "release_id": self.release_id,
+            "process_id": self.process_id,
+            "process_start_ticks": self.process_start_ticks,
+            "process_boot_id": (
+                None if self.process_boot_id is None else str(self.process_boot_id)
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class NodeMutationContext:
     """Redacted operator attribution copied into a normative node event."""
 
@@ -86,6 +132,7 @@ class NodeMutationContext:
     user_agent_sha256: str
     idempotency_key: UUID | None = None
     reason: str = "operator_request"
+    disruption_confirmation: NodeDisruptionAuditContext | None = None
 
     def __post_init__(self) -> None:
         digests = (self.source_ip_sha256, self.user_agent_sha256)
@@ -99,10 +146,7 @@ class NodeMutationContext:
             or self.authz_version < 1
             or not 1 <= len(self.action) <= 128
             or self.http_method not in {"POST", "PUT", "PATCH", "DELETE"}
-            or (
-                self.idempotency_key is not None
-                and self.idempotency_key.version != 4
-            )
+            or (self.idempotency_key is not None and self.idempotency_key.version != 4)
             or not 1 <= len(self.resource_scope) <= 256
             or not 1 <= len(self.resource_type) <= 64
             or not 1 <= len(self.resource_id) <= 128
@@ -145,6 +189,8 @@ class NodeMutationContext:
         }
         if self.idempotency_key is not None:
             payload["idempotency_key"] = str(self.idempotency_key)
+        if self.disruption_confirmation is not None:
+            payload["disruption_confirmation"] = self.disruption_confirmation.event_payload()
         return payload
 
 
@@ -190,6 +236,61 @@ class NodeRuntime(Protocol):
         action: NodeRuntimeAction,
         node: MediaNode,
     ) -> NodeRuntimeObservation: ...
+
+
+@dataclass(frozen=True, slots=True)
+class NodeDisruptionObservation:
+    active_reader_public_ids: tuple[PublicId, ...]
+    observed_at: datetime
+    process_id: int
+    process_start_ticks: int
+    process_boot_id: UUID
+    release_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.observed_at.tzinfo is None
+            or self.process_id < 1
+            or self.process_start_ticks < 1
+            or not self.release_id
+            or len(self.active_reader_public_ids) > 100
+            or self.active_reader_public_ids
+            != tuple(sorted(set(self.active_reader_public_ids), key=str))
+        ):
+            raise ValueError("node_disruption_observation_invalid")
+
+
+class NodeDisruptionObserver(Protocol):
+    def observe(self, node: MediaNode) -> NodeDisruptionObservation: ...
+
+    def fence(
+        self,
+        node: MediaNode,
+        affected_public_ids: tuple[PublicId, ...],
+    ) -> AbstractContextManager[NodeDisruptionFenceLease]: ...
+
+
+@dataclass(slots=True)
+class NodeDisruptionFenceLease:
+    observation: NodeDisruptionObservation
+    work_deadline_unix_ms: int | None = None
+    completed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.work_deadline_unix_ms is not None and self.work_deadline_unix_ms < 1:
+            raise ValueError("node_disruption_deadline_invalid")
+
+    def complete(self) -> None:
+        self.completed = True
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeDisruptionObserverAdapter:
+    observe: Callable[[MediaNode], NodeDisruptionObservation]
+    fence: Callable[
+        [MediaNode, tuple[PublicId, ...]],
+        AbstractContextManager[NodeDisruptionFenceLease],
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +420,10 @@ class NodePortChangePreview:
     desired_revision: int
     registered_cameras: int
     blast_radius_sha256: str
+    affected_public_ids: tuple[PublicId, ...]
+    active_reader_public_ids: tuple[PublicId, ...]
+    reader_blast_radius_sha256: str
+    reader_observed_at: datetime
     confirmation_token: str
 
 
@@ -329,9 +434,39 @@ class NodeReconfigurePreview:
     desired_revision: int
     registered_cameras: int
     blast_radius_sha256: str
+    affected_public_ids: tuple[PublicId, ...]
+    active_reader_public_ids: tuple[PublicId, ...]
+    reader_blast_radius_sha256: str
+    reader_observed_at: datetime
     target_release_id: str
     target_mediamtx_binary_sha256: str
     confirmation_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class NodeDisruptionConfirmationContext:
+    account_id: UUID
+    session_id: UUID
+    authz_version: int
+    mfa_verified_at_unix_ms: int
+
+    def __post_init__(self) -> None:
+        if self.authz_version < 1 or self.mfa_verified_at_unix_ms < 1:
+            raise ValueError("node_disruption_confirmation_context_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _NodeDisruptionDetails:
+    affected_public_ids: tuple[PublicId, ...]
+    active_reader_public_ids: tuple[PublicId, ...]
+    blast_radius_sha256: str
+    reader_blast_radius_sha256: str
+    reader_observed_at: datetime
+    process_id: int | None
+    process_start_ticks: int | None
+    process_boot_id: UUID | None
+    release_id: str
+    runtime_state: NodeState
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,9 +535,7 @@ class CameraCatalogPage:
             item.id for item in self.items
         ):
             raise ValueError("camera_catalog_page_invalid")
-        if self.next_after is not None and (
-            not self.items or self.next_after != self.items[-1].id
-        ):
+        if self.next_after is not None and (not self.items or self.next_after != self.items[-1].id):
             raise ValueError("camera_catalog_cursor_invalid")
 
 
@@ -537,6 +670,9 @@ class NodeDisruptionConfirmations(Protocol):
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str,
+        active_readers: int,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
     ) -> str: ...
 
     def verify_node_port_change(
@@ -549,6 +685,9 @@ class NodeDisruptionConfirmations(Protocol):
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str,
+        active_readers: int,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
     ) -> bool: ...
 
     def issue_node_reconfigure(
@@ -559,6 +698,9 @@ class NodeDisruptionConfirmations(Protocol):
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str,
+        active_readers: int,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
         target_release_id: str,
         target_mediamtx_binary_sha256: str,
     ) -> str: ...
@@ -572,6 +714,9 @@ class NodeDisruptionConfirmations(Protocol):
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str,
+        active_readers: int,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
         target_release_id: str,
         target_mediamtx_binary_sha256: str,
     ) -> bool: ...
@@ -594,9 +739,7 @@ class InMemoryNodeStore:
         self._cameras: list[CameraPlacement] = []
         self._camera_moves: list[CameraMove] = []
         self._port_changes: list[NodePortChange] = []
-        self._registration_requests: dict[
-            tuple[UUID, UUID], tuple[UUID, str, UUID]
-        ] = {}
+        self._registration_requests: dict[tuple[UUID, UUID], tuple[UUID, str, UUID]] = {}
         self._lock = RLock()
         self._lifecycle_locks = {node.id: Lock() for node in nodes}
         self._clock = clock
@@ -1455,8 +1598,7 @@ class InMemoryNodeStore:
                 (
                     candidate
                     for candidate in self._cameras
-                    if candidate.id == camera_id
-                    and candidate.state is not CameraState.DELETED
+                    if candidate.id == camera_id and candidate.state is not CameraState.DELETED
                 ),
                 None,
             )
@@ -1673,9 +1815,7 @@ class InMemoryNodeStore:
                 confirmed_disconnect_readers=confirmed_disconnect_readers,
                 source_port=source.external_port,
                 target_port=target.external_port,
-                source_endpoint=(
-                    f"rtsp://server:{source.external_port}/{camera.public_id}"
-                ),
+                source_endpoint=(f"rtsp://server:{source.external_port}/{camera.public_id}"),
                 target_endpoint=f"rtsp://server:{target.external_port}/{camera.public_id}",
                 expires_at=self._clock() + timedelta(seconds=timeout_seconds),
             )
@@ -1912,6 +2052,7 @@ class NodeControl:
         new_node_id: NodeIdFactory,
         is_port_bindable: PortBindable | None = None,
         node_runtime: NodeRuntime | None = None,
+        disruption_observer: NodeDisruptionObserver | None = None,
         provision_on_create: bool = False,
         recovery_workers: int = 4,
         confirmations: NodeDisruptionConfirmations | None = None,
@@ -1919,6 +2060,8 @@ class NodeControl:
         sleep: Callable[[float], None] = time.sleep,
         reconfigure_release_id: str | None = None,
         reconfigure_mediamtx_binary_sha256: str | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        disruption_workers: int = 2,
     ) -> None:
         if recovery_workers < 1 or recovery_workers > 16:
             raise ValueError("node_recovery_workers_invalid")
@@ -1927,27 +2070,25 @@ class NodeControl:
         self._new_node_id = new_node_id
         self._is_port_bindable = is_port_bindable or (lambda port: True)
         self._node_runtime = node_runtime
+        self._disruption_observer = disruption_observer
         self._provision_on_create = provision_on_create
         self._recovery_workers = recovery_workers
         self._confirmations = confirmations
         self._new_operation_id = new_operation_id
         self._sleep = sleep
-        if (reconfigure_release_id is None) != (
-            reconfigure_mediamtx_binary_sha256 is None
-        ):
+        self._clock = clock
+        if not 1 <= disruption_workers <= 8:
+            raise ValueError("node_disruption_workers_invalid")
+        self._disruption_admission = BoundedSemaphore(disruption_workers)
+        if (reconfigure_release_id is None) != (reconfigure_mediamtx_binary_sha256 is None):
             raise ValueError("node_release_identity_incomplete")
-        if (
-            reconfigure_release_id is not None
-            and reconfigure_mediamtx_binary_sha256 is not None
-        ):
+        if reconfigure_release_id is not None and reconfigure_mediamtx_binary_sha256 is not None:
             NodeRuntimeSpecLike.validate_release(
                 reconfigure_release_id,
                 reconfigure_mediamtx_binary_sha256,
             )
         self._reconfigure_release_id = reconfigure_release_id
-        self._reconfigure_mediamtx_binary_sha256 = (
-            reconfigure_mediamtx_binary_sha256
-        )
+        self._reconfigure_mediamtx_binary_sha256 = reconfigure_mediamtx_binary_sha256
 
     def register_node(
         self,
@@ -2149,7 +2290,12 @@ class NodeControl:
             )
             return self._execute_runtime(desired, NodeRuntimeAction.RESTART)
 
-    def preview_reconfigure(self, node_id: UUID) -> NodeReconfigurePreview:
+    def preview_reconfigure(
+        self,
+        node_id: UUID,
+        *,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
+    ) -> NodeReconfigurePreview:
         with self._store.lifecycle_guard(node_id):
             node = self._require_node_and_runtime(node_id)
             if node.state is not NodeState.DRAINING:
@@ -2162,18 +2308,20 @@ class NodeControl:
                 raise NodeLifecycleConflict("node_reconfigure_runtime_invalid")
             if self._confirmations is None:
                 raise NodeRuntimeUnavailable("node_confirmation_unavailable")
-            blast_radius_sha256 = self._node_camera_fingerprint(node.id)
+            details = self._node_disruption_details(node)
             target_release_id = self._reconfigure_release_id or node.release_id
             target_binary_sha256 = (
-                self._reconfigure_mediamtx_binary_sha256
-                or node.mediamtx_binary_sha256
+                self._reconfigure_mediamtx_binary_sha256 or node.mediamtx_binary_sha256
             )
             token = self._confirmations.issue_node_reconfigure(
                 node_id=node.id,
                 external_port=node.external_port,
                 desired_revision=node.desired_revision,
                 registered_cameras=node.registered_cameras,
-                blast_radius_sha256=blast_radius_sha256,
+                blast_radius_sha256=details.blast_radius_sha256,
+                reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                active_readers=len(details.active_reader_public_ids),
+                confirmation_context=confirmation_context,
                 target_release_id=target_release_id,
                 target_mediamtx_binary_sha256=target_binary_sha256,
             )
@@ -2182,7 +2330,11 @@ class NodeControl:
                 external_port=node.external_port,
                 desired_revision=node.desired_revision,
                 registered_cameras=node.registered_cameras,
-                blast_radius_sha256=blast_radius_sha256,
+                blast_radius_sha256=details.blast_radius_sha256,
+                affected_public_ids=details.affected_public_ids,
+                active_reader_public_ids=details.active_reader_public_ids,
+                reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                reader_observed_at=details.reader_observed_at,
                 target_release_id=target_release_id,
                 target_mediamtx_binary_sha256=target_binary_sha256,
                 confirmation_token=token,
@@ -2193,56 +2345,74 @@ class NodeControl:
         node_id: UUID,
         *,
         confirmation_token: str | None,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
         fence: NodeCommandFence | None = None,
         mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
-        with self._store.lifecycle_guard(node_id):
+        with (
+            self._disruption_slot(),
+            self._store.lifecycle_guard(node_id),
+        ):
             current = self._require_node_and_runtime(node_id)
             _require_node_command_fence(current, fence)
-            blast_radius_sha256 = self._node_camera_fingerprint(current.id)
             target_release_id = self._reconfigure_release_id or current.release_id
             target_binary_sha256 = (
-                self._reconfigure_mediamtx_binary_sha256
-                or current.mediamtx_binary_sha256
+                self._reconfigure_mediamtx_binary_sha256 or current.mediamtx_binary_sha256
             )
-            if (
-                self._confirmations is None
-                or confirmation_token is None
-                or not self._confirmations.verify_node_reconfigure(
-                    confirmation_token,
-                    node_id=current.id,
-                    external_port=current.external_port,
-                    desired_revision=current.desired_revision,
-                    registered_cameras=current.registered_cameras,
-                    blast_radius_sha256=blast_radius_sha256,
-                    target_release_id=target_release_id,
-                    target_mediamtx_binary_sha256=target_binary_sha256,
+            with self._fenced_node_disruption_details(current) as (details, lease):
+                if (
+                    self._confirmations is None
+                    or confirmation_token is None
+                    or not self._confirmations.verify_node_reconfigure(
+                        confirmation_token,
+                        node_id=current.id,
+                        external_port=current.external_port,
+                        desired_revision=current.desired_revision,
+                        registered_cameras=current.registered_cameras,
+                        blast_radius_sha256=details.blast_radius_sha256,
+                        reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                        active_readers=len(details.active_reader_public_ids),
+                        confirmation_context=confirmation_context,
+                        target_release_id=target_release_id,
+                        target_mediamtx_binary_sha256=target_binary_sha256,
+                    )
+                ):
+                    raise NodeDisruptionConfirmationRequired(
+                        "node_disruption_confirmation_required"
+                    )
+                confirmed_mutation = self._confirmed_mutation_context(
+                    mutation_context,
+                    confirmation_context,
+                    details,
                 )
-            ):
-                raise NodeDisruptionConfirmationRequired(
-                    "node_disruption_confirmation_required"
-                )
-            if self._reconfigure_release_id is None:
-                desired = self._store.request_reconfigure(
-                    node_id,
-                    expected_revision=current.desired_revision,
-                    expected_registered_cameras=current.registered_cameras,
-                    expected_blast_radius_sha256=blast_radius_sha256,
-                    mutation_context=mutation_context,
-                )
-            else:
-                desired = self._store.request_reconfigure(
-                    node_id,
-                    expected_revision=current.desired_revision,
-                    expected_registered_cameras=current.registered_cameras,
-                    expected_blast_radius_sha256=blast_radius_sha256,
-                    release_id=self._reconfigure_release_id,
-                    mediamtx_binary_sha256=(
-                        self._reconfigure_mediamtx_binary_sha256
+                if self._reconfigure_release_id is None:
+                    desired = self._store.request_reconfigure(
+                        node_id,
+                        expected_revision=current.desired_revision,
+                        expected_registered_cameras=current.registered_cameras,
+                        expected_blast_radius_sha256=details.blast_radius_sha256,
+                        mutation_context=confirmed_mutation,
+                    )
+                else:
+                    desired = self._store.request_reconfigure(
+                        node_id,
+                        expected_revision=current.desired_revision,
+                        expected_registered_cameras=current.registered_cameras,
+                        expected_blast_radius_sha256=details.blast_radius_sha256,
+                        release_id=self._reconfigure_release_id,
+                        mediamtx_binary_sha256=(self._reconfigure_mediamtx_binary_sha256),
+                        mutation_context=confirmed_mutation,
+                    )
+                result = self._execute_runtime(
+                    desired,
+                    NodeRuntimeAction.RECONFIGURE_RESTART,
+                    deadline_unix_ms=(
+                        None if lease is None else lease.work_deadline_unix_ms
                     ),
-                    mutation_context=mutation_context,
                 )
-            return self._execute_runtime(desired, NodeRuntimeAction.RECONFIGURE_RESTART)
+                if lease is not None:
+                    lease.complete()
+                return result
 
     def set_administrative_state(
         self,
@@ -2274,6 +2444,7 @@ class NodeControl:
         *,
         new_port: int,
         allowed_ports: Collection[int],
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
     ) -> NodePortChangePreview:
         with self._store.lifecycle_guard(node_id):
             node = self._store.get_node(node_id)
@@ -2287,14 +2458,17 @@ class NodeControl:
                 raise NodeLifecycleConflict("node_port_unchanged")
             if self._confirmations is None:
                 raise NodeRuntimeUnavailable("node_confirmation_unavailable")
-            blast_radius_sha256 = self._node_camera_fingerprint(node.id)
+            details = self._node_disruption_details(node)
             token = self._confirmations.issue_node_port_change(
                 node_id=node.id,
                 old_port=node.external_port,
                 new_port=new_port,
                 desired_revision=node.desired_revision,
                 registered_cameras=node.registered_cameras,
-                blast_radius_sha256=blast_radius_sha256,
+                blast_radius_sha256=details.blast_radius_sha256,
+                reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                active_readers=len(details.active_reader_public_ids),
+                confirmation_context=confirmation_context,
             )
             return NodePortChangePreview(
                 node_id=node.id,
@@ -2302,7 +2476,11 @@ class NodeControl:
                 new_port=new_port,
                 desired_revision=node.desired_revision,
                 registered_cameras=node.registered_cameras,
-                blast_radius_sha256=blast_radius_sha256,
+                blast_radius_sha256=details.blast_radius_sha256,
+                affected_public_ids=details.affected_public_ids,
+                active_reader_public_ids=details.active_reader_public_ids,
+                reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                reader_observed_at=details.reader_observed_at,
                 confirmation_token=token,
             )
 
@@ -2313,107 +2491,147 @@ class NodeControl:
         new_port: int,
         allowed_ports: Collection[int],
         confirmation_token: str | None,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
         fence: NodeCommandFence | None = None,
         mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
-        with self._store.lifecycle_guard(node_id):
+        with (
+            self._disruption_slot(),
+            self._store.lifecycle_guard(node_id),
+        ):
             current = self._require_node_and_runtime(node_id)
             _require_node_command_fence(current, fence)
-            blast_radius_sha256 = self._node_camera_fingerprint(current.id)
-            if (
-                self._confirmations is None
-                or confirmation_token is None
-                or not (
-                    self._confirmations.verify_node_port_change(
-                        confirmation_token,
-                        node_id=current.id,
-                        old_port=current.external_port,
-                        new_port=new_port,
-                        desired_revision=current.desired_revision,
-                        registered_cameras=current.registered_cameras,
-                        blast_radius_sha256=blast_radius_sha256,
+            with self._fenced_node_disruption_details(current) as (details, lease):
+                if (
+                    self._confirmations is None
+                    or confirmation_token is None
+                    or not (
+                        self._confirmations.verify_node_port_change(
+                            confirmation_token,
+                            node_id=current.id,
+                            old_port=current.external_port,
+                            new_port=new_port,
+                            desired_revision=current.desired_revision,
+                            registered_cameras=current.registered_cameras,
+                            blast_radius_sha256=details.blast_radius_sha256,
+                            reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                            active_readers=len(details.active_reader_public_ids),
+                            confirmation_context=confirmation_context,
+                        )
                     )
+                ):
+                    raise NodeDisruptionConfirmationRequired(
+                        "node_disruption_confirmation_required"
+                    )
+                if not self._is_port_bindable(new_port):
+                    raise NodePortInUse("node_port_in_use")
+                confirmed_mutation = self._confirmed_mutation_context(
+                    mutation_context,
+                    confirmation_context,
+                    details,
                 )
-            ):
-                raise NodeDisruptionConfirmationRequired("node_disruption_confirmation_required")
-            if not self._is_port_bindable(new_port):
-                raise NodePortInUse("node_port_in_use")
-            change = self._store.begin_port_change(
-                change_id=self._new_operation_id(),
-                node_id=node_id,
-                new_port=new_port,
-                allowed_ports=allowed_ports,
-                expected_revision=current.desired_revision,
-                expected_registered_cameras=current.registered_cameras,
-                expected_blast_radius_sha256=blast_radius_sha256,
-                mutation_context=mutation_context,
-            )
-            target = replace(
-                current,
-                external_port=change.new_port,
-                desired_revision=change.target_revision,
-            )
-            assert self._node_runtime is not None
-            try:
-                target_observation = self._node_runtime.execute(
-                    NodeRuntimeAction.RECONFIGURE_RESTART,
-                    target,
+                change = self._store.begin_port_change(
+                    change_id=self._new_operation_id(),
+                    node_id=node_id,
+                    new_port=new_port,
+                    allowed_ports=allowed_ports,
+                    expected_revision=current.desired_revision,
+                    expected_registered_cameras=current.registered_cameras,
+                    expected_blast_radius_sha256=details.blast_radius_sha256,
+                    mutation_context=confirmed_mutation,
                 )
-            except Exception as change_error:
-                self._rollback_port_change(current, change, change_error)
-                raise AssertionError("unreachable") from change_error
-            if not self._wait_for_port_release(change.old_port):
-                self._rollback_port_change(
+                target = replace(
                     current,
-                    change,
-                    RuntimeError("node_old_port_still_listening"),
+                    external_port=change.new_port,
+                    desired_revision=change.target_revision,
                 )
-                raise AssertionError("unreachable")
-            try:
-                return self._store.complete_port_change(change.id, target_observation)
-            except Exception as commit_error:
+                assert self._node_runtime is not None
                 try:
-                    committed = self._store.get_node(current.id)
-                    incomplete_ids = {
-                        candidate.id
-                        for candidate in self._store.list_incomplete_port_changes()
-                    }
-                except Exception:
-                    raise NodeRuntimeFailed(
-                        "node_port_change_commit_unknown",
-                        node_id=current.id,
-                    ) from commit_error
-                if (
-                    committed is not None
-                    and committed.external_port == change.new_port
-                    and committed.desired_revision == change.target_revision
-                    and committed.applied_revision == change.target_revision
-                    and change.id not in incomplete_ids
-                ):
-                    return committed
-                if (
-                    committed is None
-                    or committed.external_port != change.old_port
-                    or committed.desired_revision != change.source_revision
-                ):
-                    raise NodeRuntimeFailed(
-                        "node_port_change_commit_unknown",
-                        node_id=current.id,
-                    ) from commit_error
-                self._rollback_port_change(current, change, commit_error)
-                raise AssertionError("unreachable") from commit_error
+                    target_observation = self._execute_runtime_observation(
+                        NodeRuntimeAction.RECONFIGURE_RESTART,
+                        target,
+                        deadline_unix_ms=(
+                            None if lease is None else lease.work_deadline_unix_ms
+                        ),
+                    )
+                except Exception as change_error:
+                    self._rollback_port_change(
+                        current,
+                        change,
+                        change_error,
+                        deadline_unix_ms=(
+                            None if lease is None else lease.work_deadline_unix_ms
+                        ),
+                    )
+                    raise AssertionError("unreachable") from change_error
+                if not self._wait_for_port_release(change.old_port):
+                    self._rollback_port_change(
+                        current,
+                        change,
+                        RuntimeError("node_old_port_still_listening"),
+                        deadline_unix_ms=(
+                            None if lease is None else lease.work_deadline_unix_ms
+                        ),
+                    )
+                    raise AssertionError("unreachable")
+                try:
+                    result = self._store.complete_port_change(change.id, target_observation)
+                except Exception as commit_error:
+                    try:
+                        committed = self._store.get_node(current.id)
+                        incomplete_ids = {
+                            candidate.id for candidate in self._store.list_incomplete_port_changes()
+                        }
+                    except Exception:
+                        raise NodeRuntimeFailed(
+                            "node_port_change_commit_unknown",
+                            node_id=current.id,
+                        ) from commit_error
+                    if (
+                        committed is not None
+                        and committed.external_port == change.new_port
+                        and committed.desired_revision == change.target_revision
+                        and committed.applied_revision == change.target_revision
+                        and change.id not in incomplete_ids
+                    ):
+                        result = committed
+                    elif (
+                        committed is None
+                        or committed.external_port != change.old_port
+                        or committed.desired_revision != change.source_revision
+                    ):
+                        raise NodeRuntimeFailed(
+                            "node_port_change_commit_unknown",
+                            node_id=current.id,
+                        ) from commit_error
+                    else:
+                        self._rollback_port_change(
+                            current,
+                            change,
+                            commit_error,
+                            deadline_unix_ms=(
+                                None if lease is None else lease.work_deadline_unix_ms
+                            ),
+                        )
+                        raise AssertionError("unreachable") from commit_error
+                if lease is not None:
+                    lease.complete()
+                return result
 
     def _rollback_port_change(
         self,
         current: MediaNode,
         change: NodePortChange,
         change_error: Exception,
+        *,
+        deadline_unix_ms: int | None = None,
     ) -> None:
         assert self._node_runtime is not None
         try:
-            rollback_observation = self._node_runtime.execute(
+            rollback_observation = self._execute_runtime_observation(
                 NodeRuntimeAction.RECONFIGURE_RESTART,
                 current,
+                deadline_unix_ms=deadline_unix_ms,
             )
         except Exception as rollback_error:
             with suppress(Exception):
@@ -2436,8 +2654,7 @@ class NodeControl:
             try:
                 committed = self._store.get_node(current.id)
                 incomplete_ids = {
-                    candidate.id
-                    for candidate in self._store.list_incomplete_port_changes()
+                    candidate.id for candidate in self._store.list_incomplete_port_changes()
                 }
             except Exception:
                 raise NodeRuntimeFailed(
@@ -2490,6 +2707,233 @@ class NodeControl:
                 for camera in self._store.list_node_cameras(node_id)
             )
         )
+
+    def _node_disruption_details(
+        self,
+        node: MediaNode,
+    ) -> _NodeDisruptionDetails:
+        affected_public_ids, blast_radius_sha256 = self._node_camera_details(node)
+        if node.runtime_state is NodeState.RUNNING:
+            observer = self._resolve_disruption_observer()
+            try:
+                observation = observer.observe(node)
+            except NodeRuntimeUnavailable:
+                raise
+            except Exception:
+                raise NodeRuntimeUnavailable("node_disruption_observation_unavailable") from None
+            return self._validated_disruption_details(
+                node,
+                affected_public_ids,
+                blast_radius_sha256,
+                observation,
+            )
+        self._require_runtime_inactive(node)
+        return self._inactive_disruption_details(
+            node,
+            affected_public_ids,
+            blast_radius_sha256,
+        )
+
+    @contextmanager
+    def _fenced_node_disruption_details(
+        self,
+        node: MediaNode,
+    ) -> Iterator[tuple[_NodeDisruptionDetails, NodeDisruptionFenceLease | None]]:
+        affected_public_ids, blast_radius_sha256 = self._node_camera_details(node)
+        if node.runtime_state is not NodeState.RUNNING:
+            self._require_runtime_inactive(node)
+            yield (
+                self._inactive_disruption_details(
+                    node,
+                    affected_public_ids,
+                    blast_radius_sha256,
+                ),
+                None,
+            )
+            return
+        observer = self._resolve_disruption_observer()
+        fence = getattr(observer, "fence", None)
+        if not callable(fence):
+            raise NodeRuntimeUnavailable("node_disruption_fence_unavailable")
+        try:
+            manager = fence(node, affected_public_ids)
+            lease = manager.__enter__()
+        except Exception:
+            raise NodeRuntimeUnavailable("node_disruption_fence_failed") from None
+        try:
+            if not isinstance(lease, NodeDisruptionFenceLease):
+                raise NodeRuntimeUnavailable("node_disruption_fence_invalid")
+            yield (
+                self._validated_disruption_details(
+                    node,
+                    affected_public_ids,
+                    blast_radius_sha256,
+                    lease.observation,
+                ),
+                lease,
+            )
+        except BaseException as error:
+            try:
+                suppressed = manager.__exit__(type(error), error, error.__traceback__)
+            except Exception:
+                raise NodeRuntimeUnavailable("node_disruption_fence_failed") from None
+            if not suppressed:
+                raise
+        else:
+            try:
+                manager.__exit__(None, None, None)
+            except Exception:
+                raise NodeRuntimeUnavailable("node_disruption_fence_failed") from None
+
+    def _node_camera_details(self, node: MediaNode) -> tuple[tuple[PublicId, ...], str]:
+        cameras = tuple(
+            sorted(self._store.list_node_cameras(node.id), key=lambda item: str(item.public_id))
+        )
+        affected_public_ids = tuple(camera.public_id for camera in cameras)
+        if len(cameras) != node.registered_cameras:
+            raise NodeLifecycleConflict("node_registered_camera_count_changed")
+        blast_radius_sha256 = camera_placement_fingerprint(
+            tuple((camera.id, camera.placement_generation) for camera in cameras)
+        )
+        return affected_public_ids, blast_radius_sha256
+
+    def _resolve_disruption_observer(self) -> NodeDisruptionObserver:
+        if self._disruption_observer is not None:
+            return self._disruption_observer
+        if self._node_runtime is not None:
+            observe = getattr(self._node_runtime, "observe_disruption", None)
+            fence = getattr(self._node_runtime, "fence_disruption", None)
+            if callable(observe) and callable(fence):
+                return _RuntimeDisruptionObserverAdapter(
+                    observe=observe,
+                    fence=fence,
+                )
+        raise NodeRuntimeUnavailable("node_disruption_observation_unavailable")
+
+    def _validated_disruption_details(
+        self,
+        node: MediaNode,
+        affected_public_ids: tuple[PublicId, ...],
+        blast_radius_sha256: str,
+        observation: NodeDisruptionObservation,
+    ) -> _NodeDisruptionDetails:
+        now = self._clock()
+        if now.tzinfo is None:
+            raise NodeRuntimeUnavailable("node_confirmation_clock_invalid")
+        if (
+            observation.observed_at > now + timedelta(seconds=1)
+            or observation.observed_at < now - timedelta(seconds=30)
+            or observation.process_id != node.process_id
+            or observation.process_start_ticks != node.process_start_ticks
+            or observation.process_boot_id != node.process_boot_id
+            or observation.release_id != node.release_id
+            or not set(observation.active_reader_public_ids).issubset(affected_public_ids)
+        ):
+            raise NodeRuntimeUnavailable("node_disruption_observation_invalid")
+        reader_blast_radius_sha256 = node_reader_blast_radius_fingerprint(
+            node_id=node.id,
+            runtime_state=node.runtime_state,
+            process_identity=(
+                observation.process_id,
+                observation.process_start_ticks,
+                observation.process_boot_id,
+                observation.release_id,
+            ),
+            active_reader_public_ids=observation.active_reader_public_ids,
+        )
+        return _NodeDisruptionDetails(
+            affected_public_ids=affected_public_ids,
+            active_reader_public_ids=observation.active_reader_public_ids,
+            blast_radius_sha256=blast_radius_sha256,
+            reader_blast_radius_sha256=reader_blast_radius_sha256,
+            reader_observed_at=observation.observed_at,
+            process_id=observation.process_id,
+            process_start_ticks=observation.process_start_ticks,
+            process_boot_id=observation.process_boot_id,
+            release_id=observation.release_id,
+            runtime_state=node.runtime_state,
+        )
+
+    def _require_runtime_inactive(self, node: MediaNode) -> None:
+        assert self._node_runtime is not None
+        try:
+            observation = self._node_runtime.execute(NodeRuntimeAction.OBSERVE, node)
+        except Exception:
+            raise NodeRuntimeUnavailable("node_inactive_proof_unavailable") from None
+        if (
+            observation.state is not NodeState.STOPPED
+            or observation.process_id is not None
+            or observation.process_start_ticks is not None
+            or observation.process_boot_id is not None
+        ):
+            raise NodeRuntimeUnavailable("node_inactive_proof_invalid")
+
+    def _inactive_disruption_details(
+        self,
+        node: MediaNode,
+        affected_public_ids: tuple[PublicId, ...],
+        blast_radius_sha256: str,
+    ) -> _NodeDisruptionDetails:
+        now = self._clock()
+        if now.tzinfo is None:
+            raise NodeRuntimeUnavailable("node_confirmation_clock_invalid")
+        reader_fingerprint = node_reader_blast_radius_fingerprint(
+            node_id=node.id,
+            runtime_state=node.runtime_state,
+            process_identity=(None, None, None, node.release_id),
+            active_reader_public_ids=(),
+        )
+        return _NodeDisruptionDetails(
+            affected_public_ids=affected_public_ids,
+            active_reader_public_ids=(),
+            blast_radius_sha256=blast_radius_sha256,
+            reader_blast_radius_sha256=reader_fingerprint,
+            reader_observed_at=now,
+            process_id=None,
+            process_start_ticks=None,
+            process_boot_id=None,
+            release_id=node.release_id,
+            runtime_state=node.runtime_state,
+        )
+
+    @staticmethod
+    def _confirmed_mutation_context(
+        mutation_context: NodeMutationContext | None,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
+        details: _NodeDisruptionDetails,
+    ) -> NodeMutationContext | None:
+        if mutation_context is None:
+            return None
+        if (
+            confirmation_context is None
+            or confirmation_context.account_id != mutation_context.actor_account_id
+            or confirmation_context.session_id != mutation_context.actor_session_id
+            or confirmation_context.authz_version != mutation_context.authz_version
+        ):
+            raise NodeDisruptionConfirmationRequired("node_disruption_confirmation_required")
+        return replace(
+            mutation_context,
+            disruption_confirmation=NodeDisruptionAuditContext(
+                mfa_verified_at_unix_ms=confirmation_context.mfa_verified_at_unix_ms,
+                reader_observed_at_unix_ms=int(details.reader_observed_at.timestamp() * 1000),
+                reader_blast_radius_sha256=details.reader_blast_radius_sha256,
+                active_readers=len(details.active_reader_public_ids),
+                runtime_state=details.runtime_state,
+                release_id=details.release_id,
+                process_id=details.process_id,
+                process_start_ticks=details.process_start_ticks,
+                process_boot_id=details.process_boot_id,
+            ),
+        )
+
+    @contextmanager
+    def _disruption_slot(self) -> Iterator[None]:
+        if not self._disruption_admission.acquire(blocking=False):
+            raise NodeLifecycleBusy("node_disruption_busy")
+        try:
+            yield
+        finally:
+            self._disruption_admission.release()
 
     def delete_node(
         self,
@@ -2719,10 +3163,16 @@ class NodeControl:
         self,
         node: MediaNode,
         action: NodeRuntimeAction,
+        *,
+        deadline_unix_ms: int | None = None,
     ) -> MediaNode:
         assert self._node_runtime is not None
         try:
-            observation = self._node_runtime.execute(action, node)
+            observation = self._execute_runtime_observation(
+                action,
+                node,
+                deadline_unix_ms=deadline_unix_ms,
+            )
         except Exception as error:
             self._store.apply_runtime_observation(
                 node.id,
@@ -2747,6 +3197,28 @@ class NodeControl:
                 ),
             )
             raise NodeRuntimeFailed("node_runtime_operation_failed", node_id=node.id) from error
+
+    def _execute_runtime_observation(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+        *,
+        deadline_unix_ms: int | None = None,
+    ) -> NodeRuntimeObservation:
+        assert self._node_runtime is not None
+        if deadline_unix_ms is None:
+            return self._node_runtime.execute(action, node)
+        execute_until = getattr(self._node_runtime, "execute_until", None)
+        if not callable(execute_until):
+            raise NodeRuntimeUnavailable("node_runtime_deadline_unavailable")
+        return cast(
+            NodeRuntimeObservation,
+            execute_until(
+                action,
+                node,
+                deadline_unix_ms=deadline_unix_ms,
+            ),
+        )
 
 
 class CameraControl:
@@ -3215,6 +3687,31 @@ def camera_placement_fingerprint(
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
+def node_reader_blast_radius_fingerprint(
+    *,
+    node_id: UUID,
+    runtime_state: NodeState,
+    process_identity: tuple[int | None, int | None, UUID | None, str | None],
+    active_reader_public_ids: Collection[PublicId],
+) -> str:
+    process_id, process_start_ticks, process_boot_id, release_id = process_identity
+    readers = tuple(sorted(set(active_reader_public_ids), key=str))
+    if len(readers) > 100:
+        raise ValueError("node_reader_blast_radius_invalid")
+    payload = "\n".join(
+        (
+            str(node_id),
+            runtime_state.value,
+            "none" if process_id is None else str(process_id),
+            "none" if process_start_ticks is None else str(process_start_ticks),
+            "none" if process_boot_id is None else str(process_boot_id),
+            "none" if release_id is None else release_id,
+            *(str(public_id) for public_id in readers),
+        )
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
 def is_node_eligible(
     node: MediaNode,
     *,
@@ -3243,10 +3740,7 @@ def _require_node_command_fence(
 ) -> None:
     if fence is None:
         return
-    if (
-        node.desired_revision != fence.expected_revision
-        or node.state is not fence.expected_state
-    ):
+    if node.desired_revision != fence.expected_revision or node.state is not fence.expected_state:
         raise NodeLifecycleConflict("node_command_fence_conflict")
 
 

@@ -145,9 +145,7 @@ def test_incident_control_emits_one_failure_and_one_recovery_without_reminders()
     assert opened is not None
     assert opened.state is IncidentState.OPEN
     assert repeated == opened
-    assert [message.kind for message in store.list_notifications()] == [
-        NotificationKind.FAILURE
-    ]
+    assert [message.kind for message in store.list_notifications()] == [NotificationKind.FAILURE]
 
     recovered = control.observe(
         _node(FIRST_NODE_ID, port=10000),
@@ -247,16 +245,20 @@ def test_runtime_observation_failure_cannot_emit_a_false_recovery() -> None:
             health=NodeHealth.UNHEALTHY,
         )
     )
-    snapshot = FleetCollector(
-        nodes=InMemoryNodeStore(nodes=(node,)),
-        runtime=UnavailableRuntime(),
-        metrics=RecordingMetricSource(),
-        observations=observations,
-        incidents=IncidentControl(store=observations, clock=lambda: NOW),
-        max_nodes=50,
-        external_port_capacity=1000,
-        clock=lambda: NOW + timedelta(minutes=1),
-    ).run_once().nodes[0]
+    snapshot = (
+        FleetCollector(
+            nodes=InMemoryNodeStore(nodes=(node,)),
+            runtime=UnavailableRuntime(),
+            metrics=RecordingMetricSource(),
+            observations=observations,
+            incidents=IncidentControl(store=observations, clock=lambda: NOW),
+            max_nodes=50,
+            external_port_capacity=1000,
+            clock=lambda: NOW + timedelta(minutes=1),
+        )
+        .run_once()
+        .nodes[0]
+    )
 
     assert snapshot.scrape_status is NodeScrapeStatus.UNAVAILABLE
     assert snapshot.scrape_reason == "node_runtime_unavailable"
@@ -423,15 +425,19 @@ def test_collector_rejects_metrics_from_a_different_process_generation() -> None
                 release_id="0.2.0",
             )
 
-    snapshot = FleetCollector(
-        nodes=InMemoryNodeStore(nodes=(node,)),
-        runtime=SequencedRuntimeObserver([node]),
-        metrics=MismatchedMetrics(),
-        observations=InMemoryObservabilityStore(),
-        incidents=IncidentControl(store=InMemoryObservabilityStore()),
-        max_nodes=50,
-        external_port_capacity=1000,
-    ).run_once().nodes[0]
+    snapshot = (
+        FleetCollector(
+            nodes=InMemoryNodeStore(nodes=(node,)),
+            runtime=SequencedRuntimeObserver([node]),
+            metrics=MismatchedMetrics(),
+            observations=InMemoryObservabilityStore(),
+            incidents=IncidentControl(store=InMemoryObservabilityStore()),
+            max_nodes=50,
+            external_port_capacity=1000,
+        )
+        .run_once()
+        .nodes[0]
+    )
 
     assert snapshot.scrape_status is NodeScrapeStatus.UNAVAILABLE
     assert snapshot.scrape_reason == "node_metric_generation_mismatch"
@@ -591,9 +597,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
                 f"'{role}') THEN CREATE ROLE {role} LOGIN; END IF; END $$"
             )
         )
-        connection.execute(
-            text(f"GRANT rtsp_proxy_observability_hostile TO {role}")
-        )
+        connection.execute(text(f"GRANT rtsp_proxy_observability_hostile TO {role}"))
     for _ in range(2):
         subprocess.run(
             (
@@ -622,10 +626,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
             "0016_node_registration_keys"
         )
         assert not connection.scalar(
-            text(
-                "SELECT pg_has_role(current_user, "
-                "'rtsp_proxy_observability_hostile', 'MEMBER')"
-            )
+            text("SELECT pg_has_role(current_user, 'rtsp_proxy_observability_hostile', 'MEMBER')")
         )
     with pytest.raises(ProgrammingError), restricted.begin() as connection:
         connection.execute(text("SELECT source_url FROM cameras"))
@@ -635,9 +636,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
         connection.execute(text("UPDATE notification_incidents SET state='closed'"))
     if role == "rtsp_proxy_notifier":
         with pytest.raises(ProgrammingError), restricted.begin() as connection:
-            connection.execute(
-                text("UPDATE notification_messages SET status='sent'")
-            )
+            connection.execute(text("UPDATE notification_messages SET status='sent'"))
         store = PostgresObservabilityStore(restricted_url)
         try:
             store.assert_notification_ready()
@@ -658,9 +657,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
         try:
             store.assert_collector_ready()
             with administrator.begin() as connection:
-                connection.execute(
-                    text("REVOKE SELECT ON media_nodes FROM rtsp_proxy_collector")
-                )
+                connection.execute(text("REVOKE SELECT ON media_nodes FROM rtsp_proxy_collector"))
             with pytest.raises(RuntimeError, match="collector_capability_unavailable"):
                 store.assert_collector_ready()
         finally:
@@ -822,6 +819,7 @@ def test_notifier_database_operations_are_bounded_by_statement_timeout(
         blocker.close()
         store.close()
 
+
 def test_metric_sample_rejects_impossible_single_reader_counts() -> None:
     with pytest.raises(ValueError, match="occupied_streams_invalid"):
         NodeMetricSample(
@@ -867,9 +865,7 @@ def test_metric_and_snapshot_models_reject_inconsistent_evidence() -> None:
             0,
             2,
             1,
-            path_counters=(
-                PathMetricCounters("aaaaaaaaaaaaaaaaaaaaaaaaaa", 1, 1),
-            ),
+            path_counters=(PathMetricCounters("aaaaaaaaaaaaaaaaaaaaaaaaaa", 1, 1),),
         )
     with pytest.raises(ValueError, match="node_metric_process_identity_invalid"):
         NodeMetricObservation(
@@ -918,6 +914,7 @@ def test_observability_controls_reject_unbounded_or_naive_configuration() -> Non
             transport=RecordingNotificationTransport(),
             retry_delay=timedelta(0),
         )
+
     def collector(
         *,
         max_nodes: int = 50,
@@ -980,6 +977,7 @@ paths_outbound_bytes{name="bbbbbbbbbbbbbbbbbbbbbbbbbi",state="notReady"} 0
             PathMetricCounters("aaaaaaaaaaaaaaaaaaaaaaaaaa", 12_000, 8_000),
             PathMetricCounters("bbbbbbbbbbbbbbbbbbbbbbbbbi", 0, 0),
         ),
+        occupied_public_ids=("aaaaaaaaaaaaaaaaaaaaaaaaaa",),
     )
 
 
@@ -1323,9 +1321,7 @@ def test_smtp_transport_uses_stable_message_id_and_safe_incident_content(
         incident_id=UUID("30000000-0000-0000-0000-000000000003"),
         node_id=FIRST_NODE_ID,
         kind=NotificationKind.FAILURE,
-        dedupe_key=(
-            "node-incident:30000000-0000-0000-0000-000000000003:failure"
-        ),
+        dedupe_key=("node-incident:30000000-0000-0000-0000-000000000003:failure"),
         status=NotificationStatus.PROCESSING,
         attempts=0,
         available_at=NOW,
@@ -1349,9 +1345,7 @@ def test_smtp_transport_uses_stable_message_id_and_safe_incident_content(
     assert "From: rtsp-proxy@example.test" in email
     assert "To: operator@example.test" in email
     assert "Message-ID:" in email
-    assert (
-        "<node-incident.30000000-0000-0000-0000-000000000003.failure@rtsp-proxy>"
-    ) in email
+    assert ("<node-incident.30000000-0000-0000-0000-000000000003.failure@rtsp-proxy>") in email
     assert str(FIRST_NODE_ID) in email
     assert "failure" in email
     assert "smtp-secret" not in email
@@ -1440,7 +1434,6 @@ def test_explicit_smtp_data_rejection_uses_bounded_retry(tmp_path: Path) -> None
         def docmd(self, command: str, args: str = "") -> tuple[int, bytes]:
             self.calls.append(("docmd", (command, args)))
             return 451, b"try later"
-
 
     password_file = tmp_path / "smtp-password-rejected"
     password_file.write_text("secret\n", encoding="utf-8")

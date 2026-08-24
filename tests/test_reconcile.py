@@ -29,6 +29,7 @@ from rtsp_proxy.nodes import (
     EligibleNodeMissing,
     InMemoryNodeStore,
     MediaNode,
+    NodeDisruptionConfirmationContext,
     NodeHealth,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
@@ -596,6 +597,68 @@ def test_node_port_confirmation_is_bound_to_blast_radius_and_expiry() -> None:
     )
 
 
+def test_node_disruption_confirmation_binds_reader_generation_and_operator_session() -> None:
+    confirmations = ConfirmationTokenService(
+        secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+        lifetime_seconds=30,
+        wall_time=lambda: 1_700_000_000.0,
+    )
+    context = NodeDisruptionConfirmationContext(
+        account_id=UUID("50000000-0000-4000-8000-000000000001"),
+        session_id=UUID("50000000-0000-4000-8000-000000000002"),
+        authz_version=7,
+        mfa_verified_at_unix_ms=1_700_000_000_000,
+    )
+    token = confirmations.issue_node_port_change(
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256="a" * 64,
+        reader_blast_radius_sha256="b" * 64,
+        active_readers=1,
+        confirmation_context=context,
+    )
+
+    assert confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256="a" * 64,
+        reader_blast_radius_sha256="b" * 64,
+        active_readers=1,
+        confirmation_context=context,
+    )
+    assert not confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256="a" * 64,
+        reader_blast_radius_sha256="c" * 64,
+        active_readers=1,
+        confirmation_context=context,
+    )
+    assert not confirmations.verify_node_port_change(
+        token,
+        node_id=NODE_A,
+        old_port=12000,
+        new_port=12002,
+        desired_revision=3,
+        registered_cameras=1,
+        blast_radius_sha256="a" * 64,
+        reader_blast_radius_sha256="b" * 64,
+        active_readers=1,
+        confirmation_context=replace(context, authz_version=8),
+    )
+
+
 def test_node_reconfigure_confirmation_is_bound_to_exact_node_revision_and_placements() -> None:
     wall_time = [1_700_000_000.0]
     confirmations = ConfirmationTokenService(
@@ -815,6 +878,7 @@ def test_postgresql_move_deadline_uses_database_clock_not_web_clock(
         (NODE_A, 12000),
         (NODE_B, 12001),
     ):
+
         def allocate_node_id(selected: UUID = node_id) -> UUID:
             return selected
 
@@ -1138,12 +1202,15 @@ def test_camera_mutation_covers_noop_missing_node_and_failed_store_restore() -> 
     )
     current = store.get_camera(CAMERA_A)
     assert current is not None
-    assert control.update(
-        CAMERA_A,
-        name="renamed",
-        source_url=current.source_url,
-        confirmation_token=None,
-    ).name == "renamed"
+    assert (
+        control.update(
+            CAMERA_A,
+            name="renamed",
+            source_url=current.source_url,
+            confirmation_token=None,
+        ).name
+        == "renamed"
+    )
     store.set_camera_enabled(CAMERA_A, enabled=False)
     assert control.disable(CAMERA_A, confirmation_token=None).state is CameraState.DISABLED
 
@@ -1405,6 +1472,7 @@ def test_postgresql_move_abort_is_durable_idempotent_and_restores_revision(
         (NODE_A, 12000, 13000, 14000),
         (NODE_B, 12001, 13001, 14001),
     ):
+
         def selected_node_id(selected: UUID = node_id) -> UUID:
             return selected
 
@@ -1454,10 +1522,13 @@ def test_postgresql_move_abort_is_durable_idempotent_and_restores_revision(
 
     cleanup = store.request_camera_move_abort(move.id, reason="camera_move_expired")
     assert cleanup.state is CameraMoveState.CLEANUP_TARGET
-    assert store.request_camera_move_abort(
-        move.id,
-        reason="camera_move_expired",
-    ) == cleanup
+    assert (
+        store.request_camera_move_abort(
+            move.id,
+            reason="camera_move_expired",
+        )
+        == cleanup
+    )
     aborted = store.abort_camera_move(move.id)
     assert aborted.state is CameraMoveState.ABORTED
     assert store.abort_camera_move(move.id) == aborted

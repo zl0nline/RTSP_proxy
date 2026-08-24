@@ -32,7 +32,9 @@ from rtsp_proxy.node_runtime import (
     NodeRuntimeSpec,
     RootMediaNodeAdapter,
     SecureNodeConfigStore,
+    UnixMediaNodeClient,
     UnixMediaNodeClientFactory,
+    UnixNodeDisruptionObserver,
     UnixNodeSupervisorServer,
 )
 from rtsp_proxy.nodes import MediaNode, NodeHealth, NodeRuntimeAction, NodeState
@@ -180,6 +182,7 @@ def test_node_metrics_round_trip_binds_generation_and_path_counters() -> None:
                         "sent_bytes_total": 200,
                     }
                 ],
+                "occupied_public_ids": [str(PUBLIC_ID)],
                 "process_id": 123,
                 "process_start_ticks": 456,
                 "process_boot_id": str(ready_node().process_boot_id),
@@ -190,10 +193,14 @@ def test_node_metrics_round_trip_binds_generation_and_path_counters() -> None:
         {},
     )
 
-    actual = UnixMediaNodeClientFactory(
-        socket_path=socket_path,
-        timeout_seconds=1,
-    ).for_node(ready_node()).node_metrics()
+    actual = (
+        UnixMediaNodeClientFactory(
+            socket_path=socket_path,
+            timeout_seconds=1,
+        )
+        .for_node(ready_node())
+        .node_metrics()
+    )
 
     server.join(timeout=1)
     socket_path.unlink(missing_ok=True)
@@ -204,12 +211,340 @@ def test_node_metrics_round_trip_binds_generation_and_path_counters() -> None:
             100,
             200,
             path_counters=(PathMetricCounters(str(PUBLIC_ID), 100, 200),),
+            occupied_public_ids=(str(PUBLIC_ID),),
         ),
         process_id=123,
         process_start_ticks=456,
         process_boot_id=ready_node().process_boot_id,  # type: ignore[arg-type]
         release_id="v1.20.0",
     )
+
+
+def test_node_disruption_observer_returns_exact_process_bound_reader_set() -> None:
+    socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
+    server = unix_answer(
+        socket_path,
+        {
+            "schema_version": 1,
+            "ok": True,
+            "path": None,
+            "inventory": None,
+            "runtime": None,
+            "metrics": {
+                "active_sources": 1,
+                "occupied_streams": 1,
+                "received_bytes_total": 100,
+                "sent_bytes_total": 200,
+                "path_counters": [
+                    {
+                        "public_id": str(PUBLIC_ID),
+                        "received_bytes_total": 100,
+                        "sent_bytes_total": 200,
+                    }
+                ],
+                "occupied_public_ids": [str(PUBLIC_ID)],
+                "process_id": 123,
+                "process_start_ticks": 456,
+                "process_boot_id": str(ready_node().process_boot_id),
+                "release_id": "v1.20.0",
+            },
+            "error": None,
+        },
+        {},
+    )
+    observed_at = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+    observer = UnixNodeDisruptionObserver(
+        media_nodes=UnixMediaNodeClientFactory(
+            socket_path=socket_path,
+            timeout_seconds=1,
+        ),
+        clock=lambda: observed_at,
+    )
+
+    observation = observer.observe(ready_node())
+
+    server.join(timeout=1)
+    socket_path.unlink(missing_ok=True)
+    assert observation.active_reader_public_ids == (PUBLIC_ID,)
+    assert observation.observed_at == observed_at
+    assert observation.process_id == 123
+    assert observation.process_start_ticks == 456
+    assert observation.process_boot_id == ready_node().process_boot_id
+    assert observation.release_id == "v1.20.0"
+
+
+def test_node_disruption_fence_closes_paths_before_snapshot_and_restores_on_abort() -> None:
+    node = ready_node()
+
+    class MemoryMediaClient:
+        def __init__(self) -> None:
+            self.path = MediaPathConfig(
+                name=PUBLIC_ID,
+                source_url="rtsp://camera.invalid/main",
+            )
+            self.reader_attempts: list[str] = []
+
+        def get_path(self, name: PublicId) -> MediaPathConfig | None:
+            return self.path if name == self.path.name else None
+
+        def put_path(self, path: MediaPathConfig) -> None:
+            self.path = path
+
+        def node_metrics(self) -> NodeMetricObservation:
+            self.reader_attempts.append("denied" if self.path.max_readers == -1 else "admitted")
+            return NodeMetricObservation(
+                sample=NodeMetricSample(
+                    active_sources=1,
+                    occupied_streams=1,
+                    received_bytes_total=100,
+                    sent_bytes_total=200,
+                    path_counters=(PathMetricCounters(str(PUBLIC_ID), 100, 200),),
+                    occupied_public_ids=(str(PUBLIC_ID),),
+                ),
+                process_id=123,
+                process_start_ticks=456,
+                process_boot_id=node.process_boot_id,  # type: ignore[arg-type]
+                release_id=node.release_id,
+            )
+
+    class MemoryMediaFactory:
+        def __init__(self, client: MemoryMediaClient) -> None:
+            self.client = client
+            self.deadlines: list[int] = []
+
+        def for_node(self, selected: MediaNode) -> MemoryMediaClient:
+            assert selected == node
+            return self.client
+
+        def for_node_until(
+            self,
+            selected: MediaNode,
+            *,
+            deadline_unix_ms: int,
+        ) -> MemoryMediaClient:
+            self.deadlines.append(deadline_unix_ms)
+            return self.for_node(selected)
+
+    client = MemoryMediaClient()
+    factory = MemoryMediaFactory(client)
+    observer = UnixNodeDisruptionObserver(
+        media_nodes=factory,  # type: ignore[arg-type]
+        wall_time=lambda: 1_000.0,
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="abort"),
+        observer.fence(node, (PUBLIC_ID,)) as lease,
+    ):
+        assert lease.observation.active_reader_public_ids == (PUBLIC_ID,)
+        assert lease.work_deadline_unix_ms == 1_050_000
+        assert client.path.max_readers == -1
+        raise RuntimeError("abort")
+
+    assert client.reader_attempts == ["denied"]
+    assert client.path.max_readers == 1
+    assert factory.deadlines == [1_050_000, 1_060_000]
+
+
+def test_node_disruption_fence_accepts_registered_camera_without_runtime_path() -> None:
+    node = ready_node()
+
+    class MissingPathClient:
+        def get_path(self, _name: PublicId) -> None:
+            return None
+
+        def put_path(self, _path: MediaPathConfig) -> None:
+            raise AssertionError("an absent disabled path must not be created")
+
+        def node_metrics(self) -> NodeMetricObservation:
+            return NodeMetricObservation(
+                sample=NodeMetricSample(0, 0, 0, 0, occupied_public_ids=()),
+                process_id=123,
+                process_start_ticks=456,
+                process_boot_id=node.process_boot_id,  # type: ignore[arg-type]
+                release_id=node.release_id,
+            )
+
+    class MissingPathFactory:
+        def __init__(self) -> None:
+            self.client = MissingPathClient()
+
+        def for_node_until(
+            self,
+            selected: MediaNode,
+            *,
+            deadline_unix_ms: int,
+        ) -> MissingPathClient:
+            assert selected == node
+            assert deadline_unix_ms > int(time.time() * 1000)
+            return self.client
+
+    observer = UnixNodeDisruptionObserver(
+        media_nodes=MissingPathFactory(),  # type: ignore[arg-type]
+    )
+
+    with observer.fence(node, (PUBLIC_ID,)) as lease:
+        assert lease.observation.active_reader_public_ids == ()
+        lease.complete()
+
+
+def test_node_disruption_fence_restores_ambiguous_committed_put() -> None:
+    node = ready_node()
+
+    class AmbiguousPutClient:
+        def __init__(self) -> None:
+            self.path = MediaPathConfig(
+                name=PUBLIC_ID,
+                source_url="rtsp://camera.invalid/main",
+            )
+            self.fail_fence_once = True
+
+        def get_path(self, _name: PublicId) -> MediaPathConfig:
+            return self.path
+
+        def put_path(self, path: MediaPathConfig) -> None:
+            self.path = path
+            if path.max_readers == -1 and self.fail_fence_once:
+                self.fail_fence_once = False
+                raise MediaNodeUnavailable("node_media_deadline_exceeded")
+
+        def node_metrics(self) -> NodeMetricObservation:
+            raise AssertionError("metrics must not run after an ambiguous fence PUT")
+
+    class AmbiguousPutFactory:
+        def __init__(self) -> None:
+            self.client = AmbiguousPutClient()
+            self.deadlines: list[int] = []
+
+        def for_node_until(
+            self,
+            selected: MediaNode,
+            *,
+            deadline_unix_ms: int,
+        ) -> AmbiguousPutClient:
+            assert selected == node
+            assert deadline_unix_ms > int(time.time() * 1000)
+            self.deadlines.append(deadline_unix_ms)
+            return self.client
+
+    factory = AmbiguousPutFactory()
+    observer = UnixNodeDisruptionObserver(
+        media_nodes=factory,  # type: ignore[arg-type]
+    )
+
+    with (
+        pytest.raises(MediaNodeUnavailable, match="node_media_deadline_exceeded"),
+        observer.fence(node, (PUBLIC_ID,)),
+    ):
+        raise AssertionError("unreachable")
+
+    assert factory.client.path.max_readers == 1
+    assert len(factory.deadlines) == 2
+    assert factory.deadlines[1] > factory.deadlines[0]
+
+
+def test_node_media_shared_deadline_expires_before_any_new_helper_io(tmp_path: Path) -> None:
+    client = UnixMediaNodeClient(
+        socket_path=tmp_path / "must-not-be-opened.sock",
+        timeout_seconds=10,
+        node=ready_node(),
+        deadline_unix_ms=int(time.time() * 1000) - 1,
+    )
+
+    with pytest.raises(MediaNodeUnavailable, match="node_media_deadline_exceeded"):
+        client.get_path(PUBLIC_ID)
+
+
+def test_node_media_shared_deadline_is_bound_to_the_helper_request() -> None:
+    socket_path = Path("/tmp") / f"rtsp-media-{uuid4().hex}.sock"
+    captured: dict[str, object] = {}
+    server = unix_answer(
+        socket_path,
+        {
+            "schema_version": 1,
+            "ok": True,
+            "path": None,
+            "inventory": None,
+            "runtime": None,
+            "metrics": None,
+            "error": None,
+        },
+        captured,
+    )
+    deadline_unix_ms = int((time.time() + 10) * 1000)
+    client = UnixMediaNodeClient(
+        socket_path=socket_path,
+        timeout_seconds=10,
+        node=ready_node(),
+        deadline_unix_ms=deadline_unix_ms,
+    )
+
+    assert client.get_path(PUBLIC_ID) is None
+
+    server.join(timeout=2)
+    socket_path.unlink(missing_ok=True)
+    assert captured["deadline_unix_ms"] == deadline_unix_ms
+
+
+def test_hundred_path_fence_stops_at_one_shared_deadline() -> None:
+    node = ready_node()
+    alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+    public_ids = tuple(
+        sorted(
+            (
+                PublicId.parse("a" * 23 + alphabet[index // 32] + alphabet[index % 32] + "a")
+                for index in range(100)
+            ),
+            key=str,
+        )
+    )
+
+    class DeadlineClient:
+        calls = 0
+
+        def get_path(self, _name: PublicId) -> None:
+            self.calls += 1
+            if self.calls == 5:
+                raise MediaNodeUnavailable("node_media_deadline_exceeded")
+            return None
+
+        def put_path(self, _path: MediaPathConfig) -> None:
+            raise AssertionError("absent paths must not be mutated")
+
+        def node_metrics(self) -> NodeMetricObservation:
+            raise AssertionError("metrics must not run after deadline")
+
+    class DeadlineFactory:
+        def __init__(self) -> None:
+            self.client = DeadlineClient()
+            self.deadlines: list[int] = []
+
+        def for_node_until(
+            self,
+            selected: MediaNode,
+            *,
+            deadline_unix_ms: int,
+        ) -> DeadlineClient:
+            assert selected == node
+            self.deadlines.append(deadline_unix_ms)
+            return self.client
+
+    factory = DeadlineFactory()
+    observer = UnixNodeDisruptionObserver(
+        media_nodes=factory,  # type: ignore[arg-type]
+        wall_time=lambda: 1_000.0,
+        fence_timeout_seconds=1,
+    )
+
+    with (
+        pytest.raises(MediaNodeUnavailable, match="node_media_deadline_exceeded"),
+        observer.fence(node, public_ids),
+    ):
+        raise AssertionError("unreachable")
+
+    assert len(factory.deadlines) == 1
+    assert 1_000_000 < factory.deadlines[0] < 1_001_000
+    assert factory.client.calls == 5
 
 
 def test_node_aware_media_client_sanitizes_helper_failures(tmp_path: Path) -> None:

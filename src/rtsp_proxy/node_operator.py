@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from rtsp_proxy.nodes import NodeCommandFence, NodeMutationContext, NodeState
+from rtsp_proxy.nodes import (
+    NodeCommandFence,
+    NodeDisruptionConfirmationContext,
+    NodeMutationContext,
+    NodeState,
+)
 from rtsp_proxy.operator_access import OperatorPrincipal, OperatorRequestAuditContext
 
 
@@ -11,6 +16,26 @@ from rtsp_proxy.operator_access import OperatorPrincipal, OperatorRequestAuditCo
 class OperatorNodeCommand:
     fence: NodeCommandFence
     mutation_context: NodeMutationContext
+
+
+class OperatorRecentMfaRequired(RuntimeError):
+    """A destructive node command needs a newly MFA-verified session."""
+
+
+def node_disruption_confirmation_context(
+    *,
+    principal: OperatorPrincipal,
+    max_age_seconds: int,
+) -> NodeDisruptionConfirmationContext:
+    verified_at = principal.mfa_verified_at
+    if not principal.has_recent_mfa(max_age_seconds=max_age_seconds) or verified_at is None:
+        raise OperatorRecentMfaRequired("operator_recent_mfa_required")
+    return NodeDisruptionConfirmationContext(
+        account_id=principal.account_id,
+        session_id=principal.session_id,
+        authz_version=principal.authz_version,
+        mfa_verified_at_unix_ms=int(verified_at.timestamp() * 1000),
+    )
 
 
 def node_mutation_context(

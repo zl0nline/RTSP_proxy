@@ -358,9 +358,22 @@ class OperatorPrincipal:
     scopes: frozenset[str]
     authz_version: int
     mfa_verified_at: datetime | None
+    authenticated_at: datetime
 
     def allows(self, permission: OperatorPermission) -> bool:
         return any(permission in _ROLE_PERMISSIONS[role] for role in self.roles)
+
+    def has_recent_mfa(self, *, max_age_seconds: int) -> bool:
+        verified_at = self.mfa_verified_at
+        if (
+            max_age_seconds < 1
+            or verified_at is None
+            or verified_at.tzinfo is None
+            or self.authenticated_at.tzinfo is None
+        ):
+            return False
+        age = (self.authenticated_at - verified_at).total_seconds()
+        return 0 <= age <= max_age_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,9 +927,7 @@ class PostgresOperatorSessionStore:
         expected_authz_version: int | None = None,
         audit_context: OperatorRequestAuditContext | None = None,
     ) -> OperatorSession:
-        context = audit_context or OperatorRequestAuditContext.internal(
-            action="operator.login"
-        )
+        context = audit_context or OperatorRequestAuditContext.internal(action="operator.login")
         try:
             with self._engine.begin() as connection:
                 connection.execute(text("SET LOCAL synchronous_commit = on"))
@@ -1144,9 +1155,7 @@ class PostgresOperatorSessionStore:
                     session_id=None if row is None else row["session_id"],
                     authz_version=1 if row is None else int(row["aggregate_revision"]),
                     identity_source=(
-                        None
-                        if row is None
-                        else OperatorIdentitySource(row["identity_source"])
+                        None if row is None else OperatorIdentitySource(row["identity_source"])
                     ),
                     event_type="operator.authentication_denied",
                     reason_code=reason_code,
@@ -1249,8 +1258,7 @@ class OperatorSessionControl:
             mfa_verified=mfa_verified,
             expected_authz_version=expected_authz_version,
             audit_context=(
-                audit_context
-                or OperatorRequestAuditContext.internal(action="operator.login")
+                audit_context or OperatorRequestAuditContext.internal(action="operator.login")
             ),
         )
         return IssuedOperatorSession(session_token, csrf_token, session)
@@ -1347,6 +1355,7 @@ class OperatorSessionControl:
             scopes=account.scopes,
             authz_version=account.authz_version,
             mfa_verified_at=session.mfa_verified_at,
+            authenticated_at=session.last_seen_at,
         )
 
     def revoke(
@@ -1569,9 +1578,7 @@ def _record_request_security_event(
             "operator_permission_denied",
             "operator_scope_denied",
         },
-        "operator.authentication_denied": {
-            failure.value for failure in OperatorSessionFailure
-        },
+        "operator.authentication_denied": {failure.value for failure in OperatorSessionFailure},
     }
     if reason_code not in accepted_reasons.get(event_type, set()):
         raise ValueError("operator_security_event_invalid")

@@ -11,16 +11,25 @@ from rtsp_proxy.dashboard import (
     DASHBOARD_CSP,
     DashboardUnavailable,
     render_node_create,
+    render_node_port_change_confirmation,
+    render_node_reconfigure_confirmation,
     render_node_registration,
     render_unavailable,
 )
 from rtsp_proxy.dashboard_forms import DashboardForm, DashboardFormInvalid
-from rtsp_proxy.node_operator import node_mutation_context, operator_node_command
+from rtsp_proxy.node_operator import (
+    OperatorRecentMfaRequired,
+    node_disruption_confirmation_context,
+    node_mutation_context,
+    operator_node_command,
+)
 from rtsp_proxy.nodes import (
     MaximumNodesReached,
     MediaNode,
     NodeCommandFence,
     NodeControl,
+    NodeDisruptionConfirmationContext,
+    NodeDisruptionConfirmationRequired,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
@@ -30,6 +39,7 @@ from rtsp_proxy.nodes import (
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
+    NodeReleaseConflict,
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
     NodeState,
@@ -168,9 +178,7 @@ def node_dashboard_router(
             return _control_unavailable(principal)
         try:
             form = _form(request)
-            form.require_exact_fields(
-                frozenset({"_csrf", "expected_revision", "expected_state"})
-            )
+            form.require_exact_fields(frozenset({"_csrf", "expected_revision", "expected_state"}))
             fence = _node_fence(form)
             command = operator_node_command(
                 principal=principal,
@@ -220,6 +228,19 @@ def node_dashboard_router(
             allowed_states=frozenset(
                 {NodeState.RUNNING, NodeState.DRAINING, NodeState.MAINTENANCE}
             ),
+        )
+
+    @router.post("/dashboard/nodes/{node_id}/restart", include_in_schema=False)
+    def restart_node(request: Request, node_id: UUID) -> Response:
+        return node_action(
+            request,
+            node_id,
+            lambda control, value, fence, context: control.restart_node(
+                value,
+                fence=fence,
+                mutation_context=context,
+            ),
+            allowed_states=frozenset({NodeState.RUNNING}),
         )
 
     @router.post("/dashboard/nodes/{node_id}/drain", include_in_schema=False)
@@ -278,6 +299,202 @@ def node_dashboard_router(
             deleted=True,
         )
 
+    @router.post(
+        "/dashboard/nodes/{node_id}/port-change/preview",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def preview_port_change(request: Request, node_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if node_control is None:
+            return _control_unavailable(principal)
+        confirmation_context = _disruption_context_or_response(principal, settings)
+        if isinstance(confirmation_context, Response):
+            return confirmation_context
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset({"_csrf", "new_port", "expected_revision", "expected_state"})
+            )
+            fence = _node_fence(form)
+            if fence.expected_state is not NodeState.RUNNING:
+                raise DashboardFormInvalid("dashboard_form_invalid")
+            preview = node_control.preview_port_change(
+                node_id,
+                new_port=_required_port(form, "new_port"),
+                allowed_ports=(settings.node_registration_policy().allowed_external_ports()),
+                confirmation_context=confirmation_context,
+            )
+            if preview.desired_revision != fence.expected_revision:
+                raise NodeLifecycleConflict("node_revision_conflict")
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            expected = _node_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _html_response(
+            render_node_port_change_confirmation(
+                preview=preview,
+                principal=principal,
+                csrf_token=form.csrf_token,
+            )
+        )
+
+    @router.post("/dashboard/nodes/{node_id}/port-change", include_in_schema=False)
+    def change_port(request: Request, node_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if node_control is None:
+            return _control_unavailable(principal)
+        confirmation_context = _disruption_context_or_response(principal, settings)
+        if isinstance(confirmation_context, Response):
+            return confirmation_context
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset(
+                    {
+                        "_csrf",
+                        "new_port",
+                        "expected_revision",
+                        "expected_state",
+                        "confirmation_token",
+                    }
+                )
+            )
+            fence = _node_fence(form)
+            command = operator_node_command(
+                principal=principal,
+                audit_context=_audit_context(request),
+                expected_revision=fence.expected_revision,
+                expected_state=fence.expected_state,
+                allowed_states=frozenset({NodeState.RUNNING}),
+            )
+            node_control.change_port(
+                node_id,
+                new_port=_required_port(form, "new_port"),
+                allowed_ports=(settings.node_registration_policy().allowed_external_ports()),
+                confirmation_token=form.required("confirmation_token", max_length=4096),
+                confirmation_context=confirmation_context,
+                fence=command.fence,
+                mutation_context=command.mutation_context,
+            )
+        except (DashboardFormInvalid, ValueError):
+            return _form_invalid(principal)
+        except Exception as error:
+            expected = _node_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _node_redirect(node_id)
+
+    @router.post(
+        "/dashboard/nodes/{node_id}/reconfigure/preview",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def preview_reconfigure(request: Request, node_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if node_control is None:
+            return _control_unavailable(principal)
+        confirmation_context = _disruption_context_or_response(principal, settings)
+        if isinstance(confirmation_context, Response):
+            return confirmation_context
+        try:
+            form = _form(request)
+            form.require_exact_fields(frozenset({"_csrf", "expected_revision", "expected_state"}))
+            fence = _node_fence(form)
+            if fence.expected_state is not NodeState.DRAINING:
+                raise DashboardFormInvalid("dashboard_form_invalid")
+            preview = node_control.preview_reconfigure(
+                node_id,
+                confirmation_context=confirmation_context,
+            )
+            if preview.desired_revision != fence.expected_revision:
+                raise NodeLifecycleConflict("node_revision_conflict")
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            expected = _node_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _html_response(
+            render_node_reconfigure_confirmation(
+                preview=preview,
+                principal=principal,
+                csrf_token=form.csrf_token,
+            )
+        )
+
+    @router.post("/dashboard/nodes/{node_id}/reconfigure", include_in_schema=False)
+    def reconfigure(request: Request, node_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if node_control is None:
+            return _control_unavailable(principal)
+        confirmation_context = _disruption_context_or_response(principal, settings)
+        if isinstance(confirmation_context, Response):
+            return confirmation_context
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset(
+                    {
+                        "_csrf",
+                        "expected_revision",
+                        "expected_state",
+                        "confirmation_token",
+                    }
+                )
+            )
+            fence = _node_fence(form)
+            command = operator_node_command(
+                principal=principal,
+                audit_context=_audit_context(request),
+                expected_revision=fence.expected_revision,
+                expected_state=fence.expected_state,
+                allowed_states=frozenset({NodeState.DRAINING}),
+            )
+            node_control.reconfigure_node(
+                node_id,
+                confirmation_token=form.required("confirmation_token", max_length=4096),
+                confirmation_context=confirmation_context,
+                fence=command.fence,
+                mutation_context=command.mutation_context,
+            )
+        except (DashboardFormInvalid, ValueError):
+            return _form_invalid(principal)
+        except Exception as error:
+            expected = _node_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _node_redirect(node_id)
+
+    @router.post("/dashboard/nodes/{node_id}/release", include_in_schema=False)
+    def update_release(request: Request, node_id: UUID) -> Response:
+        return node_action(
+            request,
+            node_id,
+            lambda control, value, fence, context: control.update_node_release(
+                value,
+                release_id=settings.node_release_id,
+                mediamtx_binary_sha256=settings.node_mediamtx_binary_sha256,
+                fence=fence,
+                mutation_context=context,
+            ),
+            allowed_states=frozenset({NodeState.STOPPED}),
+        )
+
     return router
 
 
@@ -292,6 +509,17 @@ def _optional_port(form: DashboardForm) -> int | None:
     raw_port = form.optional("external_port", max_length=5)
     if raw_port is None or raw_port == "":
         return None
+    try:
+        port = int(raw_port, 10)
+    except ValueError:
+        raise DashboardFormInvalid("dashboard_form_invalid") from None
+    if not 1 <= port <= 65535:
+        raise DashboardFormInvalid("dashboard_form_invalid")
+    return port
+
+
+def _required_port(form: DashboardForm, field: str) -> int:
+    raw_port = form.required(field, max_length=5)
     try:
         port = int(raw_port, 10)
     except ValueError:
@@ -345,6 +573,30 @@ def _principal(request: Request) -> OperatorPrincipal | Response:
         ),
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     )
+
+
+def _disruption_context_or_response(
+    principal: OperatorPrincipal,
+    settings: Settings,
+) -> NodeDisruptionConfirmationContext | Response:
+    try:
+        return node_disruption_confirmation_context(
+            principal=principal,
+            max_age_seconds=settings.operator_recent_mfa_seconds,
+        )
+    except OperatorRecentMfaRequired:
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Требуется повторное подтверждение MFA",
+                message=(
+                    "Срок недавней MFA-проверки истёк. Выполните вход повторно "
+                    "перед подтверждением операции, которая отключит потоки."
+                ),
+                login_href="/auth/oidc/login",
+            ),
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            principal=principal,
+        )
 
 
 def _node_error(
@@ -410,6 +662,24 @@ def _node_error(
             DashboardUnavailable(
                 title="Нода не пуста",
                 message="Сначала переместите или удалите все камеры этой ноды.",
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(error, NodeDisruptionConfirmationRequired):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Требуется новое подтверждение",
+                message="Blast radius изменился или подтверждение истекло.",
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(error, NodeReleaseConflict):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Release нельзя изменить",
+                message="Остановите и очистите ноду перед сменой release.",
             ),
             status_code=status.HTTP_409_CONFLICT,
             principal=principal,

@@ -1041,8 +1041,8 @@ reviews plus all seven jobs at commit
 ([CI run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
 Future export/SSE/bulk routes remain activation-gated until they enter that
 inventory and add their surface-specific security evidence.
-The current published inventory contains 57 protected route-method pairs after
-the node-action router was added. It passed independent Spec/Standards review
+The last published inventory contains 57 protected route-method pairs after
+the first node-action router slice. It passed independent Spec/Standards review
 and all seven jobs in
 [CI run 32693949200](https://github.com/zl0nline/RTSP_proxy/actions/runs/32693949200)
 on commit `2f6b012d91ab4de2ad07d631f4cdfa46b2422255`.
@@ -1062,18 +1062,35 @@ a replacement. Release 0.8.0 remains rolling-compatible with 0015, but this
 specific write path returns a bounded 503 until exact schema 0016 is current.
 Exact local/Linux/review evidence is tracked in
 [`docs/evidence/phase-f-node-operations-contract.md`](evidence/phase-f-node-operations-contract.md).
-No Phase-F completion claim is made yet.
+The current implementation adds port-change and reconfigure preview/apply and
+brings the generated protected inventory to 63 route-method pairs. Both
+dashboard and JSON API require exact desired revision/source state. Port change
+and DRAINING reconfigure/restart additionally require recent MFA plus the
+complete registered-camera and active-reader sets. A RUNNING node binds exact
+PID/start/boot/release; STOPPED/FAILED reconfigure binds process absence. An
+empty RUNNING-node restart remains the ordinary revision/state-fenced action.
+RUNNING-node confirmed apply closes admission on every
+existing path without recreating absent disabled/deleting paths. One absolute
+60-second fence budget allocates 50 seconds to fence/runtime/port rollback and
+the final 10 seconds only to exact path restoration; the root helper still
+retains its own configured cleanup reserve of at least 20 seconds. Two applies
+may run concurrently per web process and excess work fails retryably before
+mutation. Exact review and direct-Linux evidence is tracked in
+[`docs/evidence/phase-f-node-disruption-contract.md`](evidence/phase-f-node-disruption-contract.md);
+native amd64/arm64 publication CI is pending. No Phase-F completion claim is
+made yet.
 
-- [~] node/camera pages and actions (read-only server/node overview, bounded
+- [x] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green; camera move
   UI CI-green; node registration and bounded lifecycle actions CI-green;
-  remaining disruptive node workflows are pending);
+  disruptive port-change/reconfigure/restart implementation and review complete,
+  native publication CI pending);
 - [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
-- [~] recursively generated route-method negative matrix (current 57-route
-  surface published and CI-green); future
-  export/SSE/bulk routes must extend it before activation;
+- [~] recursively generated route-method negative matrix (57-route surface
+  published and CI-green; current 63-route implementation pending publication);
+  future export/SSE/bulk routes must extend it before activation;
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

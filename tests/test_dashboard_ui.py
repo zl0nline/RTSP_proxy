@@ -30,12 +30,17 @@ from rtsp_proxy.nodes import (
     MediaNode,
     NodeCommandFence,
     NodeControl,
+    NodeDisruptionConfirmationContext,
+    NodeDisruptionConfirmationRequired,
     NodeHealth,
     NodeManagementPortRangeExhausted,
     NodeMutationContext,
+    NodePortChangePreview,
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
+    NodeReconfigurePreview,
+    NodeReleaseConflict,
     NodeRuntimeAction,
     NodeRuntimeFailed,
     NodeRuntimeObservation,
@@ -153,9 +158,7 @@ class RecordingNodeDashboardControl:
         fence: NodeCommandFence,
         mutation_context: NodeMutationContext,
     ) -> MediaNode:
-        self.calls.append(
-            ("administrative", (node_id, state, fence, mutation_context))
-        )
+        self.calls.append(("administrative", (node_id, state, fence, mutation_context)))
         return replace(self.node, state=state, maintenance=state is NodeState.MAINTENANCE)
 
     def delete_node(
@@ -166,6 +169,147 @@ class RecordingNodeDashboardControl:
         mutation_context: NodeMutationContext,
     ) -> None:
         self.calls.append(("delete", (node_id, fence, mutation_context)))
+
+    def restart_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(("restart", (node_id, fence, mutation_context)))
+        return self.node
+
+    def preview_port_change(
+        self,
+        node_id: UUID,
+        *,
+        new_port: int,
+        allowed_ports: tuple[int, ...],
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
+    ) -> NodePortChangePreview:
+        self.calls.append(
+            (
+                "port_preview",
+                (node_id, new_port, allowed_ports, confirmation_context),
+            )
+        )
+        affected = (
+            PublicId.parse("a" * 26),
+            PublicId.parse("b" * 25 + "i"),
+        )
+        return NodePortChangePreview(
+            node_id=node_id,
+            old_port=10543,
+            new_port=new_port,
+            desired_revision=7,
+            registered_cameras=2,
+            blast_radius_sha256="b" * 64,
+            affected_public_ids=affected,
+            active_reader_public_ids=affected,
+            reader_blast_radius_sha256="c" * 64,
+            reader_observed_at=NOW,
+            confirmation_token="port-confirmation-token",
+        )
+
+    def change_port(
+        self,
+        node_id: UUID,
+        *,
+        new_port: int,
+        allowed_ports: tuple[int, ...],
+        confirmation_token: str | None,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(
+            (
+                "port_change",
+                (
+                    node_id,
+                    new_port,
+                    allowed_ports,
+                    confirmation_token,
+                    confirmation_context,
+                    fence,
+                    mutation_context,
+                ),
+            )
+        )
+        return replace(self.node, external_port=new_port)
+
+    def preview_reconfigure(
+        self,
+        node_id: UUID,
+        *,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
+    ) -> NodeReconfigurePreview:
+        self.calls.append(("reconfigure_preview", (node_id, confirmation_context)))
+        affected = (
+            PublicId.parse("a" * 26),
+            PublicId.parse("b" * 25 + "i"),
+        )
+        return NodeReconfigurePreview(
+            node_id=node_id,
+            external_port=10543,
+            desired_revision=7,
+            registered_cameras=2,
+            blast_radius_sha256="b" * 64,
+            affected_public_ids=affected,
+            active_reader_public_ids=affected,
+            reader_blast_radius_sha256="c" * 64,
+            reader_observed_at=NOW,
+            target_release_id="0.2.1",
+            target_mediamtx_binary_sha256="a" * 64,
+            confirmation_token="reconfigure-confirmation-token",
+        )
+
+    def reconfigure_node(
+        self,
+        node_id: UUID,
+        *,
+        confirmation_token: str | None,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(
+            (
+                "reconfigure",
+                (
+                    node_id,
+                    confirmation_token,
+                    confirmation_context,
+                    fence,
+                    mutation_context,
+                ),
+            )
+        )
+        return self.node
+
+    def update_node_release(
+        self,
+        node_id: UUID,
+        *,
+        release_id: str,
+        mediamtx_binary_sha256: str,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(
+            (
+                "release",
+                (
+                    node_id,
+                    release_id,
+                    mediamtx_binary_sha256,
+                    fence,
+                    mutation_context,
+                ),
+            )
+        )
+        return self.node
 
 
 class StaticCameraCatalog:
@@ -229,9 +373,7 @@ class RecordingCameraMutations:
         name: str | None = None,
         source_url: str | None = None,
     ) -> CameraMutationPreview:
-        self.calls.append(
-            ("preview", camera_id, operation, expected_revision, name, source_url)
-        )
+        self.calls.append(("preview", camera_id, operation, expected_revision, name, source_url))
         return CameraMutationPreview(
             camera_id=camera_id,
             operation=operation,
@@ -328,9 +470,7 @@ class RecordingCameraMoves:
         target_node_id: UUID,
         expected_revision: int | None = None,
     ) -> CameraMovePreview:
-        self.calls.append(
-            ("preview", camera_id, target_node_id, expected_revision)
-        )
+        self.calls.append(("preview", camera_id, target_node_id, expected_revision))
         return CameraMovePreview(
             camera_id=camera_id,
             source_node_id=NODE_ID,
@@ -427,7 +567,7 @@ def _domain_camera_mutations(
         runtime_state=NodeState.RUNNING,
         health=NodeHealth.HEALTHY,
         management_fresh=True,
-            management_observed_at=datetime.now(UTC),
+        management_observed_at=datetime.now(UTC),
         config_compatible=True,
         desired_revision=1,
         applied_revision=1,
@@ -551,6 +691,7 @@ def _authenticated_dashboard(
     settings: Settings | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
     scopes: frozenset[str] = frozenset({"server:*"}),
+    authenticated_at: datetime = NOW,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
@@ -562,11 +703,16 @@ def _authenticated_dashboard(
         authz_version=1,
         enabled=True,
     )
+    session_clock = [NOW]
     sessions = OperatorSessionControl(
-        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        store=InMemoryOperatorSessionStore(
+            accounts=(account,),
+            clock=lambda: session_clock[0],
+        ),
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
     )
     issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    session_clock[0] = authenticated_at
     client = TestClient(
         create_app(
             settings or Settings(role=RuntimeRole.WEB),
@@ -664,9 +810,7 @@ def test_dashboard_authentication_failure_offers_oidc_login_when_configured() ->
     response = client.get("/dashboard")
 
     assert response.status_code == 401
-    assert '<a class="button-link" href="/auth/oidc/login">Войти через OIDC</a>' in (
-        response.text
-    )
+    assert '<a class="button-link" href="/auth/oidc/login">Войти через OIDC</a>' in (response.text)
 
 
 def test_dashboard_exposes_csrf_protected_browser_logout() -> None:
@@ -693,9 +837,7 @@ def test_dashboard_exposes_csrf_protected_browser_logout() -> None:
     assert '<a href="/dashboard/logout">Выйти</a>' in dashboard.text
     assert logout_page.status_code == 200
     assert '<form method="post" action="/dashboard/logout">' in logout_page.text
-    assert 'name="_csrf" value="ccccccccccccccccccccccccccccccccccccccccccc"' in (
-        logout_page.text
-    )
+    assert 'name="_csrf" value="ccccccccccccccccccccccccccccccccccccccccccc"' in (logout_page.text)
     assert missing_csrf.status_code == 401
     assert logged_out.status_code == 303
     assert logged_out.headers["location"] == "/dashboard"
@@ -919,12 +1061,8 @@ def test_dashboard_node_create_supports_random_and_manual_port_with_csrf() -> No
     assert 'name="idempotency_key"' in create_page.text
     assert "10540–10549" in create_page.text  # noqa: RUF001
     assert automatic.status_code == manual.status_code == 303
-    assert automatic.headers["location"] == (
-        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
-    )
-    assert manual.headers["location"] == (
-        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
-    )
+    assert automatic.headers["location"] == (f"/dashboard/nodes/{CREATED_NODE_ID}/registered")
+    assert manual.headers["location"] == (f"/dashboard/nodes/{CREATED_NODE_ID}/registered")
     accepted = client.get(automatic.headers["location"], headers=headers)
     assert accepted.status_code == 200
     assert "Нода зарегистрирована" in accepted.text
@@ -1004,9 +1142,7 @@ def test_dashboard_node_create_is_fail_closed_and_reports_port_exhaustion() -> N
             "Достигнут предел нод",
         ),
         (
-            NodeManagementPortRangeExhausted(
-                "node_management_port_range_exhausted"
-            ),
+            NodeManagementPortRangeExhausted("node_management_port_range_exhausted"),
             409,
             "Нет management-портов",
         ),
@@ -1080,9 +1216,7 @@ def test_dashboard_node_create_runtime_failure_redirects_to_persisted_node() -> 
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == (
-        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
-    )
+    assert response.headers["location"] == (f"/dashboard/nodes/{CREATED_NODE_ID}/registered")
     persisted = client.get(response.headers["location"], headers=headers)
     assert persisted.status_code == 200
     assert "Регистрация сохранена, запуск не завершён" in persisted.text
@@ -1125,8 +1259,10 @@ def test_dashboard_node_create_replays_one_session_bound_registration() -> None:
     )
 
     assert first.status_code == replay.status_code == 303
-    assert first.headers["location"] == replay.headers["location"] == (
-        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
+    assert (
+        first.headers["location"]
+        == replay.headers["location"]
+        == (f"/dashboard/nodes/{CREATED_NODE_ID}/registered")
     )
     assert len(control.list_nodes()) == 1
 
@@ -1331,6 +1467,533 @@ def test_dashboard_node_action_rejects_missing_or_stale_fence_before_control() -
     assert control.calls == []
 
 
+def test_dashboard_node_port_change_previews_exact_blast_radius_and_applies_once() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl()
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        node_port_range_start=10543,
+        node_port_range_end=10545,
+    )
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+        settings=settings,
+    )
+    detail_path = f"/dashboard/nodes/{NODE_ID}"
+    preview_path = f"{detail_path}/port-change/preview"
+    apply_path = f"{detail_path}/port-change"
+
+    detail = client.get(detail_path, headers=headers)
+    preview = client.post(
+        preview_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "new_port": "10544",
+            "expected_revision": "7",
+            "expected_state": "running",
+        },
+    )
+    applied = client.post(
+        apply_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "new_port": "10544",
+            "expected_revision": "7",
+            "expected_state": "running",
+            "confirmation_token": "port-confirmation-token",
+        },
+        follow_redirects=False,
+    )
+
+    assert detail.status_code == 200
+    assert f'action="{preview_path}"' in detail.text
+    assert 'name="new_port"' in detail.text
+    assert preview.status_code == 200
+    assert 'role="alert" aria-live="assertive"' in preview.text
+    assert "2 зарегистрированных камер" in preview.text
+    assert "2 активных downstream-клиента" in preview.text
+    assert "aaaaaaaaaaaaaaaaaaaaaaaaaa" in preview.text
+    assert "bbbbbbbbbbbbbbbbbbbbbbbbbi" in preview.text
+    assert "14.08.2026 12:00:00 UTC" in preview.text
+    assert "rtsp://&lt;server-address&gt;:10543/&lt;public_id&gt;" in preview.text
+    assert "rtsp://&lt;server-address&gt;:10544/&lt;public_id&gt;" in preview.text
+    assert 'value="port-confirmation-token"' in preview.text
+    assert "b" * 64 not in preview.text
+    assert applied.status_code == 303
+    assert applied.headers["location"] == detail_path
+    preview_call, change_call = control.calls
+    assert preview_call[0] == "port_preview"
+    preview_node_id, preview_port, preview_ports, preview_context = cast(
+        tuple[object, ...], preview_call[1]
+    )
+    assert (preview_node_id, preview_port, preview_ports) == (
+        NODE_ID,
+        10544,
+        (10543, 10544, 10545),
+    )
+    assert isinstance(preview_context, NodeDisruptionConfirmationContext)
+    assert change_call[0] == "port_change"
+    (
+        changed_node_id,
+        new_port,
+        allowed_ports,
+        token,
+        confirmation_context,
+        fence,
+        mutation_context,
+    ) = cast(tuple[object, ...], change_call[1])
+    assert (changed_node_id, new_port, allowed_ports, token) == (
+        NODE_ID,
+        10544,
+        (10543, 10544, 10545),
+        "port-confirmation-token",
+    )
+    assert fence == NodeCommandFence(7, NodeState.RUNNING)
+    assert confirmation_context == preview_context
+    assert cast(NodeMutationContext, mutation_context).action == "node.port_change"
+
+
+def test_dashboard_node_reconfigure_requires_drain_and_exact_confirmation() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(
+        replace(
+            _snapshot(),
+            nodes=(replace(_snapshot().nodes[0], desired_state=NodeState.DRAINING),),
+        )
+    )
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/nodes/{NODE_ID}"
+    preview_path = f"{detail_path}/reconfigure/preview"
+    apply_path = f"{detail_path}/reconfigure"
+
+    detail = client.get(detail_path, headers=headers)
+    preview = client.post(
+        preview_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "7",
+            "expected_state": "draining",
+        },
+    )
+    applied = client.post(
+        apply_path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "7",
+            "expected_state": "draining",
+            "confirmation_token": "reconfigure-confirmation-token",
+        },
+        follow_redirects=False,
+    )
+
+    assert detail.status_code == 200
+    assert f'action="{preview_path}"' in detail.text
+    assert preview.status_code == 200
+    assert "Все активные потоки ноды будут отключены" in preview.text  # noqa: RUF001
+    assert "2 зарегистрированных камер" in preview.text
+    assert "2 активных downstream-клиента" in preview.text
+    assert "aaaaaaaaaaaaaaaaaaaaaaaaaa" in preview.text
+    assert "bbbbbbbbbbbbbbbbbbbbbbbbbi" in preview.text
+    assert "0.2.1" in preview.text
+    assert "a" * 64 not in preview.text
+    assert 'value="reconfigure-confirmation-token"' in preview.text
+    assert applied.status_code == 303
+    assert applied.headers["location"] == detail_path
+    assert control.calls[0][0] == "reconfigure_preview"
+    preview_node_id, preview_context = cast(tuple[object, ...], control.calls[0][1])
+    assert preview_node_id == NODE_ID
+    assert isinstance(preview_context, NodeDisruptionConfirmationContext)
+    assert control.calls[1][0] == "reconfigure"
+    node_id, token, confirmation_context, fence, mutation_context = cast(
+        tuple[object, ...], control.calls[1][1]
+    )
+    assert confirmation_context == preview_context
+    assert (node_id, token, fence) == (
+        NODE_ID,
+        "reconfigure-confirmation-token",
+        NodeCommandFence(7, NodeState.DRAINING),
+    )
+    assert cast(NodeMutationContext, mutation_context).action == "node.reconfigure"
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "port-change/preview",
+        "port-change",
+        "reconfigure/preview",
+        "reconfigure",
+    ),
+)
+def test_dashboard_node_disruption_requires_recent_mfa_before_control(
+    suffix: str,
+) -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+        authenticated_at=NOW + timedelta(minutes=6),
+        settings=Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=10543,
+            node_port_range_end=10545,
+            operator_recent_mfa_seconds=300,
+        ),
+    )
+    payload = {
+        "_csrf": CSRF_TOKEN,
+        "expected_revision": "7",
+        "expected_state": ("running" if suffix.startswith("port-change") else "draining"),
+    }
+    if suffix.startswith("port-change"):
+        payload["new_port"] = "10544"
+    if not suffix.endswith("preview"):
+        payload["confirmation_token"] = "stale-session-token"
+
+    response = client.post(
+        f"/dashboard/nodes/{NODE_ID}/{suffix}",
+        headers=headers,
+        data=payload,
+    )
+
+    assert response.status_code == 401
+    assert "Требуется повторное подтверждение MFA" in response.text
+    assert "stale-session-token" not in response.text
+    assert control.calls == []
+
+
+def test_control_api_node_disruption_requires_recent_mfa_before_preview() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+        authenticated_at=NOW + timedelta(minutes=6),
+        settings=Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=10543,
+            node_port_range_end=10545,
+            operator_recent_mfa_seconds=300,
+        ),
+    )
+
+    response = client.post(
+        f"/api/v1/nodes/{NODE_ID}/port-change/preview",
+        headers={**headers, "X-CSRF-Token": CSRF_TOKEN},
+        json={"new_port": 10544},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": {"code": "operator_recent_mfa_required"}}
+    assert control.calls == []
+
+
+def test_dashboard_node_disruption_preview_rejects_a_stale_rendered_revision() -> None:
+    class StalePreviewControl(RecordingNodeDashboardControl):
+        def preview_port_change(
+            self,
+            node_id: UUID,
+            *,
+            new_port: int,
+            allowed_ports: tuple[int, ...],
+            confirmation_context: NodeDisruptionConfirmationContext | None = None,
+        ) -> NodePortChangePreview:
+            return replace(
+                super().preview_port_change(
+                    node_id,
+                    new_port=new_port,
+                    allowed_ports=allowed_ports,
+                    confirmation_context=confirmation_context,
+                ),
+                desired_revision=8,
+            )
+
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = StalePreviewControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+        settings=Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=10543,
+            node_port_range_end=10545,
+        ),
+    )
+
+    response = client.post(
+        f"/dashboard/nodes/{NODE_ID}/port-change/preview",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "new_port": "10544",
+            "expected_revision": "7",
+            "expected_state": "running",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Состояние ноды изменилось" in response.text
+    assert "port-confirmation-token" not in response.text
+    assert [call[0] for call in control.calls] == ["port_preview"]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "payload"),
+    (
+        (
+            "port-change/preview",
+            {
+                "new_port": "10544",
+                "expected_revision": "7",
+                "expected_state": "draining",
+            },
+        ),
+        (
+            "port-change",
+            {
+                "new_port": "not-a-port",
+                "expected_revision": "7",
+                "expected_state": "running",
+                "confirmation_token": "token",
+            },
+        ),
+        (
+            "reconfigure/preview",
+            {"expected_revision": "7", "expected_state": "running"},
+        ),
+        (
+            "reconfigure",
+            {"expected_revision": "7", "expected_state": "draining"},
+        ),
+    ),
+)
+def test_dashboard_node_disruption_forms_fail_before_control_on_invalid_fields(
+    suffix: str,
+    payload: dict[str, str],
+) -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+        settings=Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=10543,
+            node_port_range_end=10545,
+        ),
+    )
+
+    response = client.post(
+        f"/dashboard/nodes/{NODE_ID}/{suffix}",
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN, **payload},
+    )
+
+    assert response.status_code == 422
+    assert "Некорректная форма" in response.text
+    assert control.calls == []
+
+
+def test_dashboard_node_disruption_and_release_conflicts_are_safe_and_retryable() -> None:
+    class ConflictControl(RecordingNodeDashboardControl):
+        def change_port(
+            self,
+            node_id: UUID,
+            *,
+            new_port: int,
+            allowed_ports: tuple[int, ...],
+            confirmation_token: str | None,
+            confirmation_context: NodeDisruptionConfirmationContext | None = None,
+            fence: NodeCommandFence,
+            mutation_context: NodeMutationContext,
+        ) -> MediaNode:
+            raise NodeDisruptionConfirmationRequired("node_disruption_confirmation_required")
+
+        def update_node_release(
+            self,
+            node_id: UUID,
+            *,
+            release_id: str,
+            mediamtx_binary_sha256: str,
+            fence: NodeCommandFence,
+            mutation_context: NodeMutationContext,
+        ) -> MediaNode:
+            raise NodeReleaseConflict("node_release_transition_requires_stopped_empty")
+
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = ConflictControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+        settings=Settings(
+            role=RuntimeRole.WEB,
+            node_port_range_start=10543,
+            node_port_range_end=10545,
+        ),
+    )
+
+    expired = client.post(
+        f"/dashboard/nodes/{NODE_ID}/port-change",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "new_port": "10544",
+            "expected_revision": "7",
+            "expected_state": "running",
+            "confirmation_token": "expired-token",
+        },
+    )
+    release_conflict = client.post(
+        f"/dashboard/nodes/{NODE_ID}/release",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "7",
+            "expected_state": "stopped",
+        },
+    )
+
+    assert expired.status_code == 409
+    assert "Требуется новое подтверждение" in expired.text
+    assert "expired-token" not in expired.text
+    assert release_conflict.status_code == 409
+    assert "Release нельзя изменить" in release_conflict.text
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "port-change/preview",
+        "port-change",
+        "reconfigure/preview",
+        "reconfigure",
+    ),
+)
+def test_dashboard_node_disruption_routes_fail_closed_without_control(
+    suffix: str,
+) -> None:
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        node_control=None,
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        f"/dashboard/nodes/{NODE_ID}/{suffix}",
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert "Управление нодами недоступно" in response.text
+
+
+def test_dashboard_empty_node_restart_and_trusted_release_update_use_fences() -> None:
+    control = RecordingNodeDashboardControl()
+    running_observations = InMemoryObservabilityStore()
+    running_observations.save_snapshot(
+        replace(
+            _snapshot(),
+            registered_cameras=0,
+            nodes=(replace(_snapshot().nodes[0], registered_cameras=0),),
+        )
+    )
+    running_client, running_headers = _authenticated_dashboard(
+        observations=running_observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    detail_path = f"/dashboard/nodes/{NODE_ID}"
+
+    detail = running_client.get(detail_path, headers=running_headers)
+    restarted = running_client.post(
+        f"{detail_path}/restart",
+        headers=running_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "7",
+            "expected_state": "running",
+        },
+        follow_redirects=False,
+    )
+
+    stopped_observations = InMemoryObservabilityStore()
+    stopped_observations.save_snapshot(
+        replace(
+            _snapshot(),
+            registered_cameras=0,
+            nodes=(
+                replace(
+                    _snapshot().nodes[0],
+                    registered_cameras=0,
+                    desired_state=NodeState.STOPPED,
+                    runtime_state=NodeState.STOPPED,
+                ),
+            ),
+        )
+    )
+    stopped_client, stopped_headers = _authenticated_dashboard(
+        observations=stopped_observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    stopped_detail = stopped_client.get(detail_path, headers=stopped_headers)
+    released = stopped_client.post(
+        f"{detail_path}/release",
+        headers=stopped_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "7",
+            "expected_state": "stopped",
+        },
+        follow_redirects=False,
+    )
+
+    assert detail.status_code == 200
+    assert f'action="{detail_path}/restart"' in detail.text
+    assert restarted.status_code == 303
+    assert stopped_detail.status_code == 200
+    assert f'action="{detail_path}/release"' in stopped_detail.text
+    assert "0.2.1" in stopped_detail.text
+    assert released.status_code == 303
+    restart_call, release_call = control.calls
+    assert restart_call[0] == "restart"
+    assert cast(tuple[object, ...], restart_call[1])[-2] == NodeCommandFence(7, NodeState.RUNNING)
+    assert cast(NodeMutationContext, cast(tuple[object, ...], restart_call[1])[-1]).action == (
+        "node.restart"
+    )
+    assert release_call[0] == "release"
+    release_args = cast(tuple[object, ...], release_call[1])
+    assert release_args[0:2] == (NODE_ID, "0.2.1")
+    assert isinstance(release_args[2], str) and len(release_args[2]) == 64
+    assert release_args[3] == NodeCommandFence(7, NodeState.STOPPED)
+    assert cast(NodeMutationContext, release_args[4]).action == "node.release_update"
+
+
 def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None:
     client = TestClient(
         create_app(Settings(role=RuntimeRole.WEB)),
@@ -1379,7 +2042,7 @@ def test_camera_catalog_is_authenticated_bounded_escaped_and_secret_free() -> No
     assert "2 / 3" in response.text
     assert catalog.source_url not in response.text
     assert "admin:secret" not in response.text
-    assert f'/dashboard/cameras/{CAMERA_ID}' in response.text
+    assert f"/dashboard/cameras/{CAMERA_ID}" in response.text
     assert f"after={CAMERA_ID}" in response.text
     assert "q=Front" in response.text
 
@@ -1492,9 +2155,7 @@ def test_camera_detail_is_authenticated_escaped_and_secret_free() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert "Front &lt;script&gt;alert(1)&lt;/script&gt;" in response.text
     assert "edge &lt;north&gt;" in response.text
-    assert "rtsp://&lt;server-address&gt;:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa" in (
-        response.text
-    )
+    assert "rtsp://&lt;server-address&gt;:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa" in (response.text)
     assert catalog.source_url not in response.text
     assert "admin:secret" not in response.text
     assert missing.status_code == 404

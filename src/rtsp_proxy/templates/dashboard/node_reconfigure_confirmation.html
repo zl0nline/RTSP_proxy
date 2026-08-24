@@ -1,0 +1,34 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Подтвердить reconfigure — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard">Обзор</a><span aria-hidden="true">/</span><a href="/dashboard/nodes/{{ preview.node_id }}">Нода</a><span aria-hidden="true">/</span><span>Reconfigure</span>
+  </nav>
+  <div class="page-heading">
+    <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1 tabindex="-1" autofocus>Подтвердите reconfigure/restart</h1></div>
+  </div>
+  <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="reconfigure-confirmation-title">
+    <div class="panel-heading"><h2 id="reconfigure-confirmation-title">Все активные потоки ноды будут отключены</h2></div>
+    <dl class="detail-list">
+      <div><dt>Зарегистрировано</dt><dd>{{ preview.registered_cameras }} зарегистрированных камер</dd></div>
+      <div><dt>Внешний RTSP-порт</dt><dd>{{ preview.external_port }}</dd></div>
+      <div><dt>Целевой release</dt><dd>{{ preview.target_release_id }}</dd></div>
+      <div><dt>Активные readers</dt><dd>{{ preview.active_reader_public_ids|length }} активных downstream-клиента</dd></div>
+      <div><dt>Reader snapshot</dt><dd>{{ preview.reader_observed_at|dashboard_time }}</dd></div>
+    </dl>
+    <details open>
+      <summary>Точный список камер ({{ preview.affected_public_ids|length }})</summary>
+      <ul>{% for public_id in preview.affected_public_ids %}<li><code>{{ public_id }}</code>{% if public_id in preview.active_reader_public_ids %} — занят downstream-клиентом{% endif %}</li>{% endfor %}</ul>
+    </details>
+    <form class="mutation-form" method="post" action="/dashboard/nodes/{{ preview.node_id }}/reconfigure">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="expected_revision" value="{{ preview.desired_revision }}">
+      <input type="hidden" name="expected_state" value="draining">
+      <input type="hidden" name="confirmation_token" value="{{ preview.confirmation_token }}">
+      <p>Нода должна оставаться в drain. Перед apply система повторно проверит revision, состав камер, exact reader set и process generation.</p>
+      <div class="form-actions"><button class="danger-button" type="submit">Подтвердить reconfigure/restart</button><a href="/dashboard/nodes/{{ preview.node_id }}">Отмена</a></div>
+    </form>
+  </section>
+</main>
+{% endblock %}

@@ -565,6 +565,7 @@ def test_node_limits_and_port_range_are_environment_driven() -> None:
             "RTSP_PROXY_NODE_MANAGEMENT_FRESHNESS_SECONDS": "45",
             "RTSP_PROXY_NODE_LIFECYCLE_LOCK_POOL_SIZE": "6",
             "RTSP_PROXY_NODE_LIFECYCLE_LOCK_TIMEOUT_SECONDS": "7",
+            "RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS": "240",
         }
     )
 
@@ -575,6 +576,7 @@ def test_node_limits_and_port_range_are_environment_driven() -> None:
     assert settings.node_management_freshness_seconds == 45
     assert settings.node_lifecycle_lock_pool_size == 6
     assert settings.node_lifecycle_lock_timeout_seconds == 7
+    assert settings.operator_recent_mfa_seconds == 240
 
 
 def test_node_port_configuration_requires_capacity_after_exclusions() -> None:
@@ -1031,9 +1033,7 @@ def test_collector_remains_ready_across_declared_schema_bridge(
             return
         with connection:
             connection.makefile("rb").readline(65_537)
-            connection.sendall(
-                b'{"error":null,"observation":null,"ok":true,"schema_version":1}\n'
-            )
+            connection.sendall(b'{"error":null,"observation":null,"ok":true,"schema_version":1}\n')
 
     health_thread = Thread(target=answer_health)
     health_thread.start()

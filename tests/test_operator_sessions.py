@@ -27,6 +27,7 @@ from rtsp_proxy.operator_access import (
     OperatorIdentitySource,
     OperatorMutationContext,
     OperatorPermission,
+    OperatorPrincipal,
     OperatorRequestAuditContext,
     OperatorRole,
     OperatorSession,
@@ -42,6 +43,34 @@ MUTATION_CONTEXT = OperatorMutationContext(
     actor="oidc:admin@example.test",
     reason="operator authorization test",
 )
+
+
+def test_operator_principal_recent_mfa_uses_authoritative_authentication_time() -> None:
+    principal = OperatorPrincipal(
+        account_id=ACCOUNT_ID,
+        session_id=UUID("61000000-0000-4000-8000-000000000006"),
+        identity_source=OperatorIdentitySource.OIDC,
+        subject="oidc:operator@example.test",
+        display_name="Operator",
+        roles=frozenset({OperatorRole.OPERATOR}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        mfa_verified_at=NOW,
+        authenticated_at=NOW + timedelta(minutes=5),
+    )
+
+    assert principal.has_recent_mfa(max_age_seconds=300)
+    assert not replace(
+        principal,
+        authenticated_at=NOW + timedelta(minutes=5, seconds=1),
+    ).has_recent_mfa(max_age_seconds=300)
+    assert not replace(principal, mfa_verified_at=None).has_recent_mfa(max_age_seconds=300)
+    assert not replace(
+        principal,
+        authenticated_at=NOW - timedelta(seconds=1),
+    ).has_recent_mfa(max_age_seconds=300)
+
+
 READ_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
     request_id=UUID("80000000-0000-0000-0000-000000000008"),
     action="dashboard.read",
@@ -109,19 +138,17 @@ def _protected_route_method_matrix(
         ):
             continue
         route_methods.extend(
-            (method, effective_path)
-            for method in sorted(getattr(route, "methods", set()))
+            (method, effective_path) for method in sorted(getattr(route, "methods", set()))
         )
     return tuple(route_methods)
 
 
 def test_operator_request_audit_context_is_bounded_and_secret_free() -> None:
-    assert READ_AUDIT_CONTEXT.source_ip_sha256 == hashlib.sha256(
-        b"198.51.100.10"
-    ).hexdigest()
-    assert READ_AUDIT_CONTEXT.user_agent_sha256 == hashlib.sha256(
-        b"security-audit-test/1.0"
-    ).hexdigest()
+    assert READ_AUDIT_CONTEXT.source_ip_sha256 == hashlib.sha256(b"198.51.100.10").hexdigest()
+    assert (
+        READ_AUDIT_CONTEXT.user_agent_sha256
+        == hashlib.sha256(b"security-audit-test/1.0").hexdigest()
+    )
     assert "198.51.100.10" not in repr(READ_AUDIT_CONTEXT)
     assert "security-audit-test/1.0" not in repr(READ_AUDIT_CONTEXT)
 
@@ -791,9 +818,7 @@ def test_postgres_denial_logout_matrix_is_durable_redacted_and_fail_closed(
         "operator.authorization_denied",
         "operator.session_logout",
     }
-    anonymous = next(
-        row for row in audit if row["event_type"] == "operator.authentication_denied"
-    )
+    anonymous = next(row for row in audit if row["event_type"] == "operator.authentication_denied")
     assert anonymous["aggregate_type"] == "operator_security_request"
     assert anonymous["aggregate_id"] == READ_AUDIT_CONTEXT.request_id
     assert anonymous["payload"]["account_id"] is None
@@ -801,9 +826,7 @@ def test_postgres_denial_logout_matrix_is_durable_redacted_and_fail_closed(
     assert anonymous["payload"]["roles"] == []
     assert anonymous["payload"]["scopes"] == []
     assert anonymous["payload"]["auth_method"] is None
-    denial = next(
-        row for row in audit if row["event_type"] == "operator.authorization_denied"
-    )
+    denial = next(row for row in audit if row["event_type"] == "operator.authorization_denied")
     assert denial["aggregate_type"] == "operator_account"
     assert denial["aggregate_id"] == ACCOUNT_ID
     assert denial["payload"]["roles"] == ["viewer"]
@@ -905,10 +928,7 @@ def test_postgres_http_denial_logout_matrix_is_complete_and_pairwise_durable(
     repeated_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
     with engine.begin() as connection:
         connection.execute(
-            text(
-                "UPDATE operator_sessions SET revoked_at = clock_timestamp() "
-                "WHERE id = :id"
-            ),
+            text("UPDATE operator_sessions SET revoked_at = clock_timestamp() WHERE id = :id"),
             {"id": revoked_session.session.id},
         )
     revoked = client.get(
@@ -1004,9 +1024,7 @@ def test_postgres_http_denial_logout_matrix_is_complete_and_pairwise_durable(
     assert all(row["payload"]["auth_method"] == "oidc" for row in audit[1:])
     assert audit[2]["payload"]["action"] == "camera.runtime_read"
     assert audit[2]["payload"]["resource_type"] == "camera"
-    assert audit[2]["payload"]["resource_id"] == (
-        "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
-    )
+    assert audit[2]["payload"]["resource_id"] == ("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
     serialized = json.dumps([dict(row) for row in audit], default=str, sort_keys=True)
     for issued in (
         csrf_session,
@@ -1119,9 +1137,7 @@ def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:
     )
     assert missing_csrf.headers["x-request-id"] == str(events[2].audit_context.request_id)
     assert logged_out.headers["x-request-id"] == str(events[3].audit_context.request_id)
-    assert repeated_logout.headers["x-request-id"] == str(
-        events[4].audit_context.request_id
-    )
+    assert repeated_logout.headers["x-request-id"] == str(events[4].audit_context.request_id)
 
 
 def test_mutating_control_endpoint_is_fenced_before_handler() -> None:
@@ -1284,7 +1300,7 @@ def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -
         ),
     )
     route_methods = _protected_route_method_matrix(anonymous_app.routes)
-    assert len(route_methods) == 57
+    assert len(route_methods) == 63
 
     node_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
@@ -1395,9 +1411,7 @@ def test_protected_route_method_matrix_composes_nested_router_prefixes() -> None
     app = FastAPI()
     app.include_router(parent_router, prefix="/api/v1")
 
-    assert _protected_route_method_matrix(app.routes) == (
-        ("GET", "/api/v1/nested/future"),
-    )
+    assert _protected_route_method_matrix(app.routes) == (("GET", "/api/v1/nested/future"),)
 
 
 def test_dashboard_form_and_move_status_denials_keep_exact_semantic_targets() -> None:
@@ -1937,18 +1951,27 @@ def test_postgres_http_security_event_transaction_fails_closed_without_half_pair
     assert response.headers["retry-after"] == "1"
     assert response.headers["cache-control"] == "no-store"
     with engine.connect() as connection:
-        assert connection.scalar(
-            text("SELECT count(*) FROM audit_events WHERE event_type = :event_type"),
-            {"event_type": event_type},
-        ) == 0
-        assert connection.scalar(
-            text("SELECT count(*) FROM outbox_messages WHERE event_type = :event_type"),
-            {"event_type": event_type},
-        ) == 0
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM audit_events WHERE event_type = :event_type"),
+                {"event_type": event_type},
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM outbox_messages WHERE event_type = :event_type"),
+                {"event_type": event_type},
+            )
+            == 0
+        )
         if operation == "logout":
-            assert connection.scalar(
-                text("SELECT revoked_at IS NULL FROM operator_sessions WHERE id = :id"),
-                {"id": issued.session.id},
-            ) is True
+            assert (
+                connection.scalar(
+                    text("SELECT revoked_at IS NULL FROM operator_sessions WHERE id = :id"),
+                    {"id": issued.session.id},
+                )
+                is True
+            )
     engine.dispose()
     store.close()

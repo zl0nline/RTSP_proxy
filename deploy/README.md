@@ -140,9 +140,14 @@ Create:
 6. run ordinary RTSP/TCP smoke;
 7. mark RUNNING.
 
-Stop/restart/port change require drained state or explicit force confirmation.
-Only the selected instance is touched. Delete requires zero camera placements
-and stopped/failed state. Port is released only after listener/process cleanup
+Ordinary stop requires an empty node. An empty RUNNING node can be restarted
+directly. A non-empty DRAINING node uses the reconfigure/restart confirmation
+workflow, while a RUNNING port change has its own confirmation workflow and
+restarts every stream on that node. Both previews and applies require recent
+MFA (`RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS=300` by default), exact rendered
+revision/state, and the complete displayed camera/reader blast radius. Only the
+selected instance is touched. Delete requires zero camera placements and
+stopped/failed state. Port is released only after listener/process cleanup
 proof.
 
 Lifecycle reconciliation uses
@@ -156,7 +161,11 @@ node's `/start` endpoint and do not retry the create request. The root helper
 requires at least 20 seconds of cleanup reserve; the default reserves 25
 seconds of its 55-second operation budget for cleanup; the media unit stops in
 at most 15 seconds and the remaining time is kept for systemd status and port
-release proof.
+release proof. A disruptive RUNNING-node fence has a separate 60-second
+end-to-end deadline: the first 50 seconds include the helper action and any
+port rollback, while the final 10 seconds are reserved exclusively for exact
+path-admission restoration. At most two such applies run concurrently per web
+process; a third fails with retryable `node_disruption_busy` before mutation.
 
 ## Artifact catalog and activation
 

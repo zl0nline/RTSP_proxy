@@ -33,6 +33,7 @@ from rtsp_proxy.health import RoleReadinessProvider
 from rtsp_proxy.identifiers import generate_public_id
 from rtsp_proxy.node_runtime import (
     UnixMediaNodeClientFactory,
+    UnixNodeDisruptionObserver,
     UnixNodeMetricSource,
     UnixNodeRuntimeClient,
 )
@@ -114,6 +115,7 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_RECONCILE_INTERVAL_SECONDS": "reconcile_interval_seconds",
     "RTSP_PROXY_COLLECTOR_INTERVAL_SECONDS": "collector_interval_seconds",
     "RTSP_PROXY_CONFIRMATION_SECRET": "confirmation_secret",
+    "RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS": "operator_recent_mfa_seconds",
     "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
     "RTSP_PROXY_NODE_MEDIAMTX_BINARY_SHA256": "node_mediamtx_binary_sha256",
     "RTSP_PROXY_DATABASE_URL": "database_url",
@@ -258,12 +260,23 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             timeout_seconds=settings.node_runtime_timeout_seconds,
         )
     )
+    media_factory = (
+        None
+        if settings.node_runtime_socket is None
+        else UnixMediaNodeClientFactory(
+            socket_path=settings.node_runtime_socket,
+            timeout_seconds=min(10, settings.node_runtime_timeout_seconds),
+        )
+    )
     node_control = NodeControl(
         store=store,
         choose_port=secrets.choice,
         new_node_id=uuid4,
         is_port_bindable=tcp_port_is_bindable,
         node_runtime=node_runtime,
+        disruption_observer=(
+            None if media_factory is None else UnixNodeDisruptionObserver(media_nodes=media_factory)
+        ),
         provision_on_create=node_runtime is not None,
         recovery_workers=settings.node_lifecycle_lock_pool_size,
         confirmations=(
@@ -302,14 +315,6 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
     def recover_runtime_state() -> None:
         node_control.recover_runtime_state()
 
-    media_factory = (
-        None
-        if settings.node_runtime_socket is None
-        else UnixMediaNodeClientFactory(
-            socket_path=settings.node_runtime_socket,
-            timeout_seconds=min(10, settings.node_runtime_timeout_seconds),
-        )
-    )
     camera_runtime = (
         None
         if media_factory is None
@@ -1020,8 +1025,7 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
             if settings.role is RuntimeRole.AUTH
             else (
                 _BACKGROUND_DATABASE_TIMEOUT_MS
-                if settings.role
-                in {RuntimeRole.WEB, RuntimeRole.COLLECTOR, RuntimeRole.WORKER}
+                if settings.role in {RuntimeRole.WEB, RuntimeRole.COLLECTOR, RuntimeRole.WORKER}
                 else None
             )
         ),

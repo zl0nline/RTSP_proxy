@@ -89,6 +89,7 @@ class NodeMetricSample:
     received_bytes_total: int
     sent_bytes_total: int
     path_counters: tuple[PathMetricCounters, ...] = ()
+    occupied_public_ids: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if not 0 <= self.active_sources <= 100:
@@ -103,6 +104,22 @@ class NodeMetricSample:
             raise ValueError("path_metric_counters_invalid")
         if len({counter.public_id for counter in self.path_counters}) != len(self.path_counters):
             raise ValueError("path_metric_counters_invalid")
+        if self.occupied_public_ids is not None and (
+            len(self.occupied_public_ids) != len(set(self.occupied_public_ids))
+            or self.occupied_public_ids != tuple(sorted(self.occupied_public_ids))
+            or len(self.occupied_public_ids) != self.occupied_streams
+            or any(
+                str(PublicId.parse(public_id)) != public_id
+                for public_id in self.occupied_public_ids
+            )
+            or (
+                self.path_counters
+                and not set(self.occupied_public_ids).issubset(
+                    counter.public_id for counter in self.path_counters
+                )
+            )
+        ):
+            raise ValueError("occupied_public_ids_invalid")
         if self.path_counters and (
             sum(counter.received_bytes_total for counter in self.path_counters)
             != self.received_bytes_total
@@ -1560,6 +1577,7 @@ def _snapshot_payload(snapshot: FleetSnapshot) -> dict[str, object]:
             node["metric_observed_at"] = node["metric_observed_at"].isoformat()
         if node["metrics"] is not None:
             node["metrics"].pop("path_counters", None)
+            node["metrics"].pop("occupied_public_ids", None)
     return payload
 
 
@@ -1643,6 +1661,13 @@ def parse_mediamtx_path_metrics(payload: bytes) -> NodeMetricSample:
         path_counters=tuple(
             PathMetricCounters(str(public_id), inbound[public_id], outbound[public_id])
             for public_id in sorted(path_ids, key=str)
+        ),
+        occupied_public_ids=tuple(
+            str(public_id)
+            for public_id in sorted(
+                (public_id for public_id, count in readers.items() if count == 1),
+                key=str,
+            )
         ),
     )
 

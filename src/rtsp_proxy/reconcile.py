@@ -27,6 +27,7 @@ from rtsp_proxy.nodes import (
     EligibleNodeMissing,
     MediaNode,
     NodeCameraCapacityReached,
+    NodeDisruptionConfirmationContext,
     NodeLifecycleBusy,
     NodeNotFound,
     NodeState,
@@ -160,6 +161,23 @@ class CameraMutationOperation(StrEnum):
     DELETE = "delete"
 
 
+def _valid_confirmation_digest(value: str) -> bool:
+    return len(value) == 64 and not set(value) - set("0123456789abcdef")
+
+
+def _confirmation_context_payload(
+    context: NodeDisruptionConfirmationContext | None,
+) -> dict[str, object] | None:
+    if context is None:
+        return None
+    return {
+        "account_id": str(context.account_id),
+        "session_id": str(context.session_id),
+        "authz_version": context.authz_version,
+        "mfa_verified_at_unix_ms": context.mfa_verified_at_unix_ms,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class CameraMutationPreview:
     camera_id: UUID
@@ -275,6 +293,9 @@ class ConfirmationTokenService:
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str = "0" * 64,
+        active_readers: int = 0,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
     ) -> str:
         return self._sign(
             self._node_port_payload(
@@ -284,6 +305,9 @@ class ConfirmationTokenService:
                 desired_revision=desired_revision,
                 registered_cameras=registered_cameras,
                 blast_radius_sha256=blast_radius_sha256,
+                reader_blast_radius_sha256=reader_blast_radius_sha256,
+                active_readers=active_readers,
+                confirmation_context=confirmation_context,
                 expires_at=int(self._wall_time()) + self._lifetime_seconds,
             )
         )
@@ -298,9 +322,12 @@ class ConfirmationTokenService:
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str = "0" * 64,
+        active_readers: int = 0,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
     ) -> bool:
-        if len(blast_radius_sha256) != 64 or any(
-            character not in "0123456789abcdef" for character in blast_radius_sha256
+        if not _valid_confirmation_digest(blast_radius_sha256) or not (
+            _valid_confirmation_digest(reader_blast_radius_sha256)
         ):
             return False
         decoded_token = self._decode(token)
@@ -321,6 +348,9 @@ class ConfirmationTokenService:
             desired_revision=desired_revision,
             registered_cameras=registered_cameras,
             blast_radius_sha256=blast_radius_sha256,
+            reader_blast_radius_sha256=reader_blast_radius_sha256,
+            active_readers=active_readers,
+            confirmation_context=confirmation_context,
             expires_at=expires_at,
         )
         expected_signature = hmac.new(self._secret, expected, hashlib.sha256).hexdigest()
@@ -339,6 +369,9 @@ class ConfirmationTokenService:
         blast_radius_sha256: str,
         target_release_id: str,
         target_mediamtx_binary_sha256: str,
+        reader_blast_radius_sha256: str = "0" * 64,
+        active_readers: int = 0,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
     ) -> str:
         return self._sign(
             self._node_reconfigure_payload(
@@ -349,6 +382,9 @@ class ConfirmationTokenService:
                 blast_radius_sha256=blast_radius_sha256,
                 target_release_id=target_release_id,
                 target_mediamtx_binary_sha256=target_mediamtx_binary_sha256,
+                reader_blast_radius_sha256=reader_blast_radius_sha256,
+                active_readers=active_readers,
+                confirmation_context=confirmation_context,
                 expires_at=int(self._wall_time()) + self._lifetime_seconds,
             )
         )
@@ -364,9 +400,12 @@ class ConfirmationTokenService:
         blast_radius_sha256: str,
         target_release_id: str,
         target_mediamtx_binary_sha256: str,
+        reader_blast_radius_sha256: str = "0" * 64,
+        active_readers: int = 0,
+        confirmation_context: NodeDisruptionConfirmationContext | None = None,
     ) -> bool:
-        if len(blast_radius_sha256) != 64 or any(
-            character not in "0123456789abcdef" for character in blast_radius_sha256
+        if not _valid_confirmation_digest(blast_radius_sha256) or not (
+            _valid_confirmation_digest(reader_blast_radius_sha256)
         ):
             return False
         decoded_token = self._decode(token)
@@ -388,6 +427,9 @@ class ConfirmationTokenService:
             blast_radius_sha256=blast_radius_sha256,
             target_release_id=target_release_id,
             target_mediamtx_binary_sha256=target_mediamtx_binary_sha256,
+            reader_blast_radius_sha256=reader_blast_radius_sha256,
+            active_readers=active_readers,
+            confirmation_context=confirmation_context,
             expires_at=expires_at,
         )
         expected_signature = hmac.new(self._secret, expected, hashlib.sha256).hexdigest()
@@ -479,11 +521,17 @@ class ConfirmationTokenService:
         desired_revision: int,
         registered_cameras: int,
         blast_radius_sha256: str,
+        reader_blast_radius_sha256: str,
+        active_readers: int,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
         expires_at: int,
     ) -> bytes:
         return json.dumps(
             {
                 "blast_radius_sha256": blast_radius_sha256,
+                "reader_blast_radius_sha256": reader_blast_radius_sha256,
+                "active_readers": active_readers,
+                "confirmation_context": _confirmation_context_payload(confirmation_context),
                 "desired_revision": desired_revision,
                 "expires_at": expires_at,
                 "new_port": new_port,
@@ -506,11 +554,17 @@ class ConfirmationTokenService:
         blast_radius_sha256: str,
         target_release_id: str,
         target_mediamtx_binary_sha256: str,
+        reader_blast_radius_sha256: str,
+        active_readers: int,
+        confirmation_context: NodeDisruptionConfirmationContext | None,
         expires_at: int,
     ) -> bytes:
         return json.dumps(
             {
                 "blast_radius_sha256": blast_radius_sha256,
+                "reader_blast_radius_sha256": reader_blast_radius_sha256,
+                "active_readers": active_readers,
+                "confirmation_context": _confirmation_context_payload(confirmation_context),
                 "desired_revision": desired_revision,
                 "expires_at": expires_at,
                 "external_port": external_port,
@@ -735,10 +789,7 @@ class CameraMoveControl:
         camera = self._store.get_camera(camera_id)
         if camera is None:
             raise CameraNotFound("camera_not_found")
-        if (
-            expected_revision is not None
-            and camera.desired_revision != expected_revision
-        ):
+        if expected_revision is not None and camera.desired_revision != expected_revision:
             raise CameraRevisionConflict(
                 expected_revision=expected_revision,
                 current_revision=camera.desired_revision,
@@ -1065,9 +1116,7 @@ class CameraMoveReconciler:
                 {move.source_node_id, move.target_node_id},
                 key=lambda value: value.int,
             ):
-                stack.enter_context(
-                    self._store.reconcile_guard(node_id, cancelled=cancelled)
-                )
+                stack.enter_context(self._store.reconcile_guard(node_id, cancelled=cancelled))
         except Exception:
             stack.close()
             raise

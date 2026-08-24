@@ -16,6 +16,8 @@ from rtsp_proxy.nodes import (
     CameraMove,
     CameraState,
     MediaNode,
+    NodePortChangePreview,
+    NodeReconfigurePreview,
 )
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import OperatorPrincipal
@@ -88,10 +90,14 @@ def render_overview(
     principal: OperatorPrincipal,
     can_manage_nodes: bool = False,
 ) -> str:
-    return _environment().get_template("dashboard/overview.html").render(
-        snapshot=snapshot,
-        principal=principal,
-        can_manage_nodes=can_manage_nodes,
+    return (
+        _environment()
+        .get_template("dashboard/overview.html")
+        .render(
+            snapshot=snapshot,
+            principal=principal,
+            can_manage_nodes=can_manage_nodes,
+        )
     )
 
 
@@ -100,15 +106,59 @@ def render_node_detail(
     snapshot: FleetSnapshot,
     node: NodeSnapshot,
     principal: OperatorPrincipal,
-    csrf_token: str = "",
-    can_manage_nodes: bool = False,
+    csrf_token: str,
+    can_manage_nodes: bool,
+    port_range_start: int,
+    port_range_end: int,
+    target_release_id: str,
 ) -> str:
-    return _environment().get_template("dashboard/node.html").render(
-        snapshot=snapshot,
-        node=node,
-        principal=principal,
-        csrf_token=csrf_token,
-        can_manage_nodes=can_manage_nodes,
+    return (
+        _environment()
+        .get_template("dashboard/node.html")
+        .render(
+            snapshot=snapshot,
+            node=node,
+            principal=principal,
+            csrf_token=csrf_token,
+            can_manage_nodes=can_manage_nodes,
+            port_range_start=port_range_start,
+            port_range_end=port_range_end,
+            target_release_id=target_release_id,
+        )
+    )
+
+
+def render_node_port_change_confirmation(
+    *,
+    preview: NodePortChangePreview,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/node_port_change_confirmation.html")
+        .render(
+            preview=preview,
+            principal=principal,
+            csrf_token=csrf_token,
+        )
+    )
+
+
+def render_node_reconfigure_confirmation(
+    *,
+    preview: NodeReconfigurePreview,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/node_reconfigure_confirmation.html")
+        .render(
+            preview=preview,
+            principal=principal,
+            csrf_token=csrf_token,
+        )
     )
 
 
@@ -120,12 +170,16 @@ def render_node_create(
     port_range_end: int,
     idempotency_key: UUID,
 ) -> str:
-    return _environment().get_template("dashboard/node_create.html").render(
-        principal=principal,
-        csrf_token=csrf_token,
-        port_range_start=port_range_start,
-        port_range_end=port_range_end,
-        idempotency_key=idempotency_key,
+    return (
+        _environment()
+        .get_template("dashboard/node_create.html")
+        .render(
+            principal=principal,
+            csrf_token=csrf_token,
+            port_range_start=port_range_start,
+            port_range_end=port_range_end,
+            idempotency_key=idempotency_key,
+        )
     )
 
 
@@ -134,9 +188,13 @@ def render_node_registration(
     node: MediaNode,
     principal: OperatorPrincipal,
 ) -> str:
-    return _environment().get_template("dashboard/node_registered.html").render(
-        node=node,
-        principal=principal,
+    return (
+        _environment()
+        .get_template("dashboard/node_registered.html")
+        .render(
+            node=node,
+            principal=principal,
+        )
     )
 
 
@@ -147,12 +205,16 @@ def render_camera_catalog(
     next_url: str | None,
     principal: OperatorPrincipal,
 ) -> str:
-    return _environment().get_template("dashboard/cameras.html").render(
-        page=page,
-        query=query,
-        next_url=next_url,
-        principal=principal,
-        states=(CameraState.ENABLED, CameraState.DISABLED, CameraState.DELETING),
+    return (
+        _environment()
+        .get_template("dashboard/cameras.html")
+        .render(
+            page=page,
+            query=query,
+            next_url=next_url,
+            principal=principal,
+            states=(CameraState.ENABLED, CameraState.DISABLED, CameraState.DELETING),
+        )
     )
 
 
@@ -164,12 +226,16 @@ def render_camera_detail(
     can_mutate: bool,
     can_move: bool,
 ) -> str:
-    return _environment().get_template("dashboard/camera.html").render(
-        camera=camera,
-        principal=principal,
-        csrf_token=csrf_token,
-        can_mutate=can_mutate,
-        can_move=can_move,
+    return (
+        _environment()
+        .get_template("dashboard/camera.html")
+        .render(
+            camera=camera,
+            principal=principal,
+            csrf_token=csrf_token,
+            can_mutate=can_mutate,
+            can_move=can_move,
+        )
     )
 
 
@@ -179,10 +245,14 @@ def render_camera_edit(
     principal: OperatorPrincipal,
     csrf_token: str,
 ) -> str:
-    return _environment().get_template("dashboard/camera_edit.html").render(
-        camera=camera,
-        principal=principal,
-        csrf_token=csrf_token,
+    return (
+        _environment()
+        .get_template("dashboard/camera_edit.html")
+        .render(
+            camera=camera,
+            principal=principal,
+            csrf_token=csrf_token,
+        )
     )
 
 
@@ -194,12 +264,16 @@ def render_camera_mutation_confirmation(
     csrf_token: str,
     name: str | None,
 ) -> str:
-    return _environment().get_template("dashboard/camera_mutation_confirmation.html").render(
-        camera=camera,
-        preview=preview,
-        principal=principal,
-        csrf_token=csrf_token,
-        name=name,
+    return (
+        _environment()
+        .get_template("dashboard/camera_mutation_confirmation.html")
+        .render(
+            camera=camera,
+            preview=preview,
+            principal=principal,
+            csrf_token=csrf_token,
+            name=name,
+        )
     )
 
 
@@ -210,11 +284,15 @@ def render_camera_move(
     principal: OperatorPrincipal,
     csrf_token: str,
 ) -> str:
-    return _environment().get_template("dashboard/camera_move.html").render(
-        camera=camera,
-        targets=targets,
-        principal=principal,
-        csrf_token=csrf_token,
+    return (
+        _environment()
+        .get_template("dashboard/camera_move.html")
+        .render(
+            camera=camera,
+            targets=targets,
+            principal=principal,
+            csrf_token=csrf_token,
+        )
     )
 
 
@@ -225,13 +303,15 @@ def render_camera_move_confirmation(
     principal: OperatorPrincipal,
     csrf_token: str,
 ) -> str:
-    return _environment().get_template(
-        "dashboard/camera_move_confirmation.html"
-    ).render(
-        camera=camera,
-        preview=preview,
-        principal=principal,
-        csrf_token=csrf_token,
+    return (
+        _environment()
+        .get_template("dashboard/camera_move_confirmation.html")
+        .render(
+            camera=camera,
+            preview=preview,
+            principal=principal,
+            csrf_token=csrf_token,
+        )
     )
 
 
@@ -241,10 +321,14 @@ def render_camera_move_status(
     move: CameraMove,
     principal: OperatorPrincipal,
 ) -> str:
-    return _environment().get_template("dashboard/camera_move_status.html").render(
-        camera=camera,
-        move=move,
-        principal=principal,
+    return (
+        _environment()
+        .get_template("dashboard/camera_move_status.html")
+        .render(
+            camera=camera,
+            move=move,
+            principal=principal,
+        )
     )
 
 
@@ -253,16 +337,24 @@ def render_unavailable(
     *,
     principal: OperatorPrincipal | None = None,
 ) -> str:
-    return _environment().get_template("dashboard/unavailable.html").render(
-        unavailable=unavailable,
-        principal=principal,
+    return (
+        _environment()
+        .get_template("dashboard/unavailable.html")
+        .render(
+            unavailable=unavailable,
+            principal=principal,
+        )
     )
 
 
 def render_logout(*, principal: OperatorPrincipal, csrf_token: str) -> str:
-    return _environment().get_template("dashboard/logout.html").render(
-        principal=principal,
-        csrf_token=csrf_token,
+    return (
+        _environment()
+        .get_template("dashboard/logout.html")
+        .render(
+            principal=principal,
+            csrf_token=csrf_token,
+        )
     )
 
 

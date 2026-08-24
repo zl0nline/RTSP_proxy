@@ -50,6 +50,16 @@
         <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
         <button type="submit">Drain</button>
       </form>
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/port-change/preview" class="mutation-form">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <label>Новый внешний RTSP-порт
+          <input name="new_port" type="number" required inputmode="numeric" min="{{ port_range_start }}" max="{{ port_range_end }}">
+        </label>
+        <small>Разрешённый диапазон: {{ port_range_start }}–{{ port_range_end }}</small>
+        <button class="danger-button" type="submit">Показать последствия смены порта</button>
+      </form>
       {% endif %}
       {% if node.desired_state.value == 'draining' %}
       <form method="post" action="/dashboard/nodes/{{ node.node_id }}/maintenance">
@@ -57,6 +67,12 @@
         <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
         <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
         <button type="submit">Maintenance</button>
+      </form>
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/reconfigure/preview">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button class="danger-button" type="submit">Показать последствия reconfigure/restart</button>
       </form>
       {% endif %}
       {% if node.desired_state.value in ['draining', 'maintenance'] %}
@@ -75,6 +91,14 @@
         <button type="submit">Остановить</button>
       </form>
       {% endif %}
+      {% if node.registered_cameras == 0 and node.desired_state.value == 'running' %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/restart">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Перезапустить empty-ноду</button>
+      </form>
+      {% endif %}
       {% if node.registered_cameras == 0 and node.desired_state.value in ['stopped', 'failed'] %}
       <form method="post" action="/dashboard/nodes/{{ node.node_id }}/delete">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -83,8 +107,16 @@
         <button class="danger-button" type="submit">Удалить empty-ноду</button>
       </form>
       {% endif %}
+      {% if node.registered_cameras == 0 and node.desired_state.value == 'stopped' %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/release">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Подготовить release {{ target_release_id }}</button>
+      </form>
+      {% endif %}
     </div>
-    <p class="detail-note">Stop и delete разрешены только для empty-ноды. Disruptive restart и смена порта требуют отдельного blast-radius preview и подтверждения.</p>
+    <p class="detail-note">Stop, empty restart, release update и delete разрешены только для empty-ноды. Смена порта и reconfigure/restart с камерами требуют отдельного blast-radius preview и подтверждения.</p>
   </section>
   {% endif %}
 </main>

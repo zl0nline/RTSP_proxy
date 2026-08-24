@@ -1475,7 +1475,18 @@ def test_control_plane_uses_one_bounded_unix_request_for_an_exact_node() -> None
     assert observation.process_id == 1234
 
 
-def test_runtime_client_rejects_oversized_or_malformed_helper_responses() -> None:
+@pytest.mark.parametrize(
+    "response",
+    (
+        b'{"ok":true,"unexpected":"field"}\n',
+        b"",
+        b'{"schema_version":2,"ok":false,"observation":null,"error":"invalid"}\n',
+        b'{"schema_version":1,"ok":true,"observation":null,"error":null}\n',
+    ),
+)
+def test_runtime_client_rejects_oversized_or_malformed_helper_responses(
+    response: bytes,
+) -> None:
     temporary = tempfile.TemporaryDirectory(prefix="rtsp-node-", dir="/tmp")
     socket_path = Path(temporary.name) / "runtime.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1486,7 +1497,8 @@ def test_runtime_client_rejects_oversized_or_malformed_helper_responses() -> Non
         connection, _ = listener.accept()
         with connection:
             connection.makefile("rb").readline(65537)
-            connection.sendall(b'{"ok":true,"unexpected":"field"}\n')
+            if response:
+                connection.sendall(response)
 
     server = Thread(target=answer)
     server.start()
@@ -1510,6 +1522,111 @@ def test_runtime_client_rejects_oversized_or_malformed_helper_responses() -> Non
     server.join(timeout=1)
     listener.close()
     temporary.cleanup()
+
+
+def test_runtime_client_binds_disruptive_action_to_the_fence_deadline() -> None:
+    temporary = tempfile.TemporaryDirectory(prefix="rtsp-node-", dir="/tmp")
+    socket_path = Path(temporary.name) / "runtime.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    captured: dict[str, object] = {}
+
+    def answer() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            captured.update(json.loads(connection.makefile("rb").readline(65537)))
+            connection.sendall(
+                (
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "ok": False,
+                            "observation": None,
+                            "error": "node_runtime_operation_timeout",
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+            )
+
+    server = Thread(target=answer)
+    server.start()
+    node = MediaNode(
+        id=runtime_spec().node_id,
+        name="media-a",
+        external_port=runtime_spec().external_port,
+        api_port=runtime_spec().api_port,
+        metrics_port=runtime_spec().metrics_port,
+        release_id=runtime_spec().release_id,
+        mediamtx_binary_sha256=runtime_spec().mediamtx_binary_sha256,
+        desired_revision=3,
+    )
+    outer_deadline_unix_ms = int((time.time() + 20) * 1000)
+
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        UnixNodeRuntimeClient(
+            socket_path=socket_path,
+            timeout_seconds=60,
+        ).execute_until(
+            NodeRuntimeAction.RECONFIGURE_RESTART,
+            node,
+            deadline_unix_ms=outer_deadline_unix_ms,
+        )
+
+    server.join(timeout=1)
+    listener.close()
+    temporary.cleanup()
+    requested_deadline = captured["deadline_unix_ms"]
+    assert isinstance(requested_deadline, int)
+    assert int(time.time() * 1000) < requested_deadline < outer_deadline_unix_ms
+
+
+@pytest.mark.parametrize("deadline_unix_ms", (False, 0))
+def test_runtime_client_rejects_invalid_disruption_deadlines(
+    tmp_path: Path,
+    deadline_unix_ms: object,
+) -> None:
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        UnixNodeRuntimeClient(
+            socket_path=tmp_path / "must-not-open.sock",
+            timeout_seconds=1,
+        ).execute_until(
+            NodeRuntimeAction.RECONFIGURE_RESTART,
+            MediaNode(
+                id=runtime_spec().node_id,
+                name="media-a",
+                external_port=runtime_spec().external_port,
+                api_port=runtime_spec().api_port,
+                metrics_port=runtime_spec().metrics_port,
+                release_id=runtime_spec().release_id,
+                mediamtx_binary_sha256=runtime_spec().mediamtx_binary_sha256,
+                desired_revision=3,
+            ),
+            deadline_unix_ms=cast(int, deadline_unix_ms),
+        )
+
+
+def test_runtime_client_rejects_an_expired_disruption_deadline(tmp_path: Path) -> None:
+    with pytest.raises(NodeSupervisorError, match="node_runtime_operation_timeout"):
+        UnixNodeRuntimeClient(
+            socket_path=tmp_path / "must-not-open.sock",
+            timeout_seconds=1,
+        ).execute_until(
+            NodeRuntimeAction.RECONFIGURE_RESTART,
+            MediaNode(
+                id=runtime_spec().node_id,
+                name="media-a",
+                external_port=runtime_spec().external_port,
+                api_port=runtime_spec().api_port,
+                metrics_port=runtime_spec().metrics_port,
+                release_id=runtime_spec().release_id,
+                mediamtx_binary_sha256=runtime_spec().mediamtx_binary_sha256,
+                desired_revision=3,
+            ),
+            deadline_unix_ms=int(time.time() * 1000) - 1,
+        )
 
 
 def test_runtime_client_reports_missing_socket_without_exposing_os_error(

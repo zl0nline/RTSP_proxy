@@ -4,7 +4,7 @@ import socket
 import time
 from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,7 +40,10 @@ from rtsp_proxy.nodes import (
     NodeCameraCapacityReached,
     NodeCommandFence,
     NodeControl,
+    NodeDisruptionConfirmationContext,
     NodeDisruptionConfirmationRequired,
+    NodeDisruptionFenceLease,
+    NodeDisruptionObservation,
     NodeHealth,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
@@ -96,6 +99,12 @@ NODE_MUTATION_CONTEXT = NodeMutationContext(
     resource_id="collection",
     source_ip_sha256="1" * 64,
     user_agent_sha256="2" * 64,
+)
+NODE_CONFIRMATION_CONTEXT = NodeDisruptionConfirmationContext(
+    account_id=NODE_MUTATION_CONTEXT.actor_account_id,
+    session_id=NODE_MUTATION_CONTEXT.actor_session_id,
+    authz_version=NODE_MUTATION_CONTEXT.authz_version,
+    mfa_verified_at_unix_ms=1_788_091_200_000,
 )
 
 
@@ -1280,9 +1289,7 @@ def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletio
     with pytest.raises(NodeLifecycleConflict, match="node_idempotency_target_missing"):
         register()
     with engine.connect() as connection:
-        assert connection.scalar(
-            text("SELECT count(*) FROM node_registration_requests")
-        ) == 1
+        assert connection.scalar(text("SELECT count(*) FROM node_registration_requests")) == 1
         assert connection.scalar(text("SELECT count(*) FROM media_nodes")) == 0
     engine.dispose()
     store.close()
@@ -1298,9 +1305,7 @@ def test_in_memory_node_registration_replays_stable_intent_after_policy_change()
     control = NodeControl(
         store=store,
         choose_port=lambda available: available[0],
-        new_node_id=iter(
-            (UUID("00000000-0000-4000-8000-000000000104"),)
-        ).__next__,
+        new_node_id=iter((UUID("00000000-0000-4000-8000-000000000104"),)).__next__,
         is_port_bindable=lambda port: bindable.get(port, True),
     )
 
@@ -1381,13 +1386,10 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     engine = create_engine(postgres_database_url)
     invalid_names = ("", "   ", "bad\nname", "bad\u202ename", "bad\u200bname")
     camera_ids = tuple(
-        UUID(f"10000000-0000-4000-8000-{index:012d}")
-        for index in range(1, len(invalid_names) + 1)
+        UUID(f"10000000-0000-4000-8000-{index:012d}") for index in range(1, len(invalid_names) + 1)
     )
     with engine.begin() as connection:
-        for index, (camera_id, name) in enumerate(
-            zip(camera_ids, invalid_names, strict=True)
-        ):
+        for index, (camera_id, name) in enumerate(zip(camera_ids, invalid_names, strict=True)):
             connection.execute(
                 text(
                     "INSERT INTO cameras "
@@ -1454,13 +1456,17 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
             "0016_node_registration_keys"
         )
-        assert connection.scalar(
-            text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id}
-        ) == "legacy\nname"
-        assert connection.scalar(
-            text("SELECT count(*) FROM public_id_tombstones WHERE public_id=:public_id"),
-            {"public_id": public_id},
-        ) == 1
+        assert (
+            connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})
+            == "legacy\nname"
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public_id_tombstones WHERE public_id=:public_id"),
+                {"public_id": public_id},
+            )
+            == 1
+        )
 
 
 def test_camera_move_safety_migration_rejects_invalid_legacy_source_urls(
@@ -2122,20 +2128,14 @@ def test_postgres_node_command_persists_redacted_operator_attribution(
     with engine.connect() as connection:
         audit = (
             connection.execute(
-                text(
-                    "SELECT id, payload FROM audit_events "
-                    "WHERE aggregate_type = 'media_node'"
-                )
+                text("SELECT id, payload FROM audit_events WHERE aggregate_type = 'media_node'")
             )
             .mappings()
             .one()
         )
         outbox = (
             connection.execute(
-                text(
-                    "SELECT id, payload FROM outbox_messages "
-                    "WHERE aggregate_type = 'media_node'"
-                )
+                text("SELECT id, payload FROM outbox_messages WHERE aggregate_type = 'media_node'")
             )
             .mappings()
             .one()
@@ -2178,14 +2178,20 @@ def test_postgres_node_command_fence_is_checked_before_normative_mutation(
     assert persisted == node
     engine = create_engine(postgres_database_url, hide_parameters=True)
     with engine.connect() as connection:
-        assert connection.scalar(
-            text("SELECT count(*) FROM audit_events WHERE aggregate_id = :node_id"),
-            {"node_id": node.id},
-        ) == 1
-        assert connection.scalar(
-            text("SELECT count(*) FROM outbox_messages WHERE aggregate_id = :node_id"),
-            {"node_id": node.id},
-        ) == 1
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM audit_events WHERE aggregate_id = :node_id"),
+                {"node_id": node.id},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM outbox_messages WHERE aggregate_id = :node_id"),
+                {"node_id": node.id},
+            )
+            == 1
+        )
     engine.dispose()
     store.close()
 
@@ -2227,12 +2233,18 @@ def test_postgres_node_registration_rolls_back_when_normative_append_fails(
 
     assert store.list_nodes() == ()
     with engine.connect() as connection:
-        assert connection.scalar(
-            text("SELECT count(*) FROM audit_events WHERE aggregate_type = 'media_node'")
-        ) == 0
-        assert connection.scalar(
-            text("SELECT count(*) FROM outbox_messages WHERE aggregate_type = 'media_node'")
-        ) == 0
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM audit_events WHERE aggregate_type = 'media_node'")
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM outbox_messages WHERE aggregate_type = 'media_node'")
+            )
+            == 0
+        )
     store.close()
     engine.dispose()
 
@@ -2809,7 +2821,11 @@ class RecordingLifecycleRuntime(NodeRuntime):
         node: MediaNode,
     ) -> NodeRuntimeObservation:
         self.calls.append((action, node.id))
-        if action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE}:
+        if action in {NodeRuntimeAction.STOP, NodeRuntimeAction.DELETE} or (
+            action is NodeRuntimeAction.OBSERVE
+            and node.state is NodeState.DRAINING
+            and node.runtime_state is not NodeState.RUNNING
+        ):
             return NodeRuntimeObservation(
                 state=NodeState.STOPPED,
                 health=NodeHealth.UNKNOWN,
@@ -2829,6 +2845,91 @@ class RecordingLifecycleRuntime(NodeRuntime):
             process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
             config_sha256="c" * 64,
             release_id=node.release_id,
+        )
+
+    def observe_disruption(self, node: MediaNode) -> NodeDisruptionObservation:
+        return RecordingDisruptionObserver().observe(node)
+
+    def fence_disruption(
+        self,
+        node: MediaNode,
+        affected_public_ids: tuple[PublicId, ...],
+    ) -> AbstractContextManager[NodeDisruptionFenceLease]:
+        return RecordingDisruptionObserver().fence(node, affected_public_ids)
+
+
+class RecordingDisruptionObserver:
+    def __init__(
+        self,
+        active_reader_public_ids: tuple[PublicId, ...] = (),
+        *,
+        on_fenced: Callable[[], None] | None = None,
+    ) -> None:
+        self.active_reader_public_ids = active_reader_public_ids
+        self.on_fenced = on_fenced
+        self.fence_active = False
+        self.process_id_override: int | None = None
+
+    def observe(self, node: MediaNode) -> NodeDisruptionObservation:
+        if (
+            node.process_id is None
+            or node.process_start_ticks is None
+            or node.process_boot_id is None
+        ):
+            raise AssertionError("ready node fixture lacks process identity")
+        return NodeDisruptionObservation(
+            active_reader_public_ids=self.active_reader_public_ids,
+            observed_at=datetime.now(UTC),
+            process_id=self.process_id_override or node.process_id,
+            process_start_ticks=node.process_start_ticks,
+            process_boot_id=node.process_boot_id,
+            release_id=node.release_id,
+        )
+
+    @contextmanager
+    def fence(
+        self,
+        node: MediaNode,
+        affected_public_ids: tuple[PublicId, ...],
+    ) -> Iterator[NodeDisruptionFenceLease]:
+        if not set(self.active_reader_public_ids).issubset(affected_public_ids):
+            raise AssertionError("reader fixture outside affected camera inventory")
+        self.fence_active = True
+        try:
+            if self.on_fenced is not None:
+                self.on_fenced()
+            yield NodeDisruptionFenceLease(observation=self.observe(node))
+        finally:
+            self.fence_active = False
+
+
+def test_node_disruption_proof_rejects_duplicate_readers_and_invalid_deadline() -> None:
+    public_id = PublicId.parse("a" * 26)
+    observed_at = datetime.now(UTC)
+    boot_id = UUID("30000000-0000-0000-0000-000000000001")
+
+    with pytest.raises(ValueError, match="node_disruption_observation_invalid"):
+        NodeDisruptionObservation(
+            active_reader_public_ids=(public_id, public_id),
+            observed_at=observed_at,
+            process_id=3001,
+            process_start_ticks=4001,
+            process_boot_id=boot_id,
+            release_id="0.2.1",
+        )
+
+    observation = NodeDisruptionObservation(
+        active_reader_public_ids=(public_id,),
+        observed_at=observed_at,
+        process_id=3001,
+        process_start_ticks=4001,
+        process_boot_id=boot_id,
+        release_id="0.2.1",
+    )
+    with pytest.raises(ValueError, match="node_disruption_deadline_invalid"):
+        NodeDisruptionFenceLease(
+            observation=observation,
+            work_deadline_unix_ms=0,
         )
 
 
@@ -4965,7 +5066,11 @@ def test_failed_reconfigure_can_be_retried_only_while_node_remains_draining() ->
     assert recovered.state is NodeState.DRAINING
     assert recovered.runtime_state is NodeState.RUNNING
     assert recovered.applied_revision == recovered.desired_revision == 3
-    assert runtime.calls == [(NodeRuntimeAction.RECONFIGURE_RESTART, node_id)]
+    assert runtime.calls == [
+        (NodeRuntimeAction.OBSERVE, node_id),
+        (NodeRuntimeAction.OBSERVE, node_id),
+        (NodeRuntimeAction.RECONFIGURE_RESTART, node_id),
+    ]
 
 
 def test_node_administration_public_errors_are_typed() -> None:
@@ -5011,6 +5116,9 @@ def test_node_administration_public_errors_are_typed() -> None:
                 external_port=12000,
                 state=NodeState.RUNNING,
                 runtime_state=NodeState.RUNNING,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
             ),
         )
     )
@@ -5153,6 +5261,9 @@ def test_node_administration_maps_busy_runtime_and_store_errors() -> None:
                 external_port=12000,
                 state=NodeState.RUNNING,
                 runtime_state=NodeState.RUNNING,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
             ),
         )
     )
@@ -5222,6 +5333,9 @@ def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures
                 external_port=12000,
                 state=NodeState.DRAINING,
                 runtime_state=NodeState.RUNNING,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
             ),
         )
     )
@@ -5230,16 +5344,25 @@ def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures
         preview_error: Exception | None = None
         reconfigure_error: Exception | None = None
 
-        def preview_reconfigure(self, node_id: UUID) -> Any:
+        def preview_reconfigure(
+            self,
+            node_id: UUID,
+            *,
+            confirmation_context: NodeDisruptionConfirmationContext | None = None,
+        ) -> Any:
             if self.preview_error is not None:
                 raise self.preview_error
-            return super().preview_reconfigure(node_id)
+            return super().preview_reconfigure(
+                node_id,
+                confirmation_context=confirmation_context,
+            )
 
         def reconfigure_node(
             self,
             node_id: UUID,
             *,
             confirmation_token: str | None,
+            confirmation_context: NodeDisruptionConfirmationContext | None = None,
             fence: NodeCommandFence | None = None,
             mutation_context: NodeMutationContext | None = None,
         ) -> MediaNode:
@@ -5248,6 +5371,7 @@ def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures
             return super().reconfigure_node(
                 node_id,
                 confirmation_token=confirmation_token,
+                confirmation_context=confirmation_context,
                 fence=fence,
                 mutation_context=mutation_context,
             )
@@ -5299,6 +5423,9 @@ def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> No
                 external_port=12000,
                 state=NodeState.RUNNING,
                 runtime_state=NodeState.RUNNING,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
             ),
         )
     )
@@ -5314,6 +5441,7 @@ def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> No
             new_port: int,
             allowed_ports: Collection[int],
             confirmation_token: str | None,
+            confirmation_context: NodeDisruptionConfirmationContext | None = None,
             fence: NodeCommandFence | None = None,
             mutation_context: NodeMutationContext | None = None,
         ) -> MediaNode:
@@ -5324,6 +5452,7 @@ def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> No
                 new_port=new_port,
                 allowed_ports=allowed_ports,
                 confirmation_token=confirmation_token,
+                confirmation_context=confirmation_context,
                 fence=fence,
                 mutation_context=mutation_context,
             )
@@ -5450,6 +5579,9 @@ def test_port_change_confirmation_binds_exact_camera_placements_not_only_count()
                 config_compatible=True,
                 desired_revision=1,
                 applied_revision=1,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
             )
             for node_id, name, port in (
                 (source_id, "media-a", 12000),
@@ -5513,6 +5645,362 @@ def test_port_change_confirmation_binds_exact_camera_placements_not_only_count()
             allowed_ports=(12000, 12001, 12002),
             confirmation_token=preview.confirmation_token,
         )
+
+
+def test_port_change_confirmation_expires_when_exact_reader_set_changes() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    public_id = PublicId.parse("a" * 26)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=datetime.now(UTC),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
+            ),
+        )
+    )
+    store.place_camera_manually(
+        camera_id=camera_id,
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=public_id,
+        node_id=node_id,
+    )
+    observer = RecordingDisruptionObserver((public_id,))
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        disruption_observer=observer,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+
+    assert preview.active_reader_public_ids == (public_id,)
+    observer.active_reader_public_ids = ()
+
+    with pytest.raises(NodeDisruptionConfirmationRequired):
+        control.change_port(
+            node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            confirmation_token=preview.confirmation_token,
+        )
+
+
+def test_port_change_keeps_reader_admission_fenced_through_disruptive_action() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    public_id = PublicId.parse("a" * 26)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=datetime.now(UTC),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
+            ),
+        )
+    )
+    store.place_camera_manually(
+        camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=public_id,
+        node_id=node_id,
+    )
+    late_attempts: list[str] = []
+    observer = RecordingDisruptionObserver()
+
+    def attempt_late_reader() -> None:
+        late_attempts.append("denied" if observer.fence_active else "admitted")
+
+    observer.on_fenced = attempt_late_reader
+
+    class FenceAwareRuntime(RecordingLifecycleRuntime):
+        def execute(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+        ) -> NodeRuntimeObservation:
+            if action is NodeRuntimeAction.RECONFIGURE_RESTART:
+                assert observer.fence_active
+            return super().execute(action, node)
+
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=FenceAwareRuntime(),
+        disruption_observer=observer,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+
+    changed = control.change_port(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+        confirmation_token=preview.confirmation_token,
+    )
+
+    assert changed.external_port == 12001
+    assert late_attempts == ["denied"]
+    assert not observer.fence_active
+
+
+def test_port_change_bounds_runtime_action_before_admission_fence_cleanup() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    public_id = PublicId.parse("a" * 26)
+    work_deadline_unix_ms = int(time.time() * 1000) + 250
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=node_id,
+                name="media-a",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=datetime.now(UTC),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+                process_id=3001,
+                process_start_ticks=4001,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
+            ),
+        )
+    )
+    store.place_camera_manually(
+        camera_id=UUID("10000000-0000-0000-0000-000000000001"),
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        public_id=public_id,
+        node_id=node_id,
+    )
+
+    class DeadlineFence(RecordingDisruptionObserver):
+        @contextmanager
+        def fence(
+            self,
+            node: MediaNode,
+            affected_public_ids: tuple[PublicId, ...],
+        ) -> Iterator[NodeDisruptionFenceLease]:
+            self.fence_active = True
+            try:
+                yield NodeDisruptionFenceLease(
+                    observation=self.observe(node),
+                    work_deadline_unix_ms=work_deadline_unix_ms,
+                )
+            finally:
+                self.fence_active = False
+
+    class DeadlineRuntime(RecordingLifecycleRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadlines: list[int] = []
+
+        def execute_until(
+            self,
+            action: NodeRuntimeAction,
+            node: MediaNode,
+            *,
+            deadline_unix_ms: int,
+        ) -> NodeRuntimeObservation:
+            assert action is NodeRuntimeAction.RECONFIGURE_RESTART
+            self.deadlines.append(deadline_unix_ms)
+            if node.external_port == 12001:
+                time.sleep(0.3)
+                raise RuntimeError("runtime stalled until bounded deadline")
+            assert deadline_unix_ms <= int(time.time() * 1000)
+            raise RuntimeError("rollback rejected after bounded deadline")
+
+    observer = DeadlineFence()
+    runtime = DeadlineRuntime()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+        disruption_observer=observer,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(NodeRuntimeFailed, match="node_port_change_rollback_failed"):
+        control.change_port(
+            node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            confirmation_token=preview.confirmation_token,
+        )
+
+    assert runtime.deadlines == [work_deadline_unix_ms, work_deadline_unix_ms]
+    assert not observer.fence_active
+    assert time.monotonic() - started_at < 1
+
+
+def test_port_change_rejects_process_swap_after_admission_fence() -> None:
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    node = MediaNode(
+        id=node_id,
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        config_compatible=True,
+        desired_revision=1,
+        applied_revision=1,
+        process_id=3001,
+        process_start_ticks=4001,
+        process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    observer = RecordingDisruptionObserver()
+    runtime = RecordingLifecycleRuntime()
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+        disruption_observer=observer,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+    )
+    preview = control.preview_port_change(
+        node_id,
+        new_port=12001,
+        allowed_ports=(12000, 12001),
+    )
+    observer.on_fenced = lambda: setattr(observer, "process_id_override", 9999)
+
+    with pytest.raises(NodeRuntimeUnavailable, match="node_disruption_observation_invalid"):
+        control.change_port(
+            node_id,
+            new_port=12001,
+            allowed_ports=(12000, 12001),
+            confirmation_token=preview.confirmation_token,
+        )
+
+    assert runtime.calls == []
+    assert store.get_node(node_id) == node
+
+
+def test_disruptive_node_workflows_have_a_global_nonblocking_admission_budget() -> None:
+    first_id = UUID("00000000-0000-0000-0000-000000000001")
+    second_id = UUID("00000000-0000-0000-0000-000000000002")
+    entered = Event()
+    release = Event()
+
+    def block_first_fence() -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+
+    observer = RecordingDisruptionObserver(on_fenced=block_first_fence)
+    store = InMemoryNodeStore(
+        nodes=tuple(
+            MediaNode(
+                id=node_id,
+                name=name,
+                external_port=port,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+                process_id=process_id,
+                process_start_ticks=process_id + 1000,
+                process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
+            )
+            for node_id, name, port, process_id in (
+                (first_id, "media-a", 12000, 3001),
+                (second_id, "media-b", 12001, 3002),
+            )
+        )
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        disruption_observer=observer,
+        confirmations=node_confirmation_service(),
+        is_port_bindable=lambda _port: True,
+        disruption_workers=1,
+    )
+    first_preview = control.preview_port_change(
+        first_id,
+        new_port=12002,
+        allowed_ports=(12000, 12001, 12002, 12003),
+    )
+    second_preview = control.preview_port_change(
+        second_id,
+        new_port=12003,
+        allowed_ports=(12000, 12001, 12002, 12003),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            control.change_port,
+            first_id,
+            new_port=12002,
+            allowed_ports=(12000, 12001, 12002, 12003),
+            confirmation_token=first_preview.confirmation_token,
+        )
+        assert entered.wait(timeout=2)
+        with pytest.raises(NodeLifecycleBusy, match="node_disruption_busy"):
+            control.change_port(
+                second_id,
+                new_port=12003,
+                allowed_ports=(12000, 12001, 12002, 12003),
+                confirmation_token=second_preview.confirmation_token,
+            )
+        release.set()
+        assert first.result(timeout=2).external_port == 12002
 
 
 def test_prepared_port_change_fences_new_camera_placement() -> None:
@@ -6027,6 +6515,9 @@ def test_in_memory_store_rejects_invalid_camera_and_move_transitions() -> None:
                     config_compatible=True,
                     desired_revision=1,
                     applied_revision=1,
+                    process_id=3001,
+                    process_start_ticks=4001,
+                    process_boot_id=UUID("30000000-0000-0000-0000-000000000001"),
                 )
                 for node_id, name, port in (
                     (source_id, "source", 12000),
@@ -6331,10 +6822,19 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
     )
 
     control.set_administrative_state(node_id, NodeState.DRAINING)
-    reconfigure_preview = control.preview_reconfigure(node_id)
+    reconfigure_preview = control.preview_reconfigure(
+        node_id,
+        confirmation_context=NODE_CONFIRMATION_CONTEXT,
+    )
     reconfigured = control.reconfigure_node(
         node_id,
         confirmation_token=reconfigure_preview.confirmation_token,
+        confirmation_context=NODE_CONFIRMATION_CONTEXT,
+        mutation_context=replace(
+            NODE_MUTATION_CONTEXT,
+            action="node.reconfigure",
+            resource_id=str(node_id),
+        ),
     )
     control.set_administrative_state(node_id, NodeState.RUNNING)
 
@@ -6342,12 +6842,19 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
         node_id,
         new_port=12001,
         allowed_ports=(12000, 12001, 12002),
+        confirmation_context=NODE_CONFIRMATION_CONTEXT,
     )
     changed = control.change_port(
         node_id,
         new_port=12001,
         allowed_ports=(12000, 12001, 12002),
         confirmation_token=preview.confirmation_token,
+        confirmation_context=NODE_CONFIRMATION_CONTEXT,
+        mutation_context=replace(
+            NODE_MUTATION_CONTEXT,
+            action="node.port_change",
+            resource_id=str(node_id),
+        ),
     )
     drained = control.set_administrative_state(node_id, NodeState.DRAINING)
     maintained = control.set_administrative_state(node_id, NodeState.MAINTENANCE)
@@ -6391,18 +6898,96 @@ def test_postgresql_node_administration_happy_path_is_crash_durable(
             text("SELECT node_id FROM camera_placement_history WHERE camera_id = :camera_id"),
             {"camera_id": camera_id},
         )
-        reconfigure_events = connection.scalar(
-            text(
-                "SELECT count(*) FROM audit_events "
-                "WHERE aggregate_id = :node_id "
-                "AND event_type = 'media_node.reconfigure_requested'"
-            ),
-            {"node_id": node_id},
+        disruptive_payloads = tuple(
+            connection.scalars(
+                text(
+                    "SELECT payload FROM audit_events "
+                    "WHERE aggregate_id = :node_id "
+                    "AND event_type IN "
+                    "('media_node.reconfigure_requested', 'media_node.port_change_prepared') "
+                    "ORDER BY event_type"
+                ),
+                {"node_id": node_id},
+            )
         )
     assert saga == ("complete", 1, expected_blast_radius)
     assert historical_node == node_id
-    assert reconfigure_events == 1
+    assert len(disruptive_payloads) == 2
+    for payload in disruptive_payloads:
+        proof = payload["operator"]["disruption_confirmation"]
+        assert proof["mfa_verified_at_unix_ms"] == 1_788_091_200_000
+        assert proof["active_readers"] == 0
+        assert proof["reader_blast_radius_sha256"]
+        assert proof["reader_observed_at_unix_ms"] > 0
+        assert proof["runtime_state"] == "running"
+        assert proof["process_id"] > 0
+        assert proof["process_start_ticks"] > 0
+        assert proof["process_boot_id"] == "30000000-0000-0000-0000-000000000001"
     store.close()
+
+
+def test_postgresql_disruption_audit_preserves_failed_runtime_state_proof(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+    desired = store.request_desired_state(node.id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        node.id,
+        NodeRuntimeObservation(
+            state=NodeState.FAILED,
+            health=NodeHealth.UNHEALTHY,
+            applied_revision=desired.applied_revision,
+        ),
+    )
+    store.request_administrative_state(node.id, NodeState.DRAINING)
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=RecordingLifecycleRuntime(),
+        confirmations=node_confirmation_service(),
+    )
+    preview = control.preview_reconfigure(
+        node_id,
+        confirmation_context=NODE_CONFIRMATION_CONTEXT,
+    )
+
+    control.reconfigure_node(
+        node_id,
+        confirmation_token=preview.confirmation_token,
+        confirmation_context=NODE_CONFIRMATION_CONTEXT,
+        mutation_context=replace(
+            NODE_MUTATION_CONTEXT,
+            action="node.reconfigure",
+            resource_id=str(node_id),
+        ),
+    )
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        payload = connection.scalar(
+            text(
+                "SELECT payload FROM audit_events "
+                "WHERE aggregate_id=:node_id "
+                "AND event_type='media_node.reconfigure_requested'"
+            ),
+            {"node_id": node_id},
+        )
+    engine.dispose()
+    store.close()
+    assert payload["operator"]["disruption_confirmation"]["runtime_state"] == "failed"
 
 
 def test_postgresql_node_administration_rejects_stale_or_conflicting_operations(
@@ -6635,10 +7220,13 @@ def test_postgresql_camera_move_uses_the_configured_freshness_at_commit(
             {"node_id": target_id},
         )
 
-    assert store.list_camera_move_targets(
-        camera.id,
-        management_freshness_seconds=30,
-    ) == ()
+    assert (
+        store.list_camera_move_targets(
+            camera.id,
+            management_freshness_seconds=30,
+        )
+        == ()
+    )
     assert [
         node.id
         for node in store.list_camera_move_targets(

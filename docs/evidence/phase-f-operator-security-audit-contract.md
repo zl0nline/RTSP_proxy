@@ -68,10 +68,13 @@ browser remains an external client; server behavior is architecture-neutral.
 CI run 32680412385 executed the generated matrix commit `39b2981`. All seven
 jobs passed again: application/PostgreSQL, patched MediaMTX and RTSP/load
 contracts on Linux amd64 and arm64, plus the external Chromium client on amd64.
-The later node-action router expands the current local inventory to 57 pairs;
+The first node-action router expanded the published inventory to 57 pairs;
 that delta is tracked separately in
 [`phase-f-node-operations-contract.md`](phase-f-node-operations-contract.md)
-and is not retroactively attributed to the 48-route CI run.
+and is not retroactively attributed to the 48-route CI run. The current
+disruptive-node implementation expands it to 63 pairs; its review/Linux status
+and pending publication gate are recorded in
+[`phase-f-node-disruption-contract.md`](phase-f-node-disruption-contract.md).
 
 ## Remaining gates
 

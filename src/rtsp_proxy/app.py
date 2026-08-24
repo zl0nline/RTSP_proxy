@@ -48,6 +48,8 @@ from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.node_dashboard import node_dashboard_router
 from rtsp_proxy.node_operator import (
     OperatorNodeCommand,
+    OperatorRecentMfaRequired,
+    node_disruption_confirmation_context,
     node_mutation_context,
     operator_node_command,
 )
@@ -63,6 +65,7 @@ from rtsp_proxy.nodes import (
     MaximumNodesReached,
     NodeCameraCapacityReached,
     NodeControl,
+    NodeDisruptionConfirmationContext,
     NodeDisruptionConfirmationRequired,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
@@ -184,6 +187,10 @@ class NodePortChangePreviewResponse(BaseModel):
     desired_revision: int
     registered_cameras: int
     blast_radius_sha256: str
+    affected_public_ids: list[str]
+    active_reader_public_ids: list[str]
+    reader_blast_radius_sha256: str
+    reader_observed_at: datetime
     confirmation_token: str
 
 
@@ -197,6 +204,10 @@ class NodeReconfigurePreviewResponse(BaseModel):
     desired_revision: int
     registered_cameras: int
     blast_radius_sha256: str
+    affected_public_ids: list[str]
+    active_reader_public_ids: list[str]
+    reader_blast_radius_sha256: str
+    reader_observed_at: datetime
     target_release_id: str
     target_mediamtx_binary_sha256: str
     confirmation_token: str
@@ -823,8 +834,8 @@ def create_app(
     def dashboard_stylesheet() -> Response:
         from importlib.resources import files
 
-        stylesheet = files("rtsp_proxy").joinpath("assets/dashboard.css").read_text(
-            encoding="utf-8"
+        stylesheet = (
+            files("rtsp_proxy").joinpath("assets/dashboard.css").read_text(encoding="utf-8")
         )
         return PlainTextResponse(
             stylesheet,
@@ -852,9 +863,7 @@ def create_app(
                 can_manage_nodes=(
                     node_control is not None
                     and principal.allows(OperatorPermission.CONTROL_MUTATE)
-                    and 43
-                    <= len(request.cookies.get("__Host-rtsp_proxy_csrf", ""))
-                    <= 1024
+                    and 43 <= len(request.cookies.get("__Host-rtsp_proxy_csrf", "")) <= 1024
                 ),
             )
         )
@@ -933,10 +942,11 @@ def create_app(
                 can_manage_nodes=(
                     node_control is not None
                     and principal.allows(OperatorPermission.CONTROL_MUTATE)
-                    and 43
-                    <= len(request.cookies.get("__Host-rtsp_proxy_csrf", ""))
-                    <= 1024
+                    and 43 <= len(request.cookies.get("__Host-rtsp_proxy_csrf", "")) <= 1024
                 ),
+                port_range_start=settings.node_port_range_start,
+                port_range_end=settings.node_port_range_end,
+                target_release_id=settings.node_release_id,
             )
         )
 
@@ -1228,9 +1238,7 @@ def create_app(
             node = node_control.start_node(
                 node_id,
                 fence=None if command is None else command.fence,
-                mutation_context=(
-                    None if command is None else command.mutation_context
-                ),
+                mutation_context=(None if command is None else command.mutation_context),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1291,9 +1299,7 @@ def create_app(
             node = node_control.stop_node(
                 node_id,
                 fence=None if command is None else command.fence,
-                mutation_context=(
-                    None if command is None else command.mutation_context
-                ),
+                mutation_context=(None if command is None else command.mutation_context),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1346,9 +1352,7 @@ def create_app(
             node = node_control.restart_node(
                 node_id,
                 fence=None if command is None else command.fence,
-                mutation_context=(
-                    None if command is None else command.mutation_context
-                ),
+                mutation_context=(None if command is None else command.mutation_context),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1383,14 +1387,20 @@ def create_app(
         "/api/v1/nodes/{node_id}/reconfigure/preview",
         response_model=NodeReconfigurePreviewResponse,
     )
-    def preview_node_reconfigure(node_id: UUID) -> NodeReconfigurePreviewResponse:
+    def preview_node_reconfigure(
+        request: Request,
+        node_id: UUID,
+    ) -> NodeReconfigurePreviewResponse:
         if node_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "node_control_unavailable"},
             )
         try:
-            preview = node_control.preview_reconfigure(node_id)
+            preview = node_control.preview_reconfigure(
+                node_id,
+                confirmation_context=_external_disruption_context(request, settings),
+            )
         except NodeNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1414,6 +1424,10 @@ def create_app(
             desired_revision=preview.desired_revision,
             registered_cameras=preview.registered_cameras,
             blast_radius_sha256=preview.blast_radius_sha256,
+            affected_public_ids=[str(value) for value in preview.affected_public_ids],
+            active_reader_public_ids=[str(value) for value in preview.active_reader_public_ids],
+            reader_blast_radius_sha256=preview.reader_blast_radius_sha256,
+            reader_observed_at=preview.reader_observed_at,
             target_release_id=preview.target_release_id,
             target_mediamtx_binary_sha256=(preview.target_mediamtx_binary_sha256),
             confirmation_token=preview.confirmation_token,
@@ -1442,10 +1456,12 @@ def create_app(
             node = node_control.reconfigure_node(
                 node_id,
                 confirmation_token=request.confirmation_token,
-                fence=None if command is None else command.fence,
-                mutation_context=(
-                    None if command is None else command.mutation_context
+                confirmation_context=_external_disruption_context(
+                    http_request,
+                    settings,
                 ),
+                fence=None if command is None else command.fence,
+                mutation_context=(None if command is None else command.mutation_context),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1537,9 +1553,7 @@ def create_app(
                 release_id=request.release_id,
                 mediamtx_binary_sha256=request.mediamtx_binary_sha256,
                 fence=None if command is None else command.fence,
-                mutation_context=(
-                    None if command is None else command.mutation_context
-                ),
+                mutation_context=(None if command is None else command.mutation_context),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1577,9 +1591,7 @@ def create_app(
             allowed_states = {
                 NodeState.DRAINING: frozenset({NodeState.RUNNING}),
                 NodeState.MAINTENANCE: frozenset({NodeState.DRAINING}),
-                NodeState.RUNNING: frozenset(
-                    {NodeState.DRAINING, NodeState.MAINTENANCE}
-                ),
+                NodeState.RUNNING: frozenset({NodeState.DRAINING, NodeState.MAINTENANCE}),
             }
             command = _external_node_command(
                 request,
@@ -1592,9 +1604,7 @@ def create_app(
                     node_id,
                     state,
                     fence=None if command is None else command.fence,
-                    mutation_context=(
-                        None if command is None else command.mutation_context
-                    ),
+                    mutation_context=(None if command is None else command.mutation_context),
                 )
             )
         except NodeNotFound:
@@ -1660,6 +1670,7 @@ def create_app(
         response_model=NodePortChangePreviewResponse,
     )
     def preview_node_port_change(
+        http_request: Request,
         node_id: UUID,
         request: NodePortChangeRequest,
     ) -> NodePortChangePreviewResponse:
@@ -1672,7 +1683,11 @@ def create_app(
             preview = node_control.preview_port_change(
                 node_id,
                 new_port=request.new_port,
-                allowed_ports=_allowed_node_ports(settings),
+                allowed_ports=(settings.node_registration_policy().allowed_external_ports()),
+                confirmation_context=_external_disruption_context(
+                    http_request,
+                    settings,
+                ),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1701,6 +1716,10 @@ def create_app(
             desired_revision=preview.desired_revision,
             registered_cameras=preview.registered_cameras,
             blast_radius_sha256=preview.blast_radius_sha256,
+            affected_public_ids=[str(value) for value in preview.affected_public_ids],
+            active_reader_public_ids=[str(value) for value in preview.active_reader_public_ids],
+            reader_blast_radius_sha256=preview.reader_blast_radius_sha256,
+            reader_observed_at=preview.reader_observed_at,
             confirmation_token=preview.confirmation_token,
         )
 
@@ -1731,12 +1750,14 @@ def create_app(
                 node_control.change_port(
                     node_id,
                     new_port=request.new_port,
-                    allowed_ports=_allowed_node_ports(settings),
+                    allowed_ports=(settings.node_registration_policy().allowed_external_ports()),
                     confirmation_token=request.confirmation_token,
-                    fence=None if command is None else command.fence,
-                    mutation_context=(
-                        None if command is None else command.mutation_context
+                    confirmation_context=_external_disruption_context(
+                        http_request,
+                        settings,
                     ),
+                    fence=None if command is None else command.fence,
+                    mutation_context=(None if command is None else command.mutation_context),
                 )
             )
         except NodeNotFound:
@@ -1802,9 +1823,7 @@ def create_app(
             node_control.delete_node(
                 node_id,
                 fence=None if command is None else command.fence,
-                mutation_context=(
-                    None if command is None else command.mutation_context
-                ),
+                mutation_context=(None if command is None else command.mutation_context),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -2728,9 +2747,7 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
         return "request.unsupported", "server", "server"
     if path in {"/api/v1/operator/session", "/dashboard/logout"}:
         action = (
-            "operator.session_logout"
-            if method in {"POST", "DELETE"}
-            else "operator.session_read"
+            "operator.session_logout" if method in {"POST", "DELETE"} else "operator.session_read"
         )
         return action, "session", "self"
     if path in {"/dashboard", "/api/v1/dashboard/snapshot"}:
@@ -2745,10 +2762,16 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
             "registered": "node.read",
             "start": "node.start",
             "stop": "node.stop",
+            "restart": "node.restart",
             "drain": "node.drain",
             "maintenance": "node.maintenance",
             "resume": "node.resume",
             "delete": "node.delete",
+            "reconfigure/preview": "node.reconfigure_preview",
+            "reconfigure": "node.reconfigure",
+            "release": "node.release_update",
+            "port-change/preview": "node.port_change_preview",
+            "port-change": "node.port_change",
         }.get(suffix, "request.unsupported")
         return action, "node", node_id
     if path == "/api/v1/nodes":
@@ -2863,9 +2886,7 @@ def _canonical_audit_identifier(value: str) -> str:
 
 
 def _operator_protected_path(path: str) -> bool:
-    return path.startswith("/api/v1/") or path == "/dashboard" or path.startswith(
-        "/dashboard/"
-    )
+    return path.startswith("/api/v1/") or path == "/dashboard" or path.startswith("/dashboard/")
 
 
 def _dashboard_principal(
@@ -2910,8 +2931,7 @@ def _dashboard_snapshot_failure(reason: FleetSnapshotFailureReason) -> Dashboard
         return DashboardUnavailable(
             title="Снимок состояния ещё не сформирован",
             message=(
-                "Коллектор ещё не завершил первый цикл. "
-                "Повторите попытку через несколько секунд."
+                "Коллектор ещё не завершил первый цикл. Повторите попытку через несколько секунд."
             ),
         )
     if reason is FleetSnapshotFailureReason.STALE:
@@ -3148,6 +3168,25 @@ def _external_node_command(
         ) from None
 
 
+def _external_disruption_context(
+    request: Request,
+    settings: Settings,
+) -> NodeDisruptionConfirmationContext | None:
+    principal = getattr(request.state, "operator_principal", None)
+    if not isinstance(principal, OperatorPrincipal):
+        return None
+    try:
+        return node_disruption_confirmation_context(
+            principal=principal,
+            max_age_seconds=settings.operator_recent_mfa_seconds,
+        )
+    except OperatorRecentMfaRequired:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "operator_recent_mfa_required"},
+        ) from None
+
+
 def _camera_response(camera: object) -> CameraResponse:
     from rtsp_proxy.nodes import CameraPlacement, CameraState
 
@@ -3194,15 +3233,6 @@ def _camera_move_response(move: CameraMove) -> CameraMoveResponse:
         expires_at=move.expires_at,
         abort_reason=move.abort_reason,
         state=move.state.value,
-    )
-
-
-def _allowed_node_ports(settings: Settings) -> tuple[int, ...]:
-    reserved = set(settings.node_port_reserved)
-    return tuple(
-        port
-        for port in range(settings.node_port_range_start, settings.node_port_range_end + 1)
-        if port not in reserved
     )
 
 

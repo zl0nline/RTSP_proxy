@@ -13,10 +13,11 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -39,6 +40,8 @@ from rtsp_proxy.media import (
 )
 from rtsp_proxy.nodes import (
     MediaNode,
+    NodeDisruptionFenceLease,
+    NodeDisruptionObservation,
     NodeHealth,
     NodeRuntimeAction,
     NodeRuntimeObservation,
@@ -197,8 +200,8 @@ authInternalUsers:
 {reader}"""
         else:
             assert self._auth_callback_verifier is not None
-            callback_user, callback_password = (
-                self._auth_callback_verifier.callback_credentials(spec.node_id)
+            callback_user, callback_password = self._auth_callback_verifier.callback_credentials(
+                spec.node_id
             )
             auth = f"""authMethod: http
 # rtsp-proxy-auth-primary-key-id: {self._auth_callback_verifier.primary_key_id}
@@ -649,9 +652,7 @@ class SecureNodeConfigStore:
     def _install_runtime_environment(self, node_fd: int, spec: NodeRuntimeSpec) -> None:
         binary_path = self._binary_path
         if self._binary_catalog:
-            binary_path = self._binary_catalog.get(
-                (spec.release_id, spec.mediamtx_binary_sha256)
-            )
+            binary_path = self._binary_catalog.get((spec.release_id, spec.mediamtx_binary_sha256))
             if binary_path is None:
                 raise ValueError("node_release_not_allowed")
         if binary_path is None:
@@ -828,9 +829,7 @@ class LinuxNodeSupervisor:
         }
         work_deadline = deadline
         if deadline is not None:
-            work_deadline = (
-                deadline.before(cleanup_reserve_seconds) if mutating else deadline
-            )
+            work_deadline = deadline.before(cleanup_reserve_seconds) if mutating else deadline
             work_deadline.remaining_seconds()
 
         expected: RenderedNodeConfig | None
@@ -851,9 +850,7 @@ class LinuxNodeSupervisor:
             NodeRuntimeAction.START,
             NodeRuntimeAction.RESTART,
             NodeRuntimeAction.RECONFIGURE_RESTART,
-        } and (
-            expected is None or credentials is None or installed_sha256 != expected.sha256
-        ):
+        } and (expected is None or credentials is None or installed_sha256 != expected.sha256):
             raise NodeSupervisorError("node_config_not_applied")
 
         try:
@@ -989,9 +986,7 @@ class MediaNodeSmokeProbe:
         timeout_seconds: float,
         auth_callback_port: int | None = None,
         auth_callback_verifier: PepperVerifier | None = None,
-        reader_credentials: Callable[
-            [NodeRuntimeSpec], NodeReaderCredentials | None
-        ] | None = None,
+        reader_credentials: Callable[[NodeRuntimeSpec], NodeReaderCredentials | None] | None = None,
     ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 10:
             raise ValueError("node_smoke_timeout_invalid")
@@ -1024,13 +1019,14 @@ class MediaNodeSmokeProbe:
             None if self._reader_credentials is None else self._reader_credentials(spec)
         )
         if (
-            self._auth_callback_port is not None
-            and reader_credentials is None
-        ) or not isinstance(actual, dict) or not self._global_config_matches(
-            actual,
-            spec,
-            credentials,
-            reader_credentials,
+            (self._auth_callback_port is not None and reader_credentials is None)
+            or not isinstance(actual, dict)
+            or not self._global_config_matches(
+                actual,
+                spec,
+                credentials,
+                reader_credentials,
+            )
         ):
             raise NodeSupervisorError("node_api_config_mismatch")
         self._read_http(
@@ -1086,16 +1082,14 @@ class MediaNodeSmokeProbe:
                     "user": reader_credentials.username,
                     "pass": reader_credentials.password,
                     "ips": ["127.0.0.1/32", "::1/128"],
-                    "permissions": [
-                        {"action": "read", "path": "__rtsp_proxy_runtime_probe"}
-                    ],
+                    "permissions": [{"action": "read", "path": "__rtsp_proxy_runtime_probe"}],
                 },
             ]
         auth_http_address: str | None = None
         if self._auth_callback_port is not None:
             assert self._auth_callback_verifier is not None
-            callback_user, callback_password = (
-                self._auth_callback_verifier.callback_credentials(spec.node_id)
+            callback_user, callback_password = self._auth_callback_verifier.callback_credentials(
+                spec.node_id
             )
             auth_http_address = (
                 f"http://{callback_user}:{callback_password}@127.0.0.1:"
@@ -1625,6 +1619,7 @@ class _MediaMetricsPayload(BaseModel):
     received_bytes_total: int = Field(ge=0)
     sent_bytes_total: int = Field(ge=0)
     path_counters: list[_PathMetricPayload]
+    occupied_public_ids: list[str]
     process_id: int = Field(ge=1)
     process_start_ticks: int = Field(ge=1)
     process_boot_id: UUID
@@ -1659,6 +1654,26 @@ class UnixNodeRuntimeClient:
         action: NodeRuntimeAction,
         node: MediaNode,
     ) -> NodeRuntimeObservation:
+        return self._execute(action, node, deadline_unix_ms=None)
+
+    def execute_until(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+        *,
+        deadline_unix_ms: int,
+    ) -> NodeRuntimeObservation:
+        if isinstance(deadline_unix_ms, bool) or deadline_unix_ms < 1:
+            raise NodeSupervisorError("node_runtime_operation_timeout")
+        return self._execute(action, node, deadline_unix_ms=deadline_unix_ms)
+
+    def _execute(
+        self,
+        action: NodeRuntimeAction,
+        node: MediaNode,
+        *,
+        deadline_unix_ms: int | None,
+    ) -> NodeRuntimeObservation:
         spec = NodeRuntimeSpec(
             node_id=node.id,
             external_port=node.external_port,
@@ -1669,14 +1684,24 @@ class UnixNodeRuntimeClient:
             mediamtx_binary_sha256=node.mediamtx_binary_sha256,
         )
         command = NodeRuntimeCommand.for_node(action, spec)
-        response_reserve = min(1.0, self._timeout_seconds / 2)
-        deadline_unix_ms = int(
-            (time.time() + self._timeout_seconds - response_reserve) * 1000
+        now = time.time()
+        effective_deadline = now + self._timeout_seconds
+        if deadline_unix_ms is not None:
+            effective_deadline = min(effective_deadline, deadline_unix_ms / 1000)
+        remaining_seconds = effective_deadline - now
+        if remaining_seconds <= 0:
+            raise NodeSupervisorError("node_runtime_operation_timeout")
+        response_reserve = min(1.0, remaining_seconds / 2)
+        request_deadline_unix_ms = int((effective_deadline - response_reserve) * 1000)
+        if request_deadline_unix_ms <= int(now * 1000):
+            raise NodeSupervisorError("node_runtime_operation_timeout")
+        request = self._encode_command(
+            command,
+            deadline_unix_ms=request_deadline_unix_ms,
         )
-        request = self._encode_command(command, deadline_unix_ms=deadline_unix_ms)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(self._timeout_seconds)
+                connection.settimeout(remaining_seconds)
                 connection.connect(str(self._socket_path))
                 connection.sendall(request)
                 response = connection.makefile("rb").readline(_MAX_RUNTIME_MESSAGE_BYTES + 1)
@@ -1722,9 +1747,7 @@ class UnixNodeRuntimeClient:
                     "action": "health",
                     "spec": None,
                     "config": None,
-                    "deadline_unix_ms": int(
-                        (time.time() + self._timeout_seconds / 2) * 1000
-                    ),
+                    "deadline_unix_ms": int((time.time() + self._timeout_seconds / 2) * 1000),
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -1783,9 +1806,33 @@ class UnixMediaNodeClientFactory:
         self._timeout_seconds = timeout_seconds
 
     def for_node(self, node: MediaNode) -> UnixMediaNodeClient:
+        self._require_ready(node)
+        return UnixMediaNodeClient(
+            socket_path=self._socket_path,
+            timeout_seconds=self._timeout_seconds,
+            node=node,
+        )
+
+    def for_node_until(
+        self,
+        node: MediaNode,
+        *,
+        deadline_unix_ms: int,
+    ) -> UnixMediaNodeClient:
+        self._require_ready(node)
+        if deadline_unix_ms <= int(time.time() * 1000):
+            raise MediaNodeUnavailable("node_media_deadline_exceeded")
+        return UnixMediaNodeClient(
+            socket_path=self._socket_path,
+            timeout_seconds=self._timeout_seconds,
+            node=node,
+            deadline_unix_ms=deadline_unix_ms,
+        )
+
+    @staticmethod
+    def _require_ready(node: MediaNode) -> None:
         if (
-            node.state
-            not in {NodeState.RUNNING, NodeState.DRAINING, NodeState.MAINTENANCE}
+            node.state not in {NodeState.RUNNING, NodeState.DRAINING, NodeState.MAINTENANCE}
             or node.runtime_state is not NodeState.RUNNING
             or node.health is not NodeHealth.HEALTHY
             or not node.management_fresh
@@ -1793,11 +1840,6 @@ class UnixMediaNodeClientFactory:
             or node.applied_revision != node.desired_revision
         ):
             raise MediaNodeUnavailable("media_node_not_ready")
-        return UnixMediaNodeClient(
-            socket_path=self._socket_path,
-            timeout_seconds=self._timeout_seconds,
-            node=node,
-        )
 
 
 class UnixMediaNodeClient:
@@ -1807,10 +1849,12 @@ class UnixMediaNodeClient:
         socket_path: Path,
         timeout_seconds: float,
         node: MediaNode,
+        deadline_unix_ms: int | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._timeout_seconds = timeout_seconds
         self._node = node
+        self._deadline_unix_ms = deadline_unix_ms
 
     def put_path(self, path: MediaPathConfig) -> None:
         response = self._request(
@@ -1927,6 +1971,7 @@ class UnixMediaNodeClient:
                 received_bytes_total=response.metrics.received_bytes_total,
                 sent_bytes_total=response.metrics.sent_bytes_total,
                 path_counters=path_counters,
+                occupied_public_ids=tuple(response.metrics.occupied_public_ids),
             ),
             process_id=response.metrics.process_id,
             process_start_ticks=response.metrics.process_start_ticks,
@@ -1942,10 +1987,17 @@ class UnixMediaNodeClient:
         source_url: str | None = None,
         max_readers: int | None = None,
     ) -> _MediaResponsePayload:
-        response_reserve = min(1.0, self._timeout_seconds / 2)
-        deadline_unix_ms = int(
-            (time.time() + self._timeout_seconds - response_reserve) * 1000
-        )
+        now = time.time()
+        if self._deadline_unix_ms is None:
+            response_reserve = min(1.0, self._timeout_seconds / 2)
+            deadline_unix_ms = int((now + self._timeout_seconds - response_reserve) * 1000)
+            socket_timeout = self._timeout_seconds
+        else:
+            deadline_unix_ms = self._deadline_unix_ms
+            remaining_seconds = deadline_unix_ms / 1000 - now
+            if remaining_seconds <= 0:
+                raise MediaNodeUnavailable("node_media_deadline_exceeded")
+            socket_timeout = min(self._timeout_seconds, remaining_seconds)
         payload = {
             "schema_version": 1,
             "request_type": "media_path",
@@ -1969,12 +2021,10 @@ class UnixMediaNodeClient:
             raise MediaNodeUnavailable("node_media_request_too_large")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(self._timeout_seconds)
+                connection.settimeout(socket_timeout)
                 connection.connect(str(self._socket_path))
                 connection.sendall(encoded)
-                raw_response = connection.makefile("rb").readline(
-                    _MAX_RUNTIME_MESSAGE_BYTES + 1
-                )
+                raw_response = connection.makefile("rb").readline(_MAX_RUNTIME_MESSAGE_BYTES + 1)
         except (OSError, TimeoutError) as error:
             raise MediaNodeUnavailable("node_media_unavailable") from error
         if (
@@ -2010,6 +2060,121 @@ class UnixNodeMetricSource:
 
     def scrape(self, node: MediaNode) -> NodeMetricObservation:
         return self._media_nodes.for_node(node).node_metrics()
+
+
+class UnixNodeDisruptionObserver:
+    """Capture one fresh, process-bound exact reader set for confirmation."""
+
+    def __init__(
+        self,
+        *,
+        media_nodes: UnixMediaNodeClientFactory,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        wall_time: Callable[[], float] = time.time,
+        fence_timeout_seconds: float = 60.0,
+    ) -> None:
+        if fence_timeout_seconds <= 0 or fence_timeout_seconds > 60:
+            raise ValueError("node_disruption_fence_timeout_invalid")
+        self._media_nodes = media_nodes
+        self._clock = clock
+        self._wall_time = wall_time
+        self._fence_timeout_seconds = fence_timeout_seconds
+
+    def observe(self, node: MediaNode) -> NodeDisruptionObservation:
+        return self._observation(node, self._media_nodes.for_node(node).node_metrics())
+
+    def _observation(
+        self,
+        node: MediaNode,
+        metrics: NodeMetricObservation,
+    ) -> NodeDisruptionObservation:
+        occupied = metrics.sample.occupied_public_ids
+        if occupied is None or len(occupied) != metrics.sample.occupied_streams:
+            raise MediaNodeProtocolError("node_media_reader_inventory_invalid")
+        try:
+            public_ids = tuple(PublicId.parse(value) for value in occupied)
+            return NodeDisruptionObservation(
+                active_reader_public_ids=public_ids,
+                observed_at=self._clock(),
+                process_id=metrics.process_id,
+                process_start_ticks=metrics.process_start_ticks,
+                process_boot_id=metrics.process_boot_id,
+                release_id=metrics.release_id,
+            )
+        except (InvalidPublicId, ValueError):
+            raise MediaNodeProtocolError("node_media_reader_inventory_invalid") from None
+
+    @contextmanager
+    def fence(
+        self,
+        node: MediaNode,
+        affected_public_ids: tuple[PublicId, ...],
+    ) -> Iterator[NodeDisruptionFenceLease]:
+        """Close all known paths to late readers before the final exact snapshot."""
+
+        if affected_public_ids != tuple(sorted(set(affected_public_ids), key=str)):
+            raise MediaNodeProtocolError("node_media_fence_inventory_invalid")
+        started_at = self._wall_time()
+        cleanup_reserve_seconds = min(
+            10.0,
+            max(0.25, self._fence_timeout_seconds / 3),
+        )
+        work_deadline_unix_ms = int(
+            (started_at + self._fence_timeout_seconds - cleanup_reserve_seconds) * 1000
+        )
+        cleanup_deadline_unix_ms = int((started_at + self._fence_timeout_seconds) * 1000)
+        client = self._media_nodes.for_node_until(
+            node,
+            deadline_unix_ms=work_deadline_unix_ms,
+        )
+        original: list[MediaPathConfig] = []
+        lease: NodeDisruptionFenceLease | None = None
+        try:
+            for public_id in affected_public_ids:
+                configured = client.get_path(public_id)
+                if configured is None:
+                    continue
+                if configured.max_readers != 1:
+                    raise MediaNodeProtocolError("node_media_fence_path_invalid")
+                original.append(configured)
+                fenced = MediaPathConfig(
+                    name=configured.name,
+                    source_url=configured.source_url,
+                    max_readers=-1,
+                )
+                client.put_path(fenced)
+                if client.get_path(public_id) != fenced:
+                    raise MediaNodeProtocolError("node_media_fence_unverified")
+            lease = NodeDisruptionFenceLease(
+                observation=self._observation(node, client.node_metrics()),
+                work_deadline_unix_ms=work_deadline_unix_ms,
+            )
+            yield lease
+        finally:
+            if (lease is None or not lease.completed) and original:
+                restore_error: Exception | None = None
+                cleanup_client: UnixMediaNodeClient | None
+                try:
+                    cleanup_client = self._media_nodes.for_node_until(
+                        node,
+                        deadline_unix_ms=cleanup_deadline_unix_ms,
+                    )
+                except Exception as error:
+                    restore_error = error
+                    cleanup_client = None
+                for configured in reversed(original):
+                    if cleanup_client is None:
+                        break
+                    try:
+                        cleanup_client.put_path(configured)
+                        if cleanup_client.get_path(configured.name) != configured:
+                            raise MediaNodeProtocolError("node_media_fence_restore_unverified")
+                    except Exception as error:
+                        restore_error = error
+                if restore_error is not None:
+                    raise MediaNodeProtocolError(
+                        "node_media_fence_restore_failed"
+                    ) from restore_error
 
 
 def _runtime_spec_payload(node: MediaNode) -> dict[str, object]:
@@ -2050,9 +2215,7 @@ class NodeRuntimePolicy:
         if self.previous_release_id is not None:
             if self.previous_mediamtx_binary_sha256 is None:
                 raise NodeSupervisorError("node_release_policy_invalid")
-            allowed.add(
-                (self.previous_release_id, self.previous_mediamtx_binary_sha256)
-            )
+            allowed.add((self.previous_release_id, self.previous_mediamtx_binary_sha256))
         if (spec.release_id, spec.mediamtx_binary_sha256) not in allowed:
             raise NodeSupervisorError("node_release_not_allowed")
 
@@ -2077,13 +2240,7 @@ class RootMediaNodeAdapter:
         self,
         command: MediaPathCommand,
         deadline: NodeOperationDeadline | None = None,
-    ) -> (
-        MediaPathConfig
-        | MediaPathInventory
-        | tuple[bool, int]
-        | NodeMetricObservation
-        | None
-    ):
+    ) -> MediaPathConfig | MediaPathInventory | tuple[bool, int] | NodeMetricObservation | None:
         if deadline is None:
             deadline = NodeOperationDeadline(
                 expires_monotonic=time.monotonic() + self._timeout_seconds
@@ -2445,10 +2602,7 @@ class UnixNodeSupervisorServer:
             if payload.path is not None:
                 name = PublicId.parse(payload.path.name)
                 if payload.operation is MediaPathOperation.PUT:
-                    if (
-                        payload.path.source_url is None
-                        or payload.path.max_readers not in {-1, 1}
-                    ):
+                    if payload.path.source_url is None or payload.path.max_readers not in {-1, 1}:
                         raise ValueError
                     path = MediaPathConfig(
                         name=name,
@@ -2456,10 +2610,7 @@ class UnixNodeSupervisorServer:
                         max_readers=payload.path.max_readers,
                     )
                 else:
-                    if (
-                        payload.path.source_url is not None
-                        or payload.path.max_readers is not None
-                    ):
+                    if payload.path.source_url is not None or payload.path.max_readers is not None:
                         raise ValueError
                     path = name
             return (
@@ -2512,11 +2663,7 @@ class UnixNodeSupervisorServer:
     def _media_success_payload(
         operation: MediaPathOperation,
         result: (
-            MediaPathConfig
-            | MediaPathInventory
-            | tuple[bool, int]
-            | NodeMetricObservation
-            | None
+            MediaPathConfig | MediaPathInventory | tuple[bool, int] | NodeMetricObservation | None
         ),
     ) -> dict[str, object]:
         path = None
@@ -2536,9 +2683,7 @@ class UnixNodeSupervisorServer:
         if operation is MediaPathOperation.RUNTIME and isinstance(result, tuple):
             runtime = {"ready": result[0], "reader_count": result[1]}
         metrics = None
-        if operation is MediaPathOperation.METRICS and isinstance(
-            result, NodeMetricObservation
-        ):
+        if operation is MediaPathOperation.METRICS and isinstance(result, NodeMetricObservation):
             metrics = {
                 "active_sources": result.sample.active_sources,
                 "occupied_streams": result.sample.occupied_streams,
@@ -2552,6 +2697,7 @@ class UnixNodeSupervisorServer:
                     }
                     for counter in result.sample.path_counters
                 ],
+                "occupied_public_ids": list(result.sample.occupied_public_ids or ()),
                 "process_id": result.process_id,
                 "process_start_ticks": result.process_start_ticks,
                 "process_boot_id": str(result.process_boot_id),
@@ -2670,11 +2816,9 @@ class NodeHelperSettings(BaseSettings):
             raise ValueError("node_release_identity_untrusted")
         if self.previous_mediamtx_binary_sha256 is not None:
             try:
-                _previous_version, previous_trusted_digest = (
-                    trusted_mediamtx_activation_identity(
+                _previous_version, previous_trusted_digest = trusted_mediamtx_activation_identity(
                     platform.machine(),
                     cast(str, self.previous_release_id),
-                    )
                 )
             except ReleaseVerificationError:
                 raise ValueError("node_previous_release_identity_untrusted") from None
@@ -2693,9 +2837,7 @@ class NodeHelperSettings(BaseSettings):
             release_id=self.release_id,
             mediamtx_binary_sha256=self.mediamtx_binary_sha256,
             previous_release_id=self.previous_release_id,
-            previous_mediamtx_binary_sha256=(
-                self.previous_mediamtx_binary_sha256
-            ),
+            previous_mediamtx_binary_sha256=(self.previous_mediamtx_binary_sha256),
         )
 
 
