@@ -968,9 +968,11 @@ intent is reserved. If
 automatic placement must provision a node, its create/start events inherit the
 original camera request's operator account, session, action and idempotency key.
 During the 0.10.0/0017 bridge this write path returns a bounded 503 while
-existing catalog/access/node workflows remain available. Local Chromium and
-isolated direct-Linux amd64/PostgreSQL checks are green; independent
-review/native CI are still pending.
+existing catalog/access/node workflows remain available. Local Chromium,
+isolated direct-Linux amd64/PostgreSQL, independent review and all seven
+native/external CI jobs are green at commit
+`a7f2324a5354969fd773f70fc6f13b04247e51b3` in
+[CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524).
 The foundation passed independent Spec/Standards review and all six native
 amd64/arm64 CI jobs at commit `292a0302590838451e4f454322930804271b4d71`;
 the exact evidence boundary is recorded in
@@ -1095,8 +1097,11 @@ Exact local/Linux/review evidence is tracked in
 [`docs/evidence/phase-f-node-operations-contract.md`](evidence/phase-f-node-operations-contract.md).
 The last published implementation adds port-change and reconfigure preview/apply and
 contains 63 route-method pairs. The published access-administration slice
-brings the generated protected inventory to 70 route-method pairs. The current
-local camera-registration slice brings it to 72; review/native CI are pending.
+brings the generated protected inventory to 70 route-method pairs. The
+published camera-registration slice brings it to 72; independent review and all
+seven native/external CI jobs passed at commit
+`a7f2324a5354969fd773f70fc6f13b04247e51b3` in
+[CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524).
 Both
 dashboard and JSON API require exact desired revision/source state. Port change
 and DRAINING reconfigure/restart additionally require recent MFA plus the
@@ -1138,12 +1143,14 @@ No Phase-F completion claim is made yet.
   Chromium job passed on amd64, at commit
   `9b0695605e7bf9efe00db0760d90f9906da85579` in
   [CI run 32730353917](https://github.com/zl0nline/RTSP_proxy/actions/runs/32730353917));
-- [ ] camera registration dashboard/API with automatic least-loaded and manual
+- [x] camera registration dashboard/API with automatic least-loaded and manual
   eligible-node placement, session-bound pending-before-side-effect schema 0018
   ledger, durable rejection audit and operator-context propagation through
   automatic node provisioning
-  (implementation, local Chromium and isolated direct-Linux validation green;
-  independent review/native CI pending; see
+  (implementation, local Chromium, isolated direct-Linux validation,
+  independent review and all seven native/external CI jobs green at commit
+  `a7f2324a5354969fd773f70fc6f13b04247e51b3` in
+  [CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524); see
   [`docs/evidence/phase-f-camera-registration-dashboard-contract.md`](evidence/phase-f-camera-registration-dashboard-contract.md));
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;

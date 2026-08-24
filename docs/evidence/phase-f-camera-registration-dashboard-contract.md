@@ -1,7 +1,7 @@
 # Phase F camera registration dashboard contract
 
 - Last reviewed: 2026-08-24
-- Status: implementation and direct-Linux validation complete; independent review and CI pending
+- Status: implementation, direct-Linux validation, independent review and native CI complete
 - Deployment: direct Linux/systemd, no Docker
 - Server architectures: Linux amd64 and arm64, identical application contract
 - Transport: ordinary `rtsp://` with interleaved TCP; unchanged by this slice
@@ -66,26 +66,37 @@ maximum is 0017 is not supported.
 
 ## Local and direct-Linux checks
 
-The current implementation passed:
+The published implementation passed:
 
-- local full Python suite before the final documentation-only edits;
+- local full Python suite: 913 passed / 19 external-contract skips, with
+  90.05% statement coverage;
 - focused camera registration, migration bridge, release/deployment, health
   and observability suites;
 - Ruff and mypy over `src` and `tests`;
 - real local Chromium: 3 scenarios passed, including the keyboard camera form;
   and
-- isolated direct-Linux amd64 on `grob`: pinned CPython 3.12.13, `uv 0.12.3`,
-  an unprivileged PostgreSQL 18 test cluster, 903 passed / 19 external-contract
-  skips, plus Ruff green.
+- isolated direct-Linux amd64 on `grob`: pinned CPython 3.12.13, an
+  unprivileged PostgreSQL 18 test cluster, 913 passed / 19 external-contract
+  skips at 90.05% coverage, plus Ruff and mypy green.
 
 The Linux directory and Python runtime were temporary and required no Docker or
 privileged mutation. The external MediaMTX/load/systemd contracts were skipped
 because this slice does not alter those previously published seams.
 
-## Remaining gates
+## Published review and CI
 
-Independent Spec and Standards review, native amd64/arm64 CI and publication of
-the exact commit/run remain required before this evidence status can be marked
-reviewed and green. Phase F still has other operator workflows, and Phase G
-still requires hardware capacity, WAN/fault evidence and the 24-hour soak.
-Production remains **NO-GO**.
+Independent Spec and Standards reviews found no remaining High or Medium issue.
+All seven jobs passed at commit
+`a7f2324a5354969fd773f70fc6f13b04247e51b3` in
+[CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524):
+application/PostgreSQL, packaged migration, release, systemd and nft contracts
+on amd64 and arm64; patched MediaMTX and FFmpeg/ffprobe release contracts on
+both architectures; GStreamer pull/load and ordinary interleaved RTSP/TCP
+contracts on both architectures; and the external Chromium workflow on amd64.
+The run uses the BtbN monthly FFmpeg build retained for two years, with
+published archive SHA-256 and extracted binary SHA-256 pinned separately for
+amd64 and arm64.
+
+Phase F still has other operator workflows, and Phase G still requires hardware
+capacity, WAN/fault evidence and the 24-hour soak. Production remains
+**NO-GO**.
