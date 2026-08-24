@@ -1041,12 +1041,14 @@ reviews plus all seven jobs at commit
 ([CI run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
 Future export/SSE/bulk routes remain activation-gated until they enter that
 inventory and add their surface-specific security evidence.
-The current local inventory contains 57 protected route-method pairs after the
-node-action router was added; publication of the expanded matrix is part of the
-current node-operations slice.
+The current published inventory contains 57 protected route-method pairs after
+the node-action router was added. It passed independent Spec/Standards review
+and all seven jobs in
+[CI run 32693949200](https://github.com/zl0nline/RTSP_proxy/actions/runs/32693949200)
+on commit `2f6b012d91ab4de2ad07d631f4cdfa46b2422255`.
 
 Dashboard node registration and start/stop/drain/maintenance/resume/delete are
-implemented locally for review. Automatic registration selects a random free
+published and CI-green. Automatic registration selects a random free
 external port from configured policy; manual registration validates the exact
 requested port. Both dashboard and JSON API pass through the same
 operator-attributed command seam. Every lifecycle action carries the rendered
@@ -1064,12 +1066,13 @@ No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green; camera move
-  UI CI-green; node registration and lifecycle actions local/review pending);
+  UI CI-green; node registration and bounded lifecycle actions CI-green;
+  remaining disruptive node workflows are pending);
 - [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
-- [~] recursively generated route-method negative matrix (48-route published
-  baseline; current 57-route node-action expansion pending review/CI); future
+- [~] recursively generated route-method negative matrix (current 57-route
+  surface published and CI-green); future
   export/SSE/bulk routes must extend it before activation;
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;

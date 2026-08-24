@@ -1,7 +1,7 @@
 # Phase F node operations contract
 
 - Last reviewed: 2026-08-24 (Spec/Standards PASS)
-- Status: local and Linux amd64 validation green; native amd64/arm64 CI pending
+- Status: independently reviewed and published in native amd64/arm64 CI
 - Architectures: Linux amd64 and arm64, identical server contract
 - Deployment: direct Linux/systemd, no Docker
 
@@ -37,7 +37,8 @@ returns a bounded 503 until exact 0016 is current.
 
 ## Validation status
 
-The local application suite passed `805 passed, 19 skipped`; Ruff, mypy,
+The final CI application suite passed `810 passed, 19 skipped` on both amd64
+and arm64 with exact coverage `90.03%`; Ruff, mypy,
 diff-check and wheel-content verification were clean. The opt-in real Chromium
 HTTPS/OIDC scenario also passed after adding production-router node
 registration to its keyboard/CSRF workflow.
@@ -50,10 +51,13 @@ privileged systemd contracts unaffected by this slice, plus the browser job
 already executed locally. No Docker was used.
 
 The recursively generated protected-route inventory contains 57 route-method
-pairs; the prior published 48-route CI result remains historical evidence, not
-evidence for this expanded surface. Independent Spec/Standards review passed
-on the implementation tree; native amd64/arm64 CI publication still gates this
-slice.
+pairs. Independent Spec/Standards review passed on the implementation tree.
+All seven jobs in
+[CI run 32693949200](https://github.com/zl0nline/RTSP_proxy/actions/runs/32693949200)
+completed successfully on commit
+`2f6b012d91ab4de2ad07d631f4cdfa46b2422255`: application/coverage,
+packaged PostgreSQL migration, MediaMTX and pull/load contracts on native
+amd64/arm64, plus the external-client Chromium E2E job.
 
 ## Remaining gates
 
