@@ -68,7 +68,10 @@ configuration and processes.
 
 ## Remaining gates
 
-Phase F remains **IN PROGRESS** until the complete authorization-denial and
-logout audit matrix is implemented, reviewed and CI-green. Phase G physical
-hardware capacity, fault/WAN evidence and the 24-hour soak, followed by Phase H
-pilot rollout, also remain open. Production is therefore **NO-GO**.
+The shared-boundary denial-class/logout matrix with representative semantic
+targets is complete and recorded in
+[`phase-f-operator-security-audit-contract.md`](phase-f-operator-security-audit-contract.md).
+The generated all-route-method negative matrix remains pending. Phase F remains
+**IN PROGRESS** for that gate and the remaining operator workflows. Phase G
+physical hardware capacity, fault/WAN evidence and the 24-hour soak, followed
+by Phase H pilot rollout, also remain open. Production is therefore **NO-GO**.

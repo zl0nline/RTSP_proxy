@@ -73,6 +73,9 @@ state and does not claim completion early. The public path is unchanged and no
 source URL is rendered. Automated real-browser accessibility, confirmation,
 OIDC and logout evidence is recorded separately in
 [`phase-f-dashboard-browser-contract.md`](phase-f-dashboard-browser-contract.md).
+The durable authentication/authorization-denial and logout matrix is recorded
+in
+[`phase-f-operator-security-audit-contract.md`](phase-f-operator-security-audit-contract.md).
 Physical-hardware capacity and the 24-hour soak remain open. Revision-fenced
 break-glass rotation with atomic
 session revocation and an accepted/rejected notification drill passed

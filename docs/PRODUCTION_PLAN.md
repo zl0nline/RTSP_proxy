@@ -1022,13 +1022,28 @@ accepted/rejected notification drill passed independent Spec/Standards review
 and all six native amd64/arm64 jobs at commit
 `df35a2c0089564d1833c62fb65d256f09864fbde`
 ([CI run 32428149162](https://github.com/zl0nline/RTSP_proxy/actions/runs/32428149162)).
+The shared-boundary denial-class/logout matrix, with representative semantic
+targets, passed independent Spec/Standards review and all seven CI jobs at commit
+`ef0e1f3fdfb74c174ac0dffa9f88213291ab19b5`
+([CI run 32678955187](https://github.com/zl0nline/RTSP_proxy/actions/runs/32678955187)).
+It binds an allowlisted semantic action, canonical object type/id, exact scope,
+identity source, roles, session/account version and response correlation ID to
+each durable audit/outbox pair without raw IP, user-agent, cookies, CSRF or URL
+data. PostgreSQL fault injection proves authentication denial, authorization
+denial and logout fail closed without a half-pair; logout revocation rolls back
+when either normative append fails. Self-session logout is available to scoped
+operators without granting `server:*`. Exact evidence is recorded in
+[`docs/evidence/phase-f-operator-security-audit-contract.md`](evidence/phase-f-operator-security-audit-contract.md).
 No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green;
   camera move UI CI-green);
-- [~] RBAC/CSRF/OIDC/break-glass foundation (revision-fenced rotation/drill
-  CI-green; complete denial/logout audit matrix pending);
+- [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
+  shared-boundary authentication/authorization-denial/logout classes with
+  representative semantic targets;
+- [ ] generated route-method negative matrix for all protected routes, including
+  any future export/SSE/bulk surface;
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

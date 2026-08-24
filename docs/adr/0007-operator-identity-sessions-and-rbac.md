@@ -92,10 +92,12 @@ node lifecycle pool.
 - [x] Opaque digest-only session, CSRF, idle/absolute expiry and parallel-request tests
 - [x] PostgreSQL restart persistence and authoritative downgrade fence test
 - [x] OIDC PKCE/browser binding/MFA/claim-drift and IdP outage contract tests
-- [~] Break-glass TOTP, safe provisioning CLI, durable alert and rate-limit
-  contract (operator rotation drill pending)
-- [ ] Full API negative RBAC/scope/no-oracle matrix
-- [ ] Browser cookie/security-header/leak and accessibility E2E
+- [x] Break-glass TOTP, safe provisioning CLI, durable alert/rate-limit and
+  revision-fenced rotation drill
+- [~] Shared-boundary RBAC/scope/no-oracle denial classes and representative
+  semantic targets are complete; generated route-method coverage for all
+  protected routes and any future export/SSE/bulk surface remains gated
+- [x] Browser cookie/security-header/leak and accessibility E2E
 
 ## Rollout and rollback
 

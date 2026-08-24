@@ -30,6 +30,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   Real-browser OIDC/login, keyboard focus, occupied-reader confirmation and
 >   CSRF-protected logout E2E прошёл independent Spec/Standards review,
 >   isolated Linux amd64 stand и dedicated CI с browser evidence artifact.
+>   The shared protected HTTP boundary also has a durable
+>   authentication/authorization-denial and logout class matrix with
+>   representative semantic targets:
+>   identity source, scope and correlation ID are audit/outbox-bound and
+>   PostgreSQL append failures fail closed without partial revocation.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
 >   server-side templates/OIDC/session/CSRF/logout tests remain identical in the
@@ -341,7 +346,13 @@ logout прошёл independent Spec/Standards review и dedicated CI в commit
 [`docs/evidence/phase-f-dashboard-browser-contract.md`](docs/evidence/phase-f-dashboard-browser-contract.md).
 Real Chromium проверяется как внешний management client на amd64; одинаковый
 server-side auth/template/CSRF/logout contract исполняется application CI на
-amd64 и arm64. Phase F целиком также ждёт denial/logout audit matrix.
+amd64 и arm64. Shared-boundary denial-class/logout audit matrix прошла
+independent review и все семь CI jobs на commit
+`ef0e1f3fdfb74c174ac0dffa9f88213291ab19b5`
+([run 32678955187](https://github.com/zl0nline/RTSP_proxy/actions/runs/32678955187));
+точная граница записана в
+[`docs/evidence/phase-f-operator-security-audit-contract.md`](docs/evidence/phase-f-operator-security-audit-contract.md).
+Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.
