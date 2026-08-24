@@ -21,6 +21,7 @@ from rtsp_proxy.dashboard import (
     render_access_grant_secret,
     render_camera_access,
     render_camera_catalog,
+    render_camera_create,
     render_camera_detail,
     render_camera_edit,
     render_camera_move,
@@ -45,9 +46,15 @@ from rtsp_proxy.nodes import (
     EligibleNodeMissing,
     InvalidCameraName,
     InvalidCameraSource,
+    MaximumNodesReached,
     NodeCameraCapacityReached,
+    NodeLifecycleBusy,
+    NodeManagementPortRangeExhausted,
     NodeMutationContext,
     NodeNotFound,
+    NodePortRangeExhausted,
+    NodeRuntimeFailed,
+    NodeRuntimeUnavailable,
 )
 from rtsp_proxy.operator_access import (
     OperatorPermission,
@@ -120,6 +127,103 @@ def camera_dashboard_router(
                 principal=principal,
             )
         )
+
+    @router.get(
+        "/dashboard/cameras/new",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_create_page(request: Request) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if camera_control is None:
+            return _creation_unavailable(principal)
+        if not _valid_csrf_cookie(request):
+            return _fresh_session_required(principal)
+        try:
+            targets = camera_control.creation_targets()
+        except CameraCatalogUnavailable:
+            return _creation_unavailable(principal)
+        return _html_response(
+            render_camera_create(
+                targets=targets,
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+                idempotency_key=uuid4(),
+            )
+        )
+
+    @router.post("/dashboard/cameras", include_in_schema=False)
+    def create_camera(request: Request) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if camera_control is None:
+            return _creation_unavailable(principal)
+        idempotency_key: UUID | None = None
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset(
+                    {
+                        "_csrf",
+                        "name",
+                        "source_url",
+                        "placement_mode",
+                        "node_id",
+                        "idempotency_key",
+                    }
+                )
+            )
+            idempotency_key = _idempotency_key(form)
+            placement_mode = form.required("placement_mode", max_length=16)
+            raw_node_id = form.optional("node_id", max_length=36)
+            if placement_mode == "automatic":
+                if raw_node_id:
+                    raise DashboardFormInvalid("dashboard_form_invalid")
+                node_id = None
+            elif placement_mode == "manual":
+                if not raw_node_id:
+                    raise DashboardFormInvalid("dashboard_form_invalid")
+                try:
+                    node_id = UUID(raw_node_id)
+                except ValueError:
+                    raise DashboardFormInvalid("dashboard_form_invalid") from None
+            else:
+                raise DashboardFormInvalid("dashboard_form_invalid")
+            camera = camera_control.create_camera(
+                name=form.required("name", max_length=MAX_CAMERA_NAME_LENGTH),
+                source_url=form.required("source_url", max_length=8192),
+                node_id=node_id,
+                mutation_context=_access_mutation_context(
+                    request,
+                    principal,
+                    idempotency_key=idempotency_key,
+                ),
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            if (
+                isinstance(error, CameraLifecycleConflict)
+                and str(error).startswith("camera_idempotency_")
+                and idempotency_key is not None
+            ):
+                error = _record_dashboard_access_rejection(
+                    operator_sessions,
+                    request=request,
+                    principal=principal,
+                    error=error,
+                    target_grant_id=None,
+                    expected_revision=None,
+                    idempotency_key=idempotency_key,
+                )
+            expected = _creation_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _camera_redirect(camera.id)
 
     @router.get(
         "/dashboard/cameras/{camera_id}",
@@ -1217,6 +1321,14 @@ def _access_redirect(camera_id: UUID) -> RedirectResponse:
     )
 
 
+def _camera_redirect(camera_id: UUID) -> RedirectResponse:
+    return RedirectResponse(
+        f"/dashboard/cameras/{camera_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _move_redirect(camera_id: UUID, move_id: UUID) -> RedirectResponse:
     return RedirectResponse(
         f"/dashboard/cameras/{camera_id}/moves/{move_id}",
@@ -1245,6 +1357,101 @@ def _mutation_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         principal=principal,
     )
+
+
+def _creation_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
+    return _unavailable_response(
+        DashboardUnavailable(
+            title="Регистрация камер недоступна",
+            message="Безопасно зарегистрировать камеру сейчас невозможно.",
+        ),
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        principal=principal,
+    )
+
+
+def _creation_error(
+    error: Exception,
+    principal: OperatorPrincipal,
+) -> HTMLResponse | None:
+    if isinstance(error, InvalidCameraName):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Некорректное имя камеры",
+                message="Имя должно содержать от 1 до 128 символов без управляющих знаков.",
+            ),
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            principal=principal,
+        )
+    if isinstance(error, InvalidCameraSource):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Некорректный source URL",
+                message="Проверьте RTSP URL. Введённое значение не сохранено и не показано.",
+            ),
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            principal=principal,
+        )
+    if isinstance(error, NodeNotFound):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Нода не найдена",
+                message="Выбранная нода больше не существует. Обновите форму.",
+            ),
+            status_code=status.HTTP_404_NOT_FOUND,
+            principal=principal,
+        )
+    if isinstance(error, CameraLifecycleConflict) and str(error).startswith(
+        "camera_idempotency_"
+    ):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Idempotency key уже использован",
+                message="Обновите форму и повторите действие с новым ключом.",  # noqa: RUF001
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(
+        error,
+        (
+            EligibleNodeMissing,
+            NodeCameraCapacityReached,
+            MaximumNodesReached,
+            NodePortRangeExhausted,
+            NodeManagementPortRangeExhausted,
+        ),
+    ):
+        if isinstance(error, NodePortRangeExhausted):
+            message = "нет свободных портов для регистрации новой ноды"
+        elif isinstance(error, NodeManagementPortRangeExhausted):
+            message = "Нет свободной пары loopback API/metrics портов."
+        elif isinstance(error, MaximumNodesReached):
+            message = "Достигнуто максимальное количество нод."
+        elif isinstance(error, NodeCameraCapacityReached):
+            message = "Выбранная нода уже содержит 100 зарегистрированных камер."
+        else:
+            message = "Нет доступной ноды для размещения камеры. Обновите форму."
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Камеру невозможно разместить",
+                message=message,
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(
+        error,
+        (
+            CameraLifecycleConflict,
+            NodeLifecycleBusy,
+            NodeRuntimeUnavailable,
+            NodeRuntimeFailed,
+            OperatorSessionUnavailable,
+        ),
+    ):
+        return _creation_unavailable(principal)
+    return None
 
 
 def _move_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
@@ -1425,11 +1632,17 @@ def _record_dashboard_access_rejection(
     elif isinstance(error, CameraNotFound):
         reason_code = "camera_not_found"
     elif isinstance(error, CameraLifecycleConflict):
-        reason_code = (
-            "access_policy_revision_conflict"
-            if audit_context.action == "camera.access_policy_update"
-            else "access_grant_revision_conflict"
-        )
+        if audit_context.action == "camera.create" and str(error) in {
+            "camera_idempotency_conflict",
+            "camera_idempotency_target_missing",
+        }:
+            reason_code = str(error)
+        else:
+            reason_code = (
+                "access_policy_revision_conflict"
+                if audit_context.action == "camera.access_policy_update"
+                else "access_grant_revision_conflict"
+            )
     elif isinstance(error, LookupError):
         reason_code = "access_grant_not_found"
     else:

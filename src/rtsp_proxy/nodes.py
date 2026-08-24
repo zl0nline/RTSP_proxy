@@ -217,6 +217,28 @@ class NodeRegistrationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CameraRegistrationIdempotency:
+    key: UUID
+    actor_account_id: UUID
+    actor_session_id: UUID
+    request_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.key.version != 4
+            or len(self.request_sha256) != 64
+            or set(self.request_sha256) - set("0123456789abcdef")
+        ):
+            raise ValueError("camera_registration_idempotency_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CameraRegistrationResult:
+    camera: CameraPlacement
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class NodeRuntimeObservation:
     state: NodeState
     health: NodeHealth
@@ -740,6 +762,9 @@ class InMemoryNodeStore:
         self._camera_moves: list[CameraMove] = []
         self._port_changes: list[NodePortChange] = []
         self._registration_requests: dict[tuple[UUID, UUID], tuple[UUID, str, UUID]] = {}
+        self._camera_registration_requests: dict[
+            tuple[UUID, UUID], tuple[UUID, str, UUID | None]
+        ] = {}
         self._lock = RLock()
         self._lifecycle_locks = {node.id: Lock() for node in nodes}
         self._clock = clock
@@ -1473,6 +1498,7 @@ class InMemoryNodeStore:
         source_url: str,
         public_id: PublicId,
         management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -1523,6 +1549,7 @@ class InMemoryNodeStore:
         public_id: PublicId,
         node_id: UUID,
         management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -1555,6 +1582,164 @@ class InMemoryNodeStore:
                 registered_cameras=selected.registered_cameras + 1,
             )
             return placement
+
+    def place_camera_idempotently(
+        self,
+        *,
+        camera_id: UUID,
+        name: str,
+        source_url: str,
+        public_id: PublicId,
+        node_id: UUID | None,
+        idempotency: CameraRegistrationIdempotency,
+        management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> CameraRegistrationResult:
+        with self._lock:
+            key = (idempotency.actor_session_id, idempotency.key)
+            previous = self._camera_registration_requests.get(key)
+            if previous is None:
+                self._camera_registration_requests[key] = (
+                    idempotency.actor_account_id,
+                    idempotency.request_sha256,
+                    None,
+                )
+                previous_camera_id = None
+            else:
+                previous_camera_id = self._camera_registration_target_id(
+                    previous,
+                    idempotency,
+                )
+            if previous_camera_id is not None:
+                camera = next(
+                    (
+                        candidate
+                        for candidate in self._cameras
+                        if candidate.id == previous_camera_id
+                        and candidate.state is not CameraState.DELETED
+                    ),
+                    None,
+                )
+                if camera is None:
+                    raise CameraLifecycleConflict("camera_idempotency_target_missing")
+                return CameraRegistrationResult(camera=camera, replayed=True)
+            if node_id is None:
+                camera = self.place_camera_automatically(
+                    camera_id=camera_id,
+                    name=name,
+                    source_url=source_url,
+                    public_id=public_id,
+                    management_freshness_seconds=management_freshness_seconds,
+                    mutation_context=mutation_context,
+                )
+            else:
+                camera = self.place_camera_manually(
+                    camera_id=camera_id,
+                    name=name,
+                    source_url=source_url,
+                    public_id=public_id,
+                    node_id=node_id,
+                    management_freshness_seconds=management_freshness_seconds,
+                    mutation_context=mutation_context,
+                )
+            self._camera_registration_requests[key] = (
+                idempotency.actor_account_id,
+                idempotency.request_sha256,
+                camera.id,
+            )
+            return CameraRegistrationResult(camera=camera, replayed=False)
+
+    def reserve_camera_registration(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraRegistrationResult | None:
+        with self._lock:
+            key = (idempotency.actor_session_id, idempotency.key)
+            previous = self._camera_registration_requests.get(key)
+            if previous is None:
+                self._camera_registration_requests[key] = (
+                    idempotency.actor_account_id,
+                    idempotency.request_sha256,
+                    None,
+                )
+                return None
+            camera_id = self._camera_registration_target_id(previous, idempotency)
+            if camera_id is None:
+                return None
+            camera = next(
+                (
+                    candidate
+                    for candidate in self._cameras
+                    if candidate.id == camera_id and candidate.state is not CameraState.DELETED
+                ),
+                None,
+            )
+            if camera is None:
+                raise CameraLifecycleConflict("camera_idempotency_target_missing")
+            return CameraRegistrationResult(camera=camera, replayed=True)
+
+    def lookup_camera_registration(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraRegistrationResult | None:
+        with self._lock:
+            previous = self._camera_registration_requests.get(
+                (idempotency.actor_session_id, idempotency.key)
+            )
+            if previous is None:
+                return None
+            camera_id = self._camera_registration_target_id(previous, idempotency)
+            if camera_id is None:
+                return None
+            camera = next(
+                (
+                    candidate
+                    for candidate in self._cameras
+                    if candidate.id == camera_id and candidate.state is not CameraState.DELETED
+                ),
+                None,
+            )
+            if camera is None:
+                raise CameraLifecycleConflict("camera_idempotency_target_missing")
+            return CameraRegistrationResult(camera=camera, replayed=True)
+
+    @staticmethod
+    def _camera_registration_target_id(
+        previous: tuple[UUID, str, UUID | None],
+        idempotency: CameraRegistrationIdempotency,
+    ) -> UUID | None:
+        account_id, request_sha256, camera_id = previous
+        if (
+            account_id != idempotency.actor_account_id
+            or request_sha256 != idempotency.request_sha256
+        ):
+            raise CameraLifecycleConflict("camera_idempotency_conflict")
+        return camera_id
+
+    def list_camera_creation_targets(
+        self,
+        *,
+        management_freshness_seconds: int = 30,
+    ) -> tuple[MediaNode, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        node
+                        for node in self._nodes
+                        if is_node_eligible(
+                            node,
+                            management_freshness_seconds=management_freshness_seconds,
+                        )
+                        and not self._node_has_prepared_port_change(node.id)
+                    ),
+                    key=lambda node: (
+                        node.registered_cameras,
+                        node.active_sources,
+                        node.id.int,
+                    ),
+                )
+            )
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         with self._lock:
@@ -2197,7 +2382,12 @@ class NodeControl:
     def list_nodes(self) -> tuple[MediaNode, ...]:
         return self._store.list_nodes()
 
-    def ensure_automatic_capacity(self, policy: NodeProvisioningPolicy) -> MediaNode:
+    def ensure_automatic_capacity(
+        self,
+        policy: NodeProvisioningPolicy,
+        *,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         if self._node_runtime is None:
             raise NodeRuntimeUnavailable("node_runtime_unavailable")
         with self._store.provisioning_guard():
@@ -2232,7 +2422,10 @@ class NodeControl:
                 }
             )
             if retryable:
-                return self.start_node(min(retryable, key=lambda node: node.id.int).id)
+                return self.start_node(
+                    min(retryable, key=lambda node: node.id.int).id,
+                    mutation_context=mutation_context,
+                )
             return self.register_node(
                 name="automatic-node",
                 port_range_start=policy.port_range_start,
@@ -2244,6 +2437,7 @@ class NodeControl:
                 release_id=policy.release_id,
                 mediamtx_binary_sha256=policy.mediamtx_binary_sha256,
                 creation_mode=NodeCreationMode.AUTOMATIC,
+                mutation_context=mutation_context,
             )
 
     def start_node(
@@ -3229,7 +3423,8 @@ class CameraControl:
         new_camera_id: NodeIdFactory,
         new_public_id: PublicIdFactory,
         management_freshness_seconds: int = 30,
-        ensure_automatic_capacity: Callable[[], MediaNode] | None = None,
+        ensure_automatic_capacity: Callable[[NodeMutationContext | None], MediaNode]
+        | None = None,
     ) -> None:
         self._store = store
         self._new_camera_id = new_camera_id
@@ -3243,11 +3438,48 @@ class CameraControl:
         name: str,
         source_url: str,
         node_id: UUID | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> CameraPlacement:
         validated_name = validate_camera_name(name)
         validated_source_url = validate_camera_source_url(source_url)
+        idempotency = _camera_registration_idempotency(
+            name=validated_name,
+            source_url=validated_source_url,
+            node_id=node_id,
+            mutation_context=mutation_context,
+        )
+        if idempotency is not None:
+            existing = self._store.reserve_camera_registration(idempotency)
+            if existing is not None:
+                return existing.camera
         camera_id = self._new_camera_id()
         public_id = PublicId.parse(self._new_public_id())
+        if idempotency is not None:
+            try:
+                return self._store.place_camera_idempotently(
+                    camera_id=camera_id,
+                    name=validated_name,
+                    source_url=validated_source_url,
+                    public_id=public_id,
+                    node_id=node_id,
+                    idempotency=idempotency,
+                    management_freshness_seconds=self._management_freshness_seconds,
+                    mutation_context=mutation_context,
+                ).camera
+            except EligibleNodeMissing:
+                if node_id is not None or self._ensure_automatic_capacity is None:
+                    raise
+                self._ensure_automatic_capacity(mutation_context)
+                return self._store.place_camera_idempotently(
+                    camera_id=camera_id,
+                    name=validated_name,
+                    source_url=validated_source_url,
+                    public_id=public_id,
+                    node_id=None,
+                    idempotency=idempotency,
+                    management_freshness_seconds=self._management_freshness_seconds,
+                    mutation_context=mutation_context,
+                ).camera
         if node_id is not None:
             return self._store.place_camera_manually(
                 camera_id=camera_id,
@@ -3256,6 +3488,7 @@ class CameraControl:
                 public_id=public_id,
                 node_id=node_id,
                 management_freshness_seconds=self._management_freshness_seconds,
+                mutation_context=mutation_context,
             )
         try:
             return self._store.place_camera_automatically(
@@ -3264,18 +3497,28 @@ class CameraControl:
                 source_url=validated_source_url,
                 public_id=public_id,
                 management_freshness_seconds=self._management_freshness_seconds,
+                mutation_context=mutation_context,
             )
         except EligibleNodeMissing:
             if self._ensure_automatic_capacity is None:
                 raise
-        self._ensure_automatic_capacity()
+        self._ensure_automatic_capacity(mutation_context)
         return self._store.place_camera_automatically(
             camera_id=camera_id,
             name=validated_name,
             source_url=validated_source_url,
             public_id=public_id,
             management_freshness_seconds=self._management_freshness_seconds,
+            mutation_context=mutation_context,
         )
+
+    def creation_targets(self) -> tuple[MediaNode, ...]:
+        try:
+            return self._store.list_camera_creation_targets(
+                management_freshness_seconds=self._management_freshness_seconds,
+            )
+        except Exception:
+            raise CameraCatalogUnavailable("camera_creation_targets_unavailable") from None
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         return self._store.list_cameras()
@@ -3482,6 +3725,29 @@ class NodeStore(Protocol):
 
 
 class CameraStore(Protocol):
+    def reserve_camera_registration(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraRegistrationResult | None: ...
+
+    def place_camera_idempotently(
+        self,
+        *,
+        camera_id: UUID,
+        name: str,
+        source_url: str,
+        public_id: PublicId,
+        node_id: UUID | None,
+        idempotency: CameraRegistrationIdempotency,
+        management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> CameraRegistrationResult: ...
+
+    def lookup_camera_registration(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraRegistrationResult | None: ...
+
     def place_camera_automatically(
         self,
         *,
@@ -3490,6 +3756,7 @@ class CameraStore(Protocol):
         source_url: str,
         public_id: PublicId,
         management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
     ) -> CameraPlacement: ...
 
     def place_camera_manually(
@@ -3501,7 +3768,14 @@ class CameraStore(Protocol):
         public_id: PublicId,
         node_id: UUID,
         management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
     ) -> CameraPlacement: ...
+
+    def list_camera_creation_targets(
+        self,
+        *,
+        management_freshness_seconds: int = 30,
+    ) -> tuple[MediaNode, ...]: ...
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]: ...
 
@@ -3765,6 +4039,34 @@ def _node_registration_idempotency(
         sort_keys=True,
     ).encode("utf-8")
     return NodeRegistrationIdempotency(
+        key=mutation_context.idempotency_key,
+        actor_account_id=mutation_context.actor_account_id,
+        actor_session_id=mutation_context.actor_session_id,
+        request_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _camera_registration_idempotency(
+    *,
+    name: str,
+    source_url: str,
+    node_id: UUID | None,
+    mutation_context: NodeMutationContext | None,
+) -> CameraRegistrationIdempotency | None:
+    if mutation_context is None or mutation_context.idempotency_key is None:
+        return None
+    payload = json.dumps(
+        {
+            "request_schema": 1,
+            "name": name,
+            "source_url": source_url,
+            "node_id": None if node_id is None else str(node_id),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return CameraRegistrationIdempotency(
         key=mutation_context.idempotency_key,
         actor_account_id=mutation_context.actor_account_id,
         actor_session_id=mutation_context.actor_session_id,

@@ -1,0 +1,56 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Регистрация камеры — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигация">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><span>Регистрация</span>
+  </nav>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Обычный RTSP/TCP · до 100 камер на ноду</p>
+      <h1>Зарегистрировать камеру</h1>
+    </div>
+  </div>
+
+  <section class="panel" aria-labelledby="camera-create-title">
+    <div class="panel-heading">
+      <div>
+        <p class="eyebrow">Control plane</p>
+        <h2 id="camera-create-title">Источник и размещение</h2>
+      </div>
+    </div>
+    <form class="mutation-form" method="post" action="/dashboard/cameras">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+      <label>
+        <span>Имя камеры</span>
+        <input type="text" name="name" required minlength="1" maxlength="128" autocomplete="off">
+      </label>
+      <label>
+        <span>Source RTSP URL</span>
+        <input type="url" name="source_url" required maxlength="8192" autocomplete="off" placeholder="rtsp://camera.local/path">
+        <small>Логин и пароль в URL не принимаются. После ошибки введённый URL не возвращается в HTML.</small>
+      </label>
+      <fieldset>
+        <legend>Размещение</legend>
+        <label><input type="radio" name="placement_mode" value="automatic" checked> Автоматически: наименее загруженная подходящая нода</label>
+        <label><input type="radio" name="placement_mode" value="manual"> Вручную: выбранная нода</label>
+      </fieldset>
+      <label>
+        <span>Нода для ручного размещения</span>
+        <select name="node_id">
+          <option value="">Не выбрана</option>
+          {% for node in targets %}
+          <option value="{{ node.id }}">{{ node.name }} · порт {{ node.external_port }} · {{ node.registered_cameras }} / {{ node.camera_capacity }} камер · {{ node.active_sources }} active</option>
+          {% endfor %}
+        </select>
+        {% if not targets %}<small>Сейчас нет подходящих нод. Automatic может создать ноду только если серверная политика допускает это.</small>{% endif %}
+      </label>
+      <div class="form-actions">
+        <button type="submit">Зарегистрировать</button>
+        <a href="/dashboard/cameras">Отмена</a>
+      </div>
+    </form>
+  </section>
+</main>
+{% endblock %}

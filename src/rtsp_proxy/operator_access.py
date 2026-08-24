@@ -156,6 +156,7 @@ class OperatorSessionUnavailable(RuntimeError):
 
 class OperatorActionBucket(StrEnum):
     ACCESS_MUTATION = "access_mutation"
+    CAMERA_MUTATION = "camera_mutation"
     SECRET_ISSUE = "secret_issue"
 
 
@@ -1377,6 +1378,7 @@ class OperatorSessionControl:
         absolute_timeout: timedelta = timedelta(hours=12),
         secret_issue_limit_per_minute: int = 10,
         access_mutation_limit_per_minute: int = 60,
+        camera_mutation_limit_per_minute: int = 60,
     ) -> None:
         if (
             idle_timeout <= timedelta(0)
@@ -1384,6 +1386,7 @@ class OperatorSessionControl:
             or absolute_timeout > timedelta(hours=24)
             or not 1 <= secret_issue_limit_per_minute <= 600
             or not 1 <= access_mutation_limit_per_minute <= 3600
+            or not 1 <= camera_mutation_limit_per_minute <= 3600
         ):
             raise ValueError("operator_session_timing_invalid")
         self._store = store
@@ -1394,6 +1397,7 @@ class OperatorSessionControl:
         self._action_limits = {
             OperatorActionBucket.SECRET_ISSUE: secret_issue_limit_per_minute,
             OperatorActionBucket.ACCESS_MUTATION: access_mutation_limit_per_minute,
+            OperatorActionBucket.CAMERA_MUTATION: camera_mutation_limit_per_minute,
         }
 
     def issue(
@@ -1578,6 +1582,13 @@ class OperatorSessionControl:
             "access_grant_revision_conflict",
         }
         shape_valid = (
+            audit_context.action == "camera.create"
+            and reason_code
+            in {"camera_idempotency_conflict", "camera_idempotency_target_missing"}
+            and target_grant_id is None
+            and expected_revision is None
+            and idempotency_key is not None
+        ) or (
             audit_context.action == "camera.access_policy_update"
             and reason_code
             in {"access_policy_revision_conflict", "camera_not_found"}
@@ -1850,6 +1861,8 @@ def _record_request_security_event(
             "access_grant_not_found",
             "access_grant_revision_conflict",
             "access_policy_revision_conflict",
+            "camera_idempotency_conflict",
+            "camera_idempotency_target_missing",
             "camera_not_found",
         },
     }

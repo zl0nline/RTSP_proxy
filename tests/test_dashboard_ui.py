@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import re
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -10,6 +12,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 from rtsp_proxy.access import (
     AccessGrant,
@@ -36,6 +39,7 @@ from rtsp_proxy.nodes import (
     CameraMove,
     CameraMoveState,
     CameraNotFound,
+    CameraRegistrationIdempotency,
     CameraState,
     InMemoryNodeStore,
     MaximumNodesReached,
@@ -45,17 +49,20 @@ from rtsp_proxy.nodes import (
     NodeDisruptionConfirmationContext,
     NodeDisruptionConfirmationRequired,
     NodeHealth,
+    NodeLifecycleBusy,
     NodeManagementPortRangeExhausted,
     NodeMutationContext,
     NodePortChangePreview,
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
+    NodeProvisioningPolicy,
     NodeReconfigurePreview,
     NodeReleaseConflict,
     NodeRuntimeAction,
     NodeRuntimeFailed,
     NodeRuntimeObservation,
+    NodeRuntimeUnavailable,
     NodeState,
     PlacementMode,
 )
@@ -74,6 +81,7 @@ from rtsp_proxy.operator_access import (
     OperatorRole,
     OperatorSessionControl,
     OperatorSessionUnavailable,
+    PostgresOperatorSessionStore,
 )
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
@@ -931,9 +939,10 @@ def _authenticated_dashboard(
     role: OperatorRole = OperatorRole.VIEWER,
     scopes: frozenset[str] = frozenset({"server:*"}),
     authenticated_at: datetime = NOW,
-    session_store: InMemoryOperatorSessionStore | None = None,
+    session_store: InMemoryOperatorSessionStore | PostgresOperatorSessionStore | None = None,
     secret_issue_limit_per_minute: int = 10,
     access_mutation_limit_per_minute: int = 60,
+    camera_mutation_limit_per_minute: int = 60,
     secret_reveal_seconds: int = 30,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
@@ -958,6 +967,7 @@ def _authenticated_dashboard(
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
         secret_issue_limit_per_minute=secret_issue_limit_per_minute,
         access_mutation_limit_per_minute=access_mutation_limit_per_minute,
+        camera_mutation_limit_per_minute=camera_mutation_limit_per_minute,
     )
     issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
     session_clock[0] = authenticated_at
@@ -985,6 +995,24 @@ def _authenticated_dashboard(
             f"__Host-rtsp_proxy_csrf={issued.csrf_token}"
         )
     }
+
+
+def _seed_postgres_operator_account(database_url: str) -> None:
+    engine = create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO operator_accounts "
+                    "(id, identity_source, subject, display_name, roles, scopes, "
+                    "authz_version, enabled) VALUES "
+                    "(:id, 'oidc', 'oidc:viewer@example.test', 'Dashboard operator', "
+                    "ARRAY['operator'], ARRAY['server:*'], 1, true)"
+                ),
+                {"id": ACCOUNT_ID},
+            )
+    finally:
+        engine.dispose()
 
 
 def _snapshot() -> FleetSnapshot:
@@ -1276,7 +1304,6 @@ def test_dashboard_node_create_supports_random_and_manual_port_with_csrf() -> No
         settings=settings,
         role=OperatorRole.OPERATOR,
     )
-
     overview = client.get("/dashboard", headers=headers)
     create_page = client.get("/dashboard/nodes/new", headers=headers)
     automatic = client.post(
@@ -2303,6 +2330,940 @@ def test_camera_catalog_is_authenticated_bounded_escaped_and_secret_free() -> No
     )
 
     assert browser_form_response.status_code == 200
+
+
+def test_dashboard_camera_registration_supports_automatic_and_manual_placement() -> None:
+    observed_at = datetime.now(UTC)
+    manual_node_id = UUID("10000000-0000-4000-8000-000000000001")
+    automatic_node_id = UUID("20000000-0000-4000-8000-000000000002")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=manual_node_id,
+                name="manual-edge",
+                external_port=10543,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+                registered_cameras=10,
+                active_sources=1,
+            ),
+            MediaNode(
+                id=automatic_node_id,
+                name="automatic-edge",
+                external_port=10544,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+                registered_cameras=1,
+                active_sources=1,
+            ),
+        )
+    )
+    camera_ids = iter(
+        (
+            UUID("30000000-0000-4000-8000-000000000003"),
+            UUID("40000000-0000-4000-8000-000000000004"),
+        )
+    )
+    public_ids = iter(("a" * 26, "b" * 25 + "e"))
+    control = CameraControl(
+        store=store,
+        new_camera_id=camera_ids.__next__,
+        new_public_id=public_ids.__next__,
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+
+    form = client.get("/dashboard/cameras/new", headers=headers)
+    automatic = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "Automatic entrance",
+            "source_url": "rtsp://camera.internal/automatic",
+            "placement_mode": "automatic",
+            "node_id": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+    automatic_replay = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "Automatic entrance",
+            "source_url": "rtsp://camera.internal/automatic",
+            "placement_mode": "automatic",
+            "node_id": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+    manual = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "Manual entrance",
+            "source_url": "rtsp://camera.internal/manual",
+            "placement_mode": "manual",
+            "node_id": str(manual_node_id),
+            "idempotency_key": "22222222-2222-4222-8222-222222222222",
+        },
+        follow_redirects=False,
+    )
+
+    assert form.status_code == 200
+    assert form.headers["cache-control"] == "no-store"
+    assert 'action="/dashboard/cameras"' in form.text
+    assert 'name="idempotency_key"' in form.text
+    assert 'value="automatic" checked' in form.text
+    assert str(manual_node_id) in form.text
+    assert str(automatic_node_id) in form.text
+    assert "10 / 100" in form.text
+    assert "1 / 100" in form.text
+    assert automatic.status_code == 303
+    assert automatic.headers["location"] == (
+        "/dashboard/cameras/30000000-0000-4000-8000-000000000003"
+    )
+    assert automatic_replay.status_code == 303
+    assert automatic_replay.headers["location"] == automatic.headers["location"]
+    assert manual.status_code == 303
+    assert manual.headers["location"] == (
+        "/dashboard/cameras/40000000-0000-4000-8000-000000000004"
+    )
+    created = {camera.name: camera for camera in control.list_cameras()}
+    assert created["Automatic entrance"].node_id == automatic_node_id
+    assert created["Automatic entrance"].placement_mode is PlacementMode.AUTOMATIC
+    assert created["Manual entrance"].node_id == manual_node_id
+    assert created["Manual entrance"].placement_mode is PlacementMode.MANUAL
+
+
+def test_authenticated_camera_api_requires_and_replays_idempotency_key() -> None:
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=NODE_ID,
+                name="api-node",
+                external_port=10543,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=datetime.now(UTC),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+        session_store=session_store,
+    )
+    headers = {**headers, "X-CSRF-Token": CSRF_TOKEN}
+    payload = {
+        "name": "API entrance",
+        "source_url": "rtsp://camera.internal/api",
+        "node_id": str(NODE_ID),
+    }
+
+    missing = client.post("/api/v1/cameras", headers=headers, json=payload)
+    first = client.post(
+        "/api/v1/cameras",
+        headers={**headers, "Idempotency-Key": IDEMPOTENCY_KEY},
+        json=payload,
+    )
+    replay = client.post(
+        "/api/v1/cameras",
+        headers={**headers, "Idempotency-Key": IDEMPOTENCY_KEY},
+        json=payload,
+    )
+
+    assert missing.status_code == 428
+    assert missing.json()["detail"]["code"] == "camera_idempotency_key_required"
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == first.json()
+    assert len(control.list_cameras()) == 1
+
+
+def test_camera_registration_idempotency_rejections_are_audited_or_fail_closed(
+    postgres_database_url: str,
+) -> None:
+    class ConflictingCameraRegistration:
+        def __init__(self, reasons: tuple[str, ...]) -> None:
+            self._reasons = iter(reasons)
+
+        def creation_targets(self) -> tuple[MediaNode, ...]:
+            return ()
+
+        def create_camera(self, **_kwargs: object) -> None:
+            raise CameraLifecycleConflict(next(self._reasons))
+
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    session_store = PostgresOperatorSessionStore(postgres_database_url)
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(
+            CameraControl,
+            ConflictingCameraRegistration(
+                (
+                    "camera_idempotency_conflict",
+                    "camera_idempotency_target_missing",
+                )
+            ),
+        ),
+        role=OperatorRole.OPERATOR,
+        session_store=session_store,
+    )
+    form_payload = {
+        "_csrf": CSRF_TOKEN,
+        "name": "Conflicting camera",
+        "source_url": "rtsp://camera.internal/conflict",
+        "placement_mode": "automatic",
+        "node_id": "",
+        "idempotency_key": IDEMPOTENCY_KEY,
+    }
+
+    dashboard_rejection = client.post(
+        "/dashboard/cameras",
+        headers=cookie_headers,
+        data=form_payload,
+    )
+    api_rejection = client.post(
+        "/api/v1/cameras",
+        headers={
+            **cookie_headers,
+            "X-CSRF-Token": CSRF_TOKEN,
+            "Idempotency-Key": "22222222-2222-4222-8222-222222222222",
+        },
+        json={
+            "name": "Missing target camera",
+            "source_url": "rtsp://camera.internal/missing-target",
+        },
+    )
+
+    audit_engine = create_engine(postgres_database_url)
+    try:
+        with audit_engine.connect() as connection:
+            audit_payloads = tuple(
+                connection.scalars(
+                    text(
+                        "SELECT payload FROM audit_events "
+                        "WHERE event_type='operator.mutation_rejected' "
+                        "ORDER BY occurred_at, id"
+                    )
+                )
+            )
+            outbox_payloads = tuple(
+                connection.scalars(
+                    text(
+                        "SELECT payload FROM outbox_messages "
+                        "WHERE event_type='operator.mutation_rejected' "
+                        "ORDER BY occurred_at, id"
+                    )
+                )
+            )
+    finally:
+        audit_engine.dispose()
+        session_store.close()
+
+    assert dashboard_rejection.status_code == 409
+    assert api_rejection.status_code == 409
+    assert audit_payloads == outbox_payloads
+    assert [payload["reason_code"] for payload in audit_payloads] == [
+        "camera_idempotency_conflict",
+        "camera_idempotency_target_missing",
+    ]
+    assert [payload["action"] for payload in audit_payloads] == [
+        "camera.create",
+        "camera.create",
+    ]
+    assert [payload["idempotency_key"] for payload in audit_payloads] == [
+        IDEMPOTENCY_KEY,
+        "22222222-2222-4222-8222-222222222222",
+    ]
+
+    class FailingRejectionAuditStore(InMemoryOperatorSessionStore):
+        def record_request_security_event(self, **kwargs: Any) -> None:
+            if kwargs.get("event_type") == "operator.mutation_rejected":
+                raise OperatorSessionUnavailable("operator_session_store_unavailable")
+            super().record_request_security_event(**kwargs)
+
+    unavailable, unavailable_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(
+            CameraControl,
+            ConflictingCameraRegistration(("camera_idempotency_conflict",)),
+        ),
+        role=OperatorRole.OPERATOR,
+        session_store=FailingRejectionAuditStore(clock=lambda: NOW),
+    )
+    failed_closed = unavailable.post(
+        "/dashboard/cameras",
+        headers=unavailable_headers,
+        data=form_payload,
+    )
+
+    assert failed_closed.status_code == 503
+    assert "Регистрация камер недоступна" in failed_closed.text
+
+
+def test_camera_create_rate_limit_precedes_postgres_intent_reservation(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=RunningDashboardNodeRuntime(),
+        provision_on_create=True,
+        is_port_bindable=lambda _port: True,
+    )
+    node = node_control.register_node(
+        name="rate-limited-node",
+        port_range_start=10543,
+        port_range_end=10543,
+        max_nodes=1,
+        external_port=10543,
+        api_ports=(20543,),
+        metrics_ports=(30543,),
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    session_store = PostgresOperatorSessionStore(postgres_database_url)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+        session_store=session_store,
+        camera_mutation_limit_per_minute=1,
+    )
+    payload = {
+        "_csrf": CSRF_TOKEN,
+        "name": "First camera",
+        "source_url": "rtsp://camera.internal/first",
+        "placement_mode": "manual",
+        "node_id": str(node.id),
+        "idempotency_key": IDEMPOTENCY_KEY,
+    }
+
+    try:
+        form = client.get("/dashboard/cameras/new", headers=headers)
+        first = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data=payload,
+            follow_redirects=False,
+        )
+        limited = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={
+                **payload,
+                "name": "Second camera",
+                "source_url": "rtsp://camera.internal/second",
+                "idempotency_key": "33333333-3333-4333-8333-333333333333",
+            },
+            follow_redirects=False,
+        )
+        engine = create_engine(postgres_database_url)
+        try:
+            with engine.connect() as connection:
+                ledger_count = connection.scalar(
+                    text("SELECT count(*) FROM camera_registration_requests")
+                )
+                camera_count = connection.scalar(text("SELECT count(*) FROM cameras"))
+                rate_rows = connection.execute(
+                    text(
+                        "SELECT bucket, used FROM operator_action_rate_limits "
+                        "WHERE account_id=:account_id ORDER BY bucket"
+                    ),
+                    {"account_id": ACCOUNT_ID},
+                ).all()
+                rate_payload = connection.scalar(
+                    text(
+                        "SELECT payload FROM audit_events "
+                        "WHERE event_type='operator.authorization_denied' "
+                        "AND payload->>'reason_code'='operator_rate_limited'"
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        assert form.status_code == 200
+        assert first.status_code == 303
+        assert limited.status_code == 429
+        assert limited.headers["retry-after"] == "60"
+        assert ledger_count == 1
+        assert camera_count == 1
+        assert [(str(row.bucket), int(row.used)) for row in rate_rows] == [
+            ("camera_mutation", 1)
+        ]
+        assert rate_payload["reason_code"] == "operator_rate_limited"
+        assert rate_payload["action"] == "camera.create"
+    finally:
+        session_store.close()
+        store.close()
+
+
+def test_dashboard_camera_registration_requires_mutation_permission_and_control() -> None:
+    viewer, viewer_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        role=OperatorRole.VIEWER,
+    )
+    unavailable, unavailable_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=None,
+        role=OperatorRole.OPERATOR,
+    )
+
+    denied = viewer.get("/dashboard/cameras/new", headers=viewer_headers)
+    missing = unavailable.get("/dashboard/cameras/new", headers=unavailable_headers)
+
+    assert denied.status_code == 403
+    assert missing.status_code == 503
+    assert missing.headers["retry-after"] == "5"
+    assert "Регистрация камер недоступна" in missing.text
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_message"),
+    (
+        ({"placement_mode": "manual", "node_id": "not-a-uuid"}, "Некорректная форма"),
+        ({"placement_mode": "invalid"}, "Некорректная форма"),
+        (
+            {"source_url": "rtsp://operator:never-render@camera.internal/main"},
+            "Некорректный source URL",
+        ),
+    ),
+)
+def test_dashboard_camera_registration_rejects_invalid_secret_bearing_forms(
+    overrides: dict[str, str],
+    expected_message: str,
+) -> None:
+    observed_at = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=NODE_ID,
+                name="edge-north",
+                external_port=10543,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    payload = {
+        "_csrf": CSRF_TOKEN,
+        "name": "Front entrance",
+        "source_url": "rtsp://camera.internal/main",
+        "placement_mode": "automatic",
+        "node_id": "",
+        "idempotency_key": IDEMPOTENCY_KEY,
+        **overrides,
+    }
+
+    response = client.post("/dashboard/cameras", headers=headers, data=payload)
+
+    assert response.status_code == 422
+    assert expected_message in response.text
+    assert "never-render" not in response.text
+    assert control.list_cameras() == ()
+
+
+def test_postgres_dashboard_camera_registration_persists_operator_attribution(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    _seed_postgres_operator_account(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=RunningDashboardNodeRuntime(),
+        provision_on_create=True,
+        is_port_bindable=lambda _port: True,
+    )
+    node = node_control.register_node(
+        name="postgres-create-node",
+        port_range_start=10543,
+        port_range_end=10543,
+        max_nodes=1,
+        external_port=10543,
+        api_ports=(20543,),
+        metrics_ports=(30543,),
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+        session_store=session_store,
+    )
+
+    try:
+        form = client.get("/dashboard/cameras/new", headers=headers)
+        response = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={
+                "_csrf": CSRF_TOKEN,
+                "name": "Postgres entrance",
+                "source_url": "rtsp://camera.internal/postgres",
+                "placement_mode": "manual",
+                "node_id": str(node.id),
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
+            follow_redirects=False,
+        )
+        replay = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={
+                "_csrf": CSRF_TOKEN,
+                "name": "Postgres entrance",
+                "source_url": "rtsp://camera.internal/postgres",
+                "placement_mode": "manual",
+                "node_id": str(node.id),
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
+            follow_redirects=False,
+        )
+        conflict = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={
+                "_csrf": CSRF_TOKEN,
+                "name": "Changed retry",
+                "source_url": "rtsp://camera.internal/postgres",
+                "placement_mode": "manual",
+                "node_id": str(node.id),
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
+            follow_redirects=False,
+        )
+        audit_engine = create_engine(postgres_database_url)
+        try:
+            with audit_engine.begin() as connection:
+                payload = connection.execute(
+                    text(
+                        "SELECT payload FROM audit_events "
+                        "WHERE aggregate_id = :camera_id AND event_type = 'camera.created'"
+                    ),
+                    {"camera_id": CAMERA_ID},
+                ).scalar_one()
+                ledger_count = connection.scalar(
+                    text("SELECT count(*) FROM camera_registration_requests")
+                )
+                connection.execute(
+                    text("UPDATE cameras SET state='deleted' WHERE id=:camera_id"),
+                    {"camera_id": CAMERA_ID},
+                )
+        finally:
+            audit_engine.dispose()
+        missing_target = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={
+                "_csrf": CSRF_TOKEN,
+                "name": "Postgres entrance",
+                "source_url": "rtsp://camera.internal/postgres",
+                "placement_mode": "manual",
+                "node_id": str(node.id),
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
+            follow_redirects=False,
+        )
+
+        assert form.status_code == 200
+        assert "postgres-create-node" in form.text
+        assert response.status_code == 303
+        assert replay.status_code == 303
+        assert replay.headers["location"] == response.headers["location"]
+        assert conflict.status_code == 409
+        assert missing_target.status_code == 409
+        assert ledger_count == 1
+        assert payload["operator"]["action"] == "camera.create"
+        assert payload["operator"]["resource_type"] == "camera"
+        assert payload["operator"]["resource_id"] == "collection"
+        assert payload["operator"]["account_id"] == str(ACCOUNT_ID)
+        assert "source_url" not in payload
+        assert "camera.internal" not in repr(payload)
+        rejected = [
+            event
+            for event in session_store.request_security_events()
+            if event.event_type == "operator.mutation_rejected"
+        ]
+        assert [event.reason_code for event in rejected] == [
+            "camera_idempotency_conflict",
+            "camera_idempotency_target_missing",
+        ]
+    finally:
+        store.close()
+
+
+def test_postgres_camera_registration_fails_closed_across_0017_bridge(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0017_access_grant_keys")
+    _seed_postgres_operator_account(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=RunningDashboardNodeRuntime(),
+        provision_on_create=True,
+        is_port_bindable=lambda _port: True,
+    )
+    node_control.register_node(
+        name="bridge-node",
+        port_range_start=10543,
+        port_range_end=10543,
+        max_nodes=1,
+        external_port=10543,
+        api_ports=(20543,),
+        metrics_ports=(30543,),
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    request = {
+        "_csrf": CSRF_TOKEN,
+        "name": "Bridge entrance",
+        "source_url": "rtsp://camera.internal/bridge",
+        "placement_mode": "manual",
+        "node_id": str(NODE_ID),
+        "idempotency_key": IDEMPOTENCY_KEY,
+    }
+
+    try:
+        before = client.post("/dashboard/cameras", headers=headers, data=request)
+        before_cameras = control.list_cameras()
+        command.upgrade(migration, "head")
+        after = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data=request,
+            follow_redirects=False,
+        )
+
+        assert before.status_code == 503
+        assert before.headers["retry-after"] == "5"
+        assert before_cameras == ()
+        assert after.status_code == 303
+        assert tuple(camera.id for camera in control.list_cameras()) == (CAMERA_ID,)
+    finally:
+        store.close()
+
+
+def test_postgres_camera_intent_is_reserved_before_automatic_node_side_effect(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    _seed_postgres_operator_account(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=RunningDashboardNodeRuntime(),
+        is_port_bindable=lambda _port: True,
+    )
+    policy = NodeProvisioningPolicy(
+        port_range_start=10543,
+        port_range_end=10543,
+        max_nodes=1,
+        reserved_ports=(),
+        api_ports=(20543,),
+        metrics_ports=(30543,),
+        release_id="0.2.1",
+        mediamtx_binary_sha256="a" * 64,
+    )
+    fail_after_capacity = [True]
+
+    def ensure_capacity(context: NodeMutationContext | None) -> MediaNode:
+        node = node_control.ensure_automatic_capacity(
+            policy,
+            mutation_context=context,
+        )
+        if fail_after_capacity[0]:
+            raise NodeRuntimeUnavailable("simulated_post_provision_failure")
+        return node
+
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+        ensure_automatic_capacity=ensure_capacity,
+    )
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+        session_store=session_store,
+    )
+    original = {
+        "_csrf": CSRF_TOKEN,
+        "name": "Reserved camera",
+        "source_url": "rtsp://camera.internal/reserved",
+        "placement_mode": "automatic",
+        "node_id": "",
+        "idempotency_key": IDEMPOTENCY_KEY,
+    }
+
+    try:
+        interrupted = client.post("/dashboard/cameras", headers=headers, data=original)
+        engine = create_engine(postgres_database_url)
+        try:
+            with engine.connect() as connection:
+                pending = connection.execute(
+                    text(
+                        "SELECT status, camera_id FROM camera_registration_requests"
+                    )
+                ).one()
+        finally:
+            engine.dispose()
+        nodes_after_interruption = store.list_nodes()
+        cameras_after_interruption = store.list_cameras()
+        changed = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={**original, "name": "Changed retry"},
+        )
+        fail_after_capacity[0] = False
+        completed = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data=original,
+            follow_redirects=False,
+        )
+        engine = create_engine(postgres_database_url)
+        try:
+            with engine.connect() as connection:
+                final = connection.execute(
+                    text(
+                        "SELECT status, camera_id FROM camera_registration_requests"
+                    )
+                ).one()
+        finally:
+            engine.dispose()
+
+        assert interrupted.status_code == 503
+        assert tuple(pending) == ("pending", None)
+        assert len(nodes_after_interruption) == 1
+        assert cameras_after_interruption == ()
+        assert changed.status_code == 409
+        rejection = session_store.request_security_events()[-1]
+        assert rejection.event_type == "operator.mutation_rejected"
+        assert rejection.reason_code == "camera_idempotency_conflict"
+        assert rejection.idempotency_key == UUID(IDEMPOTENCY_KEY)
+        assert completed.status_code == 303
+        assert tuple(final) == ("complete", CAMERA_ID)
+        assert tuple(camera.id for camera in store.list_cameras()) == (CAMERA_ID,)
+    finally:
+        store.close()
+
+
+def test_postgres_camera_registration_lock_wait_is_bounded(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    idempotency = CameraRegistrationIdempotency(
+        key=UUID(IDEMPOTENCY_KEY),
+        actor_account_id=ACCOUNT_ID,
+        actor_session_id=UUID("99999999-9999-4999-8999-999999999999"),
+        request_sha256="a" * 64,
+    )
+    digest = hashlib.sha256(
+        b"camera-registration\x00"
+        + idempotency.actor_session_id.bytes
+        + idempotency.key.bytes
+    ).digest()
+    advisory_key = int.from_bytes(digest[:8], "big", signed=True)
+    blocker = create_engine(postgres_database_url)
+    store = PostgresNodeStore(
+        postgres_database_url,
+        lifecycle_lock_timeout_seconds=0.1,
+    )
+
+    try:
+        with blocker.connect() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_lock(:key)"),
+                {"key": advisory_key},
+            )
+            started_at = time.monotonic()
+            with pytest.raises(NodeLifecycleBusy, match="node_lifecycle_busy"):
+                store.reserve_camera_registration(idempotency)
+            elapsed = time.monotonic() - started_at
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": advisory_key},
+            )
+
+        assert elapsed < 1.0
+    finally:
+        store.close()
+        blocker.dispose()
+
+
+def test_postgres_automatic_capacity_uses_camera_operator_attribution(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "head")
+    _seed_postgres_operator_account(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=RunningDashboardNodeRuntime(),
+        is_port_bindable=lambda _port: True,
+    )
+    policy = NodeProvisioningPolicy(
+        port_range_start=10543,
+        port_range_end=10543,
+        max_nodes=1,
+        reserved_ports=(),
+        api_ports=(20543,),
+        metrics_ports=(30543,),
+        release_id="0.2.1",
+        mediamtx_binary_sha256="a" * 64,
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+        ensure_automatic_capacity=lambda context: node_control.ensure_automatic_capacity(
+            policy,
+            mutation_context=context,
+        ),
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+
+    try:
+        response = client.post(
+            "/dashboard/cameras",
+            headers=headers,
+            data={
+                "_csrf": CSRF_TOKEN,
+                "name": "Automatic provisioned camera",
+                "source_url": "rtsp://camera.internal/automatic-provision",
+                "placement_mode": "automatic",
+                "node_id": "",
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
+            follow_redirects=False,
+        )
+        audit_engine = create_engine(postgres_database_url)
+        try:
+            with audit_engine.connect() as connection:
+                events = connection.execute(
+                    text(
+                        "SELECT aggregate_type, event_type, payload FROM audit_events "
+                        "WHERE event_type IN ('media_node.created', "
+                        "'media_node.desired_state_changed', 'camera.created') "
+                        "ORDER BY occurred_at, id"
+                    )
+                ).mappings().all()
+        finally:
+            audit_engine.dispose()
+
+        assert response.status_code == 303
+        assert [event["event_type"] for event in events] == [
+            "media_node.created",
+            "media_node.desired_state_changed",
+            "camera.created",
+        ]
+        assert all(
+            event["payload"]["operator"]["account_id"] == str(ACCOUNT_ID)
+            and event["payload"]["operator"]["action"] == "camera.create"
+            and event["payload"]["operator"]["idempotency_key"] == IDEMPOTENCY_KEY
+            for event in events
+        )
+    finally:
+        store.close()
 
 
 def test_camera_catalog_requires_control_read_and_fails_closed() -> None:

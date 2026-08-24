@@ -1009,6 +1009,7 @@ def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
         "0015_camera_name_contract",
         "0016_node_registration_keys",
         "0017_access_grant_keys",
+        "0018_camera_registration_keys",
     ],
 )
 def test_collector_remains_ready_across_declared_schema_bridge(

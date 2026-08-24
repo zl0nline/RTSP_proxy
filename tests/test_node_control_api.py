@@ -1181,11 +1181,11 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "('media_nodes', 'cameras', 'audit_events', 'outbox_messages', "
                 "'camera_access_policies', 'camera_access_grants', "
                 "'node_registration_requests', 'access_grant_issue_requests', "
-                "'operator_action_rate_limits')"
+                "'operator_action_rate_limits', 'camera_registration_requests')"
             )
         )
-    assert revision == "0017_access_grant_keys"
-    assert table_count == 9
+    assert revision == "0018_camera_registration_keys"
+    assert table_count == 10
 
 
 def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(
@@ -1422,7 +1422,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0017_access_grant_keys"
+            "0018_camera_registration_keys"
         )
 
 
@@ -1455,7 +1455,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0017_access_grant_keys"
+            "0018_camera_registration_keys"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})
@@ -3201,7 +3201,7 @@ def test_automatic_camera_creation_provisions_before_committing_placement() -> N
         store=store,
         new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
         new_public_id=lambda: "a234567a234567a234567a2344",
-        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+        ensure_automatic_capacity=lambda _context: node_control.ensure_automatic_capacity(
             automatic_policy()
         ),
     )
@@ -3238,7 +3238,7 @@ def test_failed_automatic_provisioning_commits_no_camera_or_placement() -> None:
         store=store,
         new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
         new_public_id=lambda: "a234567a234567a234567a2344",
-        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+        ensure_automatic_capacity=lambda _context: node_control.ensure_automatic_capacity(
             automatic_policy()
         ),
     )
@@ -3285,7 +3285,7 @@ def test_concurrent_automatic_cameras_share_one_provisioned_node() -> None:
         store=store,
         new_camera_id=uuid4,
         new_public_id=generate_public_id,
-        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+        ensure_automatic_capacity=lambda _context: node_control.ensure_automatic_capacity(
             automatic_policy()
         ),
     )
@@ -3346,7 +3346,7 @@ def test_postgresql_serializes_cross_request_automatic_provisioning(
         store=store,
         new_camera_id=uuid4,
         new_public_id=generate_public_id,
-        ensure_automatic_capacity=lambda: node_control.ensure_automatic_capacity(
+        ensure_automatic_capacity=lambda _context: node_control.ensure_automatic_capacity(
             automatic_policy()
         ),
     )
@@ -3757,7 +3757,7 @@ def test_release_lock_contention_is_a_retryable_public_error() -> None:
 
 
 def test_automatic_capacity_lock_contention_is_a_retryable_public_error() -> None:
-    def busy_capacity() -> MediaNode:
+    def busy_capacity(_context: NodeMutationContext | None) -> MediaNode:
         raise NodeLifecycleBusy("node_lifecycle_busy")
 
     client = TestClient(

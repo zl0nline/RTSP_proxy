@@ -143,6 +143,12 @@ def test_postgres_operator_action_rate_buckets_are_durable_and_independent(
         limit=1,
         window_seconds=60,
     )
+    first_camera_mutation = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.CAMERA_MUTATION,
+        limit=1,
+        window_seconds=60,
+    )
 
     with engine.connect() as connection:
         persisted = [
@@ -158,9 +164,13 @@ def test_postgres_operator_action_rate_buckets_are_durable_and_independent(
     store.close()
     engine.dispose()
 
-    assert first_secret == first_mutation == 0
+    assert first_secret == first_mutation == first_camera_mutation == 0
     assert 1 <= limited_secret <= 60
-    assert persisted == [("access_mutation", 1), ("secret_issue", 1)]
+    assert persisted == [
+        ("access_mutation", 1),
+        ("camera_mutation", 1),
+        ("secret_issue", 1),
+    ]
 
 
 def test_postgres_first_operator_action_bucket_claim_is_concurrency_safe(
@@ -1500,7 +1510,7 @@ def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -
         ),
     )
     route_methods = _protected_route_method_matrix(anonymous_app.routes)
-    assert len(route_methods) == 70
+    assert len(route_methods) == 72
 
     node_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")

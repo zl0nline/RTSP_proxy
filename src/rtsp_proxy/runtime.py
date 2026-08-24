@@ -428,7 +428,10 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             ensure_automatic_capacity=(
                 None
                 if node_runtime is None
-                else lambda: node_control.ensure_automatic_capacity(provisioning_policy)
+                else lambda context: node_control.ensure_automatic_capacity(
+                    provisioning_policy,
+                    mutation_context=context,
+                )
             ),
         ),
         camera_move_control=move_control,

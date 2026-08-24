@@ -7,7 +7,10 @@
       <p class="eyebrow">До 100 камер на ноду</p>
       <h1>Каталог камер</h1>
     </div>
-    <p class="updated">Показано: {{ page.items | length }}</p>
+    <div>
+      <p class="updated">Показано: {{ page.items | length }}</p>
+      {% if can_create %}<a class="button-link" href="/dashboard/cameras/new">Зарегистрировать камеру</a>{% endif %}
+    </div>
   </div>
 
   <form class="catalog-filters" method="get" action="/dashboard/cameras" aria-label="Фильтры каталога камер">

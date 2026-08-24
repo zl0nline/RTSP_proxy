@@ -59,6 +59,7 @@ from rtsp_proxy.reconcile import CameraMutationControl, ConfirmationTokenService
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+CREATED_CAMERA_ID = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
 SOURCE_SECRET_CANARY = "rtsp://source-secret-canary.invalid/private"
 DOWNSTREAM_SECRET_CANARY = "browser-downstream-secret-canary-0123456789abcdef"
 
@@ -198,10 +199,12 @@ def build_lab_app(*, origin: str) -> Any:
         applied_revision=1,
     )
     node_store = InMemoryNodeStore(nodes=(node,))
+    camera_ids = iter((CAMERA_ID, CREATED_CAMERA_ID))
+    public_ids = iter(("a" * 26, "b" * 25 + "e"))
     cameras = CameraControl(
         store=node_store,
-        new_camera_id=lambda: CAMERA_ID,
-        new_public_id=lambda: "a" * 26,
+        new_camera_id=camera_ids.__next__,
+        new_public_id=public_ids.__next__,
     )
     camera = cameras.create_camera(
         name="Front entrance",

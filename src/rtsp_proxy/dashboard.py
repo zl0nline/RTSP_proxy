@@ -21,7 +21,7 @@ from rtsp_proxy.nodes import (
     NodeReconfigurePreview,
 )
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
-from rtsp_proxy.operator_access import OperatorPrincipal
+from rtsp_proxy.operator_access import OperatorPermission, OperatorPrincipal
 from rtsp_proxy.reconcile import (
     CameraMovePreview,
     CameraMoveTarget,
@@ -214,7 +214,27 @@ def render_camera_catalog(
             query=query,
             next_url=next_url,
             principal=principal,
+            can_create=principal.allows(OperatorPermission.CONTROL_MUTATE),
             states=(CameraState.ENABLED, CameraState.DISABLED, CameraState.DELETING),
+        )
+    )
+
+
+def render_camera_create(
+    *,
+    targets: tuple[MediaNode, ...],
+    principal: OperatorPrincipal,
+    csrf_token: str,
+    idempotency_key: UUID,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/camera_create.html")
+        .render(
+            targets=targets,
+            principal=principal,
+            csrf_token=csrf_token,
+            idempotency_key=idempotency_key,
         )
     )
 

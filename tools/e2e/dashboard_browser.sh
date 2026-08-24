@@ -230,6 +230,18 @@ require_url_contains "/dashboard"
 
 keyboard_activate 'a[href="/dashboard/cameras"]'
 require_url_contains "/dashboard/cameras"
+keyboard_activate 'a[href="/dashboard/cameras/new"]'
+require_url_contains "/dashboard/cameras/new"
+require_body_text "Зарегистрировать камеру"
+browser find label "Имя камеры" fill "Browser registered camera" >/dev/null
+browser find label "Source RTSP URL" fill "rtsp://new-source-secret-canary.invalid/private" >/dev/null
+keyboard_activate 'form[action="/dashboard/cameras"] button'
+require_url_contains "/dashboard/cameras/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+require_body_text "Browser registered camera"
+require_body_text "rtsp://<server-address>:10543/bbbbbbbbbbbbbbbbbbbbbbbbbe"
+require_secret_absent "rtsp://new-source-secret-canary.invalid/private"
+keyboard_activate 'a[href="/dashboard/cameras"]'
+require_url_contains "/dashboard/cameras"
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 require_body_text "rtsp://<server-address>:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -293,6 +305,11 @@ fi
 if grep -R -F --binary-files=text \
   "rtsp://source-secret-canary.invalid/private" "$artifact_dir" >/dev/null; then
   printf 'source secret canary leaked into browser evidence artifacts\n' >&2
+  exit 1
+fi
+if grep -R -F --binary-files=text \
+  "rtsp://new-source-secret-canary.invalid/private" "$artifact_dir" >/dev/null; then
+  printf 'camera-registration source canary leaked into browser evidence artifacts\n' >&2
   exit 1
 fi
 uv run python "$repo_root/tools/e2e/verify_dashboard_browser_artifacts.py" \

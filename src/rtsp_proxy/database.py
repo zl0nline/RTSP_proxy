@@ -61,6 +61,8 @@ from rtsp_proxy.nodes import (
     CameraMoveState,
     CameraNotFound,
     CameraPlacement,
+    CameraRegistrationIdempotency,
+    CameraRegistrationResult,
     CameraRevisionConflict,
     CameraState,
     EligibleNodeMissing,
@@ -210,6 +212,43 @@ cameras = Table(
     CheckConstraint("state IN ('enabled', 'disabled', 'deleting', 'deleted')"),
     CheckConstraint("desired_revision >= 1"),
     CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+)
+
+camera_registration_requests = Table(
+    "camera_registration_requests",
+    metadata,
+    Column("actor_session_id", Uuid(as_uuid=True), primary_key=True),
+    Column("idempotency_key", Uuid(as_uuid=True), primary_key=True),
+    Column(
+        "actor_account_id",
+        Uuid(as_uuid=True),
+        ForeignKey("operator_accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("request_sha256", String(64), nullable=False),
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="RESTRICT"),
+        nullable=True,
+        unique=True,
+    ),
+    Column("status", String(16), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    ),
+    CheckConstraint(
+        "request_sha256 ~ '^[0-9a-f]{64}$'",
+        name="camera_registration_requests_sha256_valid",
+    ),
+    CheckConstraint(
+        "(status = 'pending' AND camera_id IS NULL) OR "
+        "(status = 'complete' AND camera_id IS NOT NULL)",
+        name="camera_registration_requests_state_valid",
+    ),
 )
 
 public_id_tombstones = Table(
@@ -601,6 +640,7 @@ class PostgresNodeStore:
             ("0014_camera_catalog_projection",),
             ("0015_camera_name_contract",),
             ("0016_node_registration_keys",),
+            ("0017_access_grant_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -614,6 +654,21 @@ class PostgresNodeStore:
         except SQLAlchemyError:
             raise DatabaseSchemaMismatch("database_schema_mismatch") from None
         if revisions != (APPLICATION_SCHEMA,):
+            raise DatabaseSchemaMismatch("database_schema_mismatch")
+
+    def _assert_node_registration_ready(self) -> None:
+        try:
+            with self._engine.connect() as connection:
+                revisions = tuple(
+                    connection.scalars(text("SELECT version_num FROM alembic_version"))
+                )
+        except SQLAlchemyError:
+            raise DatabaseSchemaMismatch("database_schema_mismatch") from None
+        if revisions not in (
+            ("0016_node_registration_keys",),
+            ("0017_access_grant_keys",),
+            (APPLICATION_SCHEMA,),
+        ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     def schema_is_current(self) -> bool:
@@ -636,6 +691,7 @@ class PostgresNodeStore:
             ("0014_camera_catalog_projection",),
             ("0015_camera_name_contract",),
             ("0016_node_registration_keys",),
+            ("0017_access_grant_keys",),
             (APPLICATION_SCHEMA,),
         )
 
@@ -922,7 +978,7 @@ class PostgresNodeStore:
         mutation_context: NodeMutationContext | None = None,
     ) -> NodeRegistrationResult:
         try:
-            self.assert_schema_current()
+            self._assert_node_registration_ready()
         except DatabaseSchemaMismatch:
             raise NodeRuntimeUnavailable(
                 "node_registration_schema_unavailable"
@@ -990,7 +1046,7 @@ class PostgresNodeStore:
         idempotency: NodeRegistrationIdempotency,
     ) -> NodeRegistrationResult | None:
         try:
-            self.assert_schema_current()
+            self._assert_node_registration_ready()
         except DatabaseSchemaMismatch:
             raise NodeRuntimeUnavailable(
                 "node_registration_schema_unavailable"
@@ -1938,6 +1994,8 @@ class PostgresNodeStore:
         source_url: str,
         public_id: PublicId,
         management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
+        registration_idempotency: CameraRegistrationIdempotency | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -1988,6 +2046,8 @@ class PostgresNodeStore:
                 source_url=source_url,
                 public_id=public_id,
                 placement_mode=PlacementMode.AUTOMATIC,
+                mutation_context=mutation_context,
+                registration_idempotency=registration_idempotency,
             )
 
     def place_camera_manually(
@@ -1999,6 +2059,8 @@ class PostgresNodeStore:
         public_id: PublicId,
         node_id: UUID,
         management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
+        registration_idempotency: CameraRegistrationIdempotency | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -2034,6 +2096,232 @@ class PostgresNodeStore:
                 source_url=source_url,
                 public_id=public_id,
                 placement_mode=PlacementMode.MANUAL,
+                mutation_context=mutation_context,
+                registration_idempotency=registration_idempotency,
+            )
+
+    def place_camera_idempotently(
+        self,
+        *,
+        camera_id: UUID,
+        name: str,
+        source_url: str,
+        public_id: PublicId,
+        node_id: UUID | None,
+        idempotency: CameraRegistrationIdempotency,
+        management_freshness_seconds: int = 30,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> CameraRegistrationResult:
+        with self._camera_registration_guard(idempotency) as guard:
+            previous = (
+                guard.execute(
+                    select(camera_registration_requests).where(
+                        camera_registration_requests.c.actor_session_id
+                        == idempotency.actor_session_id,
+                        camera_registration_requests.c.idempotency_key
+                        == idempotency.key,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if previous is None:
+                raise NodeRuntimeUnavailable("camera_registration_reservation_missing")
+            previous_camera = self._camera_registration_target(
+                guard,
+                previous=previous,
+                idempotency=idempotency,
+            )
+            if previous_camera is not None:
+                return CameraRegistrationResult(
+                    camera=previous_camera,
+                    replayed=True,
+                )
+            if node_id is None:
+                camera = self.place_camera_automatically(
+                    camera_id=camera_id,
+                    name=name,
+                    source_url=source_url,
+                    public_id=public_id,
+                    management_freshness_seconds=management_freshness_seconds,
+                    mutation_context=mutation_context,
+                    registration_idempotency=idempotency,
+                )
+            else:
+                camera = self.place_camera_manually(
+                    camera_id=camera_id,
+                    name=name,
+                    source_url=source_url,
+                    public_id=public_id,
+                    node_id=node_id,
+                    management_freshness_seconds=management_freshness_seconds,
+                    mutation_context=mutation_context,
+                    registration_idempotency=idempotency,
+                )
+            return CameraRegistrationResult(camera=camera, replayed=False)
+
+    def reserve_camera_registration(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraRegistrationResult | None:
+        with self._camera_registration_guard(idempotency) as guard:
+            previous = (
+                guard.execute(
+                    select(camera_registration_requests).where(
+                        camera_registration_requests.c.actor_session_id
+                        == idempotency.actor_session_id,
+                        camera_registration_requests.c.idempotency_key
+                        == idempotency.key,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if previous is None:
+                _require_synchronous_commit(guard)
+                guard.execute(
+                    insert(camera_registration_requests).values(
+                        actor_session_id=idempotency.actor_session_id,
+                        idempotency_key=idempotency.key,
+                        actor_account_id=idempotency.actor_account_id,
+                        request_sha256=idempotency.request_sha256,
+                        camera_id=None,
+                        status="pending",
+                    )
+                )
+                return None
+            camera = self._camera_registration_target(
+                guard,
+                previous=previous,
+                idempotency=idempotency,
+            )
+            return (
+                None
+                if camera is None
+                else CameraRegistrationResult(camera=camera, replayed=True)
+            )
+
+    def lookup_camera_registration(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraRegistrationResult | None:
+        try:
+            with self._engine.connect() as connection:
+                _require_camera_registration_idempotency_schema(connection)
+                previous = (
+                    connection.execute(
+                        select(camera_registration_requests).where(
+                            camera_registration_requests.c.actor_session_id
+                            == idempotency.actor_session_id,
+                            camera_registration_requests.c.idempotency_key
+                            == idempotency.key,
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if previous is None:
+                    return None
+                camera = self._camera_registration_target(
+                    connection,
+                    previous=previous,
+                    idempotency=idempotency,
+                )
+                return (
+                    None
+                    if camera is None
+                    else CameraRegistrationResult(camera=camera, replayed=True)
+                )
+        except NodeRuntimeUnavailable:
+            raise
+        except SQLAlchemyError:
+            raise NodeRuntimeUnavailable("camera_registration_store_unavailable") from None
+
+    @contextmanager
+    def _camera_registration_guard(
+        self,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> Iterator[Connection]:
+        try:
+            with self._lock_connection() as guard, guard.begin():
+                _require_camera_registration_idempotency_schema(guard)
+                self._acquire_advisory_lock(
+                    guard,
+                    text("SELECT pg_try_advisory_xact_lock(:key)"),
+                    {"key": _camera_registration_advisory_key(idempotency)},
+                )
+                yield guard
+        except (NodeLifecycleBusy, NodeRuntimeUnavailable):
+            raise
+        except SQLAlchemyError:
+            raise NodeRuntimeUnavailable("camera_registration_store_unavailable") from None
+
+    def _camera_registration_target(
+        self,
+        connection: Connection,
+        *,
+        previous: RowMapping,
+        idempotency: CameraRegistrationIdempotency,
+    ) -> CameraPlacement | None:
+        if (
+            _uuid(previous["actor_account_id"]) != idempotency.actor_account_id
+            or str(previous["request_sha256"]) != idempotency.request_sha256
+        ):
+            raise CameraLifecycleConflict("camera_idempotency_conflict")
+        status_value = str(previous["status"])
+        if status_value == "pending" and previous["camera_id"] is None:
+            return None
+        if status_value != "complete" or previous["camera_id"] is None:
+            raise NodeRuntimeUnavailable("camera_registration_state_invalid")
+        row = (
+            connection.execute(
+                self._camera_query().where(
+                    cameras.c.id == _uuid(previous["camera_id"]),
+                    cameras.c.state != CameraState.DELETED.value,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise CameraLifecycleConflict("camera_idempotency_target_missing")
+        return _camera_placement(row)
+
+    def list_camera_creation_targets(
+        self,
+        *,
+        management_freshness_seconds: int = 30,
+    ) -> tuple[MediaNode, ...]:
+        with self._engine.connect() as connection:
+            return tuple(
+                _media_node(row)
+                for row in connection.execute(
+                    select(media_nodes)
+                    .where(
+                        media_nodes.c.state == NodeState.RUNNING.value,
+                        media_nodes.c.runtime_state == NodeState.RUNNING.value,
+                        media_nodes.c.health == NodeHealth.HEALTHY.value,
+                        media_nodes.c.management_fresh.is_(True),
+                        media_nodes.c.management_observed_at
+                        >= func.clock_timestamp()
+                        - timedelta(seconds=management_freshness_seconds),
+                        media_nodes.c.config_compatible.is_(True),
+                        media_nodes.c.applied_revision == media_nodes.c.desired_revision,
+                        media_nodes.c.maintenance.is_(False),
+                        media_nodes.c.registered_cameras < media_nodes.c.camera_capacity,
+                        media_nodes.c.id.not_in(
+                            select(node_port_change_sagas.c.node_id).where(
+                                node_port_change_sagas.c.state
+                                == NodePortChangeState.PREPARED.value
+                            )
+                        ),
+                    )
+                    .order_by(
+                        media_nodes.c.registered_cameras,
+                        media_nodes.c.active_sources,
+                        media_nodes.c.id,
+                    )
+                ).mappings()
             )
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
@@ -2202,6 +2490,7 @@ class PostgresNodeStore:
         if revisions not in (
             ("0015_camera_name_contract",),
             ("0016_node_registration_keys",),
+            ("0017_access_grant_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise CameraCatalogUnavailable("camera_catalog_unavailable")
@@ -3068,6 +3357,8 @@ class PostgresNodeStore:
         source_url: str,
         public_id: PublicId,
         placement_mode: PlacementMode,
+        mutation_context: NodeMutationContext | None = None,
+        registration_idempotency: CameraRegistrationIdempotency | None = None,
     ) -> CameraPlacement:
         connection.execute(insert(public_id_tombstones).values(public_id=str(public_id)))
         connection.execute(
@@ -3125,6 +3416,7 @@ class PostgresNodeStore:
                 "desired_revision": 1,
             },
             aggregate_revision=1,
+            mutation_context=mutation_context,
         )
         _record_normative_event(
             connection,
@@ -3138,7 +3430,27 @@ class PostgresNodeStore:
                 "revision": 1,
             },
             aggregate_revision=1,
+            mutation_context=mutation_context,
         )
+        if registration_idempotency is not None:
+            finalized = connection.execute(
+                update(camera_registration_requests)
+                .where(
+                    camera_registration_requests.c.actor_session_id
+                    == registration_idempotency.actor_session_id,
+                    camera_registration_requests.c.idempotency_key
+                    == registration_idempotency.key,
+                    camera_registration_requests.c.actor_account_id
+                    == registration_idempotency.actor_account_id,
+                    camera_registration_requests.c.request_sha256
+                    == registration_idempotency.request_sha256,
+                    camera_registration_requests.c.status == "pending",
+                    camera_registration_requests.c.camera_id.is_(None),
+                )
+                .values(camera_id=camera_id, status="complete")
+            )
+            if finalized.rowcount != 1:
+                raise NodeRuntimeUnavailable("camera_registration_reservation_missing")
         return CameraPlacement(
             id=camera_id,
             name=name,
@@ -3790,8 +4102,14 @@ def _classify_access_grant_request(
 
 def _require_access_grant_idempotency_schema(connection: Connection) -> None:
     revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
-    if revisions != (APPLICATION_SCHEMA,):
+    if revisions not in (("0017_access_grant_keys",), (APPLICATION_SCHEMA,)):
         raise AccessGrantSchemaUnavailable("access_grant_schema_unavailable")
+
+
+def _require_camera_registration_idempotency_schema(connection: Connection) -> None:
+    revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
+    if revisions != (APPLICATION_SCHEMA,):
+        raise NodeRuntimeUnavailable("camera_registration_schema_unavailable")
 
 
 def _camera_move(row: RowMapping) -> CameraMove:
@@ -3908,6 +4226,17 @@ def _registration_advisory_key(
 ) -> int:
     digest = hashlib.sha256(
         idempotency.actor_session_id.bytes + idempotency.key.bytes
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def _camera_registration_advisory_key(
+    idempotency: CameraRegistrationIdempotency,
+) -> int:
+    digest = hashlib.sha256(
+        b"camera-registration\x00"
+        + idempotency.actor_session_id.bytes
+        + idempotency.key.bytes
     ).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 

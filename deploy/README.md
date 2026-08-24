@@ -328,7 +328,9 @@ same retryable/no-secret boundary.
 Migration 0017 creates the bounded `access_grant_issue_requests` ledger keyed
 by `(actor_session_id, idempotency_key)` and the per-account
 `operator_action_rate_limits` ledger with independent `secret_issue` and
-`access_mutation` buckets. The request ledger stores only canonical request
+`access_mutation` buckets. Migration 0018 extends the same ledger with a
+separate `camera_mutation` bucket, admitted before a camera intent is reserved.
+The request ledger stores only canonical request
 identity/digest and grant UUID references, never the raw token, verifier or
 pepper identity. Issue/rotation reserves the UUIDv4 key, writes the grant and
 appends its operator-attributed audit/outbox pair in one synchronous
@@ -348,6 +350,34 @@ and require a sanitized 429 with an integer `Retry-After` plus a durable
 After revision 0017 commits, rollback to application 0.8.0 (maximum schema
 0016) is **NO-GO**. Fix forward with verified 0.9.0 artifacts or restore the
 pre-0017 PostgreSQL backup with the control plane stopped. Do not downgrade the
+live schema.
+
+Application release `0.10.0` adds `0018_camera_registration_keys`. Install and
+smoke 0.10.0 on every WEB/background process while PostgreSQL is still at
+0017. Existing streams, camera/node reads and lifecycle operations, node
+registration and camera access administration remain available during this
+window. Suspend new camera registration until the database reaches exact 0018:
+an authenticated 0.10.0 dashboard/API request fails closed with a bounded 503
+before it can insert a camera when the ledger is unavailable.
+
+Migration 0018 creates `camera_registration_requests`, keyed by
+`(actor_session_id, idempotency_key)`. It stores the actor account, a canonical
+request SHA-256, a `pending|complete` state and the resulting camera UUID; it
+never stores an additional copy of the source URL. The pending intent commits
+synchronously before placement or automatic node provisioning. The same row
+is finalized in the synchronous camera/tombstone/placement/access-policy and
+operator-attributed audit/outbox transaction. After migration, register one
+lab camera with a fresh session-bound UUIDv4 key, repeat the identical request
+and require the same camera URL with one catalog row. Reuse the key with a
+changed name, source or placement and require a sanitized, durably audited 409.
+Also test automatic placement with no eligible node: interrupt immediately
+after automatic node provisioning, verify the pending intent, then retry the
+unchanged request and require the automatically provisioned node events and
+final camera event to carry the same account/session/action/key context.
+
+After revision 0018 commits, rollback to application 0.9.0 (maximum schema
+0017) is **NO-GO**. Fix forward with verified 0.10.0 artifacts or restore the
+pre-0018 PostgreSQL backup with the control plane stopped. Do not downgrade the
 live schema.
 
 The five WEB authentication files are delivered by installing

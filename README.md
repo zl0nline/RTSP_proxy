@@ -35,9 +35,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   representative semantic targets:
 >   identity source, scope and correlation ID are audit/outbox-bound and
 >   PostgreSQL append failures fail closed without partial revocation.
->   The current generated matrix covers all 70 protected route-method
->   pairs, including camera access administration. Future export/SSE/bulk routes
->   must extend it before activation.
+>   The last published generated matrix covers all 70 protected route-method
+>   pairs, including camera access administration. The current local
+>   camera-registration slice raises the inventory to 72 and is awaiting
+>   independent review/native CI. Future export/SSE/bulk routes must extend the
+>   matrix before activation.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
 >   server-side templates/OIDC/session/CSRF/logout tests remain identical in the
@@ -428,6 +430,21 @@ Independent Spec/Standards review passed. Application, packaged PostgreSQL and
 patched MediaMTX/load jobs passed on both amd64 and arm64; the external Chromium
 job passed on amd64 at commit `9b0695605e7bf9efe00db0760d90f9906da85579` in
 [CI run 32730353917](https://github.com/zl0nline/RTSP_proxy/actions/runs/32730353917).
+The current local camera-registration slice adds automatic least-loaded and
+manual eligible-node placement through a keyboard-operable server-rendered
+form and the JSON API. Both boundaries require a session-scoped UUIDv4 key;
+migration 0018 stores only its canonical request digest, pending/complete state
+and resulting camera UUID. The pending intent commits synchronously before any
+automatic node provisioning; its final transition commits atomically with
+camera/tombstone/placement/default access-policy state plus audit/outbox. Exact
+replay resumes or returns the original camera, while changed or target-missing
+reuse is a durably audited 409. A separate durable per-account camera-mutation
+bucket returns audited 429 before reserving an intent. Automatic node
+provisioning inherits the same
+operator account/session/action/key attribution. Local Chromium and an isolated
+direct-Linux amd64 PostgreSQL run are green; independent review and native
+amd64/arm64 CI remain pending. Exact local evidence is recorded in
+[`docs/evidence/phase-f-camera-registration-dashboard-contract.md`](docs/evidence/phase-f-camera-registration-dashboard-contract.md).
 Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не

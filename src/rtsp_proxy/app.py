@@ -835,7 +835,10 @@ def create_app(
                 )
             except OperatorSessionUnavailable:
                 return audited_response(_operator_session_unavailable_response(request))
-            action_bucket = _operator_action_bucket(audit_context.action)
+            action_bucket = _operator_action_bucket(
+                audit_context.action,
+                audit_context.http_method,
+            )
             if action_bucket is not None:
                 try:
                     await anyio.to_thread.run_sync(
@@ -1904,7 +1907,11 @@ def create_app(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/v1/cameras", response_model=CameraResponse, status_code=201)
-    def create_camera(request: CameraCreateRequest) -> CameraResponse:
+    def create_camera(
+        request: Request,
+        payload: CameraCreateRequest,
+        idempotency_key: UUID | None = IDEMPOTENCY_KEY_HEADER,
+    ) -> CameraResponse:
         if camera_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1912,9 +1919,13 @@ def create_app(
             )
         try:
             camera = camera_control.create_camera(
-                name=request.name,
-                source_url=request.source_url,
-                node_id=request.node_id,
+                name=payload.name,
+                source_url=payload.source_url,
+                node_id=payload.node_id,
+                mutation_context=_camera_operator_mutation_context(
+                    request,
+                    idempotency_key=idempotency_key,
+                ),
             )
         except NodeCameraCapacityReached:
             raise HTTPException(
@@ -1979,6 +1990,15 @@ def create_app(
                 detail={"code": str(error)},
             ) from None
         except CameraLifecycleConflict as error:
+            if str(error).startswith("camera_idempotency_"):
+                _record_access_mutation_rejection_or_503(
+                    request,
+                    operator_sessions=operator_sessions,
+                    reason_code=str(error),
+                    target_grant_id=None,
+                    expected_revision=None,
+                    idempotency_key=idempotency_key,
+                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": str(error)},
@@ -2896,6 +2916,8 @@ def _retryable_service_response(code: str) -> JSONResponse:
 def _operator_permission_for_request(request: Request) -> OperatorPermission:
     path = request.url.path
     if path == "/dashboard/cameras" or path.startswith("/dashboard/cameras/"):
+        if path == "/dashboard/cameras/new":
+            return OperatorPermission.CONTROL_MUTATE
         if "/access-grants" in path:
             if path.endswith("/revoke"):
                 return OperatorPermission.ACCESS_ADMIN
@@ -2998,9 +3020,16 @@ def _operator_scope_for_request(request: Request) -> str | None:
     return "server:*"
 
 
-def _operator_action_bucket(action: str) -> OperatorActionBucket | None:
+def _operator_action_bucket(
+    action: str,
+    http_method: str,
+) -> OperatorActionBucket | None:
+    if http_method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
     if action in {"camera.grant_issue", "camera.grant_rotate"}:
         return OperatorActionBucket.SECRET_ISSUE
+    if action == "camera.create":
+        return OperatorActionBucket.CAMERA_MUTATION
     if action in {"camera.access_policy_update", "camera.grant_revoke"}:
         return OperatorActionBucket.ACCESS_MUTATION
     return None
@@ -3072,9 +3101,17 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
             "": "node.delete" if method == "DELETE" else "node.read",
         }.get(suffix, "request.unsupported")
         return action, "node", node_id
-    if path == "/api/v1/cameras" or path == "/dashboard/cameras":
+    if path in {
+        "/api/v1/cameras",
+        "/dashboard/cameras",
+        "/dashboard/cameras/new",
+    }:
         return (
-            ("camera.create" if method == "POST" else "camera.list"),
+            (
+                "camera.create"
+                if method == "POST" or path.endswith("/new")
+                else "camera.list"
+            ),
             "camera",
             "collection",
         )
@@ -3461,6 +3498,25 @@ def _access_operator_mutation_context(
     return node_mutation_context(
         principal=principal,
         audit_context=audit_context,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _camera_operator_mutation_context(
+    request: Request,
+    *,
+    idempotency_key: UUID | None,
+) -> NodeMutationContext | None:
+    principal = getattr(request.state, "operator_principal", None)
+    if not isinstance(principal, OperatorPrincipal):
+        return None
+    if idempotency_key is None or idempotency_key.version != 4:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={"code": "camera_idempotency_key_required"},
+        )
+    return _access_operator_mutation_context(
+        request,
         idempotency_key=idempotency_key,
     )
 
