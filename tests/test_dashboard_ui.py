@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
@@ -25,11 +26,15 @@ from rtsp_proxy.nodes import (
     CameraMoveState,
     CameraState,
     InMemoryNodeStore,
+    MaximumNodesReached,
     MediaNode,
     NodeCommandFence,
     NodeControl,
     NodeHealth,
+    NodeManagementPortRangeExhausted,
     NodeMutationContext,
+    NodePortInUse,
+    NodePortOutOfRange,
     NodePortRangeExhausted,
     NodeRuntimeAction,
     NodeRuntimeFailed,
@@ -988,6 +993,63 @@ def test_dashboard_node_create_is_fail_closed_and_reports_port_exhaustion() -> N
     assert "нет свободных портов для регистрации новой ноды" in exhausted.text
     assert len(control.calls) == 1
     assert control.calls[0][0] == "register"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_message"),
+    [
+        (
+            MaximumNodesReached("max_nodes_reached"),
+            409,
+            "Достигнут предел нод",
+        ),
+        (
+            NodeManagementPortRangeExhausted(
+                "node_management_port_range_exhausted"
+            ),
+            409,
+            "Нет management-портов",
+        ),
+        (
+            NodePortOutOfRange("node_port_out_of_range"),
+            422,
+            "Порт вне диапазона",
+        ),
+        (
+            NodePortInUse("node_port_in_use"),
+            409,
+            "Порт уже занят",
+        ),
+    ],
+)
+def test_dashboard_node_create_maps_expected_registration_failures(
+    error: Exception,
+    expected_status: int,
+    expected_message: str,
+) -> None:
+    control = RecordingNodeDashboardControl(create_error=error)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "edge north",
+            "external_port": "10544",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == expected_status
+    assert expected_message in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert len(control.calls) == 1
 
 
 def test_dashboard_node_create_runtime_failure_redirects_to_persisted_node() -> None:
