@@ -94,9 +94,10 @@ node lifecycle pool.
 - [x] OIDC PKCE/browser binding/MFA/claim-drift and IdP outage contract tests
 - [x] Break-glass TOTP, safe provisioning CLI, durable alert/rate-limit and
   revision-fenced rotation drill
-- [~] Shared-boundary RBAC/scope/no-oracle denial classes and representative
-  semantic targets are complete; generated route-method coverage for all
-  protected routes and any future export/SSE/bulk surface remains gated
+- [x] Shared-boundary RBAC/scope/no-oracle denial classes, representative
+  semantic targets and a recursively generated matrix for all 48 current
+  protected route-method pairs are complete; future export/SSE/bulk routes
+  must enter the matrix and add their surface-specific evidence before activation
 - [x] Browser cookie/security-header/leak and accessibility E2E
 
 ## Rollout and rollback

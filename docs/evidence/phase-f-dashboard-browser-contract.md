@@ -71,7 +71,10 @@ configuration and processes.
 The shared-boundary denial-class/logout matrix with representative semantic
 targets is complete and recorded in
 [`phase-f-operator-security-audit-contract.md`](phase-f-operator-security-audit-contract.md).
-The generated all-route-method negative matrix remains pending. Phase F remains
-**IN PROGRESS** for that gate and the remaining operator workflows. Phase G
+The recursively generated negative matrix now covers all 48 current protected
+route-method pairs and passed run
+[`32680412385`](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385).
+Future export/SSE/bulk routes must extend it before activation. Phase F remains
+**IN PROGRESS** for the remaining operator workflows. Phase G
 physical hardware capacity, fault/WAN evidence and the 24-hour soak, followed
 by Phase H pilot rollout, also remain open. Production is therefore **NO-GO**.

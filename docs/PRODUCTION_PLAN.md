@@ -1034,6 +1034,13 @@ denial and logout fail closed without a half-pair; logout revocation rolls back
 when either normative append fails. Self-session logout is available to scoped
 operators without granting `server:*`. Exact evidence is recorded in
 [`docs/evidence/phase-f-operator-security-audit-contract.md`](evidence/phase-f-operator-security-audit-contract.md).
+The recursively generated inventory now exercises all 48 current protected
+route-method pairs, including nested included-router prefixes, and passed both
+reviews plus all seven jobs at commit
+`39b29814d726d9020c1d19100521b4dfe729b91e`
+([CI run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
+Future export/SSE/bulk routes remain activation-gated until they enter that
+inventory and add their surface-specific security evidence.
 No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
@@ -1042,8 +1049,9 @@ No Phase-F completion claim is made yet.
 - [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
-- [ ] generated route-method negative matrix for all protected routes, including
-  any future export/SSE/bulk surface;
+- [x] recursively generated route-method negative matrix for all 48 current
+  protected routes; future export/SSE/bulk routes must extend it before
+  activation;
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
