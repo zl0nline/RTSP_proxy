@@ -335,6 +335,10 @@ def test_camera_catalog_requires_current_exact_projection(
         with pytest.raises(CameraCatalogUnavailable, match="camera_catalog_unavailable"):
             control.catalog(CameraCatalogQuery())
 
+        command.upgrade(migration, "0015_camera_name_contract")
+        store.assert_camera_catalog_ready()
+        assert control.catalog(CameraCatalogQuery()).items == ()
+
         command.upgrade(migration, "head")
         store.assert_camera_catalog_ready()
         engine = create_engine(postgres_database_url)

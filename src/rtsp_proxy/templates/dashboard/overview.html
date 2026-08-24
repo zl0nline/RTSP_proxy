@@ -7,7 +7,10 @@
       <p class="eyebrow">Один Linux-сервер</p>
       <h1>Состояние RTSP-нод</h1>
     </div>
-    <p class="updated">Снимок: <time datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
+    <div>
+      <p class="updated">Снимок: <time datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
+      {% if can_manage_nodes %}<a class="button-link" href="/dashboard/nodes/new">Создать ноду</a>{% endif %}
+    </div>
   </div>
 
   <section class="summary-grid" aria-label="Сводка сервера">

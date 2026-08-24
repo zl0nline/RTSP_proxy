@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import socket
 import time
 import unicodedata
@@ -50,6 +51,123 @@ class NodeRuntimeAction(StrEnum):
 class NodeCreationMode(StrEnum):
     OPERATOR = "operator"
     AUTOMATIC = "automatic"
+
+
+@dataclass(frozen=True, slots=True)
+class NodeCommandFence:
+    """Optimistic source-state fence for one externally requested node command."""
+
+    expected_revision: int
+    expected_state: NodeState
+
+    def __post_init__(self) -> None:
+        if self.expected_revision < 1:
+            raise ValueError("node_command_fence_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class NodeMutationContext:
+    """Redacted operator attribution copied into a normative node event."""
+
+    actor_account_id: UUID
+    actor_session_id: UUID
+    identity_source: str
+    actor_subject: str
+    roles: tuple[str, ...]
+    scopes: tuple[str, ...]
+    authz_version: int
+    request_id: UUID
+    action: str
+    http_method: str
+    resource_scope: str
+    resource_type: str
+    resource_id: str
+    source_ip_sha256: str
+    user_agent_sha256: str
+    idempotency_key: UUID | None = None
+    reason: str = "operator_request"
+
+    def __post_init__(self) -> None:
+        digests = (self.source_ip_sha256, self.user_agent_sha256)
+        if (
+            self.identity_source not in {"oidc", "break_glass"}
+            or not 1 <= len(self.actor_subject) <= 512
+            or self.roles != tuple(sorted(set(self.roles)))
+            or not self.roles
+            or self.scopes != tuple(sorted(set(self.scopes)))
+            or not self.scopes
+            or self.authz_version < 1
+            or not 1 <= len(self.action) <= 128
+            or self.http_method not in {"POST", "PUT", "PATCH", "DELETE"}
+            or (
+                self.idempotency_key is not None
+                and self.idempotency_key.version != 4
+            )
+            or not 1 <= len(self.resource_scope) <= 256
+            or not 1 <= len(self.resource_type) <= 64
+            or not 1 <= len(self.resource_id) <= 128
+            or not 1 <= len(self.reason) <= 128
+            or any(len(value) != 64 or set(value) - set("0123456789abcdef") for value in digests)
+            or any(
+                ord(character) < 32
+                for value in (
+                    self.actor_subject,
+                    self.action,
+                    self.resource_scope,
+                    self.resource_type,
+                    self.resource_id,
+                    self.reason,
+                )
+                for character in value
+            )
+        ):
+            raise ValueError("node_mutation_context_invalid")
+
+    def event_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "account_id": str(self.actor_account_id),
+            "session_id": str(self.actor_session_id),
+            "identity_source": self.identity_source,
+            "subject": self.actor_subject,
+            "roles": list(self.roles),
+            "scopes": list(self.scopes),
+            "authz_version": self.authz_version,
+            "request_id": str(self.request_id),
+            "action": self.action,
+            "http_method": self.http_method,
+            "resource_scope": self.resource_scope,
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "source_ip_sha256": self.source_ip_sha256,
+            "user_agent_sha256": self.user_agent_sha256,
+            "outcome": "accepted",
+            "reason": self.reason,
+        }
+        if self.idempotency_key is not None:
+            payload["idempotency_key"] = str(self.idempotency_key)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class NodeRegistrationIdempotency:
+    key: UUID
+    actor_account_id: UUID
+    actor_session_id: UUID
+    request_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.key.version != 4
+            or len(self.request_sha256) != 64
+            or set(self.request_sha256) - set("0123456789abcdef")
+        ):
+            raise ValueError("node_registration_idempotency_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class NodeRegistrationResult:
+    node: MediaNode
+    replayed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +594,9 @@ class InMemoryNodeStore:
         self._cameras: list[CameraPlacement] = []
         self._camera_moves: list[CameraMove] = []
         self._port_changes: list[NodePortChange] = []
+        self._registration_requests: dict[
+            tuple[UUID, UUID], tuple[UUID, str, UUID]
+        ] = {}
         self._lock = RLock()
         self._lifecycle_locks = {node.id: Lock() for node in nodes}
         self._clock = clock
@@ -530,7 +651,9 @@ class InMemoryNodeStore:
         mediamtx_binary_sha256: str = "0" * 64,
         creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
         is_port_bindable: PortBindable | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
+        del mutation_context
         with self._lock:
             if preferred_port is not None and preferred_port not in allowed_ports:
                 raise NodePortOutOfRange("node_port_out_of_range")
@@ -595,6 +718,86 @@ class InMemoryNodeStore:
             self._nodes.append(node)
             self._lifecycle_locks[node.id] = Lock()
             return node
+
+    def register_idempotently(
+        self,
+        *,
+        name: str,
+        allowed_ports: Collection[int],
+        max_nodes: int,
+        preferred_port: int | None,
+        choose_port: PortChoice,
+        new_node_id: NodeIdFactory,
+        idempotency: NodeRegistrationIdempotency,
+        api_ports: Collection[int] = tuple(range(20000, 20100)),
+        metrics_ports: Collection[int] = tuple(range(20100, 20200)),
+        release_id: str = "0.1.0",
+        mediamtx_binary_sha256: str = "0" * 64,
+        creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
+        is_port_bindable: PortBindable | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> NodeRegistrationResult:
+        request_key = (idempotency.actor_session_id, idempotency.key)
+        with self._lock:
+            previous = self._registration_requests.get(request_key)
+            if previous is not None:
+                account_id, request_sha256, node_id = previous
+                if (
+                    account_id != idempotency.actor_account_id
+                    or request_sha256 != idempotency.request_sha256
+                ):
+                    raise NodeLifecycleConflict("node_idempotency_conflict")
+                node = next(
+                    (candidate for candidate in self._nodes if candidate.id == node_id),
+                    None,
+                )
+                if node is None:
+                    raise NodeLifecycleConflict("node_idempotency_target_missing")
+                return NodeRegistrationResult(node=node, replayed=True)
+            node = self.register_automatically(
+                name=name,
+                allowed_ports=allowed_ports,
+                max_nodes=max_nodes,
+                preferred_port=preferred_port,
+                choose_port=choose_port,
+                new_node_id=new_node_id,
+                api_ports=api_ports,
+                metrics_ports=metrics_ports,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+                creation_mode=creation_mode,
+                is_port_bindable=is_port_bindable,
+                mutation_context=mutation_context,
+            )
+            self._registration_requests[request_key] = (
+                idempotency.actor_account_id,
+                idempotency.request_sha256,
+                node.id,
+            )
+            return NodeRegistrationResult(node=node, replayed=False)
+
+    def lookup_registration(
+        self,
+        idempotency: NodeRegistrationIdempotency,
+    ) -> NodeRegistrationResult | None:
+        request_key = (idempotency.actor_session_id, idempotency.key)
+        with self._lock:
+            previous = self._registration_requests.get(request_key)
+            if previous is None:
+                return None
+            account_id, request_sha256, node_id = previous
+            if (
+                account_id != idempotency.actor_account_id
+                or request_sha256 != idempotency.request_sha256
+            ):
+                raise NodeLifecycleConflict("node_idempotency_conflict")
+            node = next(
+                (candidate for candidate in self._nodes if candidate.id == node_id),
+                None,
+            )
+            if node is None:
+                raise NodeLifecycleConflict("node_idempotency_target_missing")
+            return NodeRegistrationResult(node=node, replayed=True)
 
     def list_nodes(self) -> tuple[MediaNode, ...]:
         with self._lock:
@@ -666,11 +869,27 @@ class InMemoryNodeStore:
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
-    def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode:
+    def request_desired_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
+        del mutation_context
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            _require_node_command_fence(node, fence)
+            if state is NodeState.RUNNING and node.state not in {
+                NodeState.PROVISIONING,
+                NodeState.STOPPED,
+                NodeState.FAILED,
+                NodeState.RUNNING,
+            }:
+                raise NodeLifecycleConflict("node_start_source_state_invalid")
             if node.state is state:
                 return node
             updated = replace(
@@ -685,11 +904,16 @@ class InMemoryNodeStore:
         self,
         node_id: UUID,
         state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
+        del mutation_context
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            _require_node_command_fence(node, fence)
             allowed = {
                 NodeState.DRAINING: {NodeState.RUNNING},
                 NodeState.MAINTENANCE: {NodeState.DRAINING},
@@ -720,7 +944,9 @@ class InMemoryNodeStore:
         expected_revision: int,
         expected_registered_cameras: int,
         expected_blast_radius_sha256: str,
+        mutation_context: NodeMutationContext | None = None,
     ) -> NodePortChange:
+        del mutation_context
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
@@ -881,11 +1107,19 @@ class InMemoryNodeStore:
             )
             return updated
 
-    def request_node_delete(self, node_id: UUID) -> MediaNode:
+    def request_node_delete(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
+        del mutation_context
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            _require_node_command_fence(node, fence)
             if node.registered_cameras:
                 raise NodeNotEmpty("node_not_empty")
             if node.state not in {NodeState.STOPPED, NodeState.FAILED, NodeState.DELETING}:
@@ -917,17 +1151,32 @@ class InMemoryNodeStore:
             self._nodes.remove(node)
             self._lifecycle_locks.pop(node_id, None)
 
-    def request_stop(self, node_id: UUID) -> MediaNode:
+    def request_stop(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
+        del mutation_context
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            _require_node_command_fence(node, fence)
             if self.list_node_active_moves(node_id):
                 raise NodeLifecycleConflict("node_operation_in_progress")
             if node.registered_cameras:
                 raise NodeNotEmpty("node_not_empty")
             if node.state is NodeState.STOPPED:
                 return node
+            if node.state not in {
+                NodeState.PROVISIONING,
+                NodeState.RUNNING,
+                NodeState.DRAINING,
+                NodeState.MAINTENANCE,
+            }:
+                raise NodeLifecycleConflict("node_stop_source_state_invalid")
             updated = replace(
                 node,
                 state=NodeState.STOPPED,
@@ -937,11 +1186,19 @@ class InMemoryNodeStore:
             self._nodes[self._nodes.index(node)] = updated
             return updated
 
-    def request_restart(self, node_id: UUID) -> MediaNode:
+    def request_restart(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
+        del mutation_context
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            _require_node_command_fence(node, fence)
             if self.list_node_active_moves(node_id):
                 raise NodeLifecycleConflict("node_operation_in_progress")
             if node.state is not NodeState.RUNNING:
@@ -961,7 +1218,9 @@ class InMemoryNodeStore:
         expected_blast_radius_sha256: str,
         release_id: str | None = None,
         mediamtx_binary_sha256: str | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
+        del mutation_context
         if (release_id is None) != (mediamtx_binary_sha256 is None):
             raise ValueError("node_release_identity_incomplete")
         if release_id is not None and mediamtx_binary_sha256 is not None:
@@ -1026,12 +1285,16 @@ class InMemoryNodeStore:
         *,
         release_id: str,
         mediamtx_binary_sha256: str,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
+        del mutation_context
         NodeRuntimeSpecLike.validate_release(release_id, mediamtx_binary_sha256)
         with self._lock:
             node = next((candidate for candidate in self._nodes if candidate.id == node_id), None)
             if node is None:
                 raise NodeNotFound("node_not_found")
+            _require_node_command_fence(node, fence)
             if self.list_node_active_moves(node_id):
                 raise NodeLifecycleConflict("node_operation_in_progress")
             if (
@@ -1700,7 +1963,18 @@ class NodeControl:
         release_id: str = "0.1.0",
         mediamtx_binary_sha256: str = "0" * 64,
         creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
+        idempotency = _node_registration_idempotency(
+            name=name,
+            external_port=external_port,
+            creation_mode=creation_mode,
+            mutation_context=mutation_context,
+        )
+        if idempotency is not None:
+            replay = self._store.lookup_registration(idempotency)
+            if replay is not None:
+                return replay.node
         configured_ports = tuple(
             port
             for port in range(port_range_start, port_range_end + 1)
@@ -1714,23 +1988,65 @@ class NodeControl:
             candidate_ports = tuple(
                 port for port in configured_ports if self._is_port_bindable(port)
             )
-        node = self._store.register_automatically(
-            name=name,
-            allowed_ports=candidate_ports,
-            max_nodes=max_nodes,
-            preferred_port=external_port,
-            choose_port=self._choose_port,
-            new_node_id=self._new_node_id,
-            api_ports=api_ports,
-            metrics_ports=metrics_ports,
-            release_id=release_id,
-            mediamtx_binary_sha256=mediamtx_binary_sha256,
-            creation_mode=creation_mode,
-            is_port_bindable=self._is_port_bindable,
-        )
+        replayed = False
+        if idempotency is not None:
+            registration = self._store.register_idempotently(
+                name=name,
+                allowed_ports=candidate_ports,
+                max_nodes=max_nodes,
+                preferred_port=external_port,
+                choose_port=self._choose_port,
+                new_node_id=self._new_node_id,
+                idempotency=idempotency,
+                api_ports=api_ports,
+                metrics_ports=metrics_ports,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+                creation_mode=creation_mode,
+                is_port_bindable=self._is_port_bindable,
+                mutation_context=mutation_context,
+            )
+            node = registration.node
+            replayed = registration.replayed
+        elif mutation_context is None:
+            node = self._store.register_automatically(
+                name=name,
+                allowed_ports=candidate_ports,
+                max_nodes=max_nodes,
+                preferred_port=external_port,
+                choose_port=self._choose_port,
+                new_node_id=self._new_node_id,
+                api_ports=api_ports,
+                metrics_ports=metrics_ports,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+                creation_mode=creation_mode,
+                is_port_bindable=self._is_port_bindable,
+            )
+        else:
+            node = self._store.register_automatically(
+                name=name,
+                allowed_ports=candidate_ports,
+                max_nodes=max_nodes,
+                preferred_port=external_port,
+                choose_port=self._choose_port,
+                new_node_id=self._new_node_id,
+                api_ports=api_ports,
+                metrics_ports=metrics_ports,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+                creation_mode=creation_mode,
+                is_port_bindable=self._is_port_bindable,
+                mutation_context=mutation_context,
+            )
+        if replayed:
+            return node
         if self._provision_on_create or creation_mode is NodeCreationMode.AUTOMATIC:
             try:
-                return self._provision_reserved_node(node)
+                return self._provision_reserved_node(
+                    node,
+                    mutation_context=mutation_context,
+                )
             except NodeLifecycleBusy:
                 if creation_mode is NodeCreationMode.OPERATOR:
                     return node
@@ -1789,18 +2105,48 @@ class NodeControl:
                 creation_mode=NodeCreationMode.AUTOMATIC,
             )
 
-    def start_node(self, node_id: UUID) -> MediaNode:
+    def start_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            return self._start_node_locked(node_id)
+            return self._start_node_locked(
+                node_id,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
 
-    def stop_node(self, node_id: UUID) -> MediaNode:
+    def stop_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
-            return self._stop_node_locked(node_id)
+            return self._stop_node_locked(
+                node_id,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
 
-    def restart_node(self, node_id: UUID) -> MediaNode:
+    def restart_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             self._require_node_and_runtime(node_id)
-            desired = self._store.request_restart(node_id)
+            desired = self._store.request_restart(
+                node_id,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
             return self._execute_runtime(desired, NodeRuntimeAction.RESTART)
 
     def preview_reconfigure(self, node_id: UUID) -> NodeReconfigurePreview:
@@ -1847,9 +2193,12 @@ class NodeControl:
         node_id: UUID,
         *,
         confirmation_token: str | None,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             current = self._require_node_and_runtime(node_id)
+            _require_node_command_fence(current, fence)
             blast_radius_sha256 = self._node_camera_fingerprint(current.id)
             target_release_id = self._reconfigure_release_id or current.release_id
             target_binary_sha256 = (
@@ -1879,6 +2228,7 @@ class NodeControl:
                     expected_revision=current.desired_revision,
                     expected_registered_cameras=current.registered_cameras,
                     expected_blast_radius_sha256=blast_radius_sha256,
+                    mutation_context=mutation_context,
                 )
             else:
                 desired = self._store.request_reconfigure(
@@ -1890,6 +2240,7 @@ class NodeControl:
                     mediamtx_binary_sha256=(
                         self._reconfigure_mediamtx_binary_sha256
                     ),
+                    mutation_context=mutation_context,
                 )
             return self._execute_runtime(desired, NodeRuntimeAction.RECONFIGURE_RESTART)
 
@@ -1897,6 +2248,9 @@ class NodeControl:
         self,
         node_id: UUID,
         state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             if state not in {
@@ -1905,7 +2259,14 @@ class NodeControl:
                 NodeState.RUNNING,
             }:
                 raise NodeLifecycleConflict("node_administrative_transition_invalid")
-            return self._store.request_administrative_state(node_id, state)
+            if fence is None and mutation_context is None:
+                return self._store.request_administrative_state(node_id, state)
+            return self._store.request_administrative_state(
+                node_id,
+                state,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
 
     def preview_port_change(
         self,
@@ -1952,9 +2313,12 @@ class NodeControl:
         new_port: int,
         allowed_ports: Collection[int],
         confirmation_token: str | None,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             current = self._require_node_and_runtime(node_id)
+            _require_node_command_fence(current, fence)
             blast_radius_sha256 = self._node_camera_fingerprint(current.id)
             if (
                 self._confirmations is None
@@ -1982,6 +2346,7 @@ class NodeControl:
                 expected_revision=current.desired_revision,
                 expected_registered_cameras=current.registered_cameras,
                 expected_blast_radius_sha256=blast_radius_sha256,
+                mutation_context=mutation_context,
             )
             target = replace(
                 current,
@@ -2126,11 +2491,25 @@ class NodeControl:
             )
         )
 
-    def delete_node(self, node_id: UUID) -> None:
+    def delete_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> None:
         with self._store.lifecycle_guard(node_id):
             self._require_node_and_runtime(node_id)
             assert self._node_runtime is not None
-            deleting = self._store.request_node_delete(node_id)
+            deleting = (
+                self._store.request_node_delete(node_id)
+                if fence is None and mutation_context is None
+                else self._store.request_node_delete(
+                    node_id,
+                    fence=fence,
+                    mutation_context=mutation_context,
+                )
+            )
             try:
                 observation = self._node_runtime.execute(
                     NodeRuntimeAction.DELETE,
@@ -2165,6 +2544,8 @@ class NodeControl:
         *,
         release_id: str,
         mediamtx_binary_sha256: str,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         with self._store.lifecycle_guard(node_id):
             self._require_node_and_runtime(node_id)
@@ -2172,6 +2553,8 @@ class NodeControl:
                 node_id,
                 release_id=release_id,
                 mediamtx_binary_sha256=mediamtx_binary_sha256,
+                fence=fence,
+                mutation_context=mutation_context,
             )
 
     def recover_runtime_state(self) -> tuple[MediaNode, ...]:
@@ -2268,12 +2651,32 @@ class NodeControl:
                 raise NodeNotFound("node_not_found") from None
             return failed
 
-    def _provision_reserved_node(self, node: MediaNode) -> MediaNode:
-        return self.start_node(node.id)
+    def _provision_reserved_node(
+        self,
+        node: MediaNode,
+        *,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
+        return self.start_node(node.id, mutation_context=mutation_context)
 
-    def _start_node_locked(self, node_id: UUID) -> MediaNode:
+    def _start_node_locked(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         self._require_node_and_runtime(node_id)
-        desired = self._store.request_desired_state(node_id, NodeState.RUNNING)
+        desired = (
+            self._store.request_desired_state(node_id, NodeState.RUNNING)
+            if fence is None and mutation_context is None
+            else self._store.request_desired_state(
+                node_id,
+                NodeState.RUNNING,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
+        )
         action = (
             NodeRuntimeAction.PROVISION_START
             if desired.applied_revision == 0
@@ -2281,9 +2684,23 @@ class NodeControl:
         )
         return self._execute_runtime(desired, action)
 
-    def _stop_node_locked(self, node_id: UUID) -> MediaNode:
+    def _stop_node_locked(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         self._require_node_and_runtime(node_id)
-        desired = self._store.request_stop(node_id)
+        desired = (
+            self._store.request_stop(node_id)
+            if fence is None and mutation_context is None
+            else self._store.request_stop(
+                node_id,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
+        )
         return self._execute_runtime(desired, NodeRuntimeAction.STOP)
 
     def _observe_node_locked(self, node_id: UUID) -> MediaNode:
@@ -2459,7 +2876,32 @@ class NodeStore(Protocol):
         mediamtx_binary_sha256: str = "0" * 64,
         creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
         is_port_bindable: PortBindable | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode: ...
+
+    def register_idempotently(
+        self,
+        *,
+        name: str,
+        allowed_ports: Collection[int],
+        max_nodes: int,
+        preferred_port: int | None,
+        choose_port: PortChoice,
+        new_node_id: NodeIdFactory,
+        idempotency: NodeRegistrationIdempotency,
+        api_ports: Collection[int] = tuple(range(20000, 20100)),
+        metrics_ports: Collection[int] = tuple(range(20100, 20200)),
+        release_id: str = "0.1.0",
+        mediamtx_binary_sha256: str = "0" * 64,
+        creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
+        is_port_bindable: PortBindable | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> NodeRegistrationResult: ...
+
+    def lookup_registration(
+        self,
+        idempotency: NodeRegistrationIdempotency,
+    ) -> NodeRegistrationResult | None: ...
 
     def list_nodes(self) -> tuple[MediaNode, ...]: ...
 
@@ -2467,12 +2909,22 @@ class NodeStore(Protocol):
 
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]: ...
 
-    def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode: ...
+    def request_desired_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode: ...
 
     def request_administrative_state(
         self,
         node_id: UUID,
         state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode: ...
 
     def begin_port_change(
@@ -2485,6 +2937,7 @@ class NodeStore(Protocol):
         expected_revision: int,
         expected_registered_cameras: int,
         expected_blast_radius_sha256: str,
+        mutation_context: NodeMutationContext | None = None,
     ) -> NodePortChange: ...
 
     def list_incomplete_port_changes(self) -> tuple[NodePortChange, ...]: ...
@@ -2501,13 +2954,31 @@ class NodeStore(Protocol):
         observation: NodeRuntimeObservation,
     ) -> MediaNode: ...
 
-    def request_node_delete(self, node_id: UUID) -> MediaNode: ...
+    def request_node_delete(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode: ...
 
     def finalize_node_delete(self, node_id: UUID) -> None: ...
 
-    def request_stop(self, node_id: UUID) -> MediaNode: ...
+    def request_stop(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode: ...
 
-    def request_restart(self, node_id: UUID) -> MediaNode: ...
+    def request_restart(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode: ...
 
     def request_reconfigure(
         self,
@@ -2518,6 +2989,7 @@ class NodeStore(Protocol):
         expected_blast_radius_sha256: str,
         release_id: str | None = None,
         mediamtx_binary_sha256: str | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode: ...
 
     def request_release(
@@ -2526,6 +2998,8 @@ class NodeStore(Protocol):
         *,
         release_id: str,
         mediamtx_binary_sha256: str,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode: ...
 
     def apply_runtime_observation(
@@ -2760,6 +3234,47 @@ def is_node_eligible(
         and node.applied_revision == node.desired_revision
         and not node.maintenance
         and node.registered_cameras < node.camera_capacity
+    )
+
+
+def _require_node_command_fence(
+    node: MediaNode,
+    fence: NodeCommandFence | None,
+) -> None:
+    if fence is None:
+        return
+    if (
+        node.desired_revision != fence.expected_revision
+        or node.state is not fence.expected_state
+    ):
+        raise NodeLifecycleConflict("node_command_fence_conflict")
+
+
+def _node_registration_idempotency(
+    *,
+    name: str,
+    external_port: int | None,
+    creation_mode: NodeCreationMode,
+    mutation_context: NodeMutationContext | None,
+) -> NodeRegistrationIdempotency | None:
+    if mutation_context is None or mutation_context.idempotency_key is None:
+        return None
+    payload = json.dumps(
+        {
+            "request_schema": 1,
+            "name": name,
+            "external_port": external_port,
+            "creation_mode": creation_mode.value,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return NodeRegistrationIdempotency(
+        key=mutation_context.idempotency_key,
+        actor_account_id=mutation_context.actor_account_id,
+        actor_session_id=mutation_context.actor_session_id,
+        request_sha256=hashlib.sha256(payload).hexdigest(),
     )
 
 

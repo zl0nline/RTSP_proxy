@@ -6,10 +6,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
 
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
+from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaPathConfig
 from rtsp_proxy.nodes import (
@@ -23,7 +26,14 @@ from rtsp_proxy.nodes import (
     CameraState,
     InMemoryNodeStore,
     MediaNode,
+    NodeCommandFence,
+    NodeControl,
     NodeHealth,
+    NodeMutationContext,
+    NodePortRangeExhausted,
+    NodeRuntimeAction,
+    NodeRuntimeFailed,
+    NodeRuntimeObservation,
     NodeState,
     PlacementMode,
 )
@@ -56,8 +66,101 @@ from rtsp_proxy.reconcile import (
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+CREATED_NODE_ID = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 CSRF_TOKEN = "c" * 43
+IDEMPOTENCY_KEY = "11111111-1111-4111-8111-111111111111"
+
+
+class RecordingNodeDashboardControl:
+    def __init__(self, *, create_error: Exception | None = None) -> None:
+        self.node = MediaNode(
+            id=NODE_ID,
+            name="edge-north",
+            external_port=10543,
+            state=NodeState.STOPPED,
+            runtime_state=NodeState.STOPPED,
+            health=NodeHealth.UNKNOWN,
+            desired_revision=7,
+            applied_revision=7,
+        )
+        self.created_node = MediaNode(
+            id=CREATED_NODE_ID,
+            name="edge-created",
+            external_port=10544,
+            state=(
+                NodeState.FAILED
+                if isinstance(create_error, NodeRuntimeFailed)
+                else NodeState.PROVISIONING
+            ),
+            runtime_state=(
+                NodeState.FAILED
+                if isinstance(create_error, NodeRuntimeFailed)
+                else NodeState.PROVISIONING
+            ),
+            health=(
+                NodeHealth.UNHEALTHY
+                if isinstance(create_error, NodeRuntimeFailed)
+                else NodeHealth.UNKNOWN
+            ),
+        )
+        self.create_error = create_error
+        self.calls: list[tuple[str, object]] = []
+
+    def list_nodes(self) -> tuple[MediaNode, ...]:
+        return (self.node, self.created_node)
+
+    def register_node(self, **kwargs: object) -> MediaNode:
+        self.calls.append(("register", kwargs))
+        if self.create_error is not None:
+            raise self.create_error
+        return self.created_node
+
+    def start_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(("start", (node_id, fence, mutation_context)))
+        return replace(
+            self.node,
+            state=NodeState.RUNNING,
+            runtime_state=NodeState.RUNNING,
+        )
+
+    def stop_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(("stop", (node_id, fence, mutation_context)))
+        return self.node
+
+    def set_administrative_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+        *,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> MediaNode:
+        self.calls.append(
+            ("administrative", (node_id, state, fence, mutation_context))
+        )
+        return replace(self.node, state=state, maintenance=state is NodeState.MAINTENANCE)
+
+    def delete_node(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence,
+        mutation_context: NodeMutationContext,
+    ) -> None:
+        self.calls.append(("delete", (node_id, fence, mutation_context)))
 
 
 class StaticCameraCatalog:
@@ -287,6 +390,26 @@ class RuntimeMediaNodes:
         return self.client
 
 
+class RunningDashboardNodeRuntime:
+    def execute(
+        self,
+        _action: NodeRuntimeAction,
+        node: MediaNode,
+    ) -> NodeRuntimeObservation:
+        return NodeRuntimeObservation(
+            state=NodeState.RUNNING,
+            health=NodeHealth.HEALTHY,
+            management_fresh=True,
+            config_compatible=True,
+            applied_revision=node.desired_revision,
+            process_id=node.external_port,
+            process_start_ticks=1,
+            process_boot_id=UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            config_sha256="a" * 64,
+            release_id=node.release_id,
+        )
+
+
 def _domain_camera_mutations(
     *,
     reader_count: int,
@@ -419,6 +542,8 @@ def _authenticated_dashboard(
     camera_control: CameraControl | None = None,
     camera_mutation_control: object | None = None,
     camera_move_control: object | None = None,
+    node_control: object | None = None,
+    settings: Settings | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
     scopes: frozenset[str] = frozenset({"server:*"}),
 ) -> tuple[TestClient, dict[str, str]]:
@@ -439,7 +564,7 @@ def _authenticated_dashboard(
     issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
     client = TestClient(
         create_app(
-            Settings(role=RuntimeRole.WEB),
+            settings or Settings(role=RuntimeRole.WEB),
             fleet_snapshots=observations,
             operator_sessions=sessions,
             fleet_snapshot_max_age_seconds=30,
@@ -447,6 +572,7 @@ def _authenticated_dashboard(
             camera_control=camera_control,
             camera_mutation_control=cast(Any, camera_mutation_control),
             camera_move_control=cast(Any, camera_move_control),
+            node_control=cast(Any, node_control),
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
@@ -736,6 +862,413 @@ def test_dashboard_node_detail_is_authenticated_escaped_and_snapshot_bound() -> 
     assert "Нода не найдена" in missing.text
 
 
+def test_dashboard_node_create_supports_random_and_manual_port_with_csrf() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl()
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        node_port_range_start=10540,
+        node_port_range_end=10549,
+        node_port_reserved=(10545,),
+    )
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        settings=settings,
+        role=OperatorRole.OPERATOR,
+    )
+
+    overview = client.get("/dashboard", headers=headers)
+    create_page = client.get("/dashboard/nodes/new", headers=headers)
+    automatic = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "edge north",
+            "external_port": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+    manual = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "edge east",
+            "external_port": "10544",
+            "idempotency_key": "22222222-2222-4222-8222-222222222222",
+        },
+        follow_redirects=False,
+    )
+    viewer, viewer_headers = _authenticated_dashboard(observations=observations)
+    viewer_overview = viewer.get("/dashboard", headers=viewer_headers)
+    viewer_create = viewer.get("/dashboard/nodes/new", headers=viewer_headers)
+
+    assert overview.status_code == 200
+    assert 'href="/dashboard/nodes/new"' in overview.text
+    assert create_page.status_code == 200
+    assert 'form method="post" action="/dashboard/nodes"' in create_page.text
+    assert 'name="idempotency_key"' in create_page.text
+    assert "10540–10549" in create_page.text  # noqa: RUF001
+    assert automatic.status_code == manual.status_code == 303
+    assert automatic.headers["location"] == (
+        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
+    )
+    assert manual.headers["location"] == (
+        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
+    )
+    accepted = client.get(automatic.headers["location"], headers=headers)
+    assert accepted.status_code == 200
+    assert "Нода зарегистрирована" in accepted.text
+    assert "edge-created" in accepted.text
+    assert "10544" in accepted.text
+    first = cast(dict[str, object], control.calls[0][1])
+    second = cast(dict[str, object], control.calls[1][1])
+    assert first["name"] == "edge north"
+    assert first["external_port"] is None
+    assert first["reserved_ports"] == (10545,)
+    automatic_context = cast(NodeMutationContext, first["mutation_context"])
+    assert automatic_context.action == "node.create"
+    assert automatic_context.actor_account_id == ACCOUNT_ID
+    assert automatic_context.identity_source == OperatorIdentitySource.OIDC.value
+    assert str(automatic_context.idempotency_key) == IDEMPOTENCY_KEY
+    assert second["name"] == "edge east"
+    assert second["external_port"] == 10544
+    assert 'href="/dashboard/nodes/new"' not in viewer_overview.text
+    assert viewer_create.status_code == 403
+
+
+def test_dashboard_node_create_is_fail_closed_and_reports_port_exhaustion() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl(
+        create_error=NodePortRangeExhausted("node_port_range_exhausted")
+    )
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+
+    missing_csrf = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={"name": "edge north", "external_port": ""},
+        follow_redirects=False,
+    )
+    malformed = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "edge north",
+            "external_port": "not-a-port",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+    exhausted = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "edge north",
+            "external_port": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+
+    assert missing_csrf.status_code == 401
+    assert malformed.status_code == 422
+    assert exhausted.status_code == 409
+    assert "нет свободных портов для регистрации новой ноды" in exhausted.text
+    assert len(control.calls) == 1
+    assert control.calls[0][0] == "register"
+
+
+def test_dashboard_node_create_runtime_failure_redirects_to_persisted_node() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl(
+        create_error=NodeRuntimeFailed(
+            "node_runtime_operation_failed",
+            node_id=CREATED_NODE_ID,
+        )
+    )
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "edge north",
+            "external_port": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
+    )
+    persisted = client.get(response.headers["location"], headers=headers)
+    assert persisted.status_code == 200
+    assert "Регистрация сохранена, запуск не завершён" in persisted.text
+    assert "Создать ноду" not in persisted.text
+    assert len([call for call in control.calls if call[0] == "register"]) == 1
+
+
+def test_dashboard_node_create_replays_one_session_bound_registration() -> None:
+    bindable = {10544: True}
+    control = NodeControl(
+        store=InMemoryNodeStore(),
+        choose_port=lambda ports: ports[0],
+        new_node_id=iter((CREATED_NODE_ID,)).__next__,
+        is_port_bindable=lambda port: bindable.get(port, True),
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    form = {
+        "_csrf": CSRF_TOKEN,
+        "name": "idempotent-node",
+        "external_port": "10544",
+        "idempotency_key": IDEMPOTENCY_KEY,
+    }
+
+    first = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data=form,
+        follow_redirects=False,
+    )
+    bindable[10544] = False
+    replay = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data=form,
+        follow_redirects=False,
+    )
+
+    assert first.status_code == replay.status_code == 303
+    assert first.headers["location"] == replay.headers["location"] == (
+        f"/dashboard/nodes/{CREATED_NODE_ID}/registered"
+    )
+    assert len(control.list_nodes()) == 1
+
+
+def test_authenticated_node_api_uses_the_same_idempotency_and_command_fence() -> None:
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    api_headers = {**headers, "X-CSRF-Token": CSRF_TOKEN}
+
+    missing_key = client.post(
+        "/api/v1/nodes",
+        headers=api_headers,
+        json={"name": "api-node", "external_port": 10544},
+    )
+    created = client.post(
+        "/api/v1/nodes",
+        headers={**api_headers, "Idempotency-Key": IDEMPOTENCY_KEY},
+        json={"name": "api-node", "external_port": 10544},
+    )
+    missing_fence = client.post(
+        f"/api/v1/nodes/{NODE_ID}/start",
+        headers=api_headers,
+    )
+    started = client.post(
+        f"/api/v1/nodes/{NODE_ID}/start",
+        headers={
+            **api_headers,
+            "X-Node-Revision": "7",
+            "X-Node-State": "stopped",
+        },
+    )
+
+    assert missing_key.status_code == 428
+    assert missing_key.json()["detail"]["code"] == "node_idempotency_key_required"
+    assert created.status_code == 201
+    register_call = next(call for call in control.calls if call[0] == "register")
+    context = cast(dict[str, object], register_call[1])["mutation_context"]
+    assert isinstance(context, NodeMutationContext)
+    assert context.idempotency_key == UUID(IDEMPOTENCY_KEY)
+    assert missing_fence.status_code == 428
+    assert missing_fence.json()["detail"]["code"] == "node_command_precondition_required"
+    assert started.status_code == 200
+    start_call = next(call for call in control.calls if call[0] == "start")
+    _node_id, fence, start_context = cast(
+        tuple[UUID, NodeCommandFence, NodeMutationContext], start_call[1]
+    )
+    assert fence == NodeCommandFence(expected_revision=7, expected_state=NodeState.STOPPED)
+    assert start_context.actor_account_id == ACCOUNT_ID
+
+
+def test_dashboard_node_actions_use_control_seam_and_exact_csrf_forms() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(
+        replace(
+            _snapshot(),
+            registered_cameras=0,
+            nodes=(
+                replace(
+                    _snapshot().nodes[0],
+                    registered_cameras=0,
+                    desired_state=NodeState.STOPPED,
+                    runtime_state=NodeState.STOPPED,
+                ),
+            ),
+        )
+    )
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    path = f"/dashboard/nodes/{NODE_ID}"
+
+    detail = client.get(path, headers=headers)
+    assert 'name="expected_revision" value="7"' in detail.text
+    assert 'name="expected_state" value="stopped"' in detail.text
+    action_states = {
+        "start": NodeState.STOPPED,
+        "stop": NodeState.RUNNING,
+        "drain": NodeState.RUNNING,
+        "maintenance": NodeState.DRAINING,
+        "resume": NodeState.MAINTENANCE,
+        "delete": NodeState.STOPPED,
+    }
+    for action, expected_state in action_states.items():
+        response = client.post(
+            f"{path}/{action}",
+            headers=headers,
+            data={
+                "_csrf": CSRF_TOKEN,
+                "expected_revision": "7",
+                "expected_state": expected_state.value,
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303, (action, response.text)
+    viewer, viewer_headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=RecordingNodeDashboardControl(),
+    )
+    denied = viewer.post(
+        f"{path}/drain",
+        headers=viewer_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "7",
+            "expected_state": "stopped",
+        },
+        follow_redirects=False,
+    )
+    viewer_detail = viewer.get(path, headers=viewer_headers)
+
+    assert detail.status_code == 200
+    assert f'action="{path}/start"' in detail.text
+    assert f'action="{path}/delete"' in detail.text
+    assert [call[0] for call in control.calls] == [
+        "start",
+        "stop",
+        "administrative",
+        "administrative",
+        "administrative",
+        "delete",
+    ]
+    expected_actions = (
+        "node.start",
+        "node.stop",
+        "node.drain",
+        "node.maintenance",
+        "node.resume",
+        "node.delete",
+    )
+    for call, action, expected_state in zip(
+        control.calls,
+        expected_actions,
+        action_states.values(),
+        strict=True,
+    ):
+        arguments = cast(tuple[object, ...], call[1])
+        fence = cast(NodeCommandFence, arguments[-2])
+        context = cast(NodeMutationContext, arguments[-1])
+        assert fence == NodeCommandFence(
+            expected_revision=7,
+            expected_state=expected_state,
+        )
+        assert context.action == action
+        assert context.actor_account_id == ACCOUNT_ID
+        assert context.identity_source == OperatorIdentitySource.OIDC.value
+        assert context.reason == "operator_request"
+        assert context.resource_id == str(NODE_ID)
+        assert context.request_id is not None
+    assert denied.status_code == 403
+    assert viewer_detail.status_code == 200
+    assert "Управление нодой" not in viewer_detail.text
+
+
+def test_dashboard_node_action_rejects_missing_or_stale_fence_before_control() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(
+        replace(
+            _snapshot(),
+            registered_cameras=0,
+            nodes=(
+                replace(
+                    _snapshot().nodes[0],
+                    registered_cameras=0,
+                    desired_state=NodeState.STOPPED,
+                    runtime_state=NodeState.STOPPED,
+                ),
+            ),
+        )
+    )
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+    path = f"/dashboard/nodes/{NODE_ID}/start"
+
+    missing = client.post(
+        path,
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN},
+    )
+    malformed = client.post(
+        path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "0",
+            "expected_state": "deleting",
+        },
+    )
+
+    assert missing.status_code == 422
+    assert malformed.status_code == 422
+    assert control.calls == []
+
+
 def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None:
     client = TestClient(
         create_app(Settings(role=RuntimeRole.WEB)),
@@ -822,6 +1355,59 @@ def test_camera_catalog_requires_control_read_and_fails_closed() -> None:
     assert invalid.status_code == 422
     assert invalid.headers["content-type"].startswith("text/html")
     assert "Некорректный запрос каталога" in invalid.text
+
+
+def test_postgres_dashboard_catalog_and_detail_remain_available_on_schema_0015(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0015_camera_name_contract")
+    store = PostgresNodeStore(postgres_database_url)
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=RunningDashboardNodeRuntime(),
+        provision_on_create=True,
+        is_port_bindable=lambda _port: True,
+    )
+    node = node_control.register_node(
+        name="bridge-node",
+        port_range_start=10543,
+        port_range_end=10543,
+        max_nodes=1,
+        external_port=10543,
+        api_ports=(20543,),
+        metrics_ports=(30543,),
+    )
+    camera_control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    camera_control.create_camera(
+        name="Bridge camera",
+        source_url="rtsp://camera.internal/bridge",
+        node_id=node.id,
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=camera_control,
+    )
+
+    try:
+        catalog = client.get("/dashboard/cameras", headers=headers)
+        detail = client.get(f"/dashboard/cameras/{CAMERA_ID}", headers=headers)
+
+        assert catalog.status_code == 200
+        assert "Bridge camera" in catalog.text
+        assert detail.status_code == 200
+        assert "Bridge camera" in detail.text
+        assert "camera.internal" not in catalog.text
+        assert "camera.internal" not in detail.text
+    finally:
+        store.close()
 
 
 def test_camera_detail_is_authenticated_escaped_and_secret_free() -> None:

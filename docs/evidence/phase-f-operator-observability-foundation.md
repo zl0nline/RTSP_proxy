@@ -76,8 +76,8 @@ OIDC and logout evidence is recorded separately in
 The durable authentication/authorization-denial and logout matrix is recorded
 in
 [`phase-f-operator-security-audit-contract.md`](phase-f-operator-security-audit-contract.md).
-That evidence now also includes the recursively generated matrix for all 48
-current protected route-method pairs, green in CI run
+That later evidence also includes the recursively generated matrix for all 48
+protected route-method pairs present at its commit, green in CI run
 [`32680412385`](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385).
 Physical-hardware capacity and the 24-hour soak remain open. Revision-fenced
 break-glass rotation with atomic

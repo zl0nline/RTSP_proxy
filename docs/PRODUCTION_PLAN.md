@@ -1034,24 +1034,43 @@ denial and logout fail closed without a half-pair; logout revocation rolls back
 when either normative append fails. Self-session logout is available to scoped
 operators without granting `server:*`. Exact evidence is recorded in
 [`docs/evidence/phase-f-operator-security-audit-contract.md`](evidence/phase-f-operator-security-audit-contract.md).
-The recursively generated inventory now exercises all 48 current protected
+The historical recursively generated inventory exercised all 48 protected
 route-method pairs, including nested included-router prefixes, and passed both
 reviews plus all seven jobs at commit
 `39b29814d726d9020c1d19100521b4dfe729b91e`
 ([CI run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
 Future export/SSE/bulk routes remain activation-gated until they enter that
 inventory and add their surface-specific security evidence.
+The current local inventory contains 57 protected route-method pairs after the
+node-action router was added; publication of the expanded matrix is part of the
+current node-operations slice.
+
+Dashboard node registration and start/stop/drain/maintenance/resume/delete are
+implemented locally for review. Automatic registration selects a random free
+external port from configured policy; manual registration validates the exact
+requested port. Both dashboard and JSON API pass through the same
+operator-attributed command seam. Every lifecycle action carries the rendered
+or explicit expected `desired_revision` and source state into the synchronous
+PostgreSQL transaction before any privileged runtime call. Registration uses a
+session-bound UUIDv4 idempotency key and canonical request digest. Migration
+0016 creates an immutable request ledger; the ledger row, desired node and
+matching audit/outbox pair commit atomically. Replays return the original node,
+changed payloads conflict, and deleting the node cannot make an old key create
+a replacement. Release 0.8.0 remains rolling-compatible with 0015, but this
+specific write path returns a bounded 503 until exact schema 0016 is current.
+Exact local/Linux/review evidence is tracked in
+[`docs/evidence/phase-f-node-operations-contract.md`](evidence/phase-f-node-operations-contract.md).
 No Phase-F completion claim is made yet.
 
 - [~] node/camera pages and actions (read-only server/node overview, bounded
-  camera catalog/detail and update/enable/disable/delete CI-green;
-  camera move UI CI-green);
+  camera catalog/detail and update/enable/disable/delete CI-green; camera move
+  UI CI-green; node registration and lifecycle actions local/review pending);
 - [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
-- [x] recursively generated route-method negative matrix for all 48 current
-  protected routes; future export/SSE/bulk routes must extend it before
-  activation;
+- [~] recursively generated route-method negative matrix (48-route published
+  baseline; current 57-route node-action expansion pending review/CI); future
+  export/SSE/bulk routes must extend it before activation;
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

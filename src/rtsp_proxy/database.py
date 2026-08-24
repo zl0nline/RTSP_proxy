@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping
@@ -57,12 +58,14 @@ from rtsp_proxy.nodes import (
     MaximumNodesReached,
     MediaNode,
     NodeCameraCapacityReached,
+    NodeCommandFence,
     NodeCreationMode,
     NodeHealth,
     NodeIdFactory,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
+    NodeMutationContext,
     NodeNotEmpty,
     NodeNotFound,
     NodePortChange,
@@ -70,8 +73,11 @@ from rtsp_proxy.nodes import (
     NodePortInUse,
     NodePortOutOfRange,
     NodePortRangeExhausted,
+    NodeRegistrationIdempotency,
+    NodeRegistrationResult,
     NodeReleaseConflict,
     NodeRuntimeObservation,
+    NodeRuntimeUnavailable,
     NodeState,
     PlacementMode,
     PortBindable,
@@ -142,6 +148,26 @@ media_nodes = Table(
     CheckConstraint("process_id IS NULL OR process_id > 0"),
     CheckConstraint("process_start_ticks IS NULL OR process_start_ticks > 0"),
     CheckConstraint("observed_config_sha256 IS NULL OR observed_config_sha256 ~ '^[0-9a-f]{64}$'"),
+)
+
+node_registration_requests = Table(
+    "node_registration_requests",
+    metadata,
+    Column("actor_session_id", Uuid(as_uuid=True), primary_key=True),
+    Column("idempotency_key", Uuid(as_uuid=True), primary_key=True),
+    Column("actor_account_id", Uuid(as_uuid=True), nullable=False),
+    Column("request_sha256", String(64), nullable=False),
+    Column("node_id", Uuid(as_uuid=True), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    ),
+    CheckConstraint(
+        "request_sha256 ~ '^[0-9a-f]{64}$'",
+        name="node_registration_requests_sha256_valid",
+    ),
 )
 
 cameras = Table(
@@ -518,6 +544,7 @@ class PostgresNodeStore:
             ("0012_operator_sessions",),
             ("0013_operator_login",),
             ("0014_camera_catalog_projection",),
+            ("0015_camera_name_contract",),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -551,6 +578,7 @@ class PostgresNodeStore:
         return revisions in (
             ("0013_operator_login",),
             ("0014_camera_catalog_projection",),
+            ("0015_camera_name_contract",),
             (APPLICATION_SCHEMA,),
         )
 
@@ -669,6 +697,8 @@ class PostgresNodeStore:
         mediamtx_binary_sha256: str = "0" * 64,
         creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
         is_port_bindable: PortBindable | None = None,
+        mutation_context: NodeMutationContext | None = None,
+        registration_idempotency: NodeRegistrationIdempotency | None = None,
     ) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -802,8 +832,146 @@ class PostgresNodeStore:
                     "desired_revision": node.desired_revision,
                 },
                 aggregate_revision=node.desired_revision,
+                mutation_context=mutation_context,
             )
+            if registration_idempotency is not None:
+                connection.execute(
+                    insert(node_registration_requests).values(
+                        actor_session_id=registration_idempotency.actor_session_id,
+                        idempotency_key=registration_idempotency.key,
+                        actor_account_id=registration_idempotency.actor_account_id,
+                        request_sha256=registration_idempotency.request_sha256,
+                        node_id=node.id,
+                    )
+                )
             return node
+
+    def register_idempotently(
+        self,
+        *,
+        name: str,
+        allowed_ports: Collection[int],
+        max_nodes: int,
+        preferred_port: int | None,
+        choose_port: PortChoice,
+        new_node_id: NodeIdFactory,
+        idempotency: NodeRegistrationIdempotency,
+        api_ports: Collection[int] = tuple(range(20000, 20100)),
+        metrics_ports: Collection[int] = tuple(range(20100, 20200)),
+        release_id: str = "0.1.0",
+        mediamtx_binary_sha256: str = "0" * 64,
+        creation_mode: NodeCreationMode = NodeCreationMode.OPERATOR,
+        is_port_bindable: PortBindable | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> NodeRegistrationResult:
+        try:
+            self.assert_schema_current()
+        except DatabaseSchemaMismatch:
+            raise NodeRuntimeUnavailable(
+                "node_registration_schema_unavailable"
+            ) from None
+        advisory_key = _registration_advisory_key(idempotency)
+        with self._lock_engine.begin() as guard:
+            guard.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": advisory_key},
+            )
+            previous = (
+                guard.execute(
+                    select(node_registration_requests).where(
+                        node_registration_requests.c.actor_session_id
+                        == idempotency.actor_session_id,
+                        node_registration_requests.c.idempotency_key == idempotency.key,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if previous is not None:
+                if (
+                    _uuid(previous["actor_account_id"])
+                    != idempotency.actor_account_id
+                    or str(previous["request_sha256"])
+                    != idempotency.request_sha256
+                ):
+                    raise NodeLifecycleConflict("node_idempotency_conflict")
+                node_row = (
+                    guard.execute(
+                        select(media_nodes).where(
+                            media_nodes.c.id == _uuid(previous["node_id"])
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if node_row is None:
+                    raise NodeLifecycleConflict("node_idempotency_target_missing")
+                return NodeRegistrationResult(
+                    node=_media_node(node_row),
+                    replayed=True,
+                )
+            node = self.register_automatically(
+                name=name,
+                allowed_ports=allowed_ports,
+                max_nodes=max_nodes,
+                preferred_port=preferred_port,
+                choose_port=choose_port,
+                new_node_id=new_node_id,
+                api_ports=api_ports,
+                metrics_ports=metrics_ports,
+                release_id=release_id,
+                mediamtx_binary_sha256=mediamtx_binary_sha256,
+                creation_mode=creation_mode,
+                is_port_bindable=is_port_bindable,
+                mutation_context=mutation_context,
+                registration_idempotency=idempotency,
+            )
+            return NodeRegistrationResult(node=node, replayed=False)
+
+    def lookup_registration(
+        self,
+        idempotency: NodeRegistrationIdempotency,
+    ) -> NodeRegistrationResult | None:
+        try:
+            self.assert_schema_current()
+        except DatabaseSchemaMismatch:
+            raise NodeRuntimeUnavailable(
+                "node_registration_schema_unavailable"
+            ) from None
+        with self._engine.connect() as connection:
+            previous = (
+                connection.execute(
+                    select(node_registration_requests).where(
+                        node_registration_requests.c.actor_session_id
+                        == idempotency.actor_session_id,
+                        node_registration_requests.c.idempotency_key == idempotency.key,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if previous is None:
+                return None
+            if (
+                _uuid(previous["actor_account_id"]) != idempotency.actor_account_id
+                or str(previous["request_sha256"]) != idempotency.request_sha256
+            ):
+                raise NodeLifecycleConflict("node_idempotency_conflict")
+            node_row = (
+                connection.execute(
+                    select(media_nodes).where(
+                        media_nodes.c.id == _uuid(previous["node_id"])
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if node_row is None:
+                raise NodeLifecycleConflict("node_idempotency_target_missing")
+            return NodeRegistrationResult(
+                node=_media_node(node_row),
+                replayed=True,
+            )
 
     def list_nodes(self) -> tuple[MediaNode, ...]:
         with self._engine.connect() as connection:
@@ -926,7 +1094,14 @@ class PostgresNodeStore:
                 raise NodeNotFound("node_not_found")
             return _media_node(row)
 
-    def request_desired_state(self, node_id: UUID, state: NodeState) -> MediaNode:
+    def request_desired_state(
+        self,
+        node_id: UUID,
+        state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             current = (
@@ -939,6 +1114,14 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            _require_node_command_fence(node, fence)
+            if state is NodeState.RUNNING and node.state not in {
+                NodeState.PROVISIONING,
+                NodeState.STOPPED,
+                NodeState.FAILED,
+                NodeState.RUNNING,
+            }:
+                raise NodeLifecycleConflict("node_start_source_state_invalid")
             if node.state is state:
                 return node
             desired_revision = node.desired_revision + 1
@@ -963,6 +1146,7 @@ class PostgresNodeStore:
                     "desired_revision": desired_revision,
                 },
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
@@ -970,6 +1154,9 @@ class PostgresNodeStore:
         self,
         node_id: UUID,
         state: NodeState,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -984,6 +1171,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            _require_node_command_fence(node, fence)
             allowed = {
                 NodeState.DRAINING: {NodeState.RUNNING},
                 NodeState.MAINTENANCE: {NodeState.DRAINING},
@@ -1020,6 +1208,7 @@ class PostgresNodeStore:
                     "desired_revision": desired_revision,
                 },
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
@@ -1033,6 +1222,7 @@ class PostgresNodeStore:
         expected_revision: int,
         expected_registered_cameras: int,
         expected_blast_radius_sha256: str,
+        mutation_context: NodeMutationContext | None = None,
     ) -> NodePortChange:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -1151,6 +1341,7 @@ class PostgresNodeStore:
                     "target_revision": node.desired_revision + 1,
                 },
                 aggregate_revision=node.desired_revision + 1,
+                mutation_context=mutation_context,
             )
             return _node_port_change(row)
 
@@ -1278,7 +1469,13 @@ class PostgresNodeStore:
             )
             return _media_node(node_result)
 
-    def request_node_delete(self, node_id: UUID) -> MediaNode:
+    def request_node_delete(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -1292,6 +1489,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            _require_node_command_fence(node, fence)
             if node.registered_cameras:
                 raise NodeNotEmpty("node_not_empty")
             if node.state not in {NodeState.STOPPED, NodeState.FAILED, NodeState.DELETING}:
@@ -1344,6 +1542,7 @@ class PostgresNodeStore:
                 event_type="media_node.delete_requested",
                 payload={"desired_revision": desired_revision},
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
@@ -1372,7 +1571,13 @@ class PostgresNodeStore:
                 raise NodeNotEmpty("node_not_empty")
             connection.execute(delete(media_nodes).where(media_nodes.c.id == node_id))
 
-    def request_stop(self, node_id: UUID) -> MediaNode:
+    def request_stop(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -1386,11 +1591,19 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            _require_node_command_fence(node, fence)
             self._require_no_active_node_move(connection, node_id)
             if node.registered_cameras:
                 raise NodeNotEmpty("node_not_empty")
             if node.state is NodeState.STOPPED:
                 return node
+            if node.state not in {
+                NodeState.PROVISIONING,
+                NodeState.RUNNING,
+                NodeState.DRAINING,
+                NodeState.MAINTENANCE,
+            }:
+                raise NodeLifecycleConflict("node_stop_source_state_invalid")
             desired_revision = node.desired_revision + 1
             row = (
                 connection.execute(
@@ -1417,10 +1630,17 @@ class PostgresNodeStore:
                     "desired_revision": desired_revision,
                 },
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
-    def request_restart(self, node_id: UUID) -> MediaNode:
+    def request_restart(
+        self,
+        node_id: UUID,
+        *,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> MediaNode:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -1434,6 +1654,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            _require_node_command_fence(node, fence)
             self._require_no_active_node_move(connection, node_id)
             if node.state is not NodeState.RUNNING:
                 raise NodeLifecycleConflict("node_not_running")
@@ -1457,6 +1678,7 @@ class PostgresNodeStore:
                 event_type="media_node.restart_requested",
                 payload={"desired_revision": desired_revision},
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
@@ -1469,6 +1691,7 @@ class PostgresNodeStore:
         expected_blast_radius_sha256: str,
         release_id: str | None = None,
         mediamtx_binary_sha256: str | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         if (release_id is None) != (mediamtx_binary_sha256 is None):
             raise ValueError("node_release_identity_incomplete")
@@ -1570,6 +1793,7 @@ class PostgresNodeStore:
                     "release_changed": release_changed,
                 },
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
@@ -1579,6 +1803,8 @@ class PostgresNodeStore:
         *,
         release_id: str,
         mediamtx_binary_sha256: str,
+        fence: NodeCommandFence | None = None,
+        mutation_context: NodeMutationContext | None = None,
     ) -> MediaNode:
         if not release_id or len(release_id) > 128:
             raise ValueError("node_release_id_invalid")
@@ -1599,6 +1825,7 @@ class PostgresNodeStore:
             if current is None:
                 raise NodeNotFound("node_not_found")
             node = _media_node(current)
+            _require_node_command_fence(node, fence)
             self._require_no_active_node_move(connection, node_id)
             if (
                 node.state is not NodeState.STOPPED
@@ -1642,6 +1869,7 @@ class PostgresNodeStore:
                     "desired_revision": desired_revision,
                 },
                 aggregate_revision=desired_revision,
+                mutation_context=mutation_context,
             )
             return _media_node(row)
 
@@ -1914,7 +2142,10 @@ class PostgresNodeStore:
         revisions = tuple(
             connection.scalars(text("SELECT version_num FROM alembic_version"))
         )
-        if revisions != (APPLICATION_SCHEMA,):
+        if revisions not in (
+            ("0015_camera_name_contract",),
+            (APPLICATION_SCHEMA,),
+        ):
             raise CameraCatalogUnavailable("camera_catalog_unavailable")
         if connection.scalar(
             text("SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")
@@ -3430,7 +3661,13 @@ def _record_normative_event(
     event_type: str,
     payload: dict[str, object],
     aggregate_revision: int,
+    mutation_context: NodeMutationContext | None = None,
 ) -> None:
+    event_payload = dict(payload)
+    if mutation_context is not None:
+        if "operator" in event_payload:
+            raise ValueError("node_event_operator_payload_reserved")
+        event_payload["operator"] = mutation_context.event_payload()
     event_id = uuid4()
     values = {
         "id": event_id,
@@ -3438,10 +3675,32 @@ def _record_normative_event(
         "aggregate_id": aggregate_id,
         "event_type": event_type,
         "aggregate_revision": aggregate_revision,
-        "payload": payload,
+        "payload": event_payload,
     }
     connection.execute(insert(audit_events).values(**values))
     connection.execute(insert(outbox_messages).values(**values))
+
+
+def _require_node_command_fence(
+    node: MediaNode,
+    fence: NodeCommandFence | None,
+) -> None:
+    if fence is None:
+        return
+    if (
+        node.desired_revision != fence.expected_revision
+        or node.state is not fence.expected_state
+    ):
+        raise NodeLifecycleConflict("node_command_fence_conflict")
+
+
+def _registration_advisory_key(
+    idempotency: NodeRegistrationIdempotency,
+) -> int:
+    digest = hashlib.sha256(
+        idempotency.actor_session_id.bytes + idempotency.key.bytes
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 def _require_synchronous_commit(connection: Connection) -> None:

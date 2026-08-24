@@ -1,0 +1,32 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Нода зарегистрирована — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard">Обзор</a><span aria-hidden="true">/</span><span>Результат регистрации</span>
+  </nav>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Media plane · порт {{ node.external_port }}</p>
+      <h1>Нода зарегистрирована</h1>
+    </div>
+    <span class="status status-{{ node.health.value }}">{{ node.state.value }}</span>
+  </div>
+  <section class="panel" aria-labelledby="registration-title">
+    <div class="panel-heading"><h2 id="registration-title">{{ node.name }}</h2></div>
+    {% if node.state.value == 'failed' or node.runtime_state.value == 'failed' %}
+    <p role="alert">Регистрация сохранена, запуск не завершён. Повторно создавать ноду не нужно: оператор может проверить эту запись и безопасно повторить запуск.</p>
+    {% else %}
+    <p>Регистрация сохранена. Нода появится на странице наблюдения после следующего подтверждённого снимка коллектора.</p>
+    {% endif %}
+    <dl class="detail-list">
+      <div><dt>ID</dt><dd>{{ node.id }}</dd></div>
+      <div><dt>Внешний RTSP-порт</dt><dd>{{ node.external_port }}</dd></div>
+      <div><dt>Desired state</dt><dd>{{ node.state.value }}</dd></div>
+      <div><dt>Runtime state</dt><dd>{{ node.runtime_state.value }}</dd></div>
+      <div><dt>Revision</dt><dd>{{ node.applied_revision }} / {{ node.desired_revision }}</dd></div>
+    </dl>
+    <p><a href="/dashboard">Вернуться к обзору</a></p>
+  </section>
+</main>
+{% endblock %}

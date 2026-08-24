@@ -132,7 +132,20 @@ def export_transition(database_url: str, manifest_path: Path) -> str:
             ):
                 raise PhaseDTransitionError("transition_port_change_in_progress")
             node_rows = tuple(
-                connection.execute(select(media_nodes).order_by(media_nodes.c.id)).mappings()
+                connection.execute(
+                    select(
+                        media_nodes.c.id,
+                        media_nodes.c.name,
+                        media_nodes.c.external_port,
+                        media_nodes.c.api_port,
+                        media_nodes.c.metrics_port,
+                        media_nodes.c.creation_mode,
+                        media_nodes.c.state,
+                        media_nodes.c.maintenance,
+                        media_nodes.c.registered_cameras,
+                        media_nodes.c.desired_revision,
+                    ).order_by(media_nodes.c.id)
+                ).mappings()
             )
             camera_rows = tuple(
                 connection.execute(

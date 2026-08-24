@@ -7,7 +7,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 import anyio
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -45,6 +45,12 @@ from rtsp_proxy.health import (
 )
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError
+from rtsp_proxy.node_dashboard import node_dashboard_router
+from rtsp_proxy.node_operator import (
+    OperatorNodeCommand,
+    node_mutation_context,
+    operator_node_command,
+)
 from rtsp_proxy.nodes import (
     CameraControl,
     CameraLifecycleConflict,
@@ -61,6 +67,7 @@ from rtsp_proxy.nodes import (
     NodeLifecycleBusy,
     NodeLifecycleConflict,
     NodeManagementPortRangeExhausted,
+    NodeMutationContext,
     NodeNotEmpty,
     NodeNotFound,
     NodePortInUse,
@@ -100,6 +107,10 @@ from rtsp_proxy.reconcile import (
     MoveConfirmationRequired,
     ReconcileRetry,
 )
+
+IDEMPOTENCY_KEY_HEADER = Header(default=None, alias="Idempotency-Key")
+NODE_REVISION_HEADER = Header(default=None, alias="X-Node-Revision")
+NODE_STATE_HEADER = Header(default=None, alias="X-Node-State")
 
 
 def _lifecycle_busy() -> HTTPException:
@@ -835,7 +846,17 @@ def create_app(
         if isinstance(snapshot_response, Response):
             return snapshot_response
         return _dashboard_html_response(
-            render_overview(snapshot=snapshot_response, principal=principal)
+            render_overview(
+                snapshot=snapshot_response,
+                principal=principal,
+                can_manage_nodes=(
+                    node_control is not None
+                    and principal.allows(OperatorPermission.CONTROL_MUTATE)
+                    and 43
+                    <= len(request.cookies.get("__Host-rtsp_proxy_csrf", ""))
+                    <= 1024
+                ),
+            )
         )
 
     @app.get("/dashboard/logout", response_class=HTMLResponse, include_in_schema=False)
@@ -872,6 +893,7 @@ def create_app(
             camera_move_control=camera_move_control,
         )
     )
+    app.include_router(node_dashboard_router(node_control=node_control, settings=settings))
 
     @app.get(
         "/dashboard/nodes/{node_id}",
@@ -903,7 +925,19 @@ def create_app(
                 principal=principal,
             )
         return _dashboard_html_response(
-            render_node_detail(snapshot=snapshot_response, node=node, principal=principal)
+            render_node_detail(
+                snapshot=snapshot_response,
+                node=node,
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+                can_manage_nodes=(
+                    node_control is not None
+                    and principal.allows(OperatorPermission.CONTROL_MUTATE)
+                    and 43
+                    <= len(request.cookies.get("__Host-rtsp_proxy_csrf", ""))
+                    <= 1024
+                ),
+            )
         )
 
     @app.exception_handler(NodeLifecycleBusy)
@@ -1042,7 +1076,12 @@ def create_app(
         _clear_operator_session_cookies(response)
 
     @app.post("/api/v1/nodes", response_model=NodeResponse, status_code=201)
-    def create_node(request: NodeCreateRequest, response: Response) -> NodeResponse:
+    def create_node(
+        request: Request,
+        payload: NodeCreateRequest,
+        response: Response,
+        idempotency_key: UUID | None = IDEMPOTENCY_KEY_HEADER,
+    ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1050,11 +1089,11 @@ def create_app(
             )
         try:
             node = node_control.register_node(
-                name=request.name,
+                name=payload.name,
                 port_range_start=settings.node_port_range_start,
                 port_range_end=settings.node_port_range_end,
                 max_nodes=settings.max_nodes,
-                external_port=request.external_port,
+                external_port=payload.external_port,
                 reserved_ports=settings.node_port_reserved,
                 api_ports=range(
                     settings.node_api_port_range_start,
@@ -1066,6 +1105,10 @@ def create_app(
                 ),
                 release_id=settings.node_release_id,
                 mediamtx_binary_sha256=settings.node_mediamtx_binary_sha256,
+                mutation_context=_external_node_mutation_context(
+                    request,
+                    idempotency_key=idempotency_key,
+                ),
             )
         except NodePortRangeExhausted:
             raise HTTPException(
@@ -1106,6 +1149,16 @@ def create_app(
                     "code": "node_port_in_use",
                     "message": "порт уже используется другой нодой",
                 },
+            ) from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
+        except NodeRuntimeUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "node_registration_schema_unavailable"},
             ) from None
         except NodeRuntimeFailed as error:
             raise HTTPException(
@@ -1154,14 +1207,31 @@ def create_app(
         return NodeListResponse(items=items, count=len(items), max_nodes=settings.max_nodes)
 
     @app.post("/api/v1/nodes/{node_id}/start", response_model=NodeResponse)
-    def start_node(node_id: UUID) -> NodeResponse:
+    def start_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "node_control_unavailable"},
             )
         try:
-            node = node_control.start_node(node_id)
+            command = _external_node_command(
+                request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset({NodeState.STOPPED, NodeState.FAILED}),
+            )
+            node = node_control.start_node(
+                node_id,
+                fence=None if command is None else command.fence,
+                mutation_context=(
+                    None if command is None else command.mutation_context
+                ),
+            )
         except NodeNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1169,6 +1239,11 @@ def create_app(
             ) from None
         except NodeLifecycleBusy:
             raise _lifecycle_busy() from None
+        except NodeLifecycleConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": str(error)},
+            ) from None
         except NodeRuntimeUnavailable:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1193,14 +1268,33 @@ def create_app(
         )
 
     @app.post("/api/v1/nodes/{node_id}/stop", response_model=NodeResponse)
-    def stop_node(node_id: UUID) -> NodeResponse:
+    def stop_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "node_control_unavailable"},
             )
         try:
-            node = node_control.stop_node(node_id)
+            command = _external_node_command(
+                request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset(
+                    {NodeState.RUNNING, NodeState.DRAINING, NodeState.MAINTENANCE}
+                ),
+            )
+            node = node_control.stop_node(
+                node_id,
+                fence=None if command is None else command.fence,
+                mutation_context=(
+                    None if command is None else command.mutation_context
+                ),
+            )
         except NodeNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1231,14 +1325,31 @@ def create_app(
         return _node_response(node)
 
     @app.post("/api/v1/nodes/{node_id}/restart", response_model=NodeResponse)
-    def restart_node(node_id: UUID) -> NodeResponse:
+    def restart_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "node_control_unavailable"},
             )
         try:
-            node = node_control.restart_node(node_id)
+            command = _external_node_command(
+                request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset({NodeState.RUNNING}),
+            )
+            node = node_control.restart_node(
+                node_id,
+                fence=None if command is None else command.fence,
+                mutation_context=(
+                    None if command is None else command.mutation_context
+                ),
+            )
         except NodeNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1310,8 +1421,11 @@ def create_app(
 
     @app.post("/api/v1/nodes/{node_id}/reconfigure", response_model=NodeResponse)
     def reconfigure_node(
+        http_request: Request,
         node_id: UUID,
         request: NodeReconfigureRequest,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
     ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
@@ -1319,9 +1433,19 @@ def create_app(
                 detail={"code": "node_control_unavailable"},
             )
         try:
+            command = _external_node_command(
+                http_request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset({NodeState.DRAINING}),
+            )
             node = node_control.reconfigure_node(
                 node_id,
                 confirmation_token=request.confirmation_token,
+                fence=None if command is None else command.fence,
+                mutation_context=(
+                    None if command is None else command.mutation_context
+                ),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1382,8 +1506,11 @@ def create_app(
 
     @app.put("/api/v1/nodes/{node_id}/release", response_model=NodeResponse)
     def update_node_release(
+        http_request: Request,
         node_id: UUID,
         request: NodeReleaseRequest,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
     ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
@@ -1399,10 +1526,20 @@ def create_app(
                 detail={"code": "node_release_not_configured"},
             )
         try:
+            command = _external_node_command(
+                http_request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset({NodeState.STOPPED}),
+            )
             node = node_control.update_node_release(
                 node_id,
                 release_id=request.release_id,
                 mediamtx_binary_sha256=request.mediamtx_binary_sha256,
+                fence=None if command is None else command.fence,
+                mutation_context=(
+                    None if command is None else command.mutation_context
+                ),
             )
         except NodeNotFound:
             raise HTTPException(
@@ -1424,8 +1561,12 @@ def create_app(
         return _node_response(node)
 
     def set_node_administrative_state(
+        request: Request,
         node_id: UUID,
         state: NodeState,
+        *,
+        expected_revision: int | None,
+        expected_state: NodeState | None,
     ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
@@ -1433,7 +1574,29 @@ def create_app(
                 detail={"code": "node_control_unavailable"},
             )
         try:
-            return _node_response(node_control.set_administrative_state(node_id, state))
+            allowed_states = {
+                NodeState.DRAINING: frozenset({NodeState.RUNNING}),
+                NodeState.MAINTENANCE: frozenset({NodeState.DRAINING}),
+                NodeState.RUNNING: frozenset(
+                    {NodeState.DRAINING, NodeState.MAINTENANCE}
+                ),
+            }
+            command = _external_node_command(
+                request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=allowed_states[state],
+            )
+            return _node_response(
+                node_control.set_administrative_state(
+                    node_id,
+                    state,
+                    fence=None if command is None else command.fence,
+                    mutation_context=(
+                        None if command is None else command.mutation_context
+                    ),
+                )
+            )
         except NodeNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1448,16 +1611,49 @@ def create_app(
             ) from None
 
     @app.post("/api/v1/nodes/{node_id}/drain", response_model=NodeResponse)
-    def drain_node(node_id: UUID) -> NodeResponse:
-        return set_node_administrative_state(node_id, NodeState.DRAINING)
+    def drain_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> NodeResponse:
+        return set_node_administrative_state(
+            request,
+            node_id,
+            NodeState.DRAINING,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+        )
 
     @app.post("/api/v1/nodes/{node_id}/maintenance", response_model=NodeResponse)
-    def maintain_node(node_id: UUID) -> NodeResponse:
-        return set_node_administrative_state(node_id, NodeState.MAINTENANCE)
+    def maintain_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> NodeResponse:
+        return set_node_administrative_state(
+            request,
+            node_id,
+            NodeState.MAINTENANCE,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+        )
 
     @app.post("/api/v1/nodes/{node_id}/resume", response_model=NodeResponse)
-    def resume_node(node_id: UUID) -> NodeResponse:
-        return set_node_administrative_state(node_id, NodeState.RUNNING)
+    def resume_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> NodeResponse:
+        return set_node_administrative_state(
+            request,
+            node_id,
+            NodeState.RUNNING,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+        )
 
     @app.post(
         "/api/v1/nodes/{node_id}/port-change/preview",
@@ -1513,8 +1709,11 @@ def create_app(
         response_model=NodeResponse,
     )
     def change_node_port(
+        http_request: Request,
         node_id: UUID,
         request: NodePortChangeRequest,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
     ) -> NodeResponse:
         if node_control is None:
             raise HTTPException(
@@ -1522,12 +1721,22 @@ def create_app(
                 detail={"code": "node_control_unavailable"},
             )
         try:
+            command = _external_node_command(
+                http_request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset({NodeState.RUNNING}),
+            )
             return _node_response(
                 node_control.change_port(
                     node_id,
                     new_port=request.new_port,
                     allowed_ports=_allowed_node_ports(settings),
                     confirmation_token=request.confirmation_token,
+                    fence=None if command is None else command.fence,
+                    mutation_context=(
+                        None if command is None else command.mutation_context
+                    ),
                 )
             )
         except NodeNotFound:
@@ -1572,14 +1781,31 @@ def create_app(
         "/api/v1/nodes/{node_id}",
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def delete_node(node_id: UUID) -> Response:
+    def delete_node(
+        request: Request,
+        node_id: UUID,
+        expected_revision: int | None = NODE_REVISION_HEADER,
+        expected_state: NodeState | None = NODE_STATE_HEADER,
+    ) -> Response:
         if node_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "node_control_unavailable"},
             )
         try:
-            node_control.delete_node(node_id)
+            command = _external_node_command(
+                request,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+                allowed_states=frozenset({NodeState.STOPPED, NodeState.FAILED}),
+            )
+            node_control.delete_node(
+                node_id,
+                fence=None if command is None else command.fence,
+                mutation_context=(
+                    None if command is None else command.mutation_context
+                ),
+            )
         except NodeNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2403,6 +2629,14 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
             if request.method in {"GET", "HEAD", "OPTIONS"}
             else OperatorPermission.CONTROL_MUTATE
         )
+    if path == "/dashboard/nodes/new":
+        return OperatorPermission.CONTROL_MUTATE
+    if path == "/dashboard/nodes" or path.startswith("/dashboard/nodes/"):
+        return (
+            OperatorPermission.DASHBOARD_READ
+            if request.method in {"GET", "HEAD", "OPTIONS"}
+            else OperatorPermission.CONTROL_MUTATE
+        )
     if path.startswith("/dashboard") or path in {
         "/api/v1/operator/session",
         "/api/v1/dashboard/snapshot",
@@ -2501,8 +2735,22 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
         return action, "session", "self"
     if path in {"/dashboard", "/api/v1/dashboard/snapshot"}:
         return "dashboard.read", "dashboard", "server"
+    if path == "/dashboard/nodes/new" or path == "/dashboard/nodes":
+        return "node.create", "node", "collection"
     if path.startswith("/dashboard/nodes/"):
-        return "node.read", "node", _bounded_path_identifier(path, 2)
+        node_id = _bounded_path_identifier(path, 2)
+        suffix = "/".join(path.strip("/").split("/")[3:])
+        action = {
+            "": "node.read",
+            "registered": "node.read",
+            "start": "node.start",
+            "stop": "node.stop",
+            "drain": "node.drain",
+            "maintenance": "node.maintenance",
+            "resume": "node.resume",
+            "delete": "node.delete",
+        }.get(suffix, "request.unsupported")
+        return action, "node", node_id
     if path == "/api/v1/nodes":
         return (
             ("node.create" if method == "POST" else "node.list"),
@@ -2836,6 +3084,68 @@ def _operator_principal(request: Request) -> OperatorPrincipal:
             detail={"code": "operator_authentication_required"},
         )
     return principal
+
+
+def _external_node_mutation_context(
+    request: Request,
+    *,
+    idempotency_key: UUID | None,
+) -> NodeMutationContext | None:
+    principal = getattr(request.state, "operator_principal", None)
+    if not isinstance(principal, OperatorPrincipal):
+        return None
+    audit_context = getattr(request.state, "operator_audit_context", None)
+    if not isinstance(audit_context, OperatorRequestAuditContext):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "operator_audit_context_unavailable"},
+        )
+    if idempotency_key is None or idempotency_key.version != 4:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={"code": "node_idempotency_key_required"},
+        )
+    return node_mutation_context(
+        principal=principal,
+        audit_context=audit_context,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _external_node_command(
+    request: Request,
+    *,
+    expected_revision: int | None,
+    expected_state: NodeState | None,
+    allowed_states: frozenset[NodeState],
+) -> OperatorNodeCommand | None:
+    principal = getattr(request.state, "operator_principal", None)
+    if not isinstance(principal, OperatorPrincipal):
+        return None
+    audit_context = getattr(request.state, "operator_audit_context", None)
+    if not isinstance(audit_context, OperatorRequestAuditContext):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "operator_audit_context_unavailable"},
+        )
+    if expected_revision is None or expected_state is None:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={"code": "node_command_precondition_required"},
+        )
+    try:
+        return operator_node_command(
+            principal=principal,
+            audit_context=audit_context,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+            allowed_states=allowed_states,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "node_command_source_state_invalid"},
+        ) from None
 
 
 def _camera_response(camera: object) -> CameraResponse:

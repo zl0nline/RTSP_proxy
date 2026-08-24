@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from functools import lru_cache
 from typing import Final
+from uuid import UUID
 
 from jinja2 import Environment, PackageLoader, StrictUndefined, select_autoescape
 
@@ -14,6 +15,7 @@ from rtsp_proxy.nodes import (
     CameraCatalogQuery,
     CameraMove,
     CameraState,
+    MediaNode,
 )
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import OperatorPrincipal
@@ -80,10 +82,16 @@ def _environment() -> Environment:
     return environment
 
 
-def render_overview(*, snapshot: FleetSnapshot, principal: OperatorPrincipal) -> str:
+def render_overview(
+    *,
+    snapshot: FleetSnapshot,
+    principal: OperatorPrincipal,
+    can_manage_nodes: bool = False,
+) -> str:
     return _environment().get_template("dashboard/overview.html").render(
         snapshot=snapshot,
         principal=principal,
+        can_manage_nodes=can_manage_nodes,
     )
 
 
@@ -92,9 +100,41 @@ def render_node_detail(
     snapshot: FleetSnapshot,
     node: NodeSnapshot,
     principal: OperatorPrincipal,
+    csrf_token: str = "",
+    can_manage_nodes: bool = False,
 ) -> str:
     return _environment().get_template("dashboard/node.html").render(
         snapshot=snapshot,
+        node=node,
+        principal=principal,
+        csrf_token=csrf_token,
+        can_manage_nodes=can_manage_nodes,
+    )
+
+
+def render_node_create(
+    *,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+    port_range_start: int,
+    port_range_end: int,
+    idempotency_key: UUID,
+) -> str:
+    return _environment().get_template("dashboard/node_create.html").render(
+        principal=principal,
+        csrf_token=csrf_token,
+        port_range_start=port_range_start,
+        port_range_end=port_range_end,
+        idempotency_key=idempotency_key,
+    )
+
+
+def render_node_registration(
+    *,
+    node: MediaNode,
+    principal: OperatorPrincipal,
+) -> str:
+    return _environment().get_template("dashboard/node_registered.html").render(
         node=node,
         principal=principal,
     )

@@ -21,6 +21,8 @@ The browser scenario proves:
 - anonymous dashboard to OIDC Code+PKCE login and authenticated return;
 - keyboard-only traversal with a first-focus skip link and real Tab/Enter input;
 - server, node, bounded camera catalog and secret-free camera detail rendering;
+- CSRF-protected node registration through the production dashboard router,
+  including the persisted result redirect;
 - occupied single-reader disable preview, cancellation, fresh confirmation and
   successful apply through the production confirmation seam;
 - focus on the autofocus confirmation heading and a labelled assertive alert
@@ -71,8 +73,8 @@ configuration and processes.
 The shared-boundary denial-class/logout matrix with representative semantic
 targets is complete and recorded in
 [`phase-f-operator-security-audit-contract.md`](phase-f-operator-security-audit-contract.md).
-The recursively generated negative matrix now covers all 48 current protected
-route-method pairs and passed run
+The published recursively generated negative matrix covered all 48 protected
+route-method pairs in that surface and passed run
 [`32680412385`](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385).
 Future export/SSE/bulk routes must extend it before activation. Phase F remains
 **IN PROGRESS** for the remaining operator workflows. Phase G

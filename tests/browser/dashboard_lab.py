@@ -20,6 +20,7 @@ from rtsp_proxy.nodes import (
     CameraControl,
     InMemoryNodeStore,
     MediaNode,
+    NodeControl,
     NodeHealth,
     NodeState,
 )
@@ -138,6 +139,12 @@ def build_lab_app(*, origin: str) -> Any:
         source_url=SOURCE_SECRET_CANARY,
         node_id=NODE_ID,
     )
+    nodes = NodeControl(
+        store=node_store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        is_port_bindable=lambda _port: True,
+    )
     mutations = CameraMutationControl(
         store=node_store,
         media_nodes=_LabMediaNodes(
@@ -224,6 +231,7 @@ def build_lab_app(*, origin: str) -> Any:
         fleet_snapshot_max_age_seconds=300,
         operator_sessions=sessions,
         operator_login=login,
+        node_control=nodes,
     )
 
     @app.get("/lab/idp/authorize", include_in_schema=False)

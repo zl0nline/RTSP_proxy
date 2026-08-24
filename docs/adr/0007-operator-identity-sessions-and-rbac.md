@@ -95,9 +95,11 @@ node lifecycle pool.
 - [x] Break-glass TOTP, safe provisioning CLI, durable alert/rate-limit and
   revision-fenced rotation drill
 - [x] Shared-boundary RBAC/scope/no-oracle denial classes, representative
-  semantic targets and a recursively generated matrix for all 48 current
-  protected route-method pairs are complete; future export/SSE/bulk routes
-  must enter the matrix and add their surface-specific evidence before activation
+  semantic targets and a recursively generated matrix for all 48 protected
+  route-method pairs present at that commit are complete; the later node-action
+  router expands the current local inventory to 57 pairs. Future
+  export/SSE/bulk routes must enter the matrix and add their surface-specific
+  evidence before activation
 - [x] Browser cookie/security-header/leak and accessibility E2E
 
 ## Rollout and rollback

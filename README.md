@@ -35,12 +35,20 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   representative semantic targets:
 >   identity source, scope and correlation ID are audit/outbox-bound and
 >   PostgreSQL append failures fail closed without partial revocation.
->   A recursively generated matrix covers all 48 current protected route-method
->   pairs; future export/SSE/bulk routes must extend it before activation.
+>   The published generated matrix covers the prior 48-route surface; the
+>   current local node-action expansion covers 57 protected route-method pairs
+>   and is pending review/native CI. Future export/SSE/bulk routes must extend
+>   it before activation.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
 >   server-side templates/OIDC/session/CSRF/logout tests remain identical in the
 >   amd64 and arm64 application jobs.
+> - Phase-F node operations: **implemented locally; independent review and
+>   native CI pending**. Dashboard and JSON API share one revision/state-fenced,
+>   operator-attributed command boundary. Node registration uses a
+>   session-scoped UUIDv4 idempotency key persisted atomically with the node and
+>   its audit/outbox pair, so a lost response or repeated submit cannot allocate
+>   another port or node. Schema 0016 activates this write path fail-closed.
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -354,11 +362,23 @@ independent review и все семь CI jobs на commit
 ([run 32678955187](https://github.com/zl0nline/RTSP_proxy/actions/runs/32678955187));
 точная граница записана в
 [`docs/evidence/phase-f-operator-security-audit-contract.md`](docs/evidence/phase-f-operator-security-audit-contract.md).
-Generated negative coverage for all 48 current protected route-method pairs,
+The historical generated negative coverage for 48 protected route-method pairs
 including nested included-router prefixes, прошла оба независимых review и все
 семь jobs в commit `39b29814d726d9020c1d19100521b4dfe729b91e`
 ([run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
 Будущие export/SSE/bulk routes должны расширить эту матрицу до активации.
+The current local inventory contains 57 protected route-method pairs after the
+node-action UI was added; its review/native-CI publication is part of the
+current node-operations slice.
+Dashboard node registration supports automatic random allocation or an exact
+operator-selected port, then shows the persisted result even when privileged
+provisioning fails. Start, stop, drain, maintenance, resume and empty-node
+delete forms share the same CSRF/RBAC, expected revision/state and redacted
+operator audit context as the JSON API. Registration retries reuse one
+session-bound UUIDv4 key; PostgreSQL 0016 stores that key in an immutable
+request ledger in the same synchronous transaction as `media_nodes`, audit and
+outbox. Reusing the key for another payload is a 409, and deleting the target
+node does not make the old key reusable.
 Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не

@@ -1,0 +1,33 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Новая нода — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard">Обзор</a><span aria-hidden="true">/</span><span>Новая нода</span>
+  </nav>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Media plane</p>
+      <h1>Создать ноду</h1>
+    </div>
+  </div>
+  <section class="panel mutation-panel" aria-labelledby="node-create-title">
+    <div class="panel-heading"><h2 id="node-create-title">Регистрация и порт</h2></div>
+    <form method="post" action="/dashboard/nodes" class="mutation-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+      <label>Имя ноды
+        <input name="name" required maxlength="128" autocomplete="off">
+      </label>
+      <label>Внешний RTSP-порт
+        <input name="external_port" inputmode="numeric" pattern="[0-9]*" placeholder="случайный свободный порт">
+      </label>
+      <p>Разрешённый диапазон: {{ port_range_start }}–{{ port_range_end }}. Оставьте порт пустым для автоматического случайного выбора.</p>
+      <div class="form-actions">
+        <button type="submit">Создать ноду</button>
+        <a href="/dashboard">Отмена</a>
+      </div>
+    </form>
+  </section>
+</main>
+{% endblock %}

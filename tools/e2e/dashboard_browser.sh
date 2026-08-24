@@ -217,6 +217,17 @@ require_contrast 'a[href="/dashboard/cameras"]' 4.5
 browser snapshot -i -c >"$artifact_dir/02-dashboard.snapshot.txt"
 browser screenshot --full "$artifact_dir/02-dashboard.png" >/dev/null
 
+keyboard_activate 'a[href="/dashboard/nodes/new"]'
+require_url_contains "/dashboard/nodes/new"
+require_body_text "Регистрация и порт"
+browser find label "Имя ноды" fill "browser-created-node" >/dev/null
+keyboard_activate 'form[action="/dashboard/nodes"] button'
+require_url_contains "/dashboard/nodes/dddddddd-dddd-4ddd-8ddd-dddddddddddd/registered"
+require_body_text "Нода зарегистрирована"
+require_body_text "browser-created-node"
+keyboard_activate 'a[href="/dashboard"]'
+require_url_contains "/dashboard"
+
 keyboard_activate 'a[href="/dashboard/cameras"]'
 require_url_contains "/dashboard/cameras"
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
@@ -272,4 +283,4 @@ fi
 uv run python "$repo_root/tools/e2e/verify_dashboard_browser_artifacts.py" \
   "$artifact_dir"
 
-printf 'browser E2E passed: OIDC, keyboard focus, occupied confirmation, logout\n'
+printf 'browser E2E passed: OIDC, node registration, keyboard focus, occupied confirmation, logout\n'

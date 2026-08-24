@@ -31,5 +31,61 @@
       <div><dt>Revision</dt><dd>{{ node.applied_revision }} / {{ node.desired_revision }}</dd></div>
     </dl>
   </section>
+  {% if can_manage_nodes %}
+  <section class="panel camera-actions" aria-labelledby="node-actions-title">
+    <div class="panel-heading"><h2 id="node-actions-title">Управление нодой</h2></div>
+    <div class="action-grid">
+      {% if node.desired_state.value in ['stopped', 'failed'] %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/start">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Запустить</button>
+      </form>
+      {% endif %}
+      {% if node.desired_state.value == 'running' %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/drain">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Drain</button>
+      </form>
+      {% endif %}
+      {% if node.desired_state.value == 'draining' %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/maintenance">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Maintenance</button>
+      </form>
+      {% endif %}
+      {% if node.desired_state.value in ['draining', 'maintenance'] %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/resume">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Возобновить</button>
+      </form>
+      {% endif %}
+      {% if node.registered_cameras == 0 and node.desired_state.value in ['running', 'draining', 'maintenance'] %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/stop">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button type="submit">Остановить</button>
+      </form>
+      {% endif %}
+      {% if node.registered_cameras == 0 and node.desired_state.value in ['stopped', 'failed'] %}
+      <form method="post" action="/dashboard/nodes/{{ node.node_id }}/delete">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
+        <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
+        <button class="danger-button" type="submit">Удалить empty-ноду</button>
+      </form>
+      {% endif %}
+    </div>
+    <p class="detail-note">Stop и delete разрешены только для empty-ноды. Disruptive restart и смена порта требуют отдельного blast-radius preview и подтверждения.</p>
+  </section>
+  {% endif %}
 </main>
 {% endblock %}

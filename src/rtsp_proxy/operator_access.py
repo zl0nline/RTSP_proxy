@@ -351,6 +351,7 @@ class OperatorSession:
 class OperatorPrincipal:
     account_id: UUID
     session_id: UUID
+    identity_source: OperatorIdentitySource
     subject: str
     display_name: str
     roles: frozenset[OperatorRole]
@@ -1339,6 +1340,7 @@ class OperatorSessionControl:
         return OperatorPrincipal(
             account_id=account.id,
             session_id=session.id,
+            identity_source=account.identity_source,
             subject=account.subject,
             display_name=account.display_name,
             roles=account.roles,

@@ -44,9 +44,9 @@ The public HTTP/PostgreSQL matrix covers:
   authentication denial, authorization denial and logout. Every case returns a
   retryable 503, leaves no half-pair and rolls back session revocation.
 
-The generated public HTTP matrix recursively expands included FastAPI routers,
-composes nested prefixes and currently discovers all 48 protected route-method
-pairs under `/api/v1` and `/dashboard`. Every pair is exercised anonymously and
+The published public HTTP matrix recursively expanded included FastAPI routers,
+composed nested prefixes and discovered all 48 route-method pairs in that
+surface under `/api/v1` and `/dashboard`. Every pair was exercised anonymously and
 must return one correlated, semantic 401 audit event. Except for the four
 explicit self-session read/logout routes, the same inventory is exercised with
 a camera-scoped viewer and must return one semantic permission/scope 403 before
@@ -68,6 +68,10 @@ browser remains an external client; server behavior is architecture-neutral.
 CI run 32680412385 executed the generated matrix commit `39b2981`. All seven
 jobs passed again: application/PostgreSQL, patched MediaMTX and RTSP/load
 contracts on Linux amd64 and arm64, plus the external Chromium client on amd64.
+The later node-action router expands the current local inventory to 57 pairs;
+that delta is tracked separately in
+[`phase-f-node-operations-contract.md`](phase-f-node-operations-contract.md)
+and is not retroactively attributed to the 48-route CI run.
 
 ## Remaining gates
 

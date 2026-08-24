@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event, Lock
@@ -18,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import NodeRegistrationPolicy, RuntimeRole, Settings
@@ -37,11 +38,13 @@ from rtsp_proxy.nodes import (
     InvalidCameraSource,
     MediaNode,
     NodeCameraCapacityReached,
+    NodeCommandFence,
     NodeControl,
     NodeDisruptionConfirmationRequired,
     NodeHealth,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
+    NodeMutationContext,
     NodeNotEmpty,
     NodeNotFound,
     NodePortChange,
@@ -76,6 +79,24 @@ from rtsp_proxy.release import trusted_mediamtx_identity
 from rtsp_proxy.runtime import create_app_from_environment, create_background_app, run_web
 
 TRUSTED_MEDIAMTX_SHA256 = trusted_mediamtx_identity(platform.machine())[1].root
+
+NODE_MUTATION_CONTEXT = NodeMutationContext(
+    actor_account_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+    actor_session_id=UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+    identity_source="oidc",
+    actor_subject="oidc:operator@example.test",
+    roles=("operator",),
+    scopes=("server:*",),
+    authz_version=3,
+    request_id=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+    action="node.create",
+    http_method="POST",
+    resource_scope="server:*",
+    resource_type="node",
+    resource_id="collection",
+    source_ip_sha256="1" * 64,
+    user_agent_sha256="2" * 64,
+)
 
 
 def test_node_commands_fail_closed_when_the_control_store_is_not_configured() -> None:
@@ -1149,11 +1170,206 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "WHERE table_schema = 'public' "
                 "AND table_name IN "
                 "('media_nodes', 'cameras', 'audit_events', 'outbox_messages', "
-                "'camera_access_policies', 'camera_access_grants')"
+                "'camera_access_policies', 'camera_access_grants', "
+                "'node_registration_requests')"
             )
         )
-    assert revision == "0015_camera_name_contract"
-    assert table_count == 6
+    assert revision == "0016_node_registration_keys"
+    assert table_count == 7
+
+
+def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(
+        postgres_database_url,
+        lifecycle_lock_timeout_seconds=2,
+    )
+    node_ids = iter(
+        (
+            UUID("00000000-0000-4000-8000-000000000101"),
+            UUID("00000000-0000-4000-8000-000000000102"),
+        )
+    )
+    context = replace(
+        NODE_MUTATION_CONTEXT,
+        idempotency_key=UUID("10000000-0000-4000-8000-000000000001"),
+    )
+    bindable = {12000: True}
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=node_ids.__next__,
+        is_port_bindable=lambda port: bindable.get(port, True),
+    )
+
+    def register() -> MediaNode:
+        return control.register_node(
+            name="idempotent-node",
+            port_range_start=12000,
+            port_range_end=12001,
+            max_nodes=2,
+            external_port=12000,
+            api_ports=(13000, 13001),
+            metrics_ports=(14000, 14001),
+            mutation_context=context,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(register)
+        second_future = executor.submit(register)
+        first = first_future.result(timeout=5)
+        replay = second_future.result(timeout=5)
+
+    assert replay.id == first.id
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM media_nodes")) == 1
+        request = connection.execute(
+            text(
+                "SELECT actor_account_id, actor_session_id, idempotency_key, "
+                "request_sha256, node_id FROM node_registration_requests"
+            )
+        ).one()
+        events = connection.execute(
+            text(
+                "SELECT audit_events.payload, outbox_messages.payload "
+                "FROM audit_events JOIN outbox_messages USING (id) "
+                "WHERE audit_events.event_type='media_node.created'"
+            )
+        ).one()
+    assert request.actor_account_id == context.actor_account_id
+    assert request.actor_session_id == context.actor_session_id
+    assert request.idempotency_key == context.idempotency_key
+    assert request.node_id == first.id
+    assert len(request.request_sha256) == 64
+    assert events[0] == events[1]
+    assert events[0]["operator"]["idempotency_key"] == str(context.idempotency_key)
+
+    bindable[12000] = False
+    replay_after_server_policy_change = control.register_node(
+        name="idempotent-node",
+        port_range_start=15000,
+        port_range_end=15000,
+        max_nodes=1,
+        external_port=12000,
+        reserved_ports=(15000,),
+        api_ports=(16000,),
+        metrics_ports=(17000,),
+        release_id="0.9.0",
+        mediamtx_binary_sha256="f" * 64,
+        mutation_context=context,
+    )
+    assert replay_after_server_policy_change.id == first.id
+
+    with pytest.raises(NodeLifecycleConflict, match="node_idempotency_conflict"):
+        control.register_node(
+            name="different-request",
+            port_range_start=12000,
+            port_range_end=12001,
+            max_nodes=2,
+            external_port=12000,
+            api_ports=(13000, 13001),
+            metrics_ports=(14000, 14001),
+            mutation_context=context,
+        )
+
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM media_nodes WHERE id=:id"), {"id": first.id})
+    with pytest.raises(NodeLifecycleConflict, match="node_idempotency_target_missing"):
+        register()
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT count(*) FROM node_registration_requests")
+        ) == 1
+        assert connection.scalar(text("SELECT count(*) FROM media_nodes")) == 0
+    engine.dispose()
+    store.close()
+
+
+def test_in_memory_node_registration_replays_stable_intent_after_policy_change() -> None:
+    store = InMemoryNodeStore()
+    bindable = {12000: True}
+    context = replace(
+        NODE_MUTATION_CONTEXT,
+        idempotency_key=UUID("10000000-0000-4000-8000-000000000003"),
+    )
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=iter(
+            (UUID("00000000-0000-4000-8000-000000000104"),)
+        ).__next__,
+        is_port_bindable=lambda port: bindable.get(port, True),
+    )
+
+    created = control.register_node(
+        name="stable-intent-node",
+        port_range_start=12000,
+        port_range_end=12000,
+        max_nodes=1,
+        external_port=12000,
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+        mutation_context=context,
+    )
+    bindable[12000] = False
+    replay = control.register_node(
+        name="stable-intent-node",
+        port_range_start=15000,
+        port_range_end=15000,
+        max_nodes=100,
+        external_port=12000,
+        reserved_ports=(15000,),
+        api_ports=(16000,),
+        metrics_ports=(17000,),
+        release_id="0.9.0",
+        mediamtx_binary_sha256="f" * 64,
+        mutation_context=context,
+    )
+
+    assert replay == created
+    assert store.list_nodes() == (created,)
+
+
+def test_postgresql_authenticated_node_registration_waits_for_schema_0016(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0015_camera_name_contract")
+    store = PostgresNodeStore(postgres_database_url)
+    control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-4000-8000-000000000103"),
+        is_port_bindable=lambda _port: True,
+    )
+    context = replace(
+        NODE_MUTATION_CONTEXT,
+        idempotency_key=UUID("10000000-0000-4000-8000-000000000002"),
+    )
+
+    with pytest.raises(
+        NodeRuntimeUnavailable,
+        match="node_registration_schema_unavailable",
+    ):
+        control.register_node(
+            name="blocked-until-schema-current",
+            port_range_start=12000,
+            port_range_end=12000,
+            max_nodes=1,
+            api_ports=(13000,),
+            metrics_ports=(14000,),
+            mutation_context=context,
+        )
+
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM media_nodes")) == 0
+    engine.dispose()
+    store.close()
 
 
 def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
@@ -1203,7 +1419,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0015_camera_name_contract"
+            "0016_node_registration_keys"
         )
 
 
@@ -1236,7 +1452,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0015_camera_name_contract"
+            "0016_node_registration_keys"
         )
         assert connection.scalar(
             text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id}
@@ -1883,6 +2099,142 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
         "payload": expected_payload,
         "status": "pending",
     }
+
+
+def test_postgres_node_command_persists_redacted_operator_attribution(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+
+    node = store.register_automatically(
+        name="audited-dashboard-node",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+        mutation_context=NODE_MUTATION_CONTEXT,
+    )
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        audit = (
+            connection.execute(
+                text(
+                    "SELECT id, payload FROM audit_events "
+                    "WHERE aggregate_type = 'media_node'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+        outbox = (
+            connection.execute(
+                text(
+                    "SELECT id, payload FROM outbox_messages "
+                    "WHERE aggregate_type = 'media_node'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert audit == outbox
+    assert node.desired_revision == 1
+    assert audit["payload"]["operator"] == NODE_MUTATION_CONTEXT.event_payload()
+    assert "password" not in str(audit["payload"]).lower()
+    engine.dispose()
+    store.close()
+
+
+def test_postgres_node_command_fence_is_checked_before_normative_mutation(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node_id = UUID("00000000-0000-0000-0000-000000000001")
+    node = store.register_automatically(
+        name="fenced-dashboard-node",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: node_id,
+    )
+
+    with pytest.raises(NodeLifecycleConflict, match="node_command_fence_conflict"):
+        store.request_desired_state(
+            node.id,
+            NodeState.RUNNING,
+            fence=NodeCommandFence(
+                expected_revision=node.desired_revision + 1,
+                expected_state=NodeState.PROVISIONING,
+            ),
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+
+    persisted = store.get_node(node.id)
+    assert persisted == node
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT count(*) FROM audit_events WHERE aggregate_id = :node_id"),
+            {"node_id": node.id},
+        ) == 1
+        assert connection.scalar(
+            text("SELECT count(*) FROM outbox_messages WHERE aggregate_id = :node_id"),
+            {"node_id": node.id},
+        ) == 1
+    engine.dispose()
+    store.close()
+
+
+@pytest.mark.parametrize("rejected_table", ["audit_events", "outbox_messages"])
+def test_postgres_node_registration_rolls_back_when_normative_append_fails(
+    postgres_database_url: str,
+    rejected_table: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    trigger_name = f"reject_node_{rejected_table}"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"CREATE FUNCTION {trigger_name}() RETURNS trigger AS $$ "
+                "BEGIN RAISE EXCEPTION 'reject node event'; END; $$ LANGUAGE plpgsql"
+            )
+        )
+        connection.execute(
+            text(
+                f"CREATE TRIGGER {trigger_name} BEFORE INSERT ON {rejected_table} "
+                "FOR EACH ROW WHEN (NEW.aggregate_type = 'media_node') "
+                f"EXECUTE FUNCTION {trigger_name}()"
+            )
+        )
+    store = PostgresNodeStore(postgres_database_url)
+
+    with pytest.raises(SQLAlchemyError):
+        store.register_automatically(
+            name="rolled-back-dashboard-node",
+            allowed_ports=(12000,),
+            max_nodes=1,
+            preferred_port=12000,
+            choose_port=lambda available: available[0],
+            new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+
+    assert store.list_nodes() == ()
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT count(*) FROM audit_events WHERE aggregate_type = 'media_node'")
+        ) == 0
+        assert connection.scalar(
+            text("SELECT count(*) FROM outbox_messages WHERE aggregate_type = 'media_node'")
+        ) == 0
+    store.close()
+    engine.dispose()
 
 
 def test_node_start_commits_revisioned_desired_state_before_runtime_observation(
@@ -2616,10 +2968,24 @@ def test_operator_updates_release_only_after_empty_stopped_convergence() -> None
 @pytest.mark.parametrize("operation", ("stop", "restart", "release"))
 def test_node_operations_expose_an_active_camera_move_conflict(operation: str) -> None:
     class ActiveMoveStore(InMemoryNodeStore):
-        def request_stop(self, node_id: UUID) -> MediaNode:
+        def request_stop(
+            self,
+            node_id: UUID,
+            *,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
+        ) -> MediaNode:
+            del fence, mutation_context
             raise NodeLifecycleConflict("node_operation_in_progress")
 
-        def request_restart(self, node_id: UUID) -> MediaNode:
+        def request_restart(
+            self,
+            node_id: UUID,
+            *,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
+        ) -> MediaNode:
+            del fence, mutation_context
             raise NodeLifecycleConflict("node_operation_in_progress")
 
         def request_release(
@@ -2628,7 +2994,10 @@ def test_node_operations_expose_an_active_camera_move_conflict(operation: str) -
             *,
             release_id: str,
             mediamtx_binary_sha256: str,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
         ) -> MediaNode:
+            del fence, mutation_context
             raise NodeLifecycleConflict("node_operation_in_progress")
 
     node_id = UUID("00000000-0000-0000-0000-000000000001")
@@ -4718,10 +5087,18 @@ def test_node_administration_maps_busy_runtime_and_store_errors() -> None:
             self,
             requested_node_id: UUID,
             state: NodeState,
+            *,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
         ) -> MediaNode:
             if self.administrative_error is not None:
                 raise self.administrative_error
-            return super().request_administrative_state(requested_node_id, state)
+            return super().request_administrative_state(
+                requested_node_id,
+                state,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
 
         def get_node(self, requested_node_id: UUID) -> MediaNode | None:
             if self.preview_error is not None:
@@ -4738,6 +5115,7 @@ def test_node_administration_maps_busy_runtime_and_store_errors() -> None:
             expected_revision: int,
             expected_registered_cameras: int,
             expected_blast_radius_sha256: str,
+            mutation_context: NodeMutationContext | None = None,
         ) -> NodePortChange:
             if self.port_error is not None:
                 raise self.port_error
@@ -4749,12 +5127,23 @@ def test_node_administration_maps_busy_runtime_and_store_errors() -> None:
                 expected_revision=expected_revision,
                 expected_registered_cameras=expected_registered_cameras,
                 expected_blast_radius_sha256=expected_blast_radius_sha256,
+                mutation_context=mutation_context,
             )
 
-        def request_node_delete(self, requested_node_id: UUID) -> MediaNode:
+        def request_node_delete(
+            self,
+            requested_node_id: UUID,
+            *,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
+        ) -> MediaNode:
             if self.delete_error is not None:
                 raise self.delete_error
-            return super().request_node_delete(requested_node_id)
+            return super().request_node_delete(
+                requested_node_id,
+                fence=fence,
+                mutation_context=mutation_context,
+            )
 
     store = AdministrationErrorStore(
         nodes=(
@@ -4851,12 +5240,16 @@ def test_reconfigure_public_endpoint_maps_busy_confirmation_and_runtime_failures
             node_id: UUID,
             *,
             confirmation_token: str | None,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
         ) -> MediaNode:
             if self.reconfigure_error is not None:
                 raise self.reconfigure_error
             return super().reconfigure_node(
                 node_id,
                 confirmation_token=confirmation_token,
+                fence=fence,
+                mutation_context=mutation_context,
             )
 
     control = ReconfigureControl(
@@ -4921,6 +5314,8 @@ def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> No
             new_port: int,
             allowed_ports: Collection[int],
             confirmation_token: str | None,
+            fence: NodeCommandFence | None = None,
+            mutation_context: NodeMutationContext | None = None,
         ) -> MediaNode:
             if self.error is not None:
                 raise self.error
@@ -4929,6 +5324,8 @@ def test_port_change_public_endpoint_maps_busy_port_and_runtime_failures() -> No
                 new_port=new_port,
                 allowed_ports=allowed_ports,
                 confirmation_token=confirmation_token,
+                fence=fence,
+                mutation_context=mutation_context,
             )
 
     control = PortChangeControl(

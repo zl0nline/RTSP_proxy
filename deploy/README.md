@@ -281,6 +281,29 @@ Likewise, after revision 0015 commits, rollback to application 0.6.0 (maximum
 schema 0014) is **NO-GO**. Fix forward with verified 0.7.0 artifacts or restore
 the pre-0015 PostgreSQL backup with the control plane stopped. Do not Alembic
 downgrade a live deployment.
+
+Application release `0.8.0` adds `0016_node_registration_keys`. Install and
+smoke 0.8.0 on every WEB/background process while PostgreSQL is still at 0015.
+Existing read, collector and media-node operation contracts remain available,
+but authenticated node registration deliberately returns a sanitized 503 until
+the database reaches exact 0016. Temporarily suspend node creation during this
+window; established ordinary RTSP/TCP sessions and node processes are not
+restarted.
+
+Migration 0016 creates only the bounded `node_registration_requests` ledger
+with a composite `(actor_session_id, idempotency_key)` primary key and a
+canonical request digest check. The ledger has no delete cascade from
+`media_nodes`: deleting a node must never make an already accepted registration
+request reusable. Each new registration inserts the ledger row in the same
+synchronous transaction as desired node state and its matching audit/outbox
+pair. After the migration, verify every process is ready, submit one node
+registration with a fresh UUIDv4 `Idempotency-Key`, repeat it unchanged and
+confirm the same `Location`; reuse with a changed payload must return 409.
+
+After revision 0016 commits, rollback to application 0.7.0 (maximum schema
+0015) is **NO-GO**. Recover by fixing forward with the verified 0.8.0 release or
+restore the pre-0016 PostgreSQL backup with the control plane stopped. A live
+Alembic downgrade is not supported.
 The five WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
 `/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running
