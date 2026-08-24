@@ -66,15 +66,16 @@ cross-scope and nonexistent camera produce the same pre-lookup denial.
 ## Validation performed
 
 On the development host, Ruff, strict mypy and the full non-browser application
-suite passed with `869 passed, 19 skipped`. The skipped tests are
-separately gated privileged MediaMTX/load/netem/systemd contracts.
+suite passed with `893 passed, 19 skipped`; statement coverage was `90.01%`
+against the mandatory `90%` gate. The skipped tests are separately gated
+privileged MediaMTX/load/netem/systemd contracts.
 
 The same dirty implementation tree was copied to an isolated temporary
 directory on the direct-Linux Ubuntu amd64 host `grob`. `uv 0.10.8` provisioned
 the locked CPython 3.12.13 environment without Docker or system package
 changes. With PostgreSQL 18 binaries added to the test-process PATH, the full
-suite again passed with `869 passed, 19 skipped`; Ruff and strict
-mypy were also green.
+suite again passed with `893 passed, 19 skipped` and `90.02%` statement
+coverage; Ruff and strict mypy were also green.
 
 A fresh Linux `agent-browser 0.26.0`/Chrome-for-Testing 152 session then passed
 the real HTTPS browser workflow: OIDC login, node registration, camera access
