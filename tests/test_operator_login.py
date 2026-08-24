@@ -890,8 +890,14 @@ def test_oidc_login_control_rejects_invalid_flow_and_account_boundaries() -> Non
         complete_with(resolver=rejected_resolver)
 
     class UnavailableSessions:
-        def issue(self, *, account_id: UUID, mfa_verified: bool) -> None:
-            del account_id, mfa_verified
+        def issue(
+            self,
+            *,
+            account_id: UUID,
+            mfa_verified: bool,
+            audit_context: object | None = None,
+        ) -> None:
+            del account_id, mfa_verified, audit_context
             raise OperatorSessionUnavailable("operator_session_store_unavailable")
 
     with pytest.raises(OidcLoginUnavailable, match="operator_session_store_unavailable"):

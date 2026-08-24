@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -78,6 +78,7 @@ from rtsp_proxy.operator_access import (
     OperatorAuthorizationDenied,
     OperatorPermission,
     OperatorPrincipal,
+    OperatorRequestAuditContext,
     OperatorSessionControl,
     OperatorSessionUnavailable,
 )
@@ -631,6 +632,7 @@ def create_app(
                         "__Secure-rtsp_proxy_oidc_flow",
                         "",
                     ),
+                    audit_context=_operator_login_request_audit_context(request),
                 )
             except OidcLoginInvalid:
                 try:
@@ -688,6 +690,7 @@ def create_app(
                     password=payload.password,
                     totp=payload.totp,
                     source_ip=_request_source_ip(request),
+                    audit_context=_operator_login_request_audit_context(request),
                 )
             except OidcLoginRateLimited as error:
                 return _operator_rate_limited(error.retry_after_seconds)
@@ -722,6 +725,16 @@ def create_app(
             require_csrf = request.method not in {"GET", "HEAD", "OPTIONS"}
             permission = _operator_permission_for_request(request)
             required_scope = _operator_scope_for_request(request)
+            audit_context = _operator_request_audit_context(
+                request,
+                required_scope=required_scope,
+            )
+            request.state.operator_audit_context = audit_context
+
+            def audited_response(response: Response) -> Response:
+                response.headers["X-Request-ID"] = str(audit_context.request_id)
+                return response
+
             try:
                 csrf_token = request.headers.get("X-CSRF-Token")
                 if require_csrf and request.url.path.startswith("/dashboard/"):
@@ -735,59 +748,61 @@ def create_app(
                         csrf_token=csrf_token,
                         require_csrf=require_csrf,
                         required_scope=required_scope,
+                        audit_context=audit_context,
                     ),
                     abandon_on_cancel=True,
                 )
-            except (DashboardFormInvalid, OperatorAuthenticationRequired):
-                if request.url.path.startswith("/dashboard"):
-                    return _dashboard_unavailable_response(
-                        DashboardUnavailable(
-                            title="Требуется вход оператора",
-                            message="Откройте защищённую сессию, чтобы увидеть состояние сервера.",
-                            login_href=(
-                                "/auth/oidc/login" if operator_login is not None else None
-                            ),
+            except DashboardFormInvalid:
+                try:
+                    await anyio.to_thread.run_sync(
+                        lambda: operator_sessions.record_denied_request(
+                            session_token=session_token,
+                            reason_code="operator_csrf_invalid",
+                            audit_context=audit_context,
                         ),
-                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        abandon_on_cancel=True,
                     )
-                return _operator_error_response(
-                    status.HTTP_401_UNAUTHORIZED,
-                    "operator_authentication_required",
+                except OperatorSessionUnavailable:
+                    return audited_response(_operator_session_unavailable_response(request))
+                return audited_response(
+                    _operator_authentication_required_response(
+                        request,
+                        oidc_enabled=operator_login is not None,
+                    )
+                )
+            except OperatorAuthenticationRequired:
+                return audited_response(
+                    _operator_authentication_required_response(
+                        request,
+                        oidc_enabled=operator_login is not None,
+                    )
                 )
             except OperatorAuthorizationDenied:
                 if request.url.path.startswith("/dashboard"):
-                    return _dashboard_unavailable_response(
-                        DashboardUnavailable(
-                            title="Недостаточно прав",
-                            message=(
-                                "У этой операторской сессии нет доступа к дашборду."  # noqa: RUF001
+                    return audited_response(
+                        _dashboard_unavailable_response(
+                            DashboardUnavailable(
+                                title="Недостаточно прав",
+                                message=(
+                                    "У этой операторской сессии нет доступа к дашборду."  # noqa: RUF001
+                                ),
                             ),
-                        ),
-                        status_code=status.HTTP_403_FORBIDDEN,
+                            status_code=status.HTTP_403_FORBIDDEN,
+                        )
                     )
-                return _operator_error_response(
-                    status.HTTP_403_FORBIDDEN,
-                    "operator_permission_denied",
+                return audited_response(
+                    _operator_error_response(
+                        status.HTTP_403_FORBIDDEN,
+                        "operator_permission_denied",
+                    )
                 )
             except OperatorSessionUnavailable:
-                if request.url.path.startswith("/dashboard"):
-                    return _dashboard_unavailable_response(
-                        DashboardUnavailable(
-                            title="Сессия временно недоступна",
-                            message="Проверить операторскую сессию сейчас невозможно.",
-                        ),
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    )
-                return JSONResponse(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    content={"detail": {"code": "operator_session_unavailable"}},
-                    headers={"Cache-Control": "no-store", "Retry-After": "1"},
-                )
+                return audited_response(_operator_session_unavailable_response(request))
             request.state.operator_principal = principal
             result = await call_next(request)
             assert isinstance(result, Response)
             result.headers["Cache-Control"] = "no-store"
-            return result
+            return audited_response(result)
 
     @app.get("/", include_in_schema=False)
     def application_root() -> Response:
@@ -839,7 +854,8 @@ def create_app(
     def dashboard_logout(request: Request) -> Response:
         assert operator_sessions is not None
         operator_sessions.revoke(
-            request.cookies.get("__Host-rtsp_proxy_session", "")
+            request.cookies.get("__Host-rtsp_proxy_session", ""),
+            audit_context=request.state.operator_audit_context,
         )
         response = RedirectResponse(
             "/dashboard",
@@ -1019,7 +1035,10 @@ def create_app(
     def operator_logout(request: Request, response: Response) -> None:
         assert operator_sessions is not None
         token = request.cookies.get("__Host-rtsp_proxy_session", "")
-        operator_sessions.revoke(token)
+        operator_sessions.revoke(
+            token,
+            audit_context=request.state.operator_audit_context,
+        )
         _clear_operator_session_cookies(response)
 
     @app.post("/api/v1/nodes", response_model=NodeResponse, status_code=201)
@@ -2410,7 +2429,43 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
     return OperatorPermission.CONTROL_MUTATE
 
 
-def _operator_scope_for_request(request: Request) -> str:
+def _operator_request_audit_context(
+    request: Request,
+    *,
+    required_scope: str | None,
+) -> OperatorRequestAuditContext:
+    action, resource_type, resource_id = _operator_audit_target(request)
+    return OperatorRequestAuditContext.capture(
+        request_id=uuid4(),
+        action=action,
+        http_method=_operator_audit_http_method(request.method),
+        resource_scope="session:self" if required_scope is None else required_scope,
+        source_ip=_request_source_ip(request),
+        user_agent=_request_user_agent(request),
+        resource_type=resource_type,
+        resource_id=resource_id,
+    )
+
+
+def _operator_login_request_audit_context(request: Request) -> OperatorRequestAuditContext:
+    return OperatorRequestAuditContext.capture(
+        request_id=uuid4(),
+        action="operator.login",
+        http_method=_operator_audit_http_method(request.method),
+        resource_scope="server:*",
+        source_ip=_request_source_ip(request),
+        user_agent=_request_user_agent(request),
+        resource_type="session",
+        resource_id="self",
+    )
+
+
+def _operator_scope_for_request(request: Request) -> str | None:
+    if request.url.path in {
+        "/api/v1/operator/session",
+        "/dashboard/logout",
+    }:
+        return None
     for camera_resource_prefix in ("/dashboard/cameras/", "/api/v1/cameras/"):
         if request.url.path.startswith(camera_resource_prefix):
             resource = request.url.path.removeprefix(camera_resource_prefix)
@@ -2423,6 +2478,140 @@ def _operator_scope_for_request(request: Request) -> str:
                 else:
                     return f"camera:{camera_id}"
     return "server:*"
+
+
+def _operator_audit_http_method(method: str) -> str:
+    normalized = method.upper()
+    if normalized in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
+        return normalized
+    return "OTHER"
+
+
+def _operator_audit_target(request: Request) -> tuple[str, str, str]:
+    path = request.url.path
+    method = _operator_audit_http_method(request.method)
+    if method == "OTHER":
+        return "request.unsupported", "server", "server"
+    if path in {"/api/v1/operator/session", "/dashboard/logout"}:
+        action = (
+            "operator.session_logout"
+            if method in {"POST", "DELETE"}
+            else "operator.session_read"
+        )
+        return action, "session", "self"
+    if path in {"/dashboard", "/api/v1/dashboard/snapshot"}:
+        return "dashboard.read", "dashboard", "server"
+    if path.startswith("/dashboard/nodes/"):
+        return "node.read", "node", _bounded_path_identifier(path, 2)
+    if path == "/api/v1/nodes":
+        return (
+            ("node.create" if method == "POST" else "node.list"),
+            "node",
+            "collection",
+        )
+    if path.startswith("/api/v1/nodes/"):
+        node_id = _bounded_path_identifier(path, 3)
+        suffix = "/".join(path.strip("/").split("/")[4:])
+        action = {
+            "start": "node.start",
+            "stop": "node.stop",
+            "restart": "node.restart",
+            "reconfigure/preview": "node.reconfigure_preview",
+            "reconfigure": "node.reconfigure",
+            "observe": "node.observe",
+            "release": "node.release_update",
+            "drain": "node.drain",
+            "maintenance": "node.maintenance",
+            "resume": "node.resume",
+            "port-change/preview": "node.port_change_preview",
+            "port-change": "node.port_change",
+            "": "node.delete" if method == "DELETE" else "node.read",
+        }.get(suffix, "request.unsupported")
+        return action, "node", node_id
+    if path == "/api/v1/cameras" or path == "/dashboard/cameras":
+        return (
+            ("camera.create" if method == "POST" else "camera.list"),
+            "camera",
+            "collection",
+        )
+    if path.startswith("/api/v1/camera-moves/"):
+        return "camera.move_read", "camera_move", _bounded_path_identifier(path, 3)
+    camera_prefix = next(
+        (
+            prefix
+            for prefix in ("/api/v1/cameras/", "/dashboard/cameras/")
+            if path.startswith(prefix)
+        ),
+        None,
+    )
+    if camera_prefix is not None:
+        remainder = path.removeprefix(camera_prefix)
+        camera_id, _, suffix = remainder.partition("/")
+        resource_id = _canonical_audit_identifier(camera_id)
+        if camera_prefix.startswith("/dashboard"):
+            if suffix.startswith("moves/") and suffix not in {
+                "moves/preview",
+                "moves/apply",
+            }:
+                return (
+                    "camera.move_read",
+                    "camera_move",
+                    _canonical_audit_identifier(suffix.removeprefix("moves/")),
+                )
+            action = {
+                "": "camera.read",
+                "edit": "camera.update",
+                "move": "camera.move",
+                "moves/preview": "camera.move_preview",
+                "moves/apply": "camera.move",
+                "mutations/preview": "camera.mutation_preview",
+                "mutations/apply": "camera.update",
+                "enable": "camera.enable",
+                "disable": "camera.disable",
+            }.get(suffix, "request.unsupported")
+        else:
+            action = {
+                "": "camera.delete" if method == "DELETE" else "camera.update",
+                "enable": "camera.enable",
+                "disable": "camera.disable",
+                "mutations/preview": "camera.mutation_preview",
+                "runtime": "camera.runtime_read",
+                "moves/preview": "camera.move_preview",
+                "moves": "camera.move",
+                "access-policy": (
+                    "camera.access_policy_update"
+                    if method == "PUT"
+                    else "camera.access_policy_read"
+                ),
+                "access-grants": "camera.grant_issue",
+            }.get(suffix, "request.unsupported")
+        return action, "camera", resource_id
+    if path.startswith("/api/v1/access-grants/"):
+        grant_id = _bounded_path_identifier(path, 3)
+        return (
+            "camera.grant_rotate" if path.endswith("/rotate") else "camera.grant_revoke",
+            "access_grant",
+            grant_id,
+        )
+    if path.startswith("/api/v1/operators"):
+        return "operator.admin", "operator_account", _bounded_path_identifier(path, 3)
+    if path.startswith("/api/v1/audit"):
+        return "audit.read", "audit", "collection"
+    return "request.unsupported", "server", "server"
+
+
+def _bounded_path_identifier(path: str, index: int) -> str:
+    parts = path.strip("/").split("/")
+    if index >= len(parts):
+        return "invalid"
+    return _canonical_audit_identifier(parts[index])
+
+
+def _canonical_audit_identifier(value: str) -> str:
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return "invalid"
 
 
 def _operator_protected_path(path: str) -> bool:
@@ -2526,6 +2715,42 @@ def _operator_error_response(status_code: int, code: str) -> JSONResponse:
     )
 
 
+def _operator_authentication_required_response(
+    request: Request,
+    *,
+    oidc_enabled: bool,
+) -> Response:
+    if request.url.path.startswith("/dashboard"):
+        return _dashboard_unavailable_response(
+            DashboardUnavailable(
+                title="Требуется вход оператора",
+                message="Откройте защищённую сессию, чтобы увидеть состояние сервера.",
+                login_href="/auth/oidc/login" if oidc_enabled else None,
+            ),
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+    return _operator_error_response(
+        status.HTTP_401_UNAUTHORIZED,
+        "operator_authentication_required",
+    )
+
+
+def _operator_session_unavailable_response(request: Request) -> Response:
+    if request.url.path.startswith("/dashboard"):
+        return _dashboard_unavailable_response(
+            DashboardUnavailable(
+                title="Сессия временно недоступна",
+                message="Проверить операторскую сессию сейчас невозможно.",
+            ),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": {"code": "operator_session_unavailable"}},
+        headers={"Cache-Control": "no-store", "Retry-After": "1"},
+    )
+
+
 def _operator_login_unavailable() -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -2547,6 +2772,11 @@ def _operator_rate_limited(retry_after_seconds: int) -> JSONResponse:
 
 def _request_source_ip(request: Request) -> str:
     return "unknown" if request.client is None else request.client.host
+
+
+def _request_user_agent(request: Request) -> str:
+    value = request.headers.get("user-agent", "")
+    return value if len(value) <= 4096 else "<oversized>"
 
 
 def _set_operator_session_cookies(

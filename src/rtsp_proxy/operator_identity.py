@@ -39,6 +39,7 @@ from rtsp_proxy.operator_access import (
     OperatorAccount,
     OperatorAuthenticationRequired,
     OperatorMutationContext,
+    OperatorRequestAuditContext,
     OperatorRole,
     OperatorSessionControl,
 )
@@ -807,6 +808,7 @@ class BreakGlassControl:
         password: str,
         totp: str,
         source_ip: str,
+        audit_context: OperatorRequestAuditContext | None = None,
     ) -> IssuedOperatorSession:
         now = self._clock()
         if now.tzinfo is None:
@@ -823,6 +825,7 @@ class BreakGlassControl:
                 account_id=authentication.account_id,
                 mfa_verified=True,
                 expected_authz_version=authentication.authz_version,
+                audit_context=audit_context,
             )
         except OperatorAuthenticationRequired:
             raise OidcLoginInvalid("break_glass_login_failed") from None
@@ -1832,6 +1835,7 @@ class OidcLoginControl:
         state: str,
         code: str,
         browser_token: str,
+        audit_context: OperatorRequestAuditContext | None = None,
     ) -> CompletedOidcLogin:
         if not self._callback_admission.acquire(blocking=False):
             raise OidcLoginRateLimited(1)
@@ -1889,6 +1893,7 @@ class OidcLoginControl:
             session = self._sessions.issue(
                 account_id=account_id,
                 mfa_verified=True,
+                audit_context=audit_context,
             )
         except OidcLoginInvalid:
             raise

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -23,6 +25,7 @@ from rtsp_proxy.operator_access import (
     OperatorIdentitySource,
     OperatorMutationContext,
     OperatorPermission,
+    OperatorRequestAuditContext,
     OperatorRole,
     OperatorSession,
     OperatorSessionControl,
@@ -37,6 +40,68 @@ MUTATION_CONTEXT = OperatorMutationContext(
     actor="oidc:admin@example.test",
     reason="operator authorization test",
 )
+READ_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
+    request_id=UUID("80000000-0000-0000-0000-000000000008"),
+    action="dashboard.read",
+    http_method="GET",
+    resource_scope="server:*",
+    source_ip="198.51.100.10",
+    user_agent="security-audit-test/1.0",
+)
+MUTATION_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
+    request_id=UUID("81000000-0000-0000-0000-000000000008"),
+    action="control.mutate",
+    http_method="POST",
+    resource_scope="server:*",
+    source_ip="198.51.100.10",
+    user_agent="security-audit-test/1.0",
+)
+LOGOUT_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
+    request_id=UUID("82000000-0000-0000-0000-000000000008"),
+    action="operator.session_logout",
+    http_method="DELETE",
+    resource_scope="server:*",
+    source_ip="198.51.100.10",
+    user_agent="security-audit-test/1.0",
+)
+LOGIN_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
+    request_id=UUID("85000000-0000-0000-0000-000000000008"),
+    action="operator.login",
+    http_method="GET",
+    resource_scope="server:*",
+    source_ip="198.51.100.10",
+    user_agent="security-audit-test/1.0",
+)
+
+
+def test_operator_request_audit_context_is_bounded_and_secret_free() -> None:
+    assert READ_AUDIT_CONTEXT.source_ip_sha256 == hashlib.sha256(
+        b"198.51.100.10"
+    ).hexdigest()
+    assert READ_AUDIT_CONTEXT.user_agent_sha256 == hashlib.sha256(
+        b"security-audit-test/1.0"
+    ).hexdigest()
+    assert "198.51.100.10" not in repr(READ_AUDIT_CONTEXT)
+    assert "security-audit-test/1.0" not in repr(READ_AUDIT_CONTEXT)
+
+    for changes in (
+        {"action": "GET /api/v1/cameras/secret"},
+        {"http_method": "TRACE"},
+        {"resource_scope": "camera:not/a/canonical/scope"},
+        {"source_ip": ""},
+        {"user_agent": "x" * 4097},
+    ):
+        values: dict[str, object] = {
+            "request_id": UUID("83000000-0000-0000-0000-000000000008"),
+            "action": "control.read",
+            "http_method": "GET",
+            "resource_scope": "server:*",
+            "source_ip": "198.51.100.11",
+            "user_agent": "test-agent",
+        }
+        values.update(changes)
+        with pytest.raises(ValueError, match="operator_request_audit_context_invalid"):
+            OperatorRequestAuditContext.capture(**values)  # type: ignore[arg-type]
 
 
 def test_operator_session_public_contract_rejects_invalid_boundary_states() -> None:
@@ -243,6 +308,11 @@ def test_role_downgrade_invalidates_existing_session_authoritatively() -> None:
             csrf_token=issued.csrf_token,
             require_csrf=True,
         )
+    event = store.request_security_events()[0]
+    assert event.event_type == "operator.authentication_denied"
+    assert event.reason_code == "operator_session_stale"
+    assert event.account_id == ACCOUNT_ID
+    assert event.session_id == issued.session.id
 
 
 def test_csrf_role_scope_idle_absolute_and_revocation_fail_closed() -> None:
@@ -312,6 +382,95 @@ def test_csrf_role_scope_idle_absolute_and_revocation_fail_closed() -> None:
         )
 
 
+def test_session_denial_and_logout_audit_matrix_keeps_only_safe_request_metadata() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:viewer@example.test",
+        display_name="Наблюдатель",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"camera:allowed-camera"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW)
+    control = OperatorSessionControl(
+        store=store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_session_invalid"):
+        control.authenticate(
+            session_token="unknown-session-token",
+            permission=OperatorPermission.DASHBOARD_READ,
+            audit_context=READ_AUDIT_CONTEXT,
+        )
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_csrf_invalid"):
+        control.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.DASHBOARD_READ,
+            require_csrf=True,
+            csrf_token="wrong-csrf-token",
+            audit_context=READ_AUDIT_CONTEXT,
+        )
+    with pytest.raises(OperatorAuthorizationDenied, match="operator_permission_denied"):
+        control.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.CONTROL_MUTATE,
+            csrf_token=issued.csrf_token,
+            require_csrf=True,
+            audit_context=MUTATION_AUDIT_CONTEXT,
+        )
+    with pytest.raises(OperatorAuthorizationDenied, match="operator_scope_denied"):
+        control.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.CONTROL_READ,
+            required_scope="camera:other-camera",
+            audit_context=replace(
+                READ_AUDIT_CONTEXT,
+                resource_scope="camera:other-camera",
+            ),
+        )
+
+    control.revoke(issued.session_token, audit_context=LOGOUT_AUDIT_CONTEXT)
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_session_revoked"):
+        control.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.DASHBOARD_READ,
+            audit_context=replace(
+                LOGOUT_AUDIT_CONTEXT,
+                request_id=UUID("84000000-0000-0000-0000-000000000008"),
+            ),
+        )
+
+    events = store.request_security_events()
+    assert tuple((event.event_type, event.reason_code) for event in events) == (
+        ("operator.authentication_denied", "operator_session_invalid"),
+        ("operator.authorization_denied", "operator_csrf_invalid"),
+        ("operator.authorization_denied", "operator_permission_denied"),
+        ("operator.authorization_denied", "operator_scope_denied"),
+        ("operator.session_logout", "operator_initiated"),
+        ("operator.authentication_denied", "operator_session_revoked"),
+    )
+    assert events[0].account_id is None
+    assert events[0].session_id is None
+    assert events[0].roles == frozenset()
+    assert events[0].scopes == frozenset()
+    assert all(event.outcome == "rejected" for event in events[:4])
+    assert events[4].outcome == "accepted"
+    assert events[1].account_id == ACCOUNT_ID
+    assert events[1].session_id == issued.session.id
+    assert events[1].roles == frozenset({OperatorRole.VIEWER})
+    assert events[1].scopes == frozenset({"camera:allowed-camera"})
+    assert events[1].audit_context == READ_AUDIT_CONTEXT
+    serialized = repr(events)
+    assert issued.session_token not in serialized
+    assert issued.csrf_token not in serialized
+    assert "198.51.100.10" not in serialized
+    assert "security-audit-test/1.0" not in serialized
+
+
 def test_parallel_safe_requests_share_one_session_without_spurious_logout() -> None:
     store = InMemoryOperatorSessionStore(
         accounts=(
@@ -368,7 +527,11 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
         store=first_store,
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
         session_id_factory=lambda: UUID("70000000-0000-0000-0000-000000000007"),
-    ).issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    ).issue(
+        account_id=ACCOUNT_ID,
+        mfa_verified=True,
+        audit_context=LOGIN_AUDIT_CONTEXT,
+    )
     first_store.record_request_security_event(
         account_id=ACCOUNT_ID,
         session_id=issued.session.id,
@@ -420,13 +583,18 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
     assert session_audit == session_outbox
     assert session_audit.payload["account_id"] == str(ACCOUNT_ID)
     assert session_audit.payload["mfa_verified"] is True
+    assert session_audit.payload["action"] == "operator.login"
+    assert session_audit.payload["auth_method"] == "oidc"
+    assert session_audit.payload["http_method"] == "GET"
+    assert session_audit.payload["source_ip_sha256"] == LOGIN_AUDIT_CONTEXT.source_ip_sha256
+    assert session_audit.payload["user_agent_sha256"] == LOGIN_AUDIT_CONTEXT.user_agent_sha256
     assert denial_audit == denial_outbox
-    assert denial_audit.payload == {
-        "account_id": str(ACCOUNT_ID),
-        "outcome": "rejected",
-        "reason_code": "operator_permission_denied",
-        "session_id": str(issued.session.id),
-    }
+    assert denial_audit.payload["account_id"] == str(ACCOUNT_ID)
+    assert denial_audit.payload["outcome"] == "rejected"
+    assert denial_audit.payload["reason_code"] == "operator_permission_denied"
+    assert denial_audit.payload["session_id"] == str(issued.session.id)
+    assert denial_audit.payload["action"] == "dashboard.read"
+    assert denial_audit.payload["http_method"] == "INTERNAL"
 
     reopened = PostgresOperatorSessionStore(postgres_database_url)
     principal = OperatorSessionControl(
@@ -503,12 +671,315 @@ def test_postgres_logout_is_idempotent_and_appends_one_normative_event(
     engine.dispose()
     store.close()
     assert audit == outbox
-    assert audit.payload == {
-        "account_id": str(ACCOUNT_ID),
-        "outcome": "accepted",
-        "reason_code": "operator_initiated",
-        "session_id": str(issued.session.id),
+    assert audit.payload["account_id"] == str(ACCOUNT_ID)
+    assert audit.payload["outcome"] == "accepted"
+    assert audit.payload["reason_code"] == "operator_initiated"
+    assert audit.payload["session_id"] == str(issued.session.id)
+    assert audit.payload["action"] == "operator.session_logout"
+    assert audit.payload["http_method"] == "INTERNAL"
+
+
+def test_postgres_denial_logout_matrix_is_durable_redacted_and_fail_closed(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:viewer@example.test",
+        display_name="Viewer",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresOperatorSessionStore(postgres_database_url)
+    store.create_account(account)
+    control = OperatorSessionControl(
+        store=store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+
+    with pytest.raises(OperatorAuthenticationRequired, match="operator_session_invalid"):
+        control.authenticate(
+            session_token="unknown-session-token",
+            permission=OperatorPermission.DASHBOARD_READ,
+            audit_context=READ_AUDIT_CONTEXT,
+        )
+    with pytest.raises(OperatorAuthorizationDenied, match="operator_permission_denied"):
+        control.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.CONTROL_MUTATE,
+            csrf_token=issued.csrf_token,
+            require_csrf=True,
+            audit_context=MUTATION_AUDIT_CONTEXT,
+        )
+    control.revoke(issued.session_token, audit_context=LOGOUT_AUDIT_CONTEXT)
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        audit = tuple(
+            connection.execute(
+                text(
+                    "SELECT id, aggregate_type, aggregate_id, event_type, payload "
+                    "FROM audit_events WHERE event_type IN ("
+                    "'operator.authentication_denied', "
+                    "'operator.authorization_denied', "
+                    "'operator.session_logout') ORDER BY occurred_at, id"
+                )
+            ).mappings()
+        )
+        outbox = tuple(
+            connection.execute(
+                text(
+                    "SELECT id, aggregate_type, aggregate_id, event_type, payload "
+                    "FROM outbox_messages WHERE event_type IN ("
+                    "'operator.authentication_denied', "
+                    "'operator.authorization_denied', "
+                    "'operator.session_logout') ORDER BY occurred_at, id"
+                )
+            ).mappings()
+        )
+    engine.dispose()
+    store.close()
+
+    assert audit == outbox
+    assert {row["event_type"] for row in audit} == {
+        "operator.authentication_denied",
+        "operator.authorization_denied",
+        "operator.session_logout",
     }
+    anonymous = next(
+        row for row in audit if row["event_type"] == "operator.authentication_denied"
+    )
+    assert anonymous["aggregate_type"] == "operator_security_request"
+    assert anonymous["aggregate_id"] == READ_AUDIT_CONTEXT.request_id
+    assert anonymous["payload"]["account_id"] is None
+    assert anonymous["payload"]["session_id"] is None
+    assert anonymous["payload"]["roles"] == []
+    assert anonymous["payload"]["scopes"] == []
+    assert anonymous["payload"]["auth_method"] is None
+    denial = next(
+        row for row in audit if row["event_type"] == "operator.authorization_denied"
+    )
+    assert denial["aggregate_type"] == "operator_account"
+    assert denial["aggregate_id"] == ACCOUNT_ID
+    assert denial["payload"]["roles"] == ["viewer"]
+    assert denial["payload"]["scopes"] == ["server:*"]
+    assert denial["payload"]["auth_method"] == "oidc"
+    assert denial["payload"]["resource_type"] == "server"
+    assert denial["payload"]["resource_id"] == "server"
+    logout = next(row for row in audit if row["event_type"] == "operator.session_logout")
+    assert logout["payload"]["outcome"] == "accepted"
+    assert logout["payload"]["action"] == "operator.session_logout"
+    assert logout["payload"]["auth_method"] == "oidc"
+    serialized = json.dumps([dict(row) for row in audit], default=str, sort_keys=True)
+    assert issued.session_token not in serialized
+    assert issued.csrf_token not in serialized
+    assert "198.51.100.10" not in serialized
+    assert "security-audit-test/1.0" not in serialized
+
+
+def test_postgres_http_denial_logout_matrix_is_complete_and_pairwise_durable(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:camera-operator@example.test",
+        display_name="Camera operator",
+        roles=frozenset({OperatorRole.OPERATOR}),
+        scopes=frozenset({f"camera:{camera_id}"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresOperatorSessionStore(postgres_database_url)
+    store.create_account(account)
+    tokens = iter(tuple(f"{index:02d}-" + "x" * 40 for index in range(24)))
+    control = OperatorSessionControl(store=store, token_factory=tokens.__next__)
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), operator_sessions=control),
+        base_url="https://management.example.test",
+    )
+    agent = "matrix-secret-agent/1.0"
+
+    anonymous = client.get(
+        "/api/v1/operator/session",
+        headers={"User-Agent": agent},
+    )
+    csrf_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    csrf = client.delete(
+        "/api/v1/operator/session",
+        headers={
+            "Cookie": f"__Host-rtsp_proxy_session={csrf_session.session_token}",
+            "User-Agent": agent,
+        },
+    )
+    scope_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    scope = client.get(
+        "/api/v1/cameras/dddddddd-dddd-4ddd-8ddd-dddddddddddd/runtime",
+        headers={
+            "Cookie": f"__Host-rtsp_proxy_session={scope_session.session_token}",
+            "User-Agent": agent,
+        },
+    )
+    expired_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    stale_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE operator_sessions SET "
+                "issued_at = clock_timestamp() - INTERVAL '2 seconds', "
+                "last_seen_at = clock_timestamp() - INTERVAL '2 seconds', "
+                "idle_expires_at = clock_timestamp() - INTERVAL '1 second' "
+                "WHERE id = :id"
+            ),
+            {"id": expired_session.session.id},
+        )
+    expired = client.get(
+        "/api/v1/operator/session",
+        headers={
+            "Cookie": f"__Host-rtsp_proxy_session={expired_session.session_token}",
+            "User-Agent": agent,
+        },
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE operator_accounts SET authz_version = 2 WHERE id = :id"),
+            {"id": ACCOUNT_ID},
+        )
+    stale = client.get(
+        "/api/v1/operator/session",
+        headers={
+            "Cookie": f"__Host-rtsp_proxy_session={stale_session.session_token}",
+            "User-Agent": agent,
+        },
+    )
+    revoked_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    malformed_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    repeated_session = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE operator_sessions SET revoked_at = clock_timestamp() "
+                "WHERE id = :id"
+            ),
+            {"id": revoked_session.session.id},
+        )
+    revoked = client.get(
+        "/api/v1/operator/session",
+        headers={
+            "Cookie": f"__Host-rtsp_proxy_session={revoked_session.session_token}",
+            "User-Agent": agent,
+        },
+    )
+    malformed = client.post(
+        "/dashboard/logout",
+        content="_csrf=first&_csrf=second",
+        headers={
+            "Cookie": f"__Host-rtsp_proxy_session={malformed_session.session_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": agent,
+        },
+    )
+    repeated_headers = {
+        "Cookie": f"__Host-rtsp_proxy_session={repeated_session.session_token}",
+        "X-CSRF-Token": repeated_session.csrf_token,
+        "User-Agent": agent,
+    }
+    logout = client.delete("/api/v1/operator/session", headers=repeated_headers)
+    repeated = client.delete("/api/v1/operator/session", headers=repeated_headers)
+
+    responses = (
+        anonymous,
+        csrf,
+        scope,
+        expired,
+        stale,
+        revoked,
+        malformed,
+        logout,
+        repeated,
+    )
+    assert tuple(response.status_code for response in responses) == (
+        401,
+        401,
+        403,
+        401,
+        401,
+        401,
+        401,
+        204,
+        401,
+    )
+    with engine.connect() as connection:
+        audit = tuple(
+            connection.execute(
+                text(
+                    "SELECT id, aggregate_type, aggregate_id, event_type, payload "
+                    "FROM audit_events WHERE event_type IN ("
+                    "'operator.authentication_denied', "
+                    "'operator.authorization_denied', "
+                    "'operator.session_logout') ORDER BY occurred_at, id"
+                )
+            ).mappings()
+        )
+        outbox = tuple(
+            connection.execute(
+                text(
+                    "SELECT id, aggregate_type, aggregate_id, event_type, payload "
+                    "FROM outbox_messages WHERE event_type IN ("
+                    "'operator.authentication_denied', "
+                    "'operator.authorization_denied', "
+                    "'operator.session_logout') ORDER BY occurred_at, id"
+                )
+            ).mappings()
+        )
+    engine.dispose()
+    store.close()
+
+    assert audit == outbox
+    assert len(audit) == len(responses)
+    assert tuple(row["payload"]["reason_code"] for row in audit) == (
+        "operator_session_invalid",
+        "operator_csrf_invalid",
+        "operator_scope_denied",
+        "operator_session_expired",
+        "operator_session_stale",
+        "operator_session_revoked",
+        "operator_csrf_invalid",
+        "operator_initiated",
+        "operator_session_revoked",
+    )
+    assert tuple(row["payload"]["request_id"] for row in audit) == tuple(
+        response.headers["x-request-id"] for response in responses
+    )
+    assert len({row["payload"]["request_id"] for row in audit}) == len(audit)
+    assert audit[0]["payload"]["auth_method"] is None
+    assert all(row["payload"]["auth_method"] == "oidc" for row in audit[1:])
+    assert audit[2]["payload"]["action"] == "camera.runtime_read"
+    assert audit[2]["payload"]["resource_type"] == "camera"
+    assert audit[2]["payload"]["resource_id"] == (
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    )
+    serialized = json.dumps([dict(row) for row in audit], default=str, sort_keys=True)
+    for issued in (
+        csrf_session,
+        scope_session,
+        expired_session,
+        stale_session,
+        revoked_session,
+        malformed_session,
+        repeated_session,
+    ):
+        assert issued.session_token not in serialized
+        assert issued.csrf_token not in serialized
+    assert agent not in serialized
+    assert "testclient" not in serialized
 
 
 def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:
@@ -552,6 +1023,16 @@ def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:
     }
     assert authenticated.headers["cache-control"] == "no-store"
 
+    malformed_dashboard_logout = client.post(
+        "/dashboard/logout",
+        content="_csrf=first&_csrf=second",
+        headers={
+            **cookie,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert malformed_dashboard_logout.status_code == 401
+
     missing_csrf = client.delete("/api/v1/operator/session", headers=cookie)
     assert missing_csrf.status_code == 401
     assert missing_csrf.json() == {"detail": {"code": "operator_authentication_required"}}
@@ -565,6 +1046,41 @@ def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:
     assert "HttpOnly" in logged_out.headers["set-cookie"]
     assert "Secure" in logged_out.headers["set-cookie"]
     assert "SameSite=strict" in logged_out.headers["set-cookie"]
+
+    repeated_logout = client.delete(
+        "/api/v1/operator/session",
+        headers={**cookie, "X-CSRF-Token": issued.csrf_token},
+    )
+    assert repeated_logout.status_code == 401
+    events = store.request_security_events()
+    assert tuple((event.event_type, event.reason_code) for event in events) == (
+        ("operator.authentication_denied", "operator_session_invalid"),
+        ("operator.authorization_denied", "operator_csrf_invalid"),
+        ("operator.authorization_denied", "operator_csrf_invalid"),
+        ("operator.session_logout", "operator_initiated"),
+        ("operator.authentication_denied", "operator_session_revoked"),
+    )
+    assert events[0].audit_context.action == "operator.session_read"
+    assert events[0].audit_context.http_method == "GET"
+    assert events[0].audit_context.resource_type == "session"
+    assert events[0].audit_context.resource_id == "self"
+    assert events[0].identity_source is None
+    assert events[1].audit_context.action == "operator.session_logout"
+    assert events[1].audit_context.http_method == "POST"
+    assert events[2].audit_context.action == "operator.session_logout"
+    assert events[2].audit_context.http_method == "DELETE"
+    assert events[3].audit_context.action == "operator.session_logout"
+    assert events[4].account_id == ACCOUNT_ID
+    assert events[4].session_id == issued.session.id
+    assert anonymous.headers["x-request-id"] == str(events[0].audit_context.request_id)
+    assert malformed_dashboard_logout.headers["x-request-id"] == str(
+        events[1].audit_context.request_id
+    )
+    assert missing_csrf.headers["x-request-id"] == str(events[2].audit_context.request_id)
+    assert logged_out.headers["x-request-id"] == str(events[3].audit_context.request_id)
+    assert repeated_logout.headers["x-request-id"] == str(
+        events[4].audit_context.request_id
+    )
 
 
 def test_mutating_control_endpoint_is_fenced_before_handler() -> None:
@@ -598,6 +1114,32 @@ def test_mutating_control_endpoint_is_fenced_before_handler() -> None:
     assert denied.status_code == 403
     assert denied.json() == {"detail": {"code": "operator_permission_denied"}}
     assert denied.headers["cache-control"] == "no-store"
+    event = store.request_security_events()[0]
+    assert event.event_type == "operator.authorization_denied"
+    assert event.reason_code == "operator_permission_denied"
+    assert event.audit_context.action == "node.create"
+    assert event.audit_context.resource_scope == "server:*"
+    assert event.audit_context.resource_type == "node"
+    assert event.audit_context.resource_id == "collection"
+    assert event.identity_source is OperatorIdentitySource.OIDC
+
+    node_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    restarted = client.post(
+        f"/api/v1/nodes/{node_id}/restart",
+        headers={**cookie, "X-CSRF-Token": issued.csrf_token},
+    )
+    deleted = client.delete(
+        f"/api/v1/nodes/{node_id}",
+        headers={**cookie, "X-CSRF-Token": issued.csrf_token},
+    )
+    assert restarted.status_code == deleted.status_code == 403
+    restart_event, delete_event = store.request_security_events()[-2:]
+    assert restart_event.audit_context.action == "node.restart"
+    assert delete_event.audit_context.action == "node.delete"
+    assert restart_event.audit_context.resource_type == "node"
+    assert delete_event.audit_context.resource_type == "node"
+    assert restart_event.audit_context.resource_id == str(node_id)
+    assert delete_event.audit_context.resource_id == str(node_id)
 
 
 def test_camera_scoped_session_reaches_only_its_exact_api_resource() -> None:
@@ -612,8 +1154,9 @@ def test_camera_scoped_session_reaches_only_its_exact_api_resource() -> None:
         authz_version=1,
         enabled=True,
     )
+    store = InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW)
     sessions = OperatorSessionControl(
-        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        store=store,
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
     )
     issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
@@ -629,11 +1172,112 @@ def test_camera_scoped_session_reaches_only_its_exact_api_resource() -> None:
         headers=cookie,
     )
     global_catalog = client.get("/api/v1/cameras", headers=cookie)
+    own_session = client.get("/api/v1/operator/session", headers=cookie)
+    logout_page = client.get("/dashboard/logout", headers=cookie)
+    logged_out = client.post(
+        "/dashboard/logout",
+        headers=cookie,
+        data={"_csrf": issued.csrf_token},
+        follow_redirects=False,
+    )
 
     assert own.status_code == 503
     assert own.json() == {"detail": {"code": "camera_runtime_unavailable"}}
     assert cross_camera.status_code == 403
     assert global_catalog.status_code == 403
+    assert own_session.status_code == 200
+    assert logout_page.status_code == 200
+    assert logged_out.status_code == 303
+    denials = tuple(
+        event
+        for event in store.request_security_events()
+        if event.event_type == "operator.authorization_denied"
+    )
+    assert tuple(event.reason_code for event in denials) == (
+        "operator_scope_denied",
+        "operator_scope_denied",
+    )
+    assert denials[0].audit_context.action == "camera.runtime_read"
+    assert denials[0].audit_context.resource_scope == (
+        "camera:dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    )
+    assert denials[1].audit_context.action == "camera.list"
+    assert denials[1].audit_context.resource_scope == "server:*"
+    logout = store.request_security_events()[-1]
+    assert logout.audit_context.resource_scope == "session:self"
+    assert logout.audit_context.resource_type == "session"
+    assert logout.audit_context.resource_id == "self"
+
+
+@pytest.mark.parametrize("method", ["TRACE", "CONNECT", "PROPFIND"])
+def test_unsupported_operator_http_methods_are_normalized_and_audited(method: str) -> None:
+    store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            operator_sessions=OperatorSessionControl(
+                store=store,
+                token_factory=lambda: "x" * 43,
+            ),
+        ),
+        base_url="https://management.example.test",
+    )
+
+    response = client.request(method, "/api/v1/operator/session")
+
+    assert response.status_code == 401
+    event = store.request_security_events()[0]
+    assert response.headers["x-request-id"] == str(event.audit_context.request_id)
+    assert event.audit_context.action == "request.unsupported"
+    assert event.audit_context.http_method == "OTHER"
+    assert event.reason_code == "operator_session_invalid"
+
+
+def test_dashboard_form_and_move_status_denials_keep_exact_semantic_targets() -> None:
+    camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    other_camera_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    move_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:camera-viewer@example.test",
+        display_name="Camera viewer",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({f"camera:{camera_id}"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW)
+    control = OperatorSessionControl(
+        store=store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), operator_sessions=control),
+        base_url="https://management.example.test",
+    )
+    headers = {"Cookie": f"__Host-rtsp_proxy_session={issued.session_token}"}
+
+    edit = client.get(f"/dashboard/cameras/{camera_id}/edit", headers=headers)
+    move = client.get(f"/dashboard/cameras/{camera_id}/move", headers=headers)
+    move_status = client.get(
+        f"/dashboard/cameras/{other_camera_id}/moves/{move_id}",
+        headers=headers,
+    )
+
+    assert edit.status_code == move.status_code == move_status.status_code == 403
+    edit_event, move_event, status_event = store.request_security_events()
+    assert edit_event.audit_context.action == "camera.update"
+    assert edit_event.audit_context.resource_type == "camera"
+    assert edit_event.audit_context.resource_id == str(camera_id)
+    assert move_event.audit_context.action == "camera.move"
+    assert move_event.audit_context.resource_type == "camera"
+    assert move_event.audit_context.resource_id == str(camera_id)
+    assert status_event.audit_context.action == "camera.move_read"
+    assert status_event.audit_context.resource_scope == f"camera:{other_camera_id}"
+    assert status_event.audit_context.resource_type == "camera_move"
+    assert status_event.audit_context.resource_id == str(move_id)
 
 
 @pytest.mark.parametrize("persistent", [False, True])
@@ -1043,41 +1687,101 @@ def test_operator_authentication_runs_outside_the_asgi_event_loop() -> None:
     assert response.status_code == 401
 
 
-def test_logout_normalizes_authoritative_store_outage_to_retryable_503() -> None:
-    class RevokeUnavailableStore(InMemoryOperatorSessionStore):
-        def revoke_session(self, token_sha256: str) -> bool:
-            del token_sha256
-            raise OperatorSessionUnavailable("operator_session_store_unavailable")
-
+@pytest.mark.parametrize("rejected_table", ["audit_events", "outbox_messages"])
+@pytest.mark.parametrize(
+    "operation",
+    ["authentication_denial", "authorization_denial", "logout"],
+)
+def test_postgres_http_security_event_transaction_fails_closed_without_half_pair(
+    postgres_database_url: str,
+    rejected_table: str,
+    operation: str,
+) -> None:
+    upgrade_database(postgres_database_url)
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
         id=ACCOUNT_ID,
         subject="oidc:operator@example.test",
-        display_name="Оператор",
-        roles=frozenset({OperatorRole.OPERATOR}),
+        display_name="Operator",
+        roles=frozenset({OperatorRole.VIEWER}),
         scopes=frozenset({"server:*"}),
         authz_version=1,
         enabled=True,
     )
-    store = RevokeUnavailableStore(accounts=(account,), clock=lambda: NOW)
+    store = PostgresOperatorSessionStore(postgres_database_url)
+    store.create_account(account)
     control = OperatorSessionControl(
         store=store,
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
     )
     issued = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
-
-    response = TestClient(
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    trigger_name = f"reject_security_{rejected_table}_{operation}"
+    event_type = (
+        "operator.authentication_denied"
+        if operation == "authentication_denial"
+        else (
+            "operator.authorization_denied"
+            if operation == "authorization_denial"
+            else "operator.session_logout"
+        )
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"CREATE FUNCTION {trigger_name}() RETURNS trigger AS $$ "
+                "BEGIN RAISE EXCEPTION 'reject security event'; END; $$ LANGUAGE plpgsql"
+            )
+        )
+        connection.execute(
+            text(
+                f"CREATE TRIGGER {trigger_name} BEFORE INSERT ON {rejected_table} "
+                f"FOR EACH ROW WHEN (NEW.event_type = '{event_type}') "
+                f"EXECUTE FUNCTION {trigger_name}()"
+            )
+        )
+    client = TestClient(
         create_app(Settings(role=RuntimeRole.WEB), operator_sessions=control),
         base_url="https://management.example.test",
-    ).delete(
-        "/api/v1/operator/session",
-        headers={
-            "Cookie": f"__Host-rtsp_proxy_session={issued.session_token}",
-            "X-CSRF-Token": issued.csrf_token,
-        },
     )
+
+    if operation == "authentication_denial":
+        response = client.get("/api/v1/operator/session")
+    elif operation == "authorization_denial":
+        response = client.post(
+            "/api/v1/nodes",
+            json={"name": "must-not-run"},
+            headers={
+                "Cookie": f"__Host-rtsp_proxy_session={issued.session_token}",
+                "X-CSRF-Token": issued.csrf_token,
+            },
+        )
+    else:
+        response = client.delete(
+            "/api/v1/operator/session",
+            headers={
+                "Cookie": f"__Host-rtsp_proxy_session={issued.session_token}",
+                "X-CSRF-Token": issued.csrf_token,
+            },
+        )
 
     assert response.status_code == 503
     assert response.json() == {"detail": {"code": "operator_session_unavailable"}}
     assert response.headers["retry-after"] == "1"
     assert response.headers["cache-control"] == "no-store"
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT count(*) FROM audit_events WHERE event_type = :event_type"),
+            {"event_type": event_type},
+        ) == 0
+        assert connection.scalar(
+            text("SELECT count(*) FROM outbox_messages WHERE event_type = :event_type"),
+            {"event_type": event_type},
+        ) == 0
+        if operation == "logout":
+            assert connection.scalar(
+                text("SELECT revoked_at IS NULL FROM operator_sessions WHERE id = :id"),
+                {"id": issued.session.id},
+            ) is True
+    engine.dispose()
+    store.close()
