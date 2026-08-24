@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-10
-- Updated: 2026-08-13
+- Updated: 2026-08-24
 - Decision owners: technical owner, security owner, operations owner
 - Related issues: #1, #4, #8, #9, #10
 
@@ -36,10 +36,21 @@ one authoritative PostgreSQL query, evaluates the normalized peer-IP policy
 before reading any grant row, then checks the generated high-entropy token with
 constant-time HMAC-SHA-256 under a versioned pepper. Raw tokens are one-time
 outputs and are never stored. Grant kind, explicit expiry, server-derived
-creator and safe last-use metadata are persisted. Until Phase F authenticates
-operators, creator is the fixed bootstrap control-plane principal rather than
-caller input. There is no positive or negative decision
-cache.
+creator and safe last-use metadata are persisted. Authenticated dashboard/API
+writes derive creator from the operator account. The compatibility seam uses a
+fixed bootstrap control-plane principal; caller input cannot forge either.
+There is no positive or negative decision cache.
+The operator administration boundary is camera-scoped. Secret-free grant-list
+reads append a durable sanitized audit event. Grant issue/rotation and
+ACL/revoke use separate durable per-account fixed-window buckets; an exhausted
+bucket returns sanitized HTTP 429 with `Retry-After` and records the denial.
+Issue/rotation requires a session-bound UUIDv4 idempotency key, and rotation is
+classified for replay before any mutable grant-state read. The one-time
+dashboard secret view automatically returns to a secret-free page within 30
+seconds. Rejected replay, key-conflict, not-found and stale-revision attempts
+append a separate sanitized synchronous audit/outbox pair after the failed
+grant transaction rolls back; the rejection response fails closed when this
+security journal cannot be written.
 During pepper rotation, the primary key signs new grants while explicitly
 configured previous keys are verify-only. A successful old-key verification
 atomically rehashes the verifier under the primary key with an optimistic

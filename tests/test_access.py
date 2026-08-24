@@ -10,6 +10,8 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -24,6 +26,11 @@ from rtsp_proxy.access import (
     AccessDecisionTelemetry,
     AccessGrant,
     AccessGrantControl,
+    AccessGrantIdempotency,
+    AccessGrantIdempotencyConflict,
+    AccessGrantIssueReplayed,
+    AccessGrantSchemaUnavailable,
+    AccessGrantSummary,
     AccessPolicy,
     AccessPolicyControl,
     AccessTarget,
@@ -47,6 +54,7 @@ from rtsp_proxy.nodes import (
     CameraNotFound,
     NodeControl,
     NodeHealth,
+    NodeMutationContext,
     NodeRuntimeObservation,
     NodeState,
 )
@@ -71,6 +79,9 @@ class RecordingAccessStore:
         self.calls: list[str] = []
         self.created: list[AccessGrant] = []
 
+    def check_access_grant_request(self, request: AccessGrantIdempotency) -> None:
+        del request
+
     def get_access_target(
         self, *, node_id: UUID, public_id: PublicId
     ) -> AccessTarget | None:
@@ -89,13 +100,31 @@ class RecordingAccessStore:
             return None
         return self.grant
 
-    def create_access_grant(self, grant: AccessGrant) -> AccessGrant:
+    def create_access_grant(
+        self,
+        grant: AccessGrant,
+        *,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
+    ) -> AccessGrant:
+        del mutation_context, idempotency
         self.created.append(grant)
         self.grant = grant
         return grant
 
     def get_access_grant_by_id(self, grant_id: UUID) -> AccessGrant | None:
         return self.grant if self.grant is not None and self.grant.id == grant_id else None
+
+    def list_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        limit: int,
+    ) -> tuple[AccessGrantSummary, ...]:
+        if self.grant is None or self.grant.camera_id != camera_id:
+            return ()
+        assert 1 <= limit <= 101
+        return (AccessGrantSummary.from_grant(self.grant),)
 
     def rehash_access_grant(
         self,
@@ -130,7 +159,9 @@ class RecordingAccessStore:
         policy: AccessPolicy,
         *,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessPolicy:
+        del mutation_context
         assert self.target.policy.revision == expected_revision
         self.target = replace(self.target, policy=policy)
         return policy
@@ -141,7 +172,9 @@ class RecordingAccessStore:
         *,
         revoked_at: datetime,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessGrant:
+        del mutation_context
         assert self.grant is not None
         assert self.grant.id == grant_id
         assert self.grant.revision == expected_revision
@@ -159,7 +192,10 @@ class RecordingAccessStore:
         replacement: AccessGrant,
         old_expires_at: datetime,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
     ) -> tuple[AccessGrant, AccessGrant]:
+        del mutation_context, idempotency
         assert self.grant is not None
         assert self.grant.id == grant_id
         assert self.grant.revision == expected_revision
@@ -190,6 +226,27 @@ def callback_headers(node_id: UUID = NODE_ID) -> dict[str, str]:
     return {"authorization": verifier().callback_authorization(node_id)}
 
 
+def mutation_context(idempotency_key: UUID) -> NodeMutationContext:
+    return NodeMutationContext(
+        actor_account_id=UUID("60000000-0000-4000-8000-000000000006"),
+        actor_session_id=UUID("70000000-0000-4000-8000-000000000007"),
+        identity_source="oidc",
+        actor_subject="grant-admin@example.test",
+        roles=("admin",),
+        scopes=(f"camera:{CAMERA_ID}",),
+        authz_version=1,
+        request_id=uuid4(),
+        action="camera.grant_rotate",
+        http_method="POST",
+        resource_scope=f"camera:{CAMERA_ID}",
+        resource_type="camera",
+        resource_id=str(CAMERA_ID),
+        source_ip_sha256="a" * 64,
+        user_agent_sha256="b" * 64,
+        idempotency_key=idempotency_key,
+    )
+
+
 def grant_for(password: str = "token") -> AccessGrant:
     secret_verifier = verifier()
     return AccessGrant(
@@ -203,6 +260,121 @@ def grant_for(password: str = "token") -> AccessGrant:
         revoked_at=None,
         revision=1,
     )
+
+
+def test_operator_grant_mutations_require_bound_idempotency() -> None:
+    key = UUID("80000000-0000-4000-8000-000000000008")
+    store = RecordingAccessStore(policy=policy(), grant=grant_for())
+    control = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=lambda: UUID("90000000-0000-4000-8000-000000000009"),
+        clock=lambda: NOW,
+        new_secret=lambda: "I" * 43,
+    )
+
+    with pytest.raises(ValueError, match="access_grant_idempotency_invalid"):
+        control.create(
+            camera_id=CAMERA_ID,
+            lifetime=timedelta(hours=1),
+            mutation_context=mutation_context(key),
+        )
+    with pytest.raises(ValueError, match="access_grant_idempotency_invalid"):
+        control.rotate(
+            GRANT_ID,
+            camera_id=CAMERA_ID,
+            expected_revision=1,
+            overlap=timedelta(0),
+            lifetime=timedelta(hours=1),
+            mutation_context=mutation_context(key),
+        )
+
+
+def test_grant_rotation_replay_is_rejected_before_mutable_state_read() -> None:
+    key = UUID("80000000-0000-4000-8000-000000000008")
+
+    class ReplayedStore(RecordingAccessStore):
+        def check_access_grant_request(self, request: AccessGrantIdempotency) -> None:
+            assert request.operation == "rotate"
+            raise AccessGrantIssueReplayed("access_grant_issue_replayed")
+
+        def get_access_grant_by_id(self, grant_id: UUID) -> AccessGrant | None:
+            raise AssertionError(f"mutable state read after replay: {grant_id}")
+
+    control = AccessGrantControl(
+        store=ReplayedStore(policy=policy(), grant=None),
+        verifier=verifier(),
+        new_grant_id=lambda: UUID("90000000-0000-4000-8000-000000000009"),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(AccessGrantIssueReplayed, match="access_grant_issue_replayed"):
+        control.rotate(
+            GRANT_ID,
+            camera_id=CAMERA_ID,
+            expected_revision=1,
+            overlap=timedelta(0),
+            lifetime=timedelta(hours=1),
+            mutation_context=mutation_context(key),
+            idempotency_key=key,
+        )
+
+
+def test_authenticated_grant_issue_fails_closed_until_schema_0017(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0016_node_registration_keys")
+    store = PostgresNodeStore(postgres_database_url)
+    idempotency = AccessGrantIdempotency(
+        key=UUID("80000000-0000-4000-8000-000000000008"),
+        actor_account_id=UUID("60000000-0000-4000-8000-000000000006"),
+        actor_session_id=UUID("70000000-0000-4000-8000-000000000007"),
+        operation="issue",
+        camera_id=CAMERA_ID,
+        source_grant_id=None,
+        replacement_grant_id=GRANT_ID,
+        request_sha256="a" * 64,
+    )
+
+    with pytest.raises(
+        AccessGrantSchemaUnavailable,
+        match="access_grant_schema_unavailable",
+    ):
+        store.create_access_grant(grant_for(), idempotency=idempotency)
+    control = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=lambda: GRANT_ID,
+        clock=lambda: NOW,
+    )
+    context = mutation_context(idempotency.key)
+    with pytest.raises(
+        AccessGrantSchemaUnavailable,
+        match="access_grant_schema_unavailable",
+    ):
+        control.create(
+            camera_id=CAMERA_ID,
+            lifetime=timedelta(hours=1),
+            mutation_context=context,
+            idempotency_key=idempotency.key,
+        )
+    with pytest.raises(
+        AccessGrantSchemaUnavailable,
+        match="access_grant_schema_unavailable",
+    ):
+        control.rotate(
+            GRANT_ID,
+            camera_id=CAMERA_ID,
+            expected_revision=1,
+            overlap=timedelta(0),
+            lifetime=timedelta(hours=1),
+            mutation_context=context,
+            idempotency_key=idempotency.key,
+        )
+
+    store.close()
 
 
 def request(
@@ -769,6 +941,138 @@ def test_postgres_access_policy_grant_rotation_and_authorization_are_durable(
     store.close()
 
 
+def test_postgres_grant_issue_is_operator_attributed_and_idempotent(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    node = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=ReadyNodeRuntime(),
+    ).register_node(
+        name="node-idempotent-grant",
+        port_range_start=12000,
+        port_range_end=12000,
+        max_nodes=1,
+    )
+    node = NodeControl(
+        store=store,
+        choose_port=lambda ports: ports[0],
+        new_node_id=lambda: NODE_ID,
+        node_runtime=ReadyNodeRuntime(),
+    ).start_node(node.id)
+    camera = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: str(PUBLIC_ID),
+    ).create_camera(
+        name="camera-idempotent-grant",
+        source_url="rtsp://camera.invalid/main",
+        node_id=node.id,
+    )
+    account_id = UUID("60000000-0000-4000-8000-000000000006")
+    session_id = UUID("70000000-0000-4000-8000-000000000007")
+    idempotency_key = UUID("80000000-0000-4000-8000-000000000008")
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operator_accounts "
+                "(id, identity_source, subject, display_name, roles, scopes, "
+                "authz_version, enabled) VALUES "
+                "(:id, 'oidc', 'grant-admin@example.test', 'Grant admin', "
+                "ARRAY['admin']::varchar[], ARRAY['server:*']::varchar[], 1, true)"
+            ),
+            {"id": account_id},
+        )
+    context = NodeMutationContext(
+        actor_account_id=account_id,
+        actor_session_id=session_id,
+        identity_source="oidc",
+        actor_subject="grant-admin@example.test",
+        roles=("admin",),
+        scopes=("server:*",),
+        authz_version=1,
+        request_id=uuid4(),
+        action="camera.grant_issue",
+        http_method="POST",
+        resource_scope=f"camera:{camera.id}",
+        resource_type="camera",
+        resource_id=str(camera.id),
+        source_ip_sha256="a" * 64,
+        user_agent_sha256="b" * 64,
+        idempotency_key=idempotency_key,
+    )
+    grant_ids = iter(
+        (
+            GRANT_ID,
+            UUID("90000000-0000-4000-8000-000000000009"),
+            UUID("a0000000-0000-4000-8000-00000000000a"),
+        )
+    )
+    control = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=lambda: next(grant_ids),
+        clock=lambda: NOW,
+        new_secret=lambda: "I" * 43,
+    )
+
+    issued = control.create(
+        camera_id=camera.id,
+        lifetime=timedelta(hours=1),
+        created_by=f"operator:{account_id}",
+        mutation_context=context,
+        idempotency_key=idempotency_key,
+    )
+    with pytest.raises(AccessGrantIssueReplayed, match="access_grant_issue_replayed"):
+        control.create(
+            camera_id=camera.id,
+            lifetime=timedelta(hours=1),
+            created_by=f"operator:{account_id}",
+            mutation_context=context,
+            idempotency_key=idempotency_key,
+        )
+    with pytest.raises(
+        AccessGrantIdempotencyConflict,
+        match="access_grant_idempotency_conflict",
+    ):
+        control.create(
+            camera_id=camera.id,
+            lifetime=timedelta(hours=2),
+            created_by=f"operator:{account_id}",
+            mutation_context=context,
+            idempotency_key=idempotency_key,
+        )
+
+    listed = store.list_access_grants(camera.id, limit=101)
+    with engine.connect() as connection:
+        request_count = connection.scalar(
+            text("SELECT count(*) FROM access_grant_issue_requests")
+        )
+        event_payload = connection.scalar(
+            text(
+                "SELECT payload FROM audit_events "
+                "WHERE aggregate_id=:grant_id AND event_type='camera.access_grant_created'"
+            ),
+            {"grant_id": GRANT_ID},
+        )
+    engine.dispose()
+    store.close()
+
+    assert issued.grant.id == GRANT_ID
+    assert len(listed) == 1
+    assert listed[0].id == GRANT_ID
+    assert not hasattr(listed[0], "token_verifier")
+    assert not hasattr(listed[0], "pepper_key_id")
+    assert request_count == 1
+    assert event_payload["operator"]["account_id"] == str(account_id)
+    assert event_payload["operator"]["idempotency_key"] == str(idempotency_key)
+    assert "pepper_key_id" not in event_payload
+
+
 def test_postgres_previous_pepper_rehash_is_revisioned_and_audited(
     postgres_database_url: str,
 ) -> None:
@@ -1040,6 +1344,15 @@ def test_access_http_contract_reveals_secret_once_and_denials_have_one_shape() -
     assert issued.json()["created_by"] == "bootstrap-control-plane"
     assert "token_verifier" not in issued.text
 
+    listed = client.get(f"/api/v1/cameras/{CAMERA_ID}/access-grants")
+    assert listed.status_code == 200
+    assert listed.json()["count"] == 1
+    assert listed.json()["truncated"] is False
+    assert listed.json()["items"][0]["username"] == issued.json()["username"]
+    assert "password" not in listed.text
+    assert "token_verifier" not in listed.text
+    assert "pepper_key_id" not in listed.text
+
     denied_payloads = (
         {
             "user": issued.json()["username"],
@@ -1138,10 +1451,13 @@ def test_access_http_endpoints_fail_closed_when_controls_or_records_are_missing(
         },
     ).status_code == 503
     assert client.post(
-        f"/api/v1/access-grants/{GRANT_ID}/rotate",
-        json={"lifetime_seconds": 3600},
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants/{GRANT_ID}/rotate",
+        json={"lifetime_seconds": 3600, "expected_revision": 1},
     ).status_code == 503
-    assert client.delete(f"/api/v1/access-grants/{GRANT_ID}").status_code == 503
+    assert client.delete(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants/{GRANT_ID}",
+        params={"expected_revision": 1},
+    ).status_code == 503
 
     store = RecordingAccessStore(policy=policy(), grant=None)
     configured = TestClient(
@@ -1161,10 +1477,13 @@ def test_access_http_endpoints_fail_closed_when_controls_or_records_are_missing(
         f"/api/v1/cameras/{UUID(int=99)}/access-policy"
     ).status_code == 404
     assert configured.post(
-        f"/api/v1/access-grants/{GRANT_ID}/rotate",
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants/{GRANT_ID}/rotate",
         json={},
     ).status_code == 422
-    assert configured.delete(f"/api/v1/access-grants/{GRANT_ID}").status_code == 404
+    assert configured.delete(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants/{GRANT_ID}",
+        params={"expected_revision": 1},
+    ).status_code == 404
     invalid = configured.put(
         f"/api/v1/cameras/{CAMERA_ID}/access-policy",
         json={
@@ -1185,7 +1504,9 @@ def test_access_grant_revoke_revision_race_is_a_typed_conflict() -> None:
             *,
             revoked_at: datetime,
             expected_revision: int,
+            mutation_context: NodeMutationContext | None = None,
         ) -> AccessGrant:
+            del mutation_context
             raise CameraLifecycleConflict("access_grant_revision_conflict")
 
     store = ConflictingStore(policy=policy(), grant=grant_for())
@@ -1201,7 +1522,10 @@ def test_access_grant_revoke_revision_race_is_a_typed_conflict() -> None:
         )
     )
 
-    response = client.delete(f"/api/v1/access-grants/{GRANT_ID}")
+    response = client.delete(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants/{GRANT_ID}",
+        params={"expected_revision": 1},
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "access_grant_revision_conflict"

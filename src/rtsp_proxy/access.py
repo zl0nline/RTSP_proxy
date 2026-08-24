@@ -29,6 +29,7 @@ from typing import Protocol
 from uuid import UUID
 
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.nodes import NodeMutationContext
 
 MAX_ACCESS_POLICY_CIDRS = 128
 MIN_GRANT_LIFETIME = timedelta(seconds=1)
@@ -39,6 +40,18 @@ MAX_ACCESS_PEPPER_KEYS = 2
 
 class AccessPepperFileError(ValueError):
     """The shared callback/grant pepper file violates its Linux boundary."""
+
+
+class AccessGrantIssueReplayed(RuntimeError):
+    """A secret-bearing issue/rotate request was already committed."""
+
+
+class AccessGrantIdempotencyConflict(RuntimeError):
+    """An idempotency key was reused for a different grant request."""
+
+
+class AccessGrantSchemaUnavailable(RuntimeError):
+    """The schema cannot yet persist an authenticated secret-bearing request."""
 
 
 def canonicalize_cidrs(values: Sequence[str]) -> tuple[str, ...]:
@@ -126,6 +139,65 @@ class AccessGrant:
             self.not_before <= moment < self.expires_at
             and (self.revoked_at is None or moment < self.revoked_at)
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AccessGrantSummary:
+    """Secret-free grant metadata safe for operator lists and confirmations."""
+
+    id: UUID
+    camera_id: UUID
+    username: str
+    not_before: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    revision: int
+    kind: str
+    created_by: str
+    last_used_at: datetime | None
+
+    @classmethod
+    def from_grant(cls, grant: AccessGrant) -> AccessGrantSummary:
+        return cls(
+            id=grant.id,
+            camera_id=grant.camera_id,
+            username=grant.username,
+            not_before=grant.not_before,
+            expires_at=grant.expires_at,
+            revoked_at=grant.revoked_at,
+            revision=grant.revision,
+            kind=grant.kind,
+            created_by=grant.created_by,
+            last_used_at=grant.last_used_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AccessGrantPage:
+    items: tuple[AccessGrantSummary, ...]
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AccessGrantIdempotency:
+    key: UUID
+    actor_account_id: UUID
+    actor_session_id: UUID
+    operation: str
+    camera_id: UUID
+    source_grant_id: UUID | None
+    replacement_grant_id: UUID
+    request_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.key.version != 4
+            or self.operation not in {"issue", "rotate"}
+            or (self.operation == "issue") != (self.source_grant_id is None)
+            or len(self.request_sha256) != 64
+            or set(self.request_sha256) - set("0123456789abcdef")
+        ):
+            raise ValueError("access_grant_idempotency_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,9 +349,24 @@ class AccessAuthorizerStore(Protocol):
 
 
 class AccessGrantStore(Protocol):
-    def create_access_grant(self, grant: AccessGrant) -> AccessGrant: ...
+    def check_access_grant_request(self, request: AccessGrantIdempotency) -> None: ...
+
+    def create_access_grant(
+        self,
+        grant: AccessGrant,
+        *,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
+    ) -> AccessGrant: ...
 
     def get_access_grant_by_id(self, grant_id: UUID) -> AccessGrant | None: ...
+
+    def list_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        limit: int,
+    ) -> tuple[AccessGrantSummary, ...]: ...
 
     def revoke_access_grant(
         self,
@@ -287,6 +374,7 @@ class AccessGrantStore(Protocol):
         *,
         revoked_at: datetime,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessGrant: ...
 
     def rotate_access_grant(
@@ -296,6 +384,8 @@ class AccessGrantStore(Protocol):
         replacement: AccessGrant,
         old_expires_at: datetime,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
     ) -> tuple[AccessGrant, AccessGrant]: ...
 
 
@@ -307,6 +397,7 @@ class AccessPolicyStore(Protocol):
         policy: AccessPolicy,
         *,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessPolicy: ...
 
 
@@ -327,6 +418,7 @@ class AccessPolicyControl:
         internet_cidrs: Sequence[str],
         local_cidrs: Sequence[str],
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessPolicy:
         if expected_revision < 1:
             raise ValueError("access_policy_revision_invalid")
@@ -336,7 +428,16 @@ class AccessPolicyControl:
             internet_cidrs=tuple(internet_cidrs),
             local_cidrs=tuple(local_cidrs),
         )
-        return self._store.set_access_policy(policy, expected_revision=expected_revision)
+        if mutation_context is None:
+            return self._store.set_access_policy(
+                policy,
+                expected_revision=expected_revision,
+            )
+        return self._store.set_access_policy(
+            policy,
+            expected_revision=expected_revision,
+            mutation_context=mutation_context,
+        )
 
 
 class PepperVerifier:
@@ -682,9 +783,26 @@ class AccessGrantControl:
         lifetime: timedelta,
         kind: str = "temporary",
         created_by: str = "bootstrap-operator",
+        mutation_context: NodeMutationContext | None = None,
+        idempotency_key: UUID | None = None,
     ) -> IssuedAccessGrant:
         now = self._clock()
         grant_id = self._new_grant_id()
+        idempotency = self._idempotency(
+            key=idempotency_key,
+            mutation_context=mutation_context,
+            operation="issue",
+            camera_id=camera_id,
+            source_grant_id=None,
+            replacement_grant_id=grant_id,
+            request={
+                "camera_id": str(camera_id),
+                "kind": kind,
+                "lifetime_seconds": int(lifetime.total_seconds()),
+            },
+        )
+        if idempotency is not None:
+            self._store.check_access_grant_request(idempotency)
         issued = self._issue(
             camera_id=camera_id,
             grant_id=grant_id,
@@ -693,19 +811,62 @@ class AccessGrantControl:
             kind=kind,
             created_by=created_by,
         )
-        persisted = self._store.create_access_grant(issued.grant)
+        if mutation_context is None and idempotency is None:
+            persisted = self._store.create_access_grant(issued.grant)
+        else:
+            persisted = self._store.create_access_grant(
+                issued.grant,
+                mutation_context=mutation_context,
+                idempotency=idempotency,
+            )
         return IssuedAccessGrant(grant=persisted, secret=issued.secret)
 
-    def revoke(self, grant_id: UUID) -> AccessGrant:
-        current = self._store.get_access_grant_by_id(grant_id)
-        if current is None:
+    def get(
+        self,
+        grant_id: UUID,
+        *,
+        camera_id: UUID | None = None,
+    ) -> AccessGrantSummary:
+        grant = self._store.get_access_grant_by_id(grant_id)
+        if grant is None or (camera_id is not None and grant.camera_id != camera_id):
             raise LookupError("access_grant_not_found")
+        return AccessGrantSummary.from_grant(grant)
+
+    def list_for_camera(self, camera_id: UUID, *, limit: int = 100) -> AccessGrantPage:
+        if not 1 <= limit <= 100:
+            raise ValueError("access_grant_list_limit_invalid")
+        grants = self._store.list_access_grants(camera_id, limit=limit + 1)
+        return AccessGrantPage(items=grants[:limit], truncated=len(grants) > limit)
+
+    def revoke(
+        self,
+        grant_id: UUID,
+        *,
+        camera_id: UUID | None = None,
+        expected_revision: int | None = None,
+        mutation_context: NodeMutationContext | None = None,
+    ) -> AccessGrant:
+        if mutation_context is not None and expected_revision is None:
+            raise ValueError("access_grant_revision_required")
+        current = self._store.get_access_grant_by_id(grant_id)
+        if current is None or (camera_id is not None and current.camera_id != camera_id):
+            raise LookupError("access_grant_not_found")
+        revision = current.revision if expected_revision is None else expected_revision
         if current.revoked_at is not None:
+            if revision != current.revision:
+                raise LookupError("access_grant_not_found")
             return current
+        if mutation_context is None:
+            return self._store.revoke_access_grant(
+                grant_id,
+                revoked_at=self._clock(),
+                expected_revision=revision,
+            )
         return self._store.revoke_access_grant(
             grant_id,
             revoked_at=self._clock(),
-            expected_revision=current.revision,
+            expected_revision=revision,
+            mutation_context=mutation_context,
         )
 
     def rotate(
@@ -714,30 +875,109 @@ class AccessGrantControl:
         *,
         overlap: timedelta,
         lifetime: timedelta,
+        camera_id: UUID | None = None,
+        expected_revision: int | None = None,
+        created_by: str | None = None,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency_key: UUID | None = None,
     ) -> IssuedAccessGrant:
         if overlap < timedelta(0) or overlap > MAX_ROTATION_OVERLAP:
             raise ValueError("access_grant_overlap_invalid")
+        if mutation_context is not None and (
+            camera_id is None or expected_revision is None
+        ):
+            raise ValueError("access_grant_revision_required")
+        replacement_grant_id = self._new_grant_id()
+        idempotency = self._idempotency(
+            key=idempotency_key,
+            mutation_context=mutation_context,
+            operation="rotate",
+            camera_id=camera_id if camera_id is not None else UUID(int=0),
+            source_grant_id=grant_id,
+            replacement_grant_id=replacement_grant_id,
+            request={
+                "camera_id": None if camera_id is None else str(camera_id),
+                "grant_id": str(grant_id),
+                "expected_revision": expected_revision,
+                "overlap_seconds": int(overlap.total_seconds()),
+                "lifetime_seconds": int(lifetime.total_seconds()),
+            },
+        )
+        if idempotency is not None:
+            self._store.check_access_grant_request(idempotency)
         current = self._store.get_access_grant_by_id(grant_id)
-        if current is None or current.revoked_at is not None:
+        if (
+            current is None
+            or current.revoked_at is not None
+            or (camera_id is not None and current.camera_id != camera_id)
+        ):
             raise LookupError("access_grant_not_found")
+        revision = current.revision if expected_revision is None else expected_revision
         now = self._clock()
         if not current.active_at(now):
             raise LookupError("access_grant_not_found")
         issued = self._issue(
             camera_id=current.camera_id,
-            grant_id=self._new_grant_id(),
+            grant_id=replacement_grant_id,
             now=now,
             lifetime=lifetime,
             kind=current.kind,
-            created_by=current.created_by,
+            created_by=current.created_by if created_by is None else created_by,
         )
-        _old, replacement = self._store.rotate_access_grant(
-            grant_id,
-            replacement=issued.grant,
-            old_expires_at=min(current.expires_at, now + overlap),
-            expected_revision=current.revision,
-        )
+        old_expires_at = min(current.expires_at, now + overlap)
+        if mutation_context is None and idempotency is None:
+            _old, replacement = self._store.rotate_access_grant(
+                grant_id,
+                replacement=issued.grant,
+                old_expires_at=old_expires_at,
+                expected_revision=revision,
+            )
+        else:
+            _old, replacement = self._store.rotate_access_grant(
+                grant_id,
+                replacement=issued.grant,
+                old_expires_at=old_expires_at,
+                expected_revision=revision,
+                mutation_context=mutation_context,
+                idempotency=idempotency,
+            )
         return IssuedAccessGrant(grant=replacement, secret=issued.secret)
+
+    @staticmethod
+    def _idempotency(
+        *,
+        key: UUID | None,
+        mutation_context: NodeMutationContext | None,
+        operation: str,
+        camera_id: UUID,
+        source_grant_id: UUID | None,
+        replacement_grant_id: UUID,
+        request: Mapping[str, object],
+    ) -> AccessGrantIdempotency | None:
+        if key is None and mutation_context is None:
+            return None
+        if (
+            key is None
+            or mutation_context is None
+            or mutation_context.idempotency_key != key
+        ):
+            raise ValueError("access_grant_idempotency_invalid")
+        encoded = json.dumps(
+            {"request_schema": 1, "operation": operation, **request},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return AccessGrantIdempotency(
+            key=key,
+            actor_account_id=mutation_context.actor_account_id,
+            actor_session_id=mutation_context.actor_session_id,
+            operation=operation,
+            camera_id=camera_id,
+            source_grant_id=source_grant_id,
+            replacement_grant_id=replacement_grant_id,
+            request_sha256=hashlib.sha256(encoded).hexdigest(),
+        )
 
     def _issue(
         self,

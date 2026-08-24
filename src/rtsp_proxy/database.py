@@ -32,13 +32,23 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, CIDR, JSONB
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.sql.base import Executable
 from sqlalchemy.sql.selectable import Select
 
-from rtsp_proxy.access import AccessGrant, AccessPolicy, AccessTarget
+from rtsp_proxy.access import (
+    AccessGrant,
+    AccessGrantIdempotency,
+    AccessGrantIdempotencyConflict,
+    AccessGrantIssueReplayed,
+    AccessGrantSchemaUnavailable,
+    AccessGrantSummary,
+    AccessPolicy,
+    AccessTarget,
+)
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
     CameraCatalogItem,
@@ -261,6 +271,51 @@ camera_access_grants = Table(
     CheckConstraint("revision >= 1"),
     CheckConstraint("kind IN ('temporary', 'service')"),
     CheckConstraint("length(created_by) BETWEEN 1 AND 128"),
+)
+
+access_grant_issue_requests = Table(
+    "access_grant_issue_requests",
+    metadata,
+    Column("actor_session_id", Uuid(as_uuid=True), primary_key=True),
+    Column("idempotency_key", Uuid(as_uuid=True), primary_key=True),
+    Column(
+        "actor_account_id",
+        Uuid(as_uuid=True),
+        ForeignKey("operator_accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("operation", String(16), nullable=False),
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "source_grant_id",
+        Uuid(as_uuid=True),
+        ForeignKey("camera_access_grants.id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("request_sha256", String(64), nullable=False),
+    Column(
+        "replacement_grant_id",
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "camera_access_grants.id",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=False,
+    ),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation IN ('issue', 'rotate')"),
+    CheckConstraint(
+        "(operation = 'issue' AND source_grant_id IS NULL) OR "
+        "(operation = 'rotate' AND source_grant_id IS NOT NULL)"
+    ),
+    CheckConstraint("request_sha256 ~ '^[0-9a-f]{64}$'"),
 )
 
 camera_placements = Table(
@@ -545,6 +600,7 @@ class PostgresNodeStore:
             ("0013_operator_login",),
             ("0014_camera_catalog_projection",),
             ("0015_camera_name_contract",),
+            ("0016_node_registration_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -579,6 +635,7 @@ class PostgresNodeStore:
             ("0013_operator_login",),
             ("0014_camera_catalog_projection",),
             ("0015_camera_name_contract",),
+            ("0016_node_registration_keys",),
             (APPLICATION_SCHEMA,),
         )
 
@@ -2144,6 +2201,7 @@ class PostgresNodeStore:
         )
         if revisions not in (
             ("0015_camera_name_contract",),
+            ("0016_node_registration_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise CameraCatalogUnavailable("camera_catalog_unavailable")
@@ -3112,6 +3170,7 @@ class PostgresNodeStore:
         policy: AccessPolicy,
         *,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessPolicy:
         if policy.revision != expected_revision + 1:
             raise ValueError("access_policy_revision_invalid")
@@ -3157,6 +3216,7 @@ class PostgresNodeStore:
                     "revision": policy.revision,
                 },
                 aggregate_revision=policy.revision,
+                mutation_context=mutation_context,
             )
             return _access_policy(row)
 
@@ -3251,6 +3311,46 @@ class PostgresNodeStore:
             )
             return None if row is None else _access_grant(row)
 
+    def list_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        limit: int,
+    ) -> tuple[AccessGrantSummary, ...]:
+        if not 1 <= limit <= 101:
+            raise ValueError("access_grant_list_limit_invalid")
+        with self._engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(
+                        camera_access_grants.c.id,
+                        camera_access_grants.c.camera_id,
+                        camera_access_grants.c.username,
+                        camera_access_grants.c.not_before,
+                        camera_access_grants.c.expires_at,
+                        camera_access_grants.c.revoked_at,
+                        camera_access_grants.c.revision,
+                        camera_access_grants.c.kind,
+                        camera_access_grants.c.created_by,
+                        camera_access_grants.c.last_used_at,
+                    )
+                    .where(camera_access_grants.c.camera_id == camera_id)
+                    .order_by(
+                        camera_access_grants.c.created_at.desc(),
+                        camera_access_grants.c.id.desc(),
+                    )
+                    .limit(limit)
+                )
+                .mappings()
+                .all()
+            )
+        return tuple(_access_grant_summary(row) for row in rows)
+
+    def check_access_grant_request(self, request: AccessGrantIdempotency) -> None:
+        with self._engine.connect() as connection:
+            _require_access_grant_idempotency_schema(connection)
+            _classify_access_grant_request(connection, request)
+
     def rehash_access_grant(
         self,
         grant_id: UUID,
@@ -3288,9 +3388,18 @@ class PostgresNodeStore:
                 )
             )
 
-    def create_access_grant(self, grant: AccessGrant) -> AccessGrant:
+    def create_access_grant(
+        self,
+        grant: AccessGrant,
+        *,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
+    ) -> AccessGrant:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
+            if idempotency is not None:
+                _require_access_grant_idempotency_schema(connection)
+                _claim_access_grant_request(connection, idempotency)
             if connection.scalar(
                 select(cameras.c.id).where(
                     cameras.c.id == grant.camera_id,
@@ -3328,6 +3437,7 @@ class PostgresNodeStore:
                 event_type="camera.access_grant_created",
                 payload=_access_grant_event_payload(grant),
                 aggregate_revision=grant.revision,
+                mutation_context=mutation_context,
             )
             return _access_grant(row)
 
@@ -3337,6 +3447,7 @@ class PostgresNodeStore:
         *,
         revoked_at: datetime,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
     ) -> AccessGrant:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
@@ -3367,6 +3478,7 @@ class PostgresNodeStore:
                 event_type="camera.access_grant_revoked",
                 payload=_access_grant_event_payload(updated),
                 aggregate_revision=updated.revision,
+                mutation_context=mutation_context,
             )
             return _access_grant(row)
 
@@ -3377,9 +3489,14 @@ class PostgresNodeStore:
         replacement: AccessGrant,
         old_expires_at: datetime,
         expected_revision: int,
+        mutation_context: NodeMutationContext | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
     ) -> tuple[AccessGrant, AccessGrant]:
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
+            if idempotency is not None:
+                _require_access_grant_idempotency_schema(connection)
+                _claim_access_grant_request(connection, idempotency)
             current = self._lock_access_grant(connection, grant_id)
             if current.revision != expected_revision or current.revoked_at is not None:
                 raise CameraLifecycleConflict("access_grant_revision_conflict")
@@ -3403,6 +3520,7 @@ class PostgresNodeStore:
                 event_type="camera.access_grant_rotation_started",
                 payload=_access_grant_event_payload(previous),
                 aggregate_revision=previous.revision,
+                mutation_context=mutation_context,
             )
             _record_normative_event(
                 connection,
@@ -3414,6 +3532,7 @@ class PostgresNodeStore:
                     "rotates_grant_id": str(grant_id),
                 },
                 aggregate_revision=persisted.revision,
+                mutation_context=mutation_context,
             )
             return previous, persisted
 
@@ -3572,7 +3691,6 @@ def _access_grant_event_payload(grant: AccessGrant) -> dict[str, object]:
     return {
         "camera_id": str(grant.camera_id),
         "username": grant.username,
-        "pepper_key_id": grant.pepper_key_id,
         "not_before": grant.not_before.isoformat(),
         "expires_at": grant.expires_at.isoformat(),
         "revoked_at": None if grant.revoked_at is None else grant.revoked_at.isoformat(),
@@ -3583,6 +3701,97 @@ def _access_grant_event_payload(grant: AccessGrant) -> dict[str, object]:
             None if grant.last_used_at is None else grant.last_used_at.isoformat()
         ),
     }
+
+
+def _access_grant_summary(row: RowMapping) -> AccessGrantSummary:
+    return AccessGrantSummary(
+        id=_uuid(row["id"]),
+        camera_id=_uuid(row["camera_id"]),
+        username=str(row["username"]),
+        not_before=row["not_before"],
+        expires_at=row["expires_at"],
+        revoked_at=row["revoked_at"],
+        revision=int(row["revision"]),
+        kind=str(row["kind"]),
+        created_by=str(row["created_by"]),
+        last_used_at=row["last_used_at"],
+    )
+
+
+def _claim_access_grant_request(
+    connection: Connection,
+    request: AccessGrantIdempotency,
+) -> None:
+    inserted = connection.scalar(
+        postgresql_insert(access_grant_issue_requests)
+        .values(
+            actor_session_id=request.actor_session_id,
+            idempotency_key=request.key,
+            actor_account_id=request.actor_account_id,
+            operation=request.operation,
+            camera_id=request.camera_id,
+            source_grant_id=request.source_grant_id,
+            request_sha256=request.request_sha256,
+            replacement_grant_id=request.replacement_grant_id,
+            created_at=func.clock_timestamp(),
+        )
+        .on_conflict_do_nothing(
+            index_elements=(
+                access_grant_issue_requests.c.actor_session_id,
+                access_grant_issue_requests.c.idempotency_key,
+            )
+        )
+        .returning(access_grant_issue_requests.c.idempotency_key)
+    )
+    if inserted is not None:
+        return
+    _classify_access_grant_request(connection, request)
+
+
+def _classify_access_grant_request(
+    connection: Connection,
+    request: AccessGrantIdempotency,
+) -> None:
+    existing = (
+        connection.execute(
+            select(access_grant_issue_requests).where(
+                access_grant_issue_requests.c.actor_session_id
+                == request.actor_session_id,
+                access_grant_issue_requests.c.idempotency_key == request.key,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if existing is None:
+        return
+    identity = (
+        _uuid(existing["actor_account_id"]),
+        str(existing["operation"]),
+        _uuid(existing["camera_id"]),
+        (
+            None
+            if existing["source_grant_id"] is None
+            else _uuid(existing["source_grant_id"])
+        ),
+        str(existing["request_sha256"]),
+    )
+    expected = (
+        request.actor_account_id,
+        request.operation,
+        request.camera_id,
+        request.source_grant_id,
+        request.request_sha256,
+    )
+    if identity != expected:
+        raise AccessGrantIdempotencyConflict("access_grant_idempotency_conflict")
+    raise AccessGrantIssueReplayed("access_grant_issue_replayed")
+
+
+def _require_access_grant_idempotency_schema(connection: Connection) -> None:
+    revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
+    if revisions != (APPLICATION_SCHEMA,):
+        raise AccessGrantSchemaUnavailable("access_grant_schema_unavailable")
 
 
 def _camera_move(row: RowMapping) -> CameraMove:

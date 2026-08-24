@@ -131,6 +131,21 @@ External client, обычно FFmpeg, читающий ordinary
 Camera-specific username/password, которыми consumer авторизуется у proxy.
 Они отделены от source credentials.
 
+## Downstream grant
+
+Revisioned camera-specific credential metadata with explicit `temporary` or
+`service` kind and expiry. The raw URL-safe secret is shown only in the first
+no-store response and is automatically removed from the dashboard after at
+most 30 seconds; PostgreSQL keeps only its versioned-pepper verifier and safe
+metadata. Authenticated issue/rotation is recent-MFA protected and uses a
+session-bound UUIDv4 idempotency key. Replay never reproduces the secret.
+Secret issue/rotation and ACL/revoke mutations use separate durable per-account
+rate buckets. A successful secret-free grant-list read is durably audited.
+Rejected replay, idempotency, not-found and stale-revision mutations append a
+separate sanitized durable audit/outbox pair after the failed mutation rolls
+back; an unavailable security journal fails the request closed.
+Revoke and ACL changes affect the next admission, not an established stream.
+
 ## Drain
 
 Node state, запрещающий new sessions и placements при сохранении existing

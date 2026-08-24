@@ -98,6 +98,8 @@ amd64 and arm64.
 
 ## Remaining gates
 
-Phase F remains **IN PROGRESS** for the remaining access-policy/grant operator
-workflow. Phase G hardware capacity, WAN/fault and 24-hour soak evidence, plus
-Phase H pilot rollout, are still open. Production remains **NO-GO**.
+The later access-policy/grant operator slice is tracked separately in
+[`phase-f-camera-access-dashboard-contract.md`](phase-f-camera-access-dashboard-contract.md).
+Phase F remains **IN PROGRESS** for its other operator workflows. Phase G
+hardware capacity, WAN/fault and 24-hour soak evidence, plus Phase H pilot
+rollout, are still open. Production remains **NO-GO**.

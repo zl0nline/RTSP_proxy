@@ -313,6 +313,43 @@ After revision 0016 commits, rollback to application 0.7.0 (maximum schema
 0015) is **NO-GO**. Recover by fixing forward with the verified 0.8.0 release or
 restore the pre-0016 PostgreSQL backup with the control plane stopped. A live
 Alembic downgrade is not supported.
+
+Application release `0.9.0` adds `0017_access_grant_keys`. Install and smoke
+0.9.0 on every WEB/background process while PostgreSQL is still at 0016.
+Existing RTSP authorization, secret-free grant reads, node operations and
+established streams remain available. Suspend all access-administration writes
+(ACL edit, grant issue/rotation/revoke) during the rolling window: the new WEB
+process fails them closed with a bounded 503 until the database reaches exact
+0017. A compatibility/bootstrap call that reaches the grant domain directly
+returns `503 access_grant_schema_unavailable` with `Retry-After: 1`; an
+authenticated request can fail earlier at the new action-rate ledger with the
+same retryable/no-secret boundary.
+
+Migration 0017 creates the bounded `access_grant_issue_requests` ledger keyed
+by `(actor_session_id, idempotency_key)` and the per-account
+`operator_action_rate_limits` ledger with independent `secret_issue` and
+`access_mutation` buckets. The request ledger stores only canonical request
+identity/digest and grant UUID references, never the raw token, verifier or
+pepper identity. Issue/rotation reserves the UUIDv4 key, writes the grant and
+appends its operator-attributed audit/outbox pair in one synchronous
+transaction. After migration, issue one short-lived lab grant with a fresh
+`Idempotency-Key`, repeat the identical request and require a secret-free 409;
+reuse the key with a changed lifetime and require a different secret-free 409.
+For both 409 outcomes, and for a stale/nonexistent rotate or revoke target,
+require a separate sanitized `operator.mutation_rejected` audit/outbox pair.
+If either append is unavailable the HTTP boundary must return 503 instead of an
+unaudited 404/409.
+The first response alone may contain the downstream secret, must carry
+`Cache-Control: no-store`, and the dashboard automatically returns to the
+secret-free grant list after at most 30 seconds. Exhaust either action bucket
+and require a sanitized 429 with an integer `Retry-After` plus a durable
+`operator_rate_limited` denial event; the other bucket must remain usable.
+
+After revision 0017 commits, rollback to application 0.8.0 (maximum schema
+0016) is **NO-GO**. Fix forward with verified 0.9.0 artifacts or restore the
+pre-0017 PostgreSQL backup with the control plane stopped. Do not downgrade the
+live schema.
+
 The five WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
 `/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running

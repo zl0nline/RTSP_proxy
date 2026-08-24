@@ -11,6 +11,14 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 
+from rtsp_proxy.access import (
+    AccessGrant,
+    AccessGrantIssueReplayed,
+    AccessGrantPage,
+    AccessGrantSummary,
+    AccessPolicy,
+    IssuedAccessGrant,
+)
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
@@ -22,8 +30,10 @@ from rtsp_proxy.nodes import (
     CameraCatalogQuery,
     CameraCatalogUnavailable,
     CameraControl,
+    CameraLifecycleConflict,
     CameraMove,
     CameraMoveState,
+    CameraNotFound,
     CameraState,
     InMemoryNodeStore,
     MaximumNodesReached,
@@ -61,6 +71,7 @@ from rtsp_proxy.operator_access import (
     OperatorIdentitySource,
     OperatorRole,
     OperatorSessionControl,
+    OperatorSessionUnavailable,
 )
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
@@ -80,6 +91,9 @@ CREATED_NODE_ID = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 CSRF_TOKEN = "c" * 43
 IDEMPOTENCY_KEY = "11111111-1111-4111-8111-111111111111"
+GRANT_ID = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+ROTATED_GRANT_ID = UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+GRANT_SECRET = "secret-token-abcdefghijklmnopqrstuvwxyz-0123456789"
 
 
 class RecordingNodeDashboardControl:
@@ -349,6 +363,157 @@ class StaticCameraCatalog:
     ) -> None:
         assert expected_revision == 3
         self.enabled_calls.append((camera_id, enabled))
+
+
+class RecordingAccessPolicies:
+    def __init__(self) -> None:
+        self.policy = AccessPolicy(
+            camera_id=CAMERA_ID,
+            revision=4,
+            internet_cidrs=("198.51.100.0/24",),
+            local_cidrs=("10.0.0.0/8",),
+        )
+        self.calls: list[tuple[object, ...]] = []
+
+    def get(self, camera_id: UUID) -> AccessPolicy:
+        assert camera_id == CAMERA_ID
+        return self.policy
+
+    def update(
+        self,
+        camera_id: UUID,
+        *,
+        internet_cidrs: tuple[str, ...],
+        local_cidrs: tuple[str, ...],
+        expected_revision: int,
+        mutation_context: NodeMutationContext,
+    ) -> AccessPolicy:
+        self.calls.append(
+            (
+                camera_id,
+                internet_cidrs,
+                local_cidrs,
+                expected_revision,
+                mutation_context,
+            )
+        )
+        self.policy = AccessPolicy(
+            camera_id=camera_id,
+            revision=expected_revision + 1,
+            internet_cidrs=internet_cidrs,
+            local_cidrs=local_cidrs,
+        )
+        return self.policy
+
+
+class RecordingAccessGrants:
+    def __init__(self) -> None:
+        self.grant = AccessGrant(
+            id=GRANT_ID,
+            camera_id=CAMERA_ID,
+            username=f"grant-{GRANT_ID.hex}",
+            token_verifier="a" * 64,
+            pepper_key_id="pepper-key-2026",
+            not_before=NOW - timedelta(minutes=5),
+            expires_at=NOW + timedelta(days=30),
+            revoked_at=None,
+            revision=3,
+            kind="service",
+            created_by=f"operator:{ACCOUNT_ID}",
+            last_used_at=NOW - timedelta(minutes=1),
+        )
+        self.calls: list[tuple[object, ...]] = []
+        self.replay_issue = False
+
+    def list_for_camera(self, camera_id: UUID, *, limit: int) -> object:
+        assert camera_id == CAMERA_ID
+        assert limit == 100
+        return AccessGrantPage(
+            items=(AccessGrantSummary.from_grant(self.grant),),
+            truncated=False,
+        )
+
+    def get(self, grant_id: UUID, *, camera_id: UUID | None = None) -> AccessGrant:
+        if grant_id != self.grant.id or camera_id not in {None, CAMERA_ID}:
+            raise LookupError("access_grant_not_found")
+        return self.grant
+
+    def create(
+        self,
+        *,
+        camera_id: UUID,
+        lifetime: timedelta,
+        kind: str,
+        created_by: str,
+        idempotency_key: UUID,
+        mutation_context: NodeMutationContext,
+    ) -> IssuedAccessGrant:
+        self.calls.append(
+            (
+                "create",
+                camera_id,
+                lifetime,
+                kind,
+                created_by,
+                idempotency_key,
+                mutation_context,
+            )
+        )
+        if self.replay_issue:
+            raise AccessGrantIssueReplayed("access_grant_issue_replayed")
+        return IssuedAccessGrant(grant=self.grant, secret=GRANT_SECRET)
+
+    def rotate(
+        self,
+        grant_id: UUID,
+        *,
+        camera_id: UUID,
+        overlap: timedelta,
+        lifetime: timedelta,
+        expected_revision: int,
+        created_by: str,
+        idempotency_key: UUID,
+        mutation_context: NodeMutationContext,
+    ) -> IssuedAccessGrant:
+        replacement = replace(
+            self.grant,
+            id=ROTATED_GRANT_ID,
+            username=f"grant-{ROTATED_GRANT_ID.hex}",
+            revision=1,
+            created_by=created_by,
+        )
+        self.calls.append(
+            (
+                "rotate",
+                grant_id,
+                camera_id,
+                overlap,
+                lifetime,
+                expected_revision,
+                created_by,
+                idempotency_key,
+                mutation_context,
+            )
+        )
+        return IssuedAccessGrant(grant=replacement, secret=GRANT_SECRET)
+
+    def revoke(
+        self,
+        grant_id: UUID,
+        *,
+        camera_id: UUID,
+        expected_revision: int,
+        mutation_context: NodeMutationContext,
+    ) -> AccessGrant:
+        self.calls.append(
+            ("revoke", grant_id, camera_id, expected_revision, mutation_context)
+        )
+        self.grant = replace(
+            self.grant,
+            revoked_at=NOW,
+            revision=expected_revision + 1,
+        )
+        return self.grant
 
 
 class FailingCameraCatalog:
@@ -687,11 +852,17 @@ def _authenticated_dashboard(
     camera_control: CameraControl | None = None,
     camera_mutation_control: object | None = None,
     camera_move_control: object | None = None,
+    access_policy_control: object | None = None,
+    access_grant_control: object | None = None,
     node_control: object | None = None,
     settings: Settings | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
     scopes: frozenset[str] = frozenset({"server:*"}),
     authenticated_at: datetime = NOW,
+    session_store: InMemoryOperatorSessionStore | None = None,
+    secret_issue_limit_per_minute: int = 10,
+    access_mutation_limit_per_minute: int = 60,
+    secret_reveal_seconds: int = 30,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
@@ -704,12 +875,17 @@ def _authenticated_dashboard(
         enabled=True,
     )
     session_clock = [NOW]
+    if session_store is None:
+        session_store = InMemoryOperatorSessionStore(
+            accounts=(account,), clock=lambda: session_clock[0]
+        )
+    else:
+        session_store.create_account(account)
     sessions = OperatorSessionControl(
-        store=InMemoryOperatorSessionStore(
-            accounts=(account,),
-            clock=lambda: session_clock[0],
-        ),
+        store=session_store,
         token_factory=iter(("s" * 43, "c" * 43)).__next__,
+        secret_issue_limit_per_minute=secret_issue_limit_per_minute,
+        access_mutation_limit_per_minute=access_mutation_limit_per_minute,
     )
     issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
     session_clock[0] = authenticated_at
@@ -723,7 +899,10 @@ def _authenticated_dashboard(
             camera_control=camera_control,
             camera_mutation_control=cast(Any, camera_mutation_control),
             camera_move_control=cast(Any, camera_move_control),
+            access_policy_control=cast(Any, access_policy_control),
+            access_grant_control=cast(Any, access_grant_control),
             node_control=cast(Any, node_control),
+            access_secret_reveal_seconds=secret_reveal_seconds,
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
@@ -2205,6 +2384,654 @@ def test_camera_detail_honors_exact_camera_scope_without_an_existence_oracle() -
     assert cross_camera.status_code == 403
     assert nonexistent.status_code == 403
     assert cross_camera.text == nonexistent.text
+
+
+def test_camera_access_dashboard_is_bounded_secret_free_and_explains_two_level_acl() -> None:
+    policies = RecordingAccessPolicies()
+    grants = RecordingAccessGrants()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=policies,
+        access_grant_control=grants,
+        role=OperatorRole.ADMIN,
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}/access"
+
+    response = client.get(path, headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-security-policy"] == (
+        "default-src 'none'; style-src 'self'; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'none'"
+    )
+    assert "Доступ к потоку" in response.text
+    assert "Интернет" in response.text
+    assert "Локальная сеть" in response.text
+    assert "198.51.100.0/24" in response.text
+    assert "10.0.0.0/8" in response.text
+    assert grants.grant.username in response.text
+    assert grants.grant.created_by in response.text
+    assert GRANT_SECRET not in response.text
+    assert grants.grant.token_verifier not in response.text
+    assert grants.grant.pepper_key_id not in response.text
+    assert "admin:secret" not in response.text
+    policy_form = response.text.split(
+        f'action="/dashboard/cameras/{CAMERA_ID}/access-policy"', 1
+    )[1].split("</form>", 1)[0]
+    issue_form = response.text.split(
+        f'action="/dashboard/cameras/{CAMERA_ID}/access-grants"', 1
+    )[1].split("</form>", 1)[0]
+    assert 'name="idempotency_key"' not in policy_form
+    assert 'name="idempotency_key"' in issue_form
+
+
+def test_camera_access_policy_update_is_revision_fenced_and_operator_attributed() -> None:
+    policies = RecordingAccessPolicies()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=policies,
+        access_grant_control=RecordingAccessGrants(),
+        role=OperatorRole.ADMIN,
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}/access-policy"
+
+    response = client.post(
+        path,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "4",
+            "internet_cidrs": "198.51.100.19/24\n203.0.113.0/24",
+            "local_cidrs": "10.1.2.3/8\n192.168.0.0/16",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/dashboard/cameras/{CAMERA_ID}/access"
+    assert len(policies.calls) == 1
+    camera_id, internet, local, revision, context = policies.calls[0]
+    assert camera_id == CAMERA_ID
+    assert internet == ("198.51.100.19/24", "203.0.113.0/24")
+    assert local == ("10.1.2.3/8", "192.168.0.0/16")
+    assert revision == 4
+    assert isinstance(context, NodeMutationContext)
+    assert context.actor_account_id == ACCOUNT_ID
+    assert context.action == "camera.access_policy_update"
+
+
+def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revision() -> None:
+    grants = RecordingAccessGrants()
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=grants,
+        role=OperatorRole.ADMIN,
+        session_store=session_store,
+    )
+    root = f"/dashboard/cameras/{CAMERA_ID}/access-grants"
+
+    issued = client.post(
+        root,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "kind": "service",
+            "lifetime_seconds": "2592000",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+    grants.replay_issue = True
+    replayed = client.post(
+        root,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "kind": "service",
+            "lifetime_seconds": "2592000",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+    grants.replay_issue = False
+    rotated = client.post(
+        f"{root}/{GRANT_ID}/rotate",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "3",
+            "overlap_seconds": "30",
+            "lifetime_seconds": "2592000",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+    confirmation = client.get(f"{root}/{GRANT_ID}/revoke", headers=headers)
+    revoked = client.post(
+        f"{root}/{GRANT_ID}/revoke",
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN, "expected_revision": "3"},
+        follow_redirects=False,
+    )
+
+    assert issued.status_code == 201
+    assert issued.headers["cache-control"] == "no-store"
+    assert issued.headers["refresh"] == (
+        f"30; url=/dashboard/cameras/{CAMERA_ID}/access"
+    )
+    assert "Показывается только один раз" in issued.text
+    assert f"rtsp://{grants.grant.username}:{GRANT_SECRET}@" in issued.text
+    assert "admin:secret" not in issued.text
+    assert replayed.status_code == 409
+    assert "Запрос уже выполнен" in replayed.text
+    assert GRANT_SECRET not in replayed.text
+    assert rotated.status_code == 201
+    assert rotated.headers["refresh"] == (
+        f"30; url=/dashboard/cameras/{CAMERA_ID}/access"
+    )
+    assert f"grant-{ROTATED_GRANT_ID.hex}" in rotated.text
+    assert confirmation.status_code == 200
+    assert "Уже установленный RTSP-сеанс продолжит работу" in confirmation.text
+    assert revoked.status_code == 303
+    assert revoked.headers["location"] == f"/dashboard/cameras/{CAMERA_ID}/access"
+    create_call, replay_call, rotate_call, revoke_call = grants.calls
+    assert create_call[4] == f"operator:{ACCOUNT_ID}"
+    assert create_call[5] == UUID(IDEMPOTENCY_KEY)
+    assert cast(NodeMutationContext, create_call[6]).action == "camera.grant_issue"
+    assert cast(NodeMutationContext, create_call[6]).idempotency_key == UUID(
+        IDEMPOTENCY_KEY
+    )
+    assert replay_call[5] == UUID(IDEMPOTENCY_KEY)
+    assert rotate_call[1:5] == (
+        GRANT_ID,
+        CAMERA_ID,
+        timedelta(seconds=30),
+        timedelta(days=30),
+    )
+    assert rotate_call[5] == 3
+    assert rotate_call[6] == f"operator:{ACCOUNT_ID}"
+    assert rotate_call[7] == UUID(IDEMPOTENCY_KEY)
+    assert cast(NodeMutationContext, rotate_call[8]).action == "camera.grant_rotate"
+    assert revoke_call[1:4] == (GRANT_ID, CAMERA_ID, 3)
+    assert cast(NodeMutationContext, revoke_call[4]).action == "camera.grant_revoke"
+    rejected = [
+        event
+        for event in session_store.request_security_events()
+        if event.event_type == "operator.mutation_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0].reason_code == "access_grant_issue_replayed"
+    assert rejected[0].target_grant_id is None
+    assert rejected[0].expected_revision is None
+    assert rejected[0].idempotency_key == UUID(IDEMPOTENCY_KEY)
+    assert rejected[0].audit_context.resource_scope == f"camera:{CAMERA_ID}"
+
+    stale, stale_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=RecordingAccessGrants(),
+        role=OperatorRole.ADMIN,
+        authenticated_at=NOW + timedelta(minutes=6),
+    )
+    stale_issue = stale.post(
+        root,
+        headers=stale_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "kind": "service",
+            "lifetime_seconds": "2592000",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+    assert stale_issue.status_code == 401
+    assert "Требуется недавняя MFA" in stale_issue.text
+
+
+def test_operator_access_api_requires_mfa_idempotency_and_uses_authenticated_actor() -> None:
+    grants = RecordingAccessGrants()
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=grants,
+        role=OperatorRole.ADMIN,
+    )
+    path = f"/api/v1/cameras/{CAMERA_ID}/access-grants"
+    headers = {**cookie_headers, "X-CSRF-Token": CSRF_TOKEN}
+
+    missing_key = client.post(
+        path,
+        headers=headers,
+        json={"kind": "service", "lifetime_seconds": 3600},
+    )
+    issued = client.post(
+        path,
+        headers={**headers, "Idempotency-Key": IDEMPOTENCY_KEY},
+        json={"kind": "service", "lifetime_seconds": 3600},
+    )
+    missing_rotate_revision = client.post(
+        f"{path}/{GRANT_ID}/rotate",
+        headers={
+            **headers,
+            "Idempotency-Key": "22222222-2222-4222-8222-222222222222",
+        },
+        json={"lifetime_seconds": 3600},
+    )
+    missing_revoke_revision = client.delete(
+        f"{path}/{GRANT_ID}",
+        headers=headers,
+    )
+    rotated = client.post(
+        f"{path}/{GRANT_ID}/rotate",
+        headers={
+            **headers,
+            "Idempotency-Key": "33333333-3333-4333-8333-333333333333",
+        },
+        json={"lifetime_seconds": 3600, "expected_revision": 3},
+    )
+    revoked = client.delete(
+        f"{path}/{GRANT_ID}",
+        headers=headers,
+        params={"expected_revision": 3},
+    )
+
+    assert missing_key.status_code == 428
+    assert missing_key.json()["detail"]["code"] == (
+        "access_grant_idempotency_key_required"
+    )
+    assert issued.status_code == 201
+    assert issued.json()["created_by"] == f"operator:{ACCOUNT_ID}"
+    assert issued.json()["password"] == GRANT_SECRET
+    assert missing_rotate_revision.status_code == 422
+    assert missing_revoke_revision.status_code == 422
+    assert rotated.status_code == 201
+    assert revoked.status_code == 200
+    assert len(grants.calls) == 3
+    call = grants.calls[0]
+    assert call[5] == UUID(IDEMPOTENCY_KEY)
+    assert cast(NodeMutationContext, call[6]).actor_account_id == ACCOUNT_ID
+
+
+def test_camera_grant_list_is_camera_scoped_audited_and_no_oracle() -> None:
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    grants = RecordingAccessGrants()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=grants,
+        role=OperatorRole.ADMIN,
+        scopes=frozenset({f"camera:{CAMERA_ID}"}),
+        session_store=session_store,
+    )
+    own = client.get(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants",
+        headers=headers,
+    )
+    cross = client.get(
+        f"/api/v1/cameras/{UUID(int=98)}/access-grants",
+        headers=headers,
+    )
+    absent = client.get(
+        f"/api/v1/cameras/{UUID(int=99)}/access-grants",
+        headers=headers,
+    )
+
+    assert own.status_code == 200
+    assert own.json()["items"][0]["id"] == str(GRANT_ID)
+    assert (cross.status_code, cross.json()) == (absent.status_code, absent.json())
+    assert cross.status_code == 403
+    sensitive = [
+        event
+        for event in session_store.request_security_events()
+        if event.event_type == "operator.sensitive_read"
+    ]
+    assert len(sensitive) == 1
+    assert sensitive[0].audit_context.action == "camera.grant_list"
+    assert sensitive[0].audit_context.resource_scope == f"camera:{CAMERA_ID}"
+
+
+def test_camera_grant_list_fails_closed_when_sensitive_audit_is_unavailable() -> None:
+    class FailingSensitiveReadStore(InMemoryOperatorSessionStore):
+        def record_request_security_event(self, **kwargs: Any) -> None:
+            if kwargs.get("event_type") == "operator.sensitive_read":
+                raise OperatorSessionUnavailable("operator_session_store_unavailable")
+            super().record_request_security_event(**kwargs)
+
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=RecordingAccessGrants(),
+        role=OperatorRole.ADMIN,
+        session_store=FailingSensitiveReadStore(clock=lambda: NOW),
+    )
+
+    response = client.get(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants",
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "operator_session_unavailable"
+    assert response.headers["retry-after"] == "1"
+
+
+def test_camera_access_action_limits_are_separate_durable_buckets() -> None:
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    grants = RecordingAccessGrants()
+    policies = RecordingAccessPolicies()
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=policies,
+        access_grant_control=grants,
+        role=OperatorRole.ADMIN,
+        session_store=session_store,
+        secret_issue_limit_per_minute=1,
+        access_mutation_limit_per_minute=1,
+    )
+    headers = {**cookie_headers, "X-CSRF-Token": CSRF_TOKEN}
+    path = f"/api/v1/cameras/{CAMERA_ID}"
+    first_issue = client.post(
+        f"{path}/access-grants",
+        headers={
+            **headers,
+            "Idempotency-Key": "44444444-4444-4444-8444-444444444444",
+        },
+        json={"kind": "service", "lifetime_seconds": 3600},
+    )
+    limited_issue = client.post(
+        f"{path}/access-grants",
+        headers={
+            **headers,
+            "Idempotency-Key": "55555555-5555-4555-8555-555555555555",
+        },
+        json={"kind": "service", "lifetime_seconds": 3600},
+    )
+    policy_update = client.put(
+        f"{path}/access-policy",
+        headers=headers,
+        json={
+            "internet_cidrs": [],
+            "local_cidrs": [],
+            "expected_revision": 4,
+        },
+    )
+    limited_mutation = client.delete(
+        f"{path}/access-grants/{GRANT_ID}",
+        headers=headers,
+        params={"expected_revision": 3},
+    )
+
+    assert first_issue.status_code == 201
+    assert limited_issue.status_code == 429
+    assert limited_issue.json()["detail"]["code"] == "operator_action_rate_limited"
+    assert limited_issue.headers["retry-after"] == "60"
+    assert policy_update.status_code == 200
+    assert limited_mutation.status_code == 429
+    assert limited_mutation.headers["retry-after"] == "60"
+    rate_events = [
+        event
+        for event in session_store.request_security_events()
+        if event.reason_code == "operator_rate_limited"
+    ]
+    assert [event.audit_context.action for event in rate_events] == [
+        "camera.grant_issue",
+        "camera.grant_revoke",
+    ]
+
+
+def test_rejected_api_grant_rotation_is_audited_or_fails_closed() -> None:
+    class ConflictingGrants(RecordingAccessGrants):
+        def rotate(
+            self,
+            grant_id: UUID,
+            *,
+            camera_id: UUID,
+            overlap: timedelta,
+            lifetime: timedelta,
+            expected_revision: int,
+            created_by: str,
+            idempotency_key: UUID,
+            mutation_context: NodeMutationContext,
+        ) -> IssuedAccessGrant:
+            del (
+                grant_id,
+                camera_id,
+                overlap,
+                lifetime,
+                expected_revision,
+                created_by,
+                idempotency_key,
+                mutation_context,
+            )
+            raise CameraLifecycleConflict("access_grant_revision_conflict")
+
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=ConflictingGrants(),
+        role=OperatorRole.ADMIN,
+        session_store=session_store,
+    )
+    headers = {
+        **cookie_headers,
+        "X-CSRF-Token": CSRF_TOKEN,
+        "Idempotency-Key": "66666666-6666-4666-8666-666666666666",
+    }
+    path = f"/api/v1/cameras/{CAMERA_ID}/access-grants/{GRANT_ID}/rotate"
+
+    rejected = client.post(
+        path,
+        headers=headers,
+        json={"lifetime_seconds": 3600, "expected_revision": 3},
+    )
+
+    assert rejected.status_code == 409
+    event = session_store.request_security_events()[-1]
+    assert event.event_type == "operator.mutation_rejected"
+    assert event.reason_code == "access_grant_revision_conflict"
+    assert event.target_grant_id == GRANT_ID
+    assert event.expected_revision == 3
+    assert event.idempotency_key == UUID("66666666-6666-4666-8666-666666666666")
+    assert event.audit_context.resource_scope == f"camera:{CAMERA_ID}"
+
+    class FailingRejectionAuditStore(InMemoryOperatorSessionStore):
+        def record_request_security_event(self, **kwargs: Any) -> None:
+            if kwargs.get("event_type") == "operator.mutation_rejected":
+                raise OperatorSessionUnavailable("operator_session_store_unavailable")
+            super().record_request_security_event(**kwargs)
+
+    unavailable, unavailable_cookies = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=ConflictingGrants(),
+        role=OperatorRole.ADMIN,
+        session_store=FailingRejectionAuditStore(clock=lambda: NOW),
+    )
+    failed_closed = unavailable.post(
+        path,
+        headers={
+            **unavailable_cookies,
+            "X-CSRF-Token": CSRF_TOKEN,
+            "Idempotency-Key": "77777777-7777-4777-8777-777777777777",
+        },
+        json={"lifetime_seconds": 3600, "expected_revision": 3},
+    )
+
+    assert failed_closed.status_code == 503
+    assert failed_closed.json()["detail"]["code"] == "operator_session_unavailable"
+
+
+def test_policy_and_issue_rejections_are_audited_in_api_and_dashboard() -> None:
+    class ConflictingPolicies(RecordingAccessPolicies):
+        def update(
+            self,
+            camera_id: UUID,
+            *,
+            internet_cidrs: tuple[str, ...],
+            local_cidrs: tuple[str, ...],
+            expected_revision: int,
+            mutation_context: NodeMutationContext,
+        ) -> AccessPolicy:
+            del (
+                camera_id,
+                internet_cidrs,
+                local_cidrs,
+                expected_revision,
+                mutation_context,
+            )
+            raise CameraLifecycleConflict("access_policy_revision_conflict")
+
+    class MissingCameraGrants(RecordingAccessGrants):
+        def create(
+            self,
+            *,
+            camera_id: UUID,
+            lifetime: timedelta,
+            kind: str,
+            created_by: str,
+            idempotency_key: UUID,
+            mutation_context: NodeMutationContext,
+        ) -> IssuedAccessGrant:
+            del (
+                camera_id,
+                lifetime,
+                kind,
+                created_by,
+                idempotency_key,
+                mutation_context,
+            )
+            raise CameraNotFound("camera_not_found")
+
+    session_store = InMemoryOperatorSessionStore(clock=lambda: NOW)
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=ConflictingPolicies(),
+        access_grant_control=MissingCameraGrants(),
+        role=OperatorRole.ADMIN,
+        session_store=session_store,
+    )
+    headers = {**cookie_headers, "X-CSRF-Token": CSRF_TOKEN}
+    path = f"/api/v1/cameras/{CAMERA_ID}"
+
+    api_policy = client.put(
+        f"{path}/access-policy",
+        headers=headers,
+        json={
+            "internet_cidrs": [],
+            "local_cidrs": [],
+            "expected_revision": 4,
+        },
+    )
+    dashboard_policy = client.post(
+        f"/dashboard/cameras/{CAMERA_ID}/access-policy",
+        headers=cookie_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "internet_cidrs": "",
+            "local_cidrs": "",
+            "expected_revision": "4",
+        },
+    )
+    api_issue = client.post(
+        f"{path}/access-grants",
+        headers={
+            **headers,
+            "Idempotency-Key": "88888888-8888-4888-8888-888888888888",
+        },
+        json={"kind": "service", "lifetime_seconds": 3600},
+    )
+    dashboard_issue = client.post(
+        f"/dashboard/cameras/{CAMERA_ID}/access-grants",
+        headers=cookie_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "kind": "service",
+            "lifetime_seconds": "3600",
+            "idempotency_key": "99999999-9999-4999-8999-999999999999",
+        },
+    )
+
+    assert api_policy.status_code == dashboard_policy.status_code == 409
+    assert api_issue.status_code == dashboard_issue.status_code == 404
+    rejected = [
+        event
+        for event in session_store.request_security_events()
+        if event.event_type == "operator.mutation_rejected"
+    ]
+    assert [(event.audit_context.action, event.reason_code) for event in rejected] == [
+        ("camera.access_policy_update", "access_policy_revision_conflict"),
+        ("camera.access_policy_update", "access_policy_revision_conflict"),
+        ("camera.grant_issue", "camera_not_found"),
+        ("camera.grant_issue", "camera_not_found"),
+    ]
+    assert [event.expected_revision for event in rejected] == [4, 4, None, None]
+    assert [event.target_grant_id for event in rejected] == [None] * 4
+    assert [event.idempotency_key for event in rejected] == [
+        None,
+        None,
+        UUID("88888888-8888-4888-8888-888888888888"),
+        UUID("99999999-9999-4999-8999-999999999999"),
+    ]
+
+
+def test_policy_rejection_fails_closed_when_audit_is_unavailable() -> None:
+    class ConflictingPolicies(RecordingAccessPolicies):
+        def update(
+            self,
+            camera_id: UUID,
+            *,
+            internet_cidrs: tuple[str, ...],
+            local_cidrs: tuple[str, ...],
+            expected_revision: int,
+            mutation_context: NodeMutationContext,
+        ) -> AccessPolicy:
+            del (
+                camera_id,
+                internet_cidrs,
+                local_cidrs,
+                expected_revision,
+                mutation_context,
+            )
+            raise CameraLifecycleConflict("access_policy_revision_conflict")
+
+    class FailingRejectionAuditStore(InMemoryOperatorSessionStore):
+        def record_request_security_event(self, **kwargs: Any) -> None:
+            if kwargs.get("event_type") == "operator.mutation_rejected":
+                raise OperatorSessionUnavailable("operator_session_store_unavailable")
+            super().record_request_security_event(**kwargs)
+
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=ConflictingPolicies(),
+        access_grant_control=RecordingAccessGrants(),
+        role=OperatorRole.ADMIN,
+        session_store=FailingRejectionAuditStore(clock=lambda: NOW),
+    )
+    response = client.put(
+        f"/api/v1/cameras/{CAMERA_ID}/access-policy",
+        headers={**cookie_headers, "X-CSRF-Token": CSRF_TOKEN},
+        json={
+            "internet_cidrs": [],
+            "local_cidrs": [],
+            "expected_revision": 4,
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "operator_session_unavailable"
+    assert response.headers["retry-after"] == "1"
 
 
 def test_camera_dashboard_forms_require_bound_csrf_and_confirm_occupied_disable() -> None:

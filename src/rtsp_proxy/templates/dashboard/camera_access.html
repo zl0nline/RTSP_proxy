@@ -1,0 +1,64 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Доступ · {{ camera.name }} — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка">
+    <a href="/dashboard/cameras">Камеры</a><span aria-hidden="true">/</span><a href="/dashboard/cameras/{{ camera.id }}">{{ camera.name }}</a><span aria-hidden="true">/</span><span>Доступ</span>
+  </nav>
+  <div class="page-heading"><div><p class="eyebrow">Камера · {{ camera.public_id }}</p><h1>Доступ к потоку</h1></div></div>
+
+  <section class="panel" aria-labelledby="acl-title">
+    <div class="panel-heading"><h2 id="acl-title">Белые списки IP</h2></div>
+    <p class="detail-note">Два независимых уровня: «Интернет» для внешних клиентов и «Локальная сеть» для клиентов LAN. Проверка IP выполняется до логина и пароля. Если оба списка пусты, доступ по IP открыт для всех.</p>
+    <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-policy">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="expected_revision" value="{{ policy.revision }}">
+      <label for="internet-cidrs">Интернет <small>одна IPv4/IPv6 подсеть на строку</small></label>
+      <textarea id="internet-cidrs" name="internet_cidrs" rows="5">{{ policy.internet_cidrs | join('\n') }}</textarea>
+      <label for="local-cidrs">Локальная сеть <small>одна IPv4/IPv6 подсеть на строку</small></label>
+      <textarea id="local-cidrs" name="local_cidrs" rows="5">{{ policy.local_cidrs | join('\n') }}</textarea>
+      <button type="submit">Сохранить белые списки</button>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="issue-title">
+    <div class="panel-heading"><h2 id="issue-title">Выдать доступ downstream-клиенту</h2></div>
+    <p class="detail-note">Секрет показывается один раз. Операция требует недавнюю MFA. Для unattended FFmpeg задайте явный срок service grant.</p>
+    <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="idempotency_key" value="{{ issue_idempotency_key }}">
+      <label for="grant-kind">Режим</label>
+      <select id="grant-kind" name="kind"><option value="temporary">temporary</option><option value="service">service</option></select>
+      <label for="grant-lifetime">Срок, секунд</label>
+      <input id="grant-lifetime" name="lifetime_seconds" type="number" min="1" max="31622400" required>
+      <button type="submit">Выдать grant</button>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="grants-title">
+    <div class="panel-heading"><h2 id="grants-title">Зарегистрированные grant’ы</h2><span>{{ grants.items | length }}{% if grants.truncated %}+{% endif %}</span></div>
+    {% if grants.items %}
+    <div class="table-wrap"><table><thead><tr><th>Username</th><th>Режим</th><th>Истекает</th><th>Последнее использование</th><th>Revision</th><th>Действия</th></tr></thead><tbody>
+      {% for grant in grants.items %}<tr>
+        <td><code>{{ grant.username }}</code><small>{{ grant.created_by }}</small></td>
+        <td>{{ grant.kind }}{% if grant.revoked_at %}<small>revoked</small>{% endif %}</td>
+        <td>{{ grant.expires_at | dashboard_time }}</td>
+        <td>{% if grant.last_used_at %}{{ grant.last_used_at | dashboard_time }}{% else %}—{% endif %}</td>
+        <td>{{ grant.revision }}</td>
+        <td>{% if not grant.revoked_at %}
+          <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/rotate">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="expected_revision" value="{{ grant.revision }}">
+            <input type="hidden" name="idempotency_key" value="{{ rotation_idempotency_keys[grant.id] }}">
+            <input name="overlap_seconds" type="number" min="0" max="86400" value="30" aria-label="Overlap, секунд">
+            <input name="lifetime_seconds" type="number" min="1" max="31622400" required aria-label="Новый срок, секунд">
+            <button type="submit">Ротировать</button>
+          </form>
+          <a href="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/revoke">Отозвать</a>
+        {% endif %}</td>
+      </tr>{% endfor %}
+    </tbody></table></div>
+    {% else %}<p>Grant’ов пока нет.</p>{% endif %}
+    {% if grants.truncated %}<p class="detail-note">Показаны последние 100 записей. Используйте API для дальнейшей выборки после реализации курсора.</p>{% endif %}
+  </section>
+</main>
+{% endblock %}

@@ -6,12 +6,22 @@ import secrets
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from rtsp_proxy.access import (
+    AccessGrant,
+    AccessGrantControl,
+    AccessGrantIdempotency,
+    AccessGrantIssueReplayed,
+    AccessGrantSummary,
+    AccessPolicy,
+    AccessPolicyControl,
+    PepperVerifier,
+)
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.identifiers import PublicId
@@ -50,6 +60,65 @@ ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 SOURCE_SECRET_CANARY = "rtsp://source-secret-canary.invalid/private"
+DOWNSTREAM_SECRET_CANARY = "browser-downstream-secret-canary-0123456789abcdef"
+
+
+class _LabAccessStore:
+    def __init__(self) -> None:
+        self.policy = AccessPolicy(camera_id=CAMERA_ID, revision=1)
+        self.grants: dict[UUID, AccessGrant] = {}
+        self.requests: set[tuple[UUID, UUID]] = set()
+
+    def get_access_policy(self, camera_id: UUID) -> AccessPolicy | None:
+        return self.policy if camera_id == CAMERA_ID else None
+
+    def set_access_policy(
+        self,
+        policy: AccessPolicy,
+        *,
+        expected_revision: int,
+        mutation_context: object | None = None,
+    ) -> AccessPolicy:
+        del mutation_context
+        if policy.camera_id != CAMERA_ID or self.policy.revision != expected_revision:
+            raise ValueError("lab_access_policy_conflict")
+        self.policy = policy
+        return policy
+
+    def list_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        limit: int,
+    ) -> tuple[AccessGrantSummary, ...]:
+        if camera_id != CAMERA_ID:
+            return ()
+        return tuple(
+            AccessGrantSummary.from_grant(grant)
+            for grant in tuple(self.grants.values())[:limit]
+        )
+
+    def get_access_grant_by_id(self, grant_id: UUID) -> AccessGrant | None:
+        return self.grants.get(grant_id)
+
+    def create_access_grant(
+        self,
+        grant: AccessGrant,
+        *,
+        mutation_context: object | None = None,
+        idempotency: AccessGrantIdempotency | None = None,
+    ) -> AccessGrant:
+        del mutation_context
+        if idempotency is not None:
+            key = (idempotency.actor_session_id, idempotency.key)
+            if key in self.requests:
+                raise AccessGrantIssueReplayed("access_grant_issue_replayed")
+            self.requests.add(key)
+        self.grants[grant.id] = grant
+        return grant
+
+    def check_access_grant_request(self, request: AccessGrantIdempotency) -> None:
+        del request
 
 
 class _LabTokenEndpoint:
@@ -67,7 +136,7 @@ class _LabClaimsVerifier:
             subject="browser-e2e-operator",
             display_name="Browser E2E operator",
             groups=frozenset({"rtsp-operators"}),
-            roles=frozenset({OperatorRole.OPERATOR}),
+            roles=frozenset({OperatorRole.ADMIN}),
             mfa_verified=True,
         )
 
@@ -196,7 +265,7 @@ def build_lab_app(*, origin: str) -> Any:
         id=ACCOUNT_ID,
         subject="browser-e2e-operator",
         display_name="Browser E2E operator",
-        roles=frozenset({OperatorRole.OPERATOR}),
+        roles=frozenset({OperatorRole.ADMIN}),
         scopes=frozenset({"server:*"}),
         authz_version=1,
         enabled=True,
@@ -223,6 +292,7 @@ def build_lab_app(*, origin: str) -> Any:
         ),
         sessions=sessions,
     )
+    access_store = _LabAccessStore()
     app = create_app(
         Settings(role=RuntimeRole.WEB),
         camera_control=cameras,
@@ -232,6 +302,14 @@ def build_lab_app(*, origin: str) -> Any:
         operator_sessions=sessions,
         operator_login=login,
         node_control=nodes,
+        access_policy_control=AccessPolicyControl(store=access_store),
+        access_grant_control=AccessGrantControl(
+            store=access_store,  # type: ignore[arg-type]
+            verifier=PepperVerifier(primary_key_id="lab", keys={"lab": b"L" * 32}),
+            new_grant_id=uuid4,
+            new_secret=lambda: DOWNSTREAM_SECRET_CANARY,
+        ),
+        access_secret_reveal_seconds=1,
     )
 
     @app.get("/lab/idp/authorize", include_in_schema=False)

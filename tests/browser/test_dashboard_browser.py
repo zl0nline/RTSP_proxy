@@ -72,7 +72,7 @@ def test_dashboard_oidc_confirmation_accessibility_and_logout() -> None:
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=90)
+        stdout, stderr = process.communicate(timeout=150)
     except subprocess.TimeoutExpired:
         stdout, stderr = _terminate_process_group(
             process,

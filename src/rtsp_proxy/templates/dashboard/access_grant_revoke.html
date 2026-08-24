@@ -1,0 +1,16 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Отозвать grant — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка"><a href="/dashboard/cameras/{{ camera.id }}/access">Доступ</a><span aria-hidden="true">/</span><span>Отзыв</span></nav>
+  <section class="panel" aria-labelledby="revoke-title">
+    <div class="panel-heading"><h1 id="revoke-title" tabindex="-1" autofocus>Отозвать grant?</h1></div>
+    <p role="alert" aria-live="assertive">Новые подключения с <code>{{ grant.username }}</code> будут отклонены. Уже установленный RTSP-сеанс продолжит работу до разрыва соединения.</p>
+    <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/revoke">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="expected_revision" value="{{ grant.revision }}">
+      <button class="danger-button" type="submit">Подтвердить отзыв</button>
+    </form>
+    <a class="button-link" href="/dashboard/cameras/{{ camera.id }}/access">Отмена</a>
+  </section>
+</main>
+{% endblock %}

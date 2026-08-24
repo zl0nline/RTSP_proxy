@@ -71,11 +71,13 @@ _AUDIT_ACTIONS = frozenset(
         "audit.read",
         "camera.access_policy_read",
         "camera.access_policy_update",
+        "camera.access_read",
         "camera.create",
         "camera.delete",
         "camera.disable",
         "camera.enable",
         "camera.grant_issue",
+        "camera.grant_list",
         "camera.grant_revoke",
         "camera.grant_rotate",
         "camera.list",
@@ -150,6 +152,17 @@ class OperatorAuthorizationDenied(RuntimeError):
 
 class OperatorSessionUnavailable(RuntimeError):
     """The authoritative operator session store is unavailable."""
+
+
+class OperatorActionBucket(StrEnum):
+    ACCESS_MUTATION = "access_mutation"
+    SECRET_ISSUE = "secret_issue"
+
+
+class OperatorActionRateLimited(RuntimeError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("operator_action_rate_limited")
 
 
 class OperatorConflict(RuntimeError):
@@ -268,6 +281,9 @@ class OperatorRequestSecurityEvent:
     scopes: frozenset[str]
     audit_context: OperatorRequestAuditContext
     identity_source: OperatorIdentitySource | None
+    target_grant_id: UUID | None = None
+    expected_revision: int | None = None
+    idempotency_key: UUID | None = None
 
 
 class OperatorSessionFailure(StrEnum):
@@ -459,7 +475,19 @@ class OperatorSessionStore(Protocol):
         roles: frozenset[OperatorRole] = frozenset(),
         scopes: frozenset[str] = frozenset(),
         audit_context: OperatorRequestAuditContext | None = None,
+        target_grant_id: UUID | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: UUID | None = None,
     ) -> None: ...
+
+    def claim_operator_action(
+        self,
+        *,
+        account_id: UUID,
+        bucket: OperatorActionBucket,
+        limit: int,
+        window_seconds: int,
+    ) -> int: ...
 
 
 class InMemoryOperatorSessionStore:
@@ -473,6 +501,9 @@ class InMemoryOperatorSessionStore:
         self._sessions: dict[UUID, OperatorSession] = {}
         self._authorization_events: list[OperatorAuthorizationEvent] = []
         self._request_security_events: list[OperatorRequestSecurityEvent] = []
+        self._action_limits: dict[
+            tuple[UUID, OperatorActionBucket], tuple[datetime, int]
+        ] = {}
         self._lock = RLock()
         self._clock = clock
 
@@ -699,6 +730,9 @@ class InMemoryOperatorSessionStore:
         roles: frozenset[OperatorRole] = frozenset(),
         scopes: frozenset[str] = frozenset(),
         audit_context: OperatorRequestAuditContext | None = None,
+        target_grant_id: UUID | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: UUID | None = None,
     ) -> None:
         del authz_version
         context = audit_context or OperatorRequestAuditContext.internal(
@@ -716,17 +750,46 @@ class InMemoryOperatorSessionStore:
                     session_id=session_id,
                     event_type=event_type,
                     reason_code=reason_code,
-                    outcome="accepted" if event_type.endswith("logout") else "rejected",
+                    outcome=(
+                        "accepted"
+                        if event_type in {"operator.session_logout", "operator.sensitive_read"}
+                        else "rejected"
+                    ),
                     roles=roles,
                     scopes=scopes,
                     audit_context=context,
                     identity_source=None if account is None else account.identity_source,
+                    target_grant_id=target_grant_id,
+                    expected_revision=expected_revision,
+                    idempotency_key=idempotency_key,
                 )
             )
 
     def request_security_events(self) -> tuple[OperatorRequestSecurityEvent, ...]:
         with self._lock:
             return tuple(self._request_security_events)
+
+    def claim_operator_action(
+        self,
+        *,
+        account_id: UUID,
+        bucket: OperatorActionBucket,
+        limit: int,
+        window_seconds: int,
+    ) -> int:
+        if limit < 1 or not 1 <= window_seconds <= 3600:
+            raise ValueError("operator_action_limit_invalid")
+        with self._lock:
+            now = self._now()
+            key = (account_id, bucket)
+            started_at, used = self._action_limits.get(key, (now, 0))
+            window = timedelta(seconds=window_seconds)
+            if now >= started_at + window:
+                started_at, used = now, 0
+            if used >= limit:
+                return max(1, math.ceil((started_at + window - now).total_seconds()))
+            self._action_limits[key] = (started_at, used + 1)
+            return 0
 
     def _evaluate(
         self,
@@ -784,6 +847,89 @@ class PostgresOperatorSessionStore:
             with self._engine.connect() as connection:
                 connection.execute(text("SELECT id FROM operator_accounts LIMIT 0"))
                 connection.execute(text("SELECT id FROM operator_sessions LIMIT 0"))
+        except SQLAlchemyError:
+            raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
+
+    def claim_operator_action(
+        self,
+        *,
+        account_id: UUID,
+        bucket: OperatorActionBucket,
+        limit: int,
+        window_seconds: int,
+    ) -> int:
+        if limit < 1 or not 1 <= window_seconds <= 3600:
+            raise ValueError("operator_action_limit_invalid")
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                now = connection.scalar(text("SELECT clock_timestamp()"))
+                if not isinstance(now, datetime):
+                    raise ValueError("operator_action_limit_invalid")
+                window = timedelta(seconds=window_seconds)
+                inserted = connection.scalar(
+                    text(
+                        "INSERT INTO operator_action_rate_limits "
+                        "(account_id, bucket, window_started_at, used) "
+                        "VALUES (:account_id, :bucket, :started_at, 1) "
+                        "ON CONFLICT (account_id, bucket) DO NOTHING RETURNING 1"
+                    ),
+                    {
+                        "account_id": account_id,
+                        "bucket": bucket.value,
+                        "started_at": now,
+                    },
+                )
+                if inserted == 1:
+                    return 0
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT window_started_at, used FROM operator_action_rate_limits "
+                            "WHERE account_id=:account_id AND bucket=:bucket FOR UPDATE"
+                        ),
+                        {"account_id": account_id, "bucket": bucket.value},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    raise OperatorSessionUnavailable(
+                        "operator_session_store_unavailable"
+                    )
+                started_at = row["window_started_at"]
+                if not isinstance(started_at, datetime) or started_at.tzinfo is None:
+                    raise OperatorSessionUnavailable(
+                        "operator_session_store_unavailable"
+                    )
+                used = int(row["used"])
+                if now >= started_at + window:
+                    connection.execute(
+                        text(
+                            "UPDATE operator_action_rate_limits SET "
+                            "window_started_at=:started_at, used=1 "
+                            "WHERE account_id=:account_id AND bucket=:bucket"
+                        ),
+                        {
+                            "account_id": account_id,
+                            "bucket": bucket.value,
+                            "started_at": now,
+                        },
+                    )
+                    return 0
+                if used >= limit:
+                    retry_after = math.ceil(
+                        (started_at + window - now).total_seconds()
+                    )
+                    return max(1, retry_after)
+                connection.execute(
+                    text(
+                        "UPDATE operator_action_rate_limits SET used=used+1 "
+                        "WHERE account_id=:account_id AND bucket=:bucket"
+                    ),
+                    {"account_id": account_id, "bucket": bucket.value},
+                )
+                return 0
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
 
@@ -1181,6 +1327,9 @@ class PostgresOperatorSessionStore:
         roles: frozenset[OperatorRole] = frozenset(),
         scopes: frozenset[str] = frozenset(),
         audit_context: OperatorRequestAuditContext | None = None,
+        target_grant_id: UUID | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: UUID | None = None,
     ) -> None:
         context = audit_context or OperatorRequestAuditContext.internal(
             action=(
@@ -1209,6 +1358,9 @@ class PostgresOperatorSessionStore:
                     roles=roles,
                     scopes=scopes,
                     audit_context=context,
+                    target_grant_id=target_grant_id,
+                    expected_revision=expected_revision,
+                    idempotency_key=idempotency_key,
                 )
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
@@ -1223,11 +1375,15 @@ class OperatorSessionControl:
         session_id_factory: Callable[[], UUID] = uuid4,
         idle_timeout: timedelta = timedelta(minutes=30),
         absolute_timeout: timedelta = timedelta(hours=12),
+        secret_issue_limit_per_minute: int = 10,
+        access_mutation_limit_per_minute: int = 60,
     ) -> None:
         if (
             idle_timeout <= timedelta(0)
             or absolute_timeout <= idle_timeout
             or absolute_timeout > timedelta(hours=24)
+            or not 1 <= secret_issue_limit_per_minute <= 600
+            or not 1 <= access_mutation_limit_per_minute <= 3600
         ):
             raise ValueError("operator_session_timing_invalid")
         self._store = store
@@ -1235,6 +1391,10 @@ class OperatorSessionControl:
         self._session_id_factory = session_id_factory
         self._idle_timeout = idle_timeout
         self._absolute_timeout = absolute_timeout
+        self._action_limits = {
+            OperatorActionBucket.SECRET_ISSUE: secret_issue_limit_per_minute,
+            OperatorActionBucket.ACCESS_MUTATION: access_mutation_limit_per_minute,
+        }
 
     def issue(
         self,
@@ -1378,6 +1538,106 @@ class OperatorSessionControl:
                 audit_context=context,
             )
             raise OperatorAuthenticationRequired("operator_session_invalid")
+
+    def record_sensitive_read(
+        self,
+        *,
+        principal: OperatorPrincipal,
+        audit_context: OperatorRequestAuditContext,
+    ) -> None:
+        self._store.record_request_security_event(
+            account_id=principal.account_id,
+            session_id=principal.session_id,
+            authz_version=principal.authz_version,
+            event_type="operator.sensitive_read",
+            reason_code="operator_authorized",
+            roles=principal.roles,
+            scopes=principal.scopes,
+            audit_context=audit_context,
+        )
+
+    def record_mutation_rejection(
+        self,
+        *,
+        principal: OperatorPrincipal,
+        reason_code: str,
+        audit_context: OperatorRequestAuditContext,
+        target_grant_id: UUID | None,
+        expected_revision: int | None,
+        idempotency_key: UUID | None,
+    ) -> None:
+        issue_reasons = {
+            "access_grant_idempotency_conflict",
+            "access_grant_issue_replayed",
+            "camera_not_found",
+        }
+        rotate_reasons = {
+            "access_grant_idempotency_conflict",
+            "access_grant_issue_replayed",
+            "access_grant_not_found",
+            "access_grant_revision_conflict",
+        }
+        shape_valid = (
+            audit_context.action == "camera.access_policy_update"
+            and reason_code
+            in {"access_policy_revision_conflict", "camera_not_found"}
+            and target_grant_id is None
+            and expected_revision is not None
+            and idempotency_key is None
+        ) or (
+            audit_context.action == "camera.grant_issue"
+            and reason_code in issue_reasons
+            and target_grant_id is None
+            and expected_revision is None
+            and idempotency_key is not None
+        ) or (
+            audit_context.action == "camera.grant_rotate"
+            and reason_code in rotate_reasons
+            and target_grant_id is not None
+            and expected_revision is not None
+            and idempotency_key is not None
+        ) or (
+            audit_context.action == "camera.grant_revoke"
+            and reason_code
+            in {"access_grant_not_found", "access_grant_revision_conflict"}
+            and target_grant_id is not None
+            and expected_revision is not None
+            and idempotency_key is None
+        )
+        if (
+            not shape_valid
+            or (expected_revision is not None and expected_revision < 1)
+            or (idempotency_key is not None and idempotency_key.version != 4)
+        ):
+            raise ValueError("operator_security_event_invalid")
+        self._store.record_request_security_event(
+            account_id=principal.account_id,
+            session_id=principal.session_id,
+            authz_version=principal.authz_version,
+            event_type="operator.mutation_rejected",
+            reason_code=reason_code,
+            roles=principal.roles,
+            scopes=principal.scopes,
+            audit_context=audit_context,
+            target_grant_id=target_grant_id,
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+        )
+
+    def admit_action(
+        self,
+        *,
+        principal: OperatorPrincipal,
+        bucket: OperatorActionBucket,
+    ) -> None:
+        retry_after = self._store.claim_operator_action(
+            account_id=principal.account_id,
+            bucket=bucket,
+            limit=self._action_limits[bucket],
+            window_seconds=60,
+        )
+        if retry_after:
+            raise OperatorActionRateLimited(retry_after)
 
     def record_denied_request(
         self,
@@ -1570,15 +1830,28 @@ def _record_request_security_event(
     roles: frozenset[OperatorRole],
     scopes: frozenset[str],
     audit_context: OperatorRequestAuditContext,
+    target_grant_id: UUID | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: UUID | None = None,
 ) -> None:
     accepted_reasons = {
         "operator.session_logout": {"operator_initiated"},
+        "operator.sensitive_read": {"operator_authorized"},
         "operator.authorization_denied": {
             "operator_csrf_invalid",
             "operator_permission_denied",
+            "operator_rate_limited",
             "operator_scope_denied",
         },
         "operator.authentication_denied": {failure.value for failure in OperatorSessionFailure},
+        "operator.mutation_rejected": {
+            "access_grant_idempotency_conflict",
+            "access_grant_issue_replayed",
+            "access_grant_not_found",
+            "access_grant_revision_conflict",
+            "access_policy_revision_conflict",
+            "camera_not_found",
+        },
     }
     if reason_code not in accepted_reasons.get(event_type, set()):
         raise ValueError("operator_security_event_invalid")
@@ -1590,8 +1863,16 @@ def _record_request_security_event(
             "action": audit_context.action,
             "auth_method": None if identity_source is None else identity_source.value,
             "authz_version": None if account_id is None else authz_version,
+            "expected_revision": expected_revision,
             "http_method": audit_context.http_method,
-            "outcome": "accepted" if event_type.endswith("logout") else "rejected",
+            "idempotency_key": (
+                None if idempotency_key is None else str(idempotency_key)
+            ),
+            "outcome": (
+                "accepted"
+                if event_type in {"operator.session_logout", "operator.sensitive_read"}
+                else "rejected"
+            ),
             "reason_code": reason_code,
             "request_id": str(audit_context.request_id),
             "resource_id": audit_context.resource_id,
@@ -1601,6 +1882,9 @@ def _record_request_security_event(
             "scopes": sorted(scopes),
             "session_id": None if session_id is None else str(session_id),
             "source_ip_sha256": audit_context.source_ip_sha256,
+            "target_grant_id": (
+                None if target_grant_id is None else str(target_grant_id)
+            ),
             "user_agent_sha256": audit_context.user_agent_sha256,
         },
         separators=(",", ":"),

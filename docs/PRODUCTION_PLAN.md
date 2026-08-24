@@ -844,7 +844,7 @@ to receive RTP; CI runs it on amd64 and arm64.
 
 ### Phase E — access and one-reader contract
 
-- [x] access policy/grant schema and API (dashboard UI remains Phase F);
+- [x] access policy/grant schema and API (operator dashboard is implemented in Phase F);
 - [x] IPv4/IPv6 CIDR normalization;
 - [x] ACL-before-password verifier;
 - [x] one-time URL-safe downstream credentials, versioned pepper,
@@ -889,9 +889,10 @@ camera placement plus RUNNING/non-maintenance node state, evaluates observed
 peer IP before reading a grant, and verifies a generated high-entropy token by
 constant-time HMAC-SHA-256. Creation explicitly chooses `temporary` or
 `service` and expiry; rotation also requires an explicit replacement lifetime,
-so there is no implicit unattended-client TTL. Until Phase F authenticates
-operators, creator is the server-derived `bootstrap-control-plane` principal,
-not caller input. The raw token is a one-time API response and is never stored
+so there is no implicit unattended-client TTL. Authenticated Phase-F writes
+derive creator from the operator account; the compatibility seam uses the
+fixed server-side `bootstrap-control-plane` principal, never caller input. The
+raw token is a one-time API response and is never stored
 or emitted to audit/outbox. Safe creator/last-use fields remain queryable;
 failed last-use persistence is visible at the auth service's loopback-only
 `/internal/v1/metrics` endpoint; its labels are limited to bounded
@@ -940,6 +941,20 @@ dispatcher, digest-only PostgreSQL operator sessions, authoritative
 with exact MFA claims, and durable break-glass TOTP audit/email admission are
 implemented locally. Live OIDC discovery/claims compatibility is polled through
 bounded readiness and emits one durable failure/recovery alert per transition.
+The camera access-administration slice is also implemented locally: it renders
+the two independent internet/local CIDR policies, a bounded secret-free grant
+inventory, recent-MFA issue/rotate/revoke forms and a one-time no-store RTSP
+credential page. Secret-bearing issue/rotation uses session-bound UUIDv4
+idempotency keys and migration 0017 commits the immutable request digest with
+the grant and operator audit/outbox pair; replay never re-renders the secret.
+The one-time page auto-clears in at most 30 seconds. Grant inventory reads append
+a durable sanitized sensitive-read event, while independent durable
+per-account `secret_issue` and `access_mutation` buckets return 429 with
+`Retry-After` and a denial audit when exhausted. JSON rotation/revoke is nested
+under the camera and requires the exact current grant revision. Replay,
+idempotency-conflict, not-found and stale-revision rejections append their own
+sanitized synchronous audit/outbox pair after rollback and fail closed when
+that journal is unavailable.
 The foundation passed independent Spec/Standards review and all six native
 amd64/arm64 CI jobs at commit `292a0302590838451e4f454322930804271b4d71`;
 the exact evidence boundary is recorded in
@@ -1062,8 +1077,9 @@ a replacement. Release 0.8.0 remains rolling-compatible with 0015, but this
 specific write path returns a bounded 503 until exact schema 0016 is current.
 Exact local/Linux/review evidence is tracked in
 [`docs/evidence/phase-f-node-operations-contract.md`](evidence/phase-f-node-operations-contract.md).
-The current published implementation adds port-change and reconfigure preview/apply and
-brings the generated protected inventory to 63 route-method pairs. Both
+The last published implementation adds port-change and reconfigure preview/apply and
+contains 63 route-method pairs. The current local access-administration slice
+brings the generated protected inventory to 70 route-method pairs. Both
 dashboard and JSON API require exact desired revision/source state. Port change
 and DRAINING reconfigure/restart additionally require recent MFA plus the
 complete registered-camera and active-reader sets. A RUNNING node binds exact
@@ -1091,8 +1107,16 @@ No Phase-F completion claim is made yet.
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
 - [x] recursively generated route-method negative matrix (current 63-route
-  surface published and CI-green);
+  node-operation surface published and CI-green; current 70-route access
+  surface locally green and awaiting independent review/native CI);
   future export/SSE/bulk routes must extend it before activation;
+- [x] camera-scoped access dashboard/API list, two-level ACL edit and
+  recent-MFA grant issue/rotate/revoke with one-time no-store secret output,
+  30-second auto-clear, durable sensitive-read audit, separate action-rate
+  buckets, exact revision fencing, session-bound idempotency and fail-closed
+  durable rejection audit
+  (local/direct-Linux implementation green; independent review/native CI
+  pending);
 - [x] metrics collector and bounded queries;
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;

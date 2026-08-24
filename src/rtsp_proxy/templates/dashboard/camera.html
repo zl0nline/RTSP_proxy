@@ -38,6 +38,7 @@
     <div class="action-grid">
       <a class="button-link" href="/dashboard/cameras/{{ camera.id }}/edit">Изменить имя или source URL</a>
       {% if can_move %}<a class="button-link" href="/dashboard/cameras/{{ camera.id }}/move">Переместить на другую ноду</a>{% endif %}
+      {% if can_manage_access %}<a class="button-link" href="/dashboard/cameras/{{ camera.id }}/access">Управлять доступом к потоку</a>{% endif %}
       {% if camera.state.value == "enabled" %}
       <form method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/preview">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">

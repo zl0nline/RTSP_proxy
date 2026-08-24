@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from urllib.parse import urlencode
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from rtsp_proxy.access import (
+    AccessGrantControl,
+    AccessGrantIdempotencyConflict,
+    AccessGrantIssueReplayed,
+    AccessGrantSchemaUnavailable,
+    AccessPolicyControl,
+)
 from rtsp_proxy.dashboard import (
     DASHBOARD_CSP,
     DashboardUnavailable,
+    render_access_grant_revoke,
+    render_access_grant_secret,
+    render_camera_access,
     render_camera_catalog,
     render_camera_detail,
     render_camera_edit,
@@ -20,6 +31,7 @@ from rtsp_proxy.dashboard import (
 )
 from rtsp_proxy.dashboard_forms import DashboardForm, DashboardFormInvalid
 from rtsp_proxy.media import MediaNodeError
+from rtsp_proxy.node_operator import node_mutation_context
 from rtsp_proxy.nodes import (
     MAX_CAMERA_NAME_LENGTH,
     CameraCatalogItem,
@@ -34,11 +46,15 @@ from rtsp_proxy.nodes import (
     InvalidCameraName,
     InvalidCameraSource,
     NodeCameraCapacityReached,
+    NodeMutationContext,
     NodeNotFound,
 )
 from rtsp_proxy.operator_access import (
     OperatorPermission,
     OperatorPrincipal,
+    OperatorRequestAuditContext,
+    OperatorSessionControl,
+    OperatorSessionUnavailable,
 )
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
@@ -57,8 +73,16 @@ def camera_dashboard_router(
     camera_control: CameraControl | None,
     camera_mutation_control: CameraMutationControl | None,
     camera_move_control: CameraMoveControl | None,
+    access_policy_control: AccessPolicyControl | None,
+    access_grant_control: AccessGrantControl | None,
+    operator_sessions: OperatorSessionControl | None,
+    recent_mfa_seconds: int,
+    secret_reveal_seconds: int,
 ) -> APIRouter:
     """Build the complete secret-free camera dashboard surface."""
+
+    if not 1 <= secret_reveal_seconds <= 30:
+        raise ValueError("access_secret_reveal_seconds_invalid")
 
     router = APIRouter()
 
@@ -122,8 +146,406 @@ def camera_dashboard_router(
                     camera_move_control is not None
                     and camera.state is CameraState.ENABLED
                 ),
+                can_manage_access=(
+                    access_policy_control is not None
+                    and access_grant_control is not None
+                    and principal.allows(OperatorPermission.ACCESS_ADMIN)
+                ),
             )
         )
+
+    @router.get(
+        "/dashboard/cameras/{camera_id}/access",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_access(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        unavailable = _access_controls_unavailable(
+            access_policy_control,
+            access_grant_control,
+            principal,
+        )
+        if unavailable is not None:
+            return unavailable
+        if not _valid_csrf_cookie(request):
+            return _fresh_session_required(principal)
+        camera = _camera_item(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        assert access_policy_control is not None
+        assert access_grant_control is not None
+        try:
+            policy = access_policy_control.get(camera_id)
+            grants = access_grant_control.list_for_camera(camera_id, limit=100)
+            if operator_sessions is not None:
+                audit_context = getattr(request.state, "operator_audit_context", None)
+                if not isinstance(audit_context, OperatorRequestAuditContext):
+                    raise OperatorSessionUnavailable("operator_session_store_unavailable")
+                operator_sessions.record_sensitive_read(
+                    principal=principal,
+                    audit_context=audit_context,
+                )
+        except Exception as error:
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _html_response(
+            render_camera_access(
+                camera=camera,
+                policy=policy,
+                grants=grants,
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+                issue_idempotency_key=uuid4(),
+                rotation_idempotency_keys={grant.id: uuid4() for grant in grants.items},
+            )
+        )
+
+    @router.post(
+        "/dashboard/cameras/{camera_id}/access-policy",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def camera_access_policy(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if access_policy_control is None:
+            return _access_unavailable(principal)
+        expected_revision: int | None = None
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset(
+                    {"_csrf", "expected_revision", "internet_cidrs", "local_cidrs"}
+                )
+            )
+            expected_revision = _positive_revision(form)
+            access_policy_control.update(
+                camera_id,
+                internet_cidrs=_cidr_lines(form, "internet_cidrs"),
+                local_cidrs=_cidr_lines(form, "local_cidrs"),
+                expected_revision=expected_revision,
+                mutation_context=_access_mutation_context(request, principal),
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            if isinstance(error, (CameraNotFound, CameraLifecycleConflict)) and (
+                expected_revision is not None
+            ):
+                error = _record_dashboard_access_rejection(
+                    operator_sessions,
+                    request=request,
+                    principal=principal,
+                    error=error,
+                    target_grant_id=None,
+                    expected_revision=expected_revision,
+                    idempotency_key=None,
+                )
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _access_redirect(camera_id)
+
+    @router.post(
+        "/dashboard/cameras/{camera_id}/access-grants",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def issue_access_grant(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if access_grant_control is None:
+            return _access_unavailable(principal)
+        recent_mfa = _require_recent_mfa(principal, recent_mfa_seconds)
+        if recent_mfa is not None:
+            return recent_mfa
+        idempotency_key: UUID | None = None
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset(
+                    {"_csrf", "kind", "lifetime_seconds", "idempotency_key"}
+                )
+            )
+            kind = form.required("kind", max_length=16)
+            if kind not in {"temporary", "service"}:
+                raise DashboardFormInvalid("dashboard_form_invalid")
+            lifetime = timedelta(
+                seconds=_bounded_integer(
+                    form,
+                    "lifetime_seconds",
+                    minimum=1,
+                    maximum=366 * 24 * 60 * 60,
+                )
+            )
+            idempotency_key = _idempotency_key(form)
+            camera = _camera_item(camera_control, camera_id, principal)
+            if isinstance(camera, Response):
+                if camera.status_code == status.HTTP_404_NOT_FOUND:
+                    audit_error = _record_dashboard_access_rejection(
+                        operator_sessions,
+                        request=request,
+                        principal=principal,
+                        error=CameraNotFound("camera_not_found"),
+                        target_grant_id=None,
+                        expected_revision=None,
+                        idempotency_key=idempotency_key,
+                    )
+                    if isinstance(audit_error, OperatorSessionUnavailable):
+                        expected = _access_error(audit_error, principal)
+                        assert expected is not None
+                        return expected
+                return camera
+            issued = access_grant_control.create(
+                camera_id=camera_id,
+                lifetime=lifetime,
+                kind=kind,
+                created_by=f"operator:{principal.account_id}",
+                idempotency_key=idempotency_key,
+                mutation_context=_access_mutation_context(
+                    request,
+                    principal,
+                    idempotency_key=idempotency_key,
+                ),
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            if isinstance(
+                error,
+                (
+                    CameraNotFound,
+                    AccessGrantIssueReplayed,
+                    AccessGrantIdempotencyConflict,
+                ),
+            ) and idempotency_key is not None:
+                error = _record_dashboard_access_rejection(
+                    operator_sessions,
+                    request=request,
+                    principal=principal,
+                    error=error,
+                    target_grant_id=None,
+                    expected_revision=None,
+                    idempotency_key=idempotency_key,
+                )
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        response = _html_response(
+            render_access_grant_secret(
+                camera=camera,
+                issued=issued,
+                principal=principal,
+            ),
+            status_code=status.HTTP_201_CREATED,
+        )
+        response.headers["Refresh"] = (
+            f"{secret_reveal_seconds}; url=/dashboard/cameras/{camera_id}/access"
+        )
+        return response
+
+    @router.post(
+        "/dashboard/cameras/{camera_id}/access-grants/{grant_id}/rotate",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def rotate_access_grant(
+        request: Request,
+        camera_id: UUID,
+        grant_id: UUID,
+    ) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if access_grant_control is None:
+            return _access_unavailable(principal)
+        recent_mfa = _require_recent_mfa(principal, recent_mfa_seconds)
+        if recent_mfa is not None:
+            return recent_mfa
+        expected_revision: int | None = None
+        idempotency_key: UUID | None = None
+        try:
+            form = _form(request)
+            form.require_exact_fields(
+                frozenset(
+                    {
+                        "_csrf",
+                        "expected_revision",
+                        "overlap_seconds",
+                        "lifetime_seconds",
+                        "idempotency_key",
+                    }
+                )
+            )
+            camera = _camera_item(camera_control, camera_id, principal)
+            if isinstance(camera, Response):
+                return camera
+            expected_revision = _positive_revision(form)
+            idempotency_key = _idempotency_key(form)
+            issued = access_grant_control.rotate(
+                grant_id,
+                camera_id=camera_id,
+                overlap=timedelta(
+                    seconds=_bounded_integer(
+                        form,
+                        "overlap_seconds",
+                        minimum=0,
+                        maximum=24 * 60 * 60,
+                    )
+                ),
+                lifetime=timedelta(
+                    seconds=_bounded_integer(
+                        form,
+                        "lifetime_seconds",
+                        minimum=1,
+                        maximum=366 * 24 * 60 * 60,
+                    )
+                ),
+                expected_revision=expected_revision,
+                created_by=f"operator:{principal.account_id}",
+                idempotency_key=idempotency_key,
+                mutation_context=_access_mutation_context(
+                    request,
+                    principal,
+                    idempotency_key=idempotency_key,
+                ),
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            if (
+                isinstance(
+                    error,
+                    (
+                        LookupError,
+                        CameraLifecycleConflict,
+                        AccessGrantIssueReplayed,
+                        AccessGrantIdempotencyConflict,
+                    ),
+                )
+                and expected_revision is not None
+                and idempotency_key is not None
+            ):
+                error = _record_dashboard_access_rejection(
+                    operator_sessions,
+                    request=request,
+                    principal=principal,
+                    error=error,
+                    target_grant_id=grant_id,
+                    expected_revision=expected_revision,
+                    idempotency_key=idempotency_key,
+                )
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        response = _html_response(
+            render_access_grant_secret(
+                camera=camera,
+                issued=issued,
+                principal=principal,
+            ),
+            status_code=status.HTTP_201_CREATED,
+        )
+        response.headers["Refresh"] = (
+            f"{secret_reveal_seconds}; url=/dashboard/cameras/{camera_id}/access"
+        )
+        return response
+
+    @router.get(
+        "/dashboard/cameras/{camera_id}/access-grants/{grant_id}/revoke",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def access_grant_revoke_confirmation(
+        request: Request,
+        camera_id: UUID,
+        grant_id: UUID,
+    ) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if access_grant_control is None:
+            return _access_unavailable(principal)
+        if not _valid_csrf_cookie(request):
+            return _fresh_session_required(principal)
+        camera = _camera_item(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        try:
+            grant = access_grant_control.get(grant_id, camera_id=camera_id)
+        except Exception as error:
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _html_response(
+            render_access_grant_revoke(
+                camera=camera,
+                grant=grant,
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+            )
+        )
+
+    @router.post(
+        "/dashboard/cameras/{camera_id}/access-grants/{grant_id}/revoke",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def revoke_access_grant(
+        request: Request,
+        camera_id: UUID,
+        grant_id: UUID,
+    ) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if access_grant_control is None:
+            return _access_unavailable(principal)
+        recent_mfa = _require_recent_mfa(principal, recent_mfa_seconds)
+        if recent_mfa is not None:
+            return recent_mfa
+        expected_revision: int | None = None
+        try:
+            form = _form(request)
+            form.require_exact_fields(frozenset({"_csrf", "expected_revision"}))
+            expected_revision = _positive_revision(form)
+            access_grant_control.revoke(
+                grant_id,
+                camera_id=camera_id,
+                expected_revision=expected_revision,
+                mutation_context=_access_mutation_context(request, principal),
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            if isinstance(error, (LookupError, CameraLifecycleConflict)) and (
+                expected_revision is not None
+            ):
+                error = _record_dashboard_access_rejection(
+                    operator_sessions,
+                    request=request,
+                    principal=principal,
+                    error=error,
+                    target_grant_id=grant_id,
+                    expected_revision=expected_revision,
+                    idempotency_key=None,
+                )
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _access_redirect(camera_id)
 
     @router.get(
         "/dashboard/cameras/{camera_id}/edit",
@@ -470,6 +892,58 @@ def _positive_revision(form: DashboardForm) -> int:
     return value
 
 
+def _bounded_integer(
+    form: DashboardForm,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(form.required(name, max_length=20), 10)
+    except ValueError:
+        raise DashboardFormInvalid("dashboard_form_invalid") from None
+    if not minimum <= value <= maximum:
+        raise DashboardFormInvalid("dashboard_form_invalid")
+    return value
+
+
+def _cidr_lines(form: DashboardForm, name: str) -> tuple[str, ...]:
+    raw = form.optional(name, max_length=16_384)
+    if raw is None or not raw.strip():
+        return ()
+    values = tuple(line.strip() for line in raw.splitlines() if line.strip())
+    if len(values) > 128:
+        raise DashboardFormInvalid("dashboard_form_invalid")
+    return values
+
+
+def _access_mutation_context(
+    request: Request,
+    principal: OperatorPrincipal,
+    *,
+    idempotency_key: UUID | None = None,
+) -> NodeMutationContext:
+    audit_context = getattr(request.state, "operator_audit_context", None)
+    if not isinstance(audit_context, OperatorRequestAuditContext):
+        raise DashboardFormInvalid("dashboard_form_invalid")
+    return node_mutation_context(
+        principal=principal,
+        audit_context=audit_context,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _idempotency_key(form: DashboardForm) -> UUID:
+    try:
+        key = UUID(form.required("idempotency_key", max_length=36))
+    except ValueError:
+        raise DashboardFormInvalid("dashboard_form_invalid") from None
+    if key.version != 4:
+        raise DashboardFormInvalid("dashboard_form_invalid")
+    return key
+
+
 def _mutation_fields(
     form: DashboardForm,
     *,
@@ -735,6 +1209,14 @@ def _redirect(camera_id: UUID) -> RedirectResponse:
     )
 
 
+def _access_redirect(camera_id: UUID) -> RedirectResponse:
+    return RedirectResponse(
+        f"/dashboard/cameras/{camera_id}/access",
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _move_redirect(camera_id: UUID, move_id: UUID) -> RedirectResponse:
     return RedirectResponse(
         f"/dashboard/cameras/{camera_id}/moves/{move_id}",
@@ -798,6 +1280,172 @@ def _catalog_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         principal=principal,
     )
+
+
+def _access_controls_unavailable(
+    policy_control: AccessPolicyControl | None,
+    grant_control: AccessGrantControl | None,
+    principal: OperatorPrincipal,
+) -> HTMLResponse | None:
+    if policy_control is None or grant_control is None:
+        return _access_unavailable(principal)
+    return None
+
+
+def _access_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
+    return _unavailable_response(
+        DashboardUnavailable(
+            title="Управление доступом недоступно",
+            message="Безопасно прочитать или изменить правила доступа сейчас невозможно.",
+        ),
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        principal=principal,
+    )
+
+
+def _fresh_session_required(principal: OperatorPrincipal) -> HTMLResponse:
+    return _unavailable_response(
+        DashboardUnavailable(
+            title="Требуется новая сессия",
+            message="CSRF cookie отсутствует или повреждён. Выполните вход повторно.",
+        ),
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        principal=principal,
+    )
+
+
+def _require_recent_mfa(
+    principal: OperatorPrincipal,
+    maximum_age_seconds: int,
+) -> HTMLResponse | None:
+    if principal.has_recent_mfa(max_age_seconds=maximum_age_seconds):
+        return None
+    return _unavailable_response(
+        DashboardUnavailable(
+            title="Требуется недавняя MFA",
+            message="Повторно подтвердите второй фактор и затем повторите действие.",
+        ),
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        principal=principal,
+    )
+
+
+def _access_error(
+    error: Exception,
+    principal: OperatorPrincipal,
+) -> HTMLResponse | None:
+    if isinstance(error, AccessGrantIssueReplayed):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Запрос уже выполнен",
+                message=(
+                    "Grant уже создан, но секрет повторно не показывается. "
+                    "Вернитесь к списку и при необходимости выполните ротацию."
+                ),
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(error, AccessGrantIdempotencyConflict):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Idempotency key уже использован",
+                message="Обновите страницу и повторите действие, используя новый ключ.",
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(error, AccessGrantSchemaUnavailable):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Обновление схемы не завершено",
+                message="Выдача и ротация grant временно приостановлены. Повторите позже.",
+            ),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            principal=principal,
+        )
+    if isinstance(error, OperatorSessionUnavailable):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Журнал безопасности недоступен",
+                message="Чувствительное чтение или изменение заблокировано. Повторите позже.",
+            ),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            principal=principal,
+        )
+    if isinstance(error, (LookupError, CameraNotFound)):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Grant или камера не найдены",
+                message="Для этой камеры запрошенной записи нет.",
+            ),
+            status_code=status.HTTP_404_NOT_FOUND,
+            principal=principal,
+        )
+    if isinstance(error, CameraLifecycleConflict):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Правила доступа изменились",
+                message="Revision устарела. Обновите страницу и повторите действие.",
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+            principal=principal,
+        )
+    if isinstance(error, ValueError):
+        return _unavailable_response(
+            DashboardUnavailable(
+                title="Некорректные правила доступа",
+                message="Проверьте CIDR, срок и параметры grant.",
+            ),
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            principal=principal,
+        )
+    return None
+
+
+def _record_dashboard_access_rejection(
+    operator_sessions: OperatorSessionControl | None,
+    *,
+    request: Request,
+    principal: OperatorPrincipal,
+    error: Exception,
+    target_grant_id: UUID | None,
+    expected_revision: int | None,
+    idempotency_key: UUID | None,
+) -> Exception:
+    if operator_sessions is None:
+        return error
+    audit_context = getattr(request.state, "operator_audit_context", None)
+    if not isinstance(audit_context, OperatorRequestAuditContext):
+        return OperatorSessionUnavailable("operator_session_store_unavailable")
+    if isinstance(error, AccessGrantIssueReplayed):
+        reason_code = "access_grant_issue_replayed"
+    elif isinstance(error, AccessGrantIdempotencyConflict):
+        reason_code = "access_grant_idempotency_conflict"
+    elif isinstance(error, CameraNotFound):
+        reason_code = "camera_not_found"
+    elif isinstance(error, CameraLifecycleConflict):
+        reason_code = (
+            "access_policy_revision_conflict"
+            if audit_context.action == "camera.access_policy_update"
+            else "access_grant_revision_conflict"
+        )
+    elif isinstance(error, LookupError):
+        reason_code = "access_grant_not_found"
+    else:
+        return error
+    try:
+        operator_sessions.record_mutation_rejection(
+            principal=principal,
+            reason_code=reason_code,
+            audit_context=audit_context,
+            target_grant_id=target_grant_id,
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+        )
+    except OperatorSessionUnavailable as audit_error:
+        return audit_error
+    return error
 
 
 def _html_response(

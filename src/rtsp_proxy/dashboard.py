@@ -9,6 +9,7 @@ from uuid import UUID
 
 from jinja2 import Environment, PackageLoader, StrictUndefined, select_autoescape
 
+from rtsp_proxy.access import AccessGrantPage, AccessGrantSummary, AccessPolicy, IssuedAccessGrant
 from rtsp_proxy.nodes import (
     CameraCatalogItem,
     CameraCatalogPage,
@@ -225,6 +226,7 @@ def render_camera_detail(
     csrf_token: str,
     can_mutate: bool,
     can_move: bool,
+    can_manage_access: bool = False,
 ) -> str:
     return (
         _environment()
@@ -235,6 +237,64 @@ def render_camera_detail(
             csrf_token=csrf_token,
             can_mutate=can_mutate,
             can_move=can_move,
+            can_manage_access=can_manage_access,
+        )
+    )
+
+
+def render_camera_access(
+    *,
+    camera: CameraCatalogItem,
+    policy: AccessPolicy,
+    grants: AccessGrantPage,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+    issue_idempotency_key: UUID,
+    rotation_idempotency_keys: dict[UUID, UUID],
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/camera_access.html")
+        .render(
+            camera=camera,
+            policy=policy,
+            grants=grants,
+            principal=principal,
+            csrf_token=csrf_token,
+            issue_idempotency_key=issue_idempotency_key,
+            rotation_idempotency_keys=rotation_idempotency_keys,
+        )
+    )
+
+
+def render_access_grant_secret(
+    *,
+    camera: CameraCatalogItem,
+    issued: IssuedAccessGrant,
+    principal: OperatorPrincipal,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/access_grant_secret.html")
+        .render(camera=camera, issued=issued, principal=principal)
+    )
+
+
+def render_access_grant_revoke(
+    *,
+    camera: CameraCatalogItem,
+    grant: AccessGrantSummary,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/access_grant_revoke.html")
+        .render(
+            camera=camera,
+            grant=grant,
+            principal=principal,
+            csrf_token=csrf_token,
         )
     )
 

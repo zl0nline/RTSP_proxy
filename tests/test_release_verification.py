@@ -80,6 +80,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0016_node_registration_idempotency.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0017_access_grant_idempotency.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -143,7 +148,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         },
         "schema_compatibility": {
             "minimum": "0012_operator_sessions",
-            "maximum": "0016_node_registration_keys",
+            "maximum": "0017_access_grant_keys",
         },
         "config_schema_version": 1,
     }
@@ -348,7 +353,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert {manifest.release_id for manifest in manifests} == {"0.8.0"}
+    assert {manifest.release_id for manifest in manifests} == {"0.9.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
 
 

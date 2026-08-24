@@ -234,6 +234,21 @@ keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccc
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 require_body_text "rtsp://<server-address>:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa"
 require_secret_absent "rtsp://source-secret-canary.invalid/private"
+keyboard_activate 'a[href$="/access"]'
+require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
+require_body_text "Два независимых уровня"
+require_body_text "Если оба списка пусты"
+browser find label "Срок, секунд" fill "3600" >/dev/null
+keyboard_activate 'form[action$="/access-grants"] button'
+require_body_text "Показывается только один раз"
+require_body_text "browser-downstream-secret-canary-0123456789abcdef"
+require_secret_absent "rtsp://source-secret-canary.invalid/private"
+browser wait 3000 >/dev/null
+require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
+require_body_text "Зарегистрированные grant’ы"
+require_secret_absent "browser-downstream-secret-canary-0123456789abcdef"
+keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
+require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 keyboard_activate 'form[action$="/mutations/preview"] button'
 require_body_text "Будет отключён 1 downstream-клиент"
 require_active "h1[autofocus]"
@@ -283,4 +298,4 @@ fi
 uv run python "$repo_root/tools/e2e/verify_dashboard_browser_artifacts.py" \
   "$artifact_dir"
 
-printf 'browser E2E passed: OIDC, node registration, keyboard focus, occupied confirmation, logout\n'
+printf 'browser E2E passed: OIDC, node registration, access grant, keyboard focus, occupied confirmation, logout\n'

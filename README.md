@@ -35,8 +35,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   representative semantic targets:
 >   identity source, scope and correlation ID are audit/outbox-bound and
 >   PostgreSQL append failures fail closed without partial revocation.
->   The current generated matrix covers all 63 protected route-method
->   pairs, including the node-action expansion. Future export/SSE/bulk routes
+>   The current generated matrix covers all 70 protected route-method
+>   pairs, including camera access administration. Future export/SSE/bulk routes
 >   must extend it before activation.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
@@ -137,9 +137,10 @@ source. API сохраняет и возвращает старый/новый p
   затем camera username/password.
 - Forwarded headers не используются для RTSP authorization.
 - Downstream grants explicitly choose `temporary` or `service` and expiry;
-  there is no implicit one-hour service credential, including rotation. Until
-  Phase F authenticates operators, creator is the server-derived
-  `bootstrap-control-plane` principal and cannot be supplied by a caller. Raw
+  there is no implicit one-hour service credential, including rotation.
+  Authenticated dashboard/API writes derive creator from the operator account;
+  the unauthenticated compatibility seam uses the fixed server-side
+  `bootstrap-control-plane` principal. Caller input cannot forge either. Raw
   URL-safe secret is shown once, while PostgreSQL stores only a versioned-
   pepper HMAC verifier plus safe creator/last-use metadata.
 - Pepper rotation loads the new primary plus bounded verify-only previous keys;
@@ -229,7 +230,8 @@ nodes.
 4. **Media control** — node-aware reconciler, camera CRUD, drain, move, port
    change and delete-empty.
 5. **Access** — internet/local ACL and credentials integrated with the
-   Phase-D one-reader/RTSP 453 admission primitive.
+   Phase-D one-reader/RTSP 453 admission primitive, with authenticated
+   dashboard administration and one-time secret delivery.
 6. **Dashboard/observability** — UI, RBAC, metrics aggregation and email
    incident/recovery.
 7. **Evidence/pilot** — per-node 100-camera and multi-node server matrix,
@@ -406,7 +408,24 @@ runtime/rollback deadline. Exact review and direct-Linux evidence is recorded in
 all seven native amd64/arm64 and external-browser jobs passed at commit
 `466e72feb6c5401dd4b281baabc07095b7173669` in
 [CI run 32708863738](https://github.com/zl0nline/RTSP_proxy/actions/runs/32708863738).
-Phase F остаётся в работе до завершения остальных операторских workflows.
+The current access-administration slice raises the generated inventory to 70
+route-method pairs. It adds a camera-scoped dashboard for the independent
+internet/local CIDR lists, bounded secret-free grant inventory, recent-MFA
+issue/rotate/revoke workflows and a one-time no-store RTSP credential page.
+Issue and rotation carry session-bound UUIDv4 idempotency keys; migration 0017
+stores the immutable request digest in the same synchronous transaction as the
+grant and audit/outbox pair. The dashboard removes the visible secret after at
+most 30 seconds; a replay never reveals it. Grant-list reads are durably
+audited, and independent durable per-account buckets rate-limit secret issuance
+and ACL/revoke mutations with sanitized 429/`Retry-After` responses. The JSON
+rotate/revoke routes are camera-scoped and require exact grant revisions.
+Replay, idempotency, not-found and stale-revision rejections append a separate
+sanitized audit/outbox pair after rollback and fail closed if that journal is
+unavailable. Exact
+local and direct-Linux evidence is recorded in
+[`docs/evidence/phase-f-camera-access-dashboard-contract.md`](docs/evidence/phase-f-camera-access-dashboard-contract.md).
+Independent review and native CI publication are still pending, so Phase F
+остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не
 означает готовый product или published capacity.

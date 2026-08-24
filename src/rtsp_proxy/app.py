@@ -17,7 +17,12 @@ from rtsp_proxy.access import (
     AccessAuthorizer,
     AccessDecisionReason,
     AccessDecisionTelemetry,
+    AccessGrant,
     AccessGrantControl,
+    AccessGrantIdempotencyConflict,
+    AccessGrantIssueReplayed,
+    AccessGrantSchemaUnavailable,
+    AccessGrantSummary,
     AccessPolicy,
     AccessPolicyControl,
     AuthorizeRequest,
@@ -84,6 +89,8 @@ from rtsp_proxy.nodes import (
 from rtsp_proxy.observability import FleetSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import (
     IssuedOperatorSession,
+    OperatorActionBucket,
+    OperatorActionRateLimited,
     OperatorAuthenticationRequired,
     OperatorAuthorizationDenied,
     OperatorPermission,
@@ -398,6 +405,7 @@ class AccessGrantCreateRequest(BaseModel):
 class AccessGrantRotateRequest(BaseModel):
     overlap_seconds: int = Field(default=30, ge=0, le=24 * 60 * 60)
     lifetime_seconds: int = Field(ge=1, le=366 * 24 * 60 * 60)
+    expected_revision: int = Field(ge=1)
 
 
 class AccessGrantSecretResponse(BaseModel):
@@ -424,6 +432,12 @@ class AccessGrantResponse(BaseModel):
     kind: str
     created_by: str
     last_used_at: datetime | None
+
+
+class AccessGrantListResponse(BaseModel):
+    items: list[AccessGrantResponse]
+    count: int
+    truncated: bool
 
 
 class MediaAuthRequest(BaseModel):
@@ -597,6 +611,7 @@ def create_app(
     operator_login: OidcLoginControl | None = None,
     break_glass: BreakGlassControl | None = None,
     fleet_snapshot_max_age_seconds: float = 30,
+    access_secret_reveal_seconds: int = 30,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     startup: Callable[[], None] | None = None,
     shutdown: Callable[[], None] | None = None,
@@ -820,6 +835,35 @@ def create_app(
                 )
             except OperatorSessionUnavailable:
                 return audited_response(_operator_session_unavailable_response(request))
+            action_bucket = _operator_action_bucket(audit_context.action)
+            if action_bucket is not None:
+                try:
+                    await anyio.to_thread.run_sync(
+                        lambda: operator_sessions.admit_action(
+                            principal=principal,
+                            bucket=action_bucket,
+                        ),
+                        abandon_on_cancel=True,
+                    )
+                except OperatorActionRateLimited as error:
+                    try:
+                        await anyio.to_thread.run_sync(
+                            lambda: operator_sessions.record_denied_request(
+                                session_token=session_token,
+                                reason_code="operator_rate_limited",
+                                audit_context=audit_context,
+                            ),
+                            abandon_on_cancel=True,
+                        )
+                    except OperatorSessionUnavailable:
+                        return audited_response(
+                            _operator_session_unavailable_response(request)
+                        )
+                    return audited_response(
+                        _operator_action_rate_limited(error.retry_after_seconds)
+                    )
+                except OperatorSessionUnavailable:
+                    return audited_response(_operator_session_unavailable_response(request))
             request.state.operator_principal = principal
             result = await call_next(request)
             assert isinstance(result, Response)
@@ -900,6 +944,11 @@ def create_app(
             camera_control=camera_control,
             camera_mutation_control=camera_mutation_control,
             camera_move_control=camera_move_control,
+            access_policy_control=access_policy_control,
+            access_grant_control=access_grant_control,
+            operator_sessions=operator_sessions,
+            recent_mfa_seconds=settings.operator_recent_mfa_seconds,
+            secret_reveal_seconds=access_secret_reveal_seconds,
         )
     )
     app.include_router(node_dashboard_router(node_control=node_control, settings=settings))
@@ -2328,7 +2377,8 @@ def create_app(
     )
     def update_access_policy(
         camera_id: UUID,
-        request: AccessPolicyUpdateRequest,
+        payload: AccessPolicyUpdateRequest,
+        request: Request,
     ) -> AccessPolicyResponse:
         if access_policy_control is None:
             raise HTTPException(
@@ -2338,16 +2388,33 @@ def create_app(
         try:
             policy = access_policy_control.update(
                 camera_id,
-                internet_cidrs=request.internet_cidrs,
-                local_cidrs=request.local_cidrs,
-                expected_revision=request.expected_revision,
+                internet_cidrs=payload.internet_cidrs,
+                local_cidrs=payload.local_cidrs,
+                expected_revision=payload.expected_revision,
+                mutation_context=_access_operator_mutation_context(request),
             )
         except LookupError:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="camera_not_found",
+                target_grant_id=None,
+                expected_revision=payload.expected_revision,
+                idempotency_key=None,
+            )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
         except CameraLifecycleConflict:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_policy_revision_conflict",
+                target_grant_id=None,
+                expected_revision=payload.expected_revision,
+                idempotency_key=None,
+            )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "access_policy_revision_conflict"},
@@ -2359,6 +2426,47 @@ def create_app(
             ) from None
         return _access_policy_response(policy)
 
+    @app.get(
+        "/api/v1/cameras/{camera_id}/access-grants",
+        response_model=AccessGrantListResponse,
+    )
+    def list_access_grants(camera_id: UUID, request: Request) -> AccessGrantListResponse:
+        if access_grant_control is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_control_unavailable"},
+            )
+        page = access_grant_control.list_for_camera(camera_id, limit=100)
+        if operator_sessions is not None:
+            principal = getattr(request.state, "operator_principal", None)
+            audit_context = getattr(request.state, "operator_audit_context", None)
+            if not isinstance(principal, OperatorPrincipal) or not isinstance(
+                audit_context,
+                OperatorRequestAuditContext,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"code": "operator_session_unavailable"},
+                    headers={"Retry-After": "1"},
+                )
+            try:
+                operator_sessions.record_sensitive_read(
+                    principal=principal,
+                    audit_context=audit_context,
+                )
+            except OperatorSessionUnavailable:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"code": "operator_session_unavailable"},
+                    headers={"Retry-After": "1"},
+                ) from None
+        items = [_access_grant_response(grant) for grant in page.items]
+        return AccessGrantListResponse(
+            items=items,
+            count=len(items),
+            truncated=page.truncated,
+        )
+
     @app.post(
         "/api/v1/cameras/{camera_id}/access-grants",
         response_model=AccessGrantSecretResponse,
@@ -2366,8 +2474,10 @@ def create_app(
     )
     def create_access_grant(
         camera_id: UUID,
-        request: AccessGrantCreateRequest,
+        payload: AccessGrantCreateRequest,
+        request: Request,
         response: Response,
+        idempotency_key: UUID | None = IDEMPOTENCY_KEY_HEADER,
     ) -> AccessGrantSecretResponse:
         if access_grant_control is None:
             raise HTTPException(
@@ -2375,31 +2485,90 @@ def create_app(
                 detail={"code": "access_control_unavailable"},
             )
         try:
+            mutation_context = _access_operator_mutation_context(
+                request,
+                require_recent_mfa=True,
+                recent_mfa_seconds=settings.operator_recent_mfa_seconds,
+                idempotency_key=idempotency_key,
+                require_idempotency=True,
+            )
+            principal = getattr(request.state, "operator_principal", None)
             issued = access_grant_control.create(
                 camera_id=camera_id,
-                lifetime=timedelta(seconds=request.lifetime_seconds),
-                kind=request.kind,
-                created_by="bootstrap-control-plane",
+                lifetime=timedelta(seconds=payload.lifetime_seconds),
+                kind=payload.kind,
+                created_by=(
+                    f"operator:{principal.account_id}"
+                    if isinstance(principal, OperatorPrincipal)
+                    else "bootstrap-control-plane"
+                ),
+                mutation_context=mutation_context,
+                idempotency_key=idempotency_key,
             )
         except CameraNotFound:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="camera_not_found",
+                target_grant_id=None,
+                expected_revision=None,
+                idempotency_key=idempotency_key,
+            )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "camera_not_found"},
             ) from None
+        except AccessGrantIssueReplayed:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_issue_replayed",
+                target_grant_id=None,
+                expected_revision=None,
+                idempotency_key=idempotency_key,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_grant_issue_replayed"},
+            ) from None
+        except AccessGrantIdempotencyConflict:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_idempotency_conflict",
+                target_grant_id=None,
+                expected_revision=None,
+                idempotency_key=idempotency_key,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_grant_idempotency_conflict"},
+            ) from None
+        except AccessGrantSchemaUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_grant_schema_unavailable"},
+                headers={"Retry-After": "1"},
+            ) from None
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
-        response.headers["Location"] = f"/api/v1/access-grants/{issued.grant.id}"
+        response.headers["Location"] = (
+            f"/api/v1/cameras/{camera_id}/access-grants/{issued.grant.id}"
+        )
         return _issued_access_grant_response(issued)
 
     @app.post(
-        "/api/v1/access-grants/{grant_id}/rotate",
+        "/api/v1/cameras/{camera_id}/access-grants/{grant_id}/rotate",
         response_model=AccessGrantSecretResponse,
         status_code=status.HTTP_201_CREATED,
     )
     def rotate_access_grant(
+        camera_id: UUID,
         grant_id: UUID,
-        request: AccessGrantRotateRequest,
+        payload: AccessGrantRotateRequest,
+        request: Request,
         response: Response,
+        idempotency_key: UUID | None = IDEMPOTENCY_KEY_HEADER,
     ) -> AccessGrantSecretResponse:
         if access_grant_control is None:
             raise HTTPException(
@@ -2407,60 +2576,146 @@ def create_app(
                 detail={"code": "access_control_unavailable"},
             )
         try:
+            mutation_context = _access_operator_mutation_context(
+                request,
+                require_recent_mfa=True,
+                recent_mfa_seconds=settings.operator_recent_mfa_seconds,
+                idempotency_key=idempotency_key,
+                require_idempotency=True,
+            )
+            principal = getattr(request.state, "operator_principal", None)
             issued = access_grant_control.rotate(
                 grant_id,
-                overlap=timedelta(seconds=request.overlap_seconds),
-                lifetime=timedelta(seconds=request.lifetime_seconds),
+                camera_id=camera_id,
+                overlap=timedelta(seconds=payload.overlap_seconds),
+                lifetime=timedelta(seconds=payload.lifetime_seconds),
+                expected_revision=payload.expected_revision,
+                created_by=(
+                    f"operator:{principal.account_id}"
+                    if isinstance(principal, OperatorPrincipal)
+                    else None
+                ),
+                mutation_context=mutation_context,
+                idempotency_key=idempotency_key,
             )
         except LookupError:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_not_found",
+                target_grant_id=grant_id,
+                expected_revision=payload.expected_revision,
+                idempotency_key=idempotency_key,
+            )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "access_grant_not_found"},
             ) from None
         except CameraLifecycleConflict:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_revision_conflict",
+                target_grant_id=grant_id,
+                expected_revision=payload.expected_revision,
+                idempotency_key=idempotency_key,
+            )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "access_grant_revision_conflict"},
             ) from None
+        except AccessGrantIssueReplayed:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_issue_replayed",
+                target_grant_id=grant_id,
+                expected_revision=payload.expected_revision,
+                idempotency_key=idempotency_key,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_grant_issue_replayed"},
+            ) from None
+        except AccessGrantIdempotencyConflict:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_idempotency_conflict",
+                target_grant_id=grant_id,
+                expected_revision=payload.expected_revision,
+                idempotency_key=idempotency_key,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "access_grant_idempotency_conflict"},
+            ) from None
+        except AccessGrantSchemaUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "access_grant_schema_unavailable"},
+                headers={"Retry-After": "1"},
+            ) from None
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
-        response.headers["Location"] = f"/api/v1/access-grants/{issued.grant.id}"
+        response.headers["Location"] = (
+            f"/api/v1/cameras/{camera_id}/access-grants/{issued.grant.id}"
+        )
         return _issued_access_grant_response(issued)
 
     @app.delete(
-        "/api/v1/access-grants/{grant_id}",
+        "/api/v1/cameras/{camera_id}/access-grants/{grant_id}",
         response_model=AccessGrantResponse,
     )
-    def revoke_access_grant(grant_id: UUID) -> AccessGrantResponse:
+    def revoke_access_grant(
+        camera_id: UUID,
+        grant_id: UUID,
+        request: Request,
+        expected_revision: int,
+    ) -> AccessGrantResponse:
         if access_grant_control is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "access_control_unavailable"},
             )
         try:
-            grant = access_grant_control.revoke(grant_id)
+            grant = access_grant_control.revoke(
+                grant_id,
+                camera_id=camera_id,
+                expected_revision=expected_revision,
+                mutation_context=_access_operator_mutation_context(
+                    request,
+                    require_recent_mfa=True,
+                    recent_mfa_seconds=settings.operator_recent_mfa_seconds,
+                ),
+            )
         except LookupError:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_not_found",
+                target_grant_id=grant_id,
+                expected_revision=expected_revision,
+                idempotency_key=None,
+            )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "access_grant_not_found"},
             ) from None
         except CameraLifecycleConflict:
+            _record_access_mutation_rejection_or_503(
+                request,
+                operator_sessions=operator_sessions,
+                reason_code="access_grant_revision_conflict",
+                target_grant_id=grant_id,
+                expected_revision=expected_revision,
+                idempotency_key=None,
+            )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "access_grant_revision_conflict"},
             ) from None
-        return AccessGrantResponse(
-            id=str(grant.id),
-            camera_id=str(grant.camera_id),
-            username=grant.username,
-            not_before=grant.not_before,
-            expires_at=grant.expires_at,
-            revoked_at=grant.revoked_at,
-            revision=grant.revision,
-            kind=grant.kind,
-            created_by=grant.created_by,
-            last_used_at=grant.last_used_at,
-        )
+        return _access_grant_response(grant)
 
     return app
 
@@ -2641,6 +2896,16 @@ def _retryable_service_response(code: str) -> JSONResponse:
 def _operator_permission_for_request(request: Request) -> OperatorPermission:
     path = request.url.path
     if path == "/dashboard/cameras" or path.startswith("/dashboard/cameras/"):
+        if "/access-grants" in path:
+            if path.endswith("/revoke"):
+                return OperatorPermission.ACCESS_ADMIN
+            return (
+                OperatorPermission.ACCESS_ADMIN
+                if request.method in {"GET", "HEAD", "OPTIONS"}
+                else OperatorPermission.SECRET_ISSUE
+            )
+        if path.endswith("/access-policy") or path.endswith("/access"):
+            return OperatorPermission.ACCESS_ADMIN
         if path.endswith(("/edit", "/move")):
             return OperatorPermission.CONTROL_MUTATE
         return (
@@ -2731,6 +2996,14 @@ def _operator_scope_for_request(request: Request) -> str | None:
                 else:
                     return f"camera:{camera_id}"
     return "server:*"
+
+
+def _operator_action_bucket(action: str) -> OperatorActionBucket | None:
+    if action in {"camera.grant_issue", "camera.grant_rotate"}:
+        return OperatorActionBucket.SECRET_ISSUE
+    if action in {"camera.access_policy_update", "camera.grant_revoke"}:
+        return OperatorActionBucket.ACCESS_MUTATION
+    return None
 
 
 def _operator_audit_http_method(method: str) -> str:
@@ -2839,7 +3112,17 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
                 "mutations/apply": "camera.update",
                 "enable": "camera.enable",
                 "disable": "camera.disable",
+                "access": "camera.access_read",
+                "access-policy": "camera.access_policy_update",
             }.get(suffix, "request.unsupported")
+            if suffix == "access-grants":
+                action = "camera.grant_list" if method == "GET" else "camera.grant_issue"
+            elif suffix.startswith("access-grants/"):
+                action = (
+                    "camera.grant_revoke"
+                    if suffix.endswith("/revoke")
+                    else "camera.grant_rotate"
+                )
         else:
             action = {
                 "": "camera.delete" if method == "DELETE" else "camera.update",
@@ -2856,14 +3139,15 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
                 ),
                 "access-grants": "camera.grant_issue",
             }.get(suffix, "request.unsupported")
+            if suffix == "access-grants" and method == "GET":
+                action = "camera.grant_list"
+            elif suffix.startswith("access-grants/"):
+                action = (
+                    "camera.grant_rotate"
+                    if suffix.endswith("/rotate")
+                    else "camera.grant_revoke"
+                )
         return action, "camera", resource_id
-    if path.startswith("/api/v1/access-grants/"):
-        grant_id = _bounded_path_identifier(path, 3)
-        return (
-            "camera.grant_rotate" if path.endswith("/rotate") else "camera.grant_revoke",
-            "access_grant",
-            grant_id,
-        )
     if path.startswith("/api/v1/operators"):
         return "operator.admin", "operator_account", _bounded_path_identifier(path, 3)
     if path.startswith("/api/v1/audit"):
@@ -3038,6 +3322,17 @@ def _operator_rate_limited(retry_after_seconds: int) -> JSONResponse:
     )
 
 
+def _operator_action_rate_limited(retry_after_seconds: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": {"code": "operator_action_rate_limited"}},
+        headers={
+            "Cache-Control": "no-store",
+            "Retry-After": str(retry_after_seconds),
+        },
+    )
+
+
 def _request_source_ip(request: Request) -> str:
     return "unknown" if request.client is None else request.client.host
 
@@ -3130,6 +3425,83 @@ def _external_node_mutation_context(
         audit_context=audit_context,
         idempotency_key=idempotency_key,
     )
+
+
+def _access_operator_mutation_context(
+    request: Request,
+    *,
+    require_recent_mfa: bool = False,
+    recent_mfa_seconds: int = 300,
+    idempotency_key: UUID | None = None,
+    require_idempotency: bool = False,
+) -> NodeMutationContext | None:
+    principal = getattr(request.state, "operator_principal", None)
+    if not isinstance(principal, OperatorPrincipal):
+        return None
+    if require_recent_mfa and not principal.has_recent_mfa(
+        max_age_seconds=recent_mfa_seconds
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "operator_recent_mfa_required"},
+        )
+    if require_idempotency and (
+        idempotency_key is None or idempotency_key.version != 4
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={"code": "access_grant_idempotency_key_required"},
+        )
+    audit_context = getattr(request.state, "operator_audit_context", None)
+    if not isinstance(audit_context, OperatorRequestAuditContext):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "operator_audit_context_unavailable"},
+        )
+    return node_mutation_context(
+        principal=principal,
+        audit_context=audit_context,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _record_access_mutation_rejection_or_503(
+    request: Request,
+    *,
+    operator_sessions: OperatorSessionControl | None,
+    reason_code: str,
+    target_grant_id: UUID | None,
+    expected_revision: int | None,
+    idempotency_key: UUID | None,
+) -> None:
+    if operator_sessions is None:
+        return
+    principal = getattr(request.state, "operator_principal", None)
+    audit_context = getattr(request.state, "operator_audit_context", None)
+    if not isinstance(principal, OperatorPrincipal) or not isinstance(
+        audit_context,
+        OperatorRequestAuditContext,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "operator_session_unavailable"},
+            headers={"Retry-After": "1"},
+        )
+    try:
+        operator_sessions.record_mutation_rejection(
+            principal=principal,
+            reason_code=reason_code,
+            audit_context=audit_context,
+            target_grant_id=target_grant_id,
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+        )
+    except OperatorSessionUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "operator_session_unavailable"},
+            headers={"Retry-After": "1"},
+        ) from None
 
 
 def _external_node_command(
@@ -3257,4 +3629,21 @@ def _issued_access_grant_response(issued: IssuedAccessGrant) -> AccessGrantSecre
         kind=issued.grant.kind,
         created_by=issued.grant.created_by,
         last_used_at=issued.grant.last_used_at,
+    )
+
+
+def _access_grant_response(
+    grant: AccessGrant | AccessGrantSummary,
+) -> AccessGrantResponse:
+    return AccessGrantResponse(
+        id=str(grant.id),
+        camera_id=str(grant.camera_id),
+        username=grant.username,
+        not_before=grant.not_before,
+        expires_at=grant.expires_at,
+        revoked_at=grant.revoked_at,
+        revision=grant.revision,
+        kind=grant.kind,
+        created_by=grant.created_by,
+        last_used_at=grant.last_used_at,
     )

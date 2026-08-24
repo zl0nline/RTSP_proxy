@@ -623,7 +623,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
     restricted = create_engine(restricted_url)
     with restricted.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0016_node_registration_keys"
+            "0017_access_grant_keys"
         )
         assert not connection.scalar(
             text("SELECT pg_has_role(current_user, 'rtsp_proxy_observability_hostile', 'MEMBER')")

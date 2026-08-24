@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 from uuid import UUID
 
 import pytest
@@ -21,6 +22,7 @@ from rtsp_proxy.operator_access import (
     MAX_AUTHZ_VERSION,
     InMemoryOperatorSessionStore,
     OperatorAccount,
+    OperatorActionBucket,
     OperatorAuthenticationRequired,
     OperatorAuthorizationDenied,
     OperatorConflict,
@@ -103,6 +105,204 @@ LOGIN_AUDIT_CONTEXT = OperatorRequestAuditContext.capture(
     source_ip="198.51.100.10",
     user_agent="security-audit-test/1.0",
 )
+
+
+def test_postgres_operator_action_rate_buckets_are_durable_and_independent(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operator_accounts "
+                "(id, identity_source, subject, display_name, roles, scopes, "
+                "authz_version, enabled) VALUES "
+                "(:id, 'oidc', 'rate-admin@example.test', 'Rate admin', "
+                "ARRAY['admin']::varchar[], ARRAY['server:*']::varchar[], 1, true)"
+            ),
+            {"id": ACCOUNT_ID},
+        )
+    store = PostgresOperatorSessionStore(postgres_database_url)
+
+    first_secret = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.SECRET_ISSUE,
+        limit=1,
+        window_seconds=60,
+    )
+    limited_secret = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.SECRET_ISSUE,
+        limit=1,
+        window_seconds=60,
+    )
+    first_mutation = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.ACCESS_MUTATION,
+        limit=1,
+        window_seconds=60,
+    )
+
+    with engine.connect() as connection:
+        persisted = [
+            (str(row.bucket), int(row.used))
+            for row in connection.execute(
+                text(
+                    "SELECT bucket, used FROM operator_action_rate_limits "
+                    "WHERE account_id=:account_id ORDER BY bucket"
+                ),
+                {"account_id": ACCOUNT_ID},
+            ).all()
+        ]
+    store.close()
+    engine.dispose()
+
+    assert first_secret == first_mutation == 0
+    assert 1 <= limited_secret <= 60
+    assert persisted == [("access_mutation", 1), ("secret_issue", 1)]
+
+
+def test_postgres_first_operator_action_bucket_claim_is_concurrency_safe(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operator_accounts "
+                "(id, identity_source, subject, display_name, roles, scopes, "
+                "authz_version, enabled) VALUES "
+                "(:id, 'oidc', 'concurrent-rate@example.test', 'Concurrent rate', "
+                "ARRAY['admin']::varchar[], ARRAY['server:*']::varchar[], 1, true)"
+            ),
+            {"id": ACCOUNT_ID},
+        )
+    stores = tuple(
+        PostgresOperatorSessionStore(postgres_database_url) for _index in range(8)
+    )
+    barrier = Barrier(len(stores))
+
+    def claim(store: PostgresOperatorSessionStore) -> int:
+        barrier.wait(timeout=5)
+        return store.claim_operator_action(
+            account_id=ACCOUNT_ID,
+            bucket=OperatorActionBucket.SECRET_ISSUE,
+            limit=10,
+            window_seconds=60,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        results = list(executor.map(claim, stores))
+    with engine.connect() as connection:
+        used = connection.scalar(
+            text(
+                "SELECT used FROM operator_action_rate_limits "
+                "WHERE account_id=:account_id AND bucket='secret_issue'"
+            ),
+            {"account_id": ACCOUNT_ID},
+        )
+    for store in stores:
+        store.close()
+    engine.dispose()
+
+    assert results == [0] * len(stores)
+    assert used == len(stores)
+
+
+def test_postgres_rejected_access_mutation_is_a_durable_sanitized_pair(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    grant_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+    request_id = UUID("83000000-0000-4000-8000-000000000008")
+    idempotency_key = UUID("66666666-6666-4666-8666-666666666666")
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:access-admin@example.test",
+        display_name="Access admin",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresOperatorSessionStore(postgres_database_url)
+    store.create_account(account)
+    control = OperatorSessionControl(
+        store=store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+        session_id_factory=lambda: UUID("70000000-0000-4000-8000-000000000007"),
+    )
+    issued = control.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    context = OperatorRequestAuditContext.capture(
+        request_id=request_id,
+        action="camera.grant_rotate",
+        http_method="POST",
+        resource_scope=f"camera:{camera_id}",
+        resource_type="access_grant",
+        resource_id=str(grant_id),
+        source_ip="198.51.100.10",
+        user_agent="security-audit-test/1.0",
+    )
+    principal = control.authenticate(
+        session_token=issued.session_token,
+        permission=OperatorPermission.SECRET_ISSUE,
+        required_scope=f"camera:{camera_id}",
+        audit_context=context,
+    )
+
+    control.record_mutation_rejection(
+        principal=principal,
+        reason_code="access_grant_revision_conflict",
+        audit_context=context,
+        target_grant_id=grant_id,
+        expected_revision=3,
+        idempotency_key=idempotency_key,
+    )
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                "SELECT id, payload FROM audit_events "
+                "WHERE event_type='operator.mutation_rejected'"
+            )
+        ).one()
+        outbox = connection.execute(
+            text(
+                "SELECT id, payload FROM outbox_messages "
+                "WHERE event_type='operator.mutation_rejected'"
+            )
+        ).one()
+    store.close()
+    engine.dispose()
+
+    assert audit.id == outbox.id
+    assert audit.payload == outbox.payload
+    assert audit.payload == {
+        "account_id": str(ACCOUNT_ID),
+        "action": "camera.grant_rotate",
+        "auth_method": "oidc",
+        "authz_version": 1,
+        "expected_revision": 3,
+        "http_method": "POST",
+        "idempotency_key": str(idempotency_key),
+        "outcome": "rejected",
+        "reason_code": "access_grant_revision_conflict",
+        "request_id": str(request_id),
+        "resource_id": str(grant_id),
+        "resource_scope": f"camera:{camera_id}",
+        "resource_type": "access_grant",
+        "roles": ["admin"],
+        "scopes": ["server:*"],
+        "session_id": str(issued.session.id),
+        "source_ip_sha256": context.source_ip_sha256,
+        "target_grant_id": str(grant_id),
+        "user_agent_sha256": context.user_agent_sha256,
+    }
 
 
 def _protected_route_method_matrix(
@@ -1300,7 +1500,7 @@ def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -
         ),
     )
     route_methods = _protected_route_method_matrix(anonymous_app.routes)
-    assert len(route_methods) == 63
+    assert len(route_methods) == 70
 
     node_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
