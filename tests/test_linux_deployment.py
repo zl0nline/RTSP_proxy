@@ -34,6 +34,15 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
     media = read_unit("mediamtx.service")
     assert web["Service"]["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy.env")
     assert web["Service"]["Environment"] == "RTSP_PROXY_ROLE=web"
+    assert web["Service"]["ExecStart"] == (
+        "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-web "
+        "--management-tls-certificate-file=%d/management-tls.pem "
+        "--management-tls-private-key-file=%d/management-tls.pem"
+    )
+    assert web["Service"]["LoadCredential"] == (
+        "management-tls.pem:/etc/rtsp-proxy/control-plane/management-tls-current/"
+        "management-tls.pem"
+    )
     auth_drop_in = read_unit("rtsp-proxy-web-auth.conf.example")["Service"]
     assert "%d/oidc-client-secret" in auth_drop_in["Environment"]
     assert "oidc-client-secret:" in auth_drop_in["LoadCredential"]
@@ -115,6 +124,41 @@ def test_notifier_uses_a_dedicated_identity_and_systemd_credential() -> None:
     assert "NODE_RUNTIME_SOCKET=/run/rtsp-proxy-node-metrics/metrics.sock" in (
         collector_environment
     )
+
+
+def test_management_tls_rotation_runbook_switches_one_validated_pair_atomically() -> None:
+    runbook = Path("deploy/README.md").read_text(encoding="utf-8")
+
+    assert "ipaddress.ip_address(sys.argv[1])" in runbook
+    assert "-checkip \"$tls_management_name\"" in runbook
+    assert "-checkhost \"$tls_management_name\"" in runbook
+    assert "For an IPv6" in runbook
+    assert "literal, keep the SAN value unbracketed" in runbook
+    assert "tls_management_url=https://management.example.net:8000/health/ready" in runbook
+    assert "ln -s \"$tls_candidate_target\" \"$tls_next_link\"" in runbook
+    atomic_switch = 'mv -Tf "$tls_next_link" "$tls_current_link"'
+    assert atomic_switch in runbook
+    assert runbook.index("trap tls_restore EXIT HUP INT TERM") < runbook.rindex(atomic_switch)
+    assert "readlink \"$tls_current_link\"" in runbook
+    assert "flock -n 9" in runbook
+    assert "/run/lock/rtsp-proxy-management-tls.lock" not in runbook
+    assert "tls_lock=$tls_control_root/.management-tls-rotation.lock" in runbook
+    assert "set -o noclobber" in runbook
+    assert "regular file:0:0:600:1" in runbook
+    assert "os.fsync" in runbook
+    assert '"$tls_previous_dir/management-tls.pem" -pubkey -noout' in runbook
+    assert '"$tls_previous_dir/management-tls.pem" -pubout -outform DER' in runbook
+    candidate_link = 'ln -s "$tls_candidate_target" "$tls_next_link"'
+    assert runbook.rfind('tls_fsync "$tls_control_root"', 0, runbook.index(candidate_link)) > 0
+    assert "tls_restart_and_wait" in runbook
+    assert "InvocationID" in runbook
+    assert 'if ! tls_previous_invocation=$(timeout --signal=KILL 2s systemctl show' in runbook
+    assert '[ -z "$tls_previous_invocation" ]; then' in runbook
+    assert '"$tls_observed_invocation" != "$tls_previous_invocation"' in runbook
+    assert "tls_served_fingerprint" in runbook
+    assert 'test "$tls_served" = "$tls_candidate_fingerprint"' in runbook
+    assert 'test "$tls_served" = "$tls_previous_fingerprint"' in runbook
+    assert "--connect-timeout 2 --max-time 5" in runbook
 
 
 def test_media_auth_callback_is_a_dedicated_unprivileged_loopback_service() -> None:

@@ -4,7 +4,7 @@
 на независимые bounded nodes: каждая node — отдельный MediaMTX process/systemd
 instance, один внешний RTSP port и не более 100 зарегистрированных камер.
 
-> **Статус на 24 августа 2026**
+> **Статус на 29 августа 2026**
 >
 > - Bounded-node architecture: **согласована**, issues #1–#14 обновлены.
 > - Phase 0A MediaMTX/ordinary-RTSP compatibility: **complete** на native
@@ -60,6 +60,13 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   Admission remains fenced through the bounded runtime action;
 >   timeout/rollback retains a separate path-restoration reserve. This does not
 >   close Phase F or production readiness.
+> - Phase-F management HTTPS boundary: **implementation, direct-Linux amd64
+>   validation and independent review complete; native amd64/arm64 CI pending**.
+>   WEB rejects wildcard/broadcast/multicast binds, terminates TLS directly,
+>   applies HSTS to every response and consumes one immutable combined PEM from
+>   systemd `LoadCredential`; plaintext is rejected. Exact local/Linux evidence
+>   is recorded in
+>   [`docs/evidence/phase-f-management-https-contract.md`](docs/evidence/phase-f-management-https-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -448,6 +455,10 @@ native/external CI jobs are green at commit
 [CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524).
 Exact evidence is recorded in
 [`docs/evidence/phase-f-camera-registration-dashboard-contract.md`](docs/evidence/phase-f-camera-registration-dashboard-contract.md).
+The management HTTPS slice is also locally and direct-Linux validated and has
+passed both independent reviews; its native dual-architecture publication run
+is still pending. The exact boundary is recorded in
+[`docs/evidence/phase-f-management-https-contract.md`](docs/evidence/phase-f-management-https-contract.md).
 Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не

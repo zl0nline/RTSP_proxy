@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     role: RuntimeRole
     http_host: IPvAnyAddress = IPv4Address("127.0.0.1")
     http_port: int = Field(default=8000, ge=1, le=65535)
+    management_tls_certificate_file: Path | None = None
+    management_tls_private_key_file: Path | None = None
     max_nodes: int = Field(default=50, ge=1, le=100)
     node_port_range_start: int = Field(default=10000, ge=1, le=65535)
     node_port_range_end: int = Field(default=10999, ge=1, le=65535)
@@ -170,6 +172,25 @@ class Settings(BaseSettings):
             raise ValueError("node_port_ranges_overlap")
         if any(self.http_port in configured for configured in (external, api, metrics)):
             raise ValueError("node_port_range_overlaps_control_port")
+        if self.role is RuntimeRole.WEB and (
+            self.http_host.is_unspecified
+            or self.http_host.is_multicast
+            or self.http_host == IPv4Address("255.255.255.255")
+        ):
+            raise ValueError("management_host_must_be_specific")
+        management_tls_files = (
+            self.management_tls_certificate_file,
+            self.management_tls_private_key_file,
+        )
+        if any(path is not None for path in management_tls_files):
+            if any(path is None for path in management_tls_files):
+                raise ValueError("management_tls_configuration_incomplete")
+            if any(path is not None and not path.is_absolute() for path in management_tls_files):
+                raise ValueError("management_tls_file_must_be_absolute")
+        if self.role is RuntimeRole.WEB and not self.http_host.is_loopback and not all(
+            path is not None for path in management_tls_files
+        ):
+            raise ValueError("management_tls_required_for_non_loopback")
         if not self.auth_host.is_loopback:
             raise ValueError("auth_host_must_be_loopback")
         if self.auth_port == self.http_port or any(

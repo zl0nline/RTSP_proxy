@@ -103,6 +103,10 @@ jobs:
           sudo ln -s releases/ci /opt/rtsp-proxy/current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
           sudo touch /etc/rtsp-proxy/control-plane/access-peppers.json
+          sudo mkdir -p /etc/rtsp-proxy/control-plane/management-tls.initial
+          sudo touch /etc/rtsp-proxy/control-plane/management-tls.initial/management-tls.pem
+          sudo ln -sfn management-tls.initial \
+            /etc/rtsp-proxy/control-plane/management-tls-current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy-worker.env
           sudo touch /etc/rtsp-proxy/collector.env
           sudo touch /etc/rtsp-proxy/notifier.env
@@ -110,6 +114,11 @@ jobs:
           sudo touch /etc/rtsp-proxy/mediamtx/mediamtx.yml
           sudo touch /etc/rtsp-proxy/node-runtime.env
           systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.socket
+          sudo env \
+            RTSP_PROXY_RUN_SYSTEMD_HTTPS_CONTRACT=1 \
+            PYTHONPATH="$PWD/src" \
+            "$PWD/.venv/bin/python" -m pytest -q \
+            tests/contract/test_management_https_systemd.py
 
       - name: Validate owned nftables policy
         run: |

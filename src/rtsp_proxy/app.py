@@ -121,6 +121,28 @@ from rtsp_proxy.reconcile import (
 IDEMPOTENCY_KEY_HEADER = Header(default=None, alias="Idempotency-Key")
 NODE_REVISION_HEADER = Header(default=None, alias="X-Node-Revision")
 NODE_STATE_HEADER = Header(default=None, alias="X-Node-State")
+MANAGEMENT_HSTS = "max-age=31536000"
+
+
+class ManagementHstsBoundary:
+    """Set one exact HSTS policy on every management HTTP response."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_hsts(message: Message) -> None:
+            if scope["type"] == "http" and message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"strict-transport-security"
+                ]
+                headers.append((b"strict-transport-security", MANAGEMENT_HSTS.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self._app(scope, receive, send_with_hsts)
 
 
 def _lifecycle_busy() -> HTTPException:
@@ -872,6 +894,31 @@ def create_app(
             assert isinstance(result, Response)
             result.headers["Cache-Control"] = "no-store"
             return audited_response(result)
+
+    if settings.management_tls_certificate_file is not None:
+
+        @app.exception_handler(Exception)
+        async def management_https_unhandled_error(
+            _request: Request,
+            _error: Exception,
+        ) -> Response:
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"detail": {"code": "internal_server_error"}},
+                headers={
+                    "Cache-Control": "no-store",
+                    "Strict-Transport-Security": MANAGEMENT_HSTS,
+                },
+            )
+
+        @app.middleware("http")
+        async def management_https_headers(
+            request: Request,
+            call_next: Callable[[Request], Awaitable[Response]],
+        ) -> Response:
+            response = await call_next(request)
+            response.headers["Strict-Transport-Security"] = MANAGEMENT_HSTS
+            return response
 
     @app.get("/", include_in_schema=False)
     def application_root() -> Response:

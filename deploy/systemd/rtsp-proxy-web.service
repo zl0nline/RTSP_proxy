@@ -9,8 +9,9 @@ User=rtsp-proxy
 Group=rtsp-proxy
 Environment=RTSP_PROXY_ROLE=web
 EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env
+LoadCredential=management-tls.pem:/etc/rtsp-proxy/control-plane/management-tls-current/management-tls.pem
 WorkingDirectory=/opt/rtsp-proxy/current
-ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-web
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-web --management-tls-certificate-file=%d/management-tls.pem --management-tls-private-key-file=%d/management-tls.pem
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s

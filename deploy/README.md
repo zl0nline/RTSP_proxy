@@ -19,7 +19,10 @@ Linux amd64/arm64 имеют одинаковые functional/security/release ga
 └── current -> releases/<release-id>
 
 /etc/rtsp-proxy/
-├── control-plane/rtsp-proxy.env
+├── control-plane/
+│   ├── rtsp-proxy.env
+│   ├── management-tls-current -> management-tls.<version>/
+│   └── management-tls.<version>/management-tls.pem
 └── nodes/<node-id>/mediamtx.yml
 
 /var/lib/rtsp-proxy/
@@ -46,6 +49,249 @@ Each media instance has:
 - stable node id in environment/log identity;
 - config/state paths restricted to that node;
 - no access to another node's writable state.
+
+## Management HTTPS boundary
+
+`rtsp-proxy-web.service` terminates TLS itself; no external plaintext listener
+or implicit reverse-proxy trust is part of the deployment contract. Install a
+CA-issued certificate whose SAN contains the exact management DNS name/IP and
+its matching private key before enabling the unit. Keep each pair in one
+root-owned versioned directory and atomically point `management-tls-current` at
+that directory; the unit never reads two independently replaced active files:
+
+```sh
+set -euo pipefail
+tls_control_root=/etc/rtsp-proxy/control-plane
+tls_initial_dir=$tls_control_root/management-tls.initial
+sudo install -d -o root -g root -m 0700 "$tls_initial_dir"
+sudo sh -c 'umask 077; cat "$1" "$2" >"$3"' sh \
+  management-tls.crt management-tls.key "$tls_initial_dir/management-tls.pem"
+sudo chown root:root "$tls_initial_dir/management-tls.pem"
+sudo sync -f "$tls_initial_dir/management-tls.pem"
+sudo sync -f "$tls_initial_dir"
+sudo ln -s "$(basename "$tls_initial_dir")" \
+  "$tls_control_root/.management-tls-current.new"
+sudo mv -Tf "$tls_control_root/.management-tls-current.new" \
+  "$tls_control_root/management-tls-current"
+sudo sync -f "$tls_control_root"
+```
+
+The unit copies the combined certificate/private-key PEM as one immutable file
+into its private systemd credential directory and passes that same path as both
+Uvicorn TLS inputs. A concurrent service start therefore observes one complete
+version, never two independently resolved files. Certificate or key bytes never
+enter an environment variable. Keep `RTSP_PROXY_HTTP_HOST=127.0.0.1` for local-only
+administration, or set it to the exact management-LAN address; a non-loopback
+bind without both TLS credentials is rejected before the listener starts.
+Wildcard (`0.0.0.0`/`::`) and multicast binds are rejected even with TLS: the
+listener must name one concrete loopback or management-interface address.
+Restrict that address to the management subnet in the host firewall and use
+only `https://<management-name>:<port>` from browsers. A plaintext request to
+the same port is rejected by the TLS listener. HTTPS responses set
+`Strict-Transport-Security: max-age=31536000`; the contract deliberately does
+not claim unrelated management subdomains or browser preload ownership.
+Certificate renewal is a staged, rollback-capable operation; never replace the
+active pair before validating the candidate. Run the following as an operator
+with sudo after setting the task-specific variables. `tls_management_name` is
+the exact, unbracketed DNS name or IP SAN used by browsers. Set
+`tls_management_url` independently to the exact browser URL. For an IPv6
+literal, keep the SAN value unbracketed but bracket the URL authority, for
+example `tls_management_name=2001:db8::10` and
+`tls_management_connect=[2001:db8::10]:8000` with
+`tls_management_url=https://[2001:db8::10]:8000/health/ready`.
+`tls_ca_bundle` must validate both the candidate and current certificate during
+the rollback window.
+
+Save this block as a root-owned file and execute it with `sudo bash <file>`; it
+rejects non-root execution and holds an exclusive host lock for the complete
+preflight, switch, readiness and rollback transaction.
+
+```sh
+set -euo pipefail
+test "$(id -u)" -eq 0 || { printf 'management TLS rotation requires root\n' >&2; exit 1; }
+export LC_ALL=C
+tls_candidate_certificate=/secure/staging/management-tls.crt
+tls_candidate_private_key=/secure/staging/management-tls.key
+tls_management_name=management.example.net
+tls_management_connect=management.example.net:8000
+tls_management_url=https://management.example.net:8000/health/ready
+tls_ca_bundle=/etc/ssl/certs/ca-certificates.crt
+tls_control_root=/etc/rtsp-proxy/control-plane
+tls_current_link=$tls_control_root/management-tls-current
+test "$(stat -c '%F:%u:%g:%a' "$tls_control_root")" = 'directory:0:0:750'
+tls_lock=$tls_control_root/.management-tls-rotation.lock
+if [ ! -e "$tls_lock" ] && [ ! -L "$tls_lock" ]; then
+  (umask 077; set -o noclobber; : >"$tls_lock") 2>/dev/null || :
+fi
+test "$(stat -c '%F:%u:%g:%a:%h' "$tls_lock")" = 'regular file:0:0:600:1'
+exec 9<>"$tls_lock"
+flock -n 9 || { printf 'management TLS rotation already running\n' >&2; exit 1; }
+
+tls_stage=$(mktemp -d "$tls_control_root/.management-tls-candidate.XXXXXX")
+tls_candidate_target=$(basename "$tls_stage")
+tls_next_link=$tls_control_root/.management-tls-current.next.$$
+tls_previous_target=$(readlink "$tls_current_link")
+case "$tls_previous_target" in
+  ''|/*|*/*|.|..)
+    printf 'unsafe management TLS current target: %s\n' "$tls_previous_target" >&2
+    exit 1
+    ;;
+esac
+tls_previous_dir=$tls_control_root/$tls_previous_target
+test "$(stat -c '%F:%u:%g:%a' "$tls_previous_dir")" = 'directory:0:0:700'
+test "$(stat -c '%F:%u:%g:%a:%h' "$tls_previous_dir/management-tls.pem")" = \
+  'regular file:0:0:600:1'
+
+tls_fsync() {
+  python3 - "$@" <<'PY'
+import os
+import sys
+
+for path in sys.argv[1:]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+PY
+}
+
+tls_restart_and_wait() {
+  if ! tls_previous_invocation=$(timeout --signal=KILL 2s systemctl show \
+    --property=InvocationID --value rtsp-proxy-web.service); then
+    return 1
+  fi
+  if [ -z "$tls_previous_invocation" ]; then
+    return 1
+  fi
+  timeout --signal=KILL 3s systemctl --no-block restart rtsp-proxy-web.service
+  tls_restart_deadline=$((SECONDS + 20))
+  while [ "$SECONDS" -lt "$tls_restart_deadline" ]; do
+    tls_observed_invocation=$(timeout --signal=KILL 2s systemctl show \
+      --property=InvocationID --value rtsp-proxy-web.service || :)
+    if [ -n "$tls_observed_invocation" ] && \
+       [ "$tls_observed_invocation" != "$tls_previous_invocation" ] && \
+       timeout --signal=KILL 2s systemctl is-active --quiet rtsp-proxy-web.service; then
+      return 0
+    fi
+    if timeout --signal=KILL 2s systemctl is-failed --quiet rtsp-proxy-web.service; then
+      return 1
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+tls_served_fingerprint() {
+  timeout --signal=KILL 5s openssl s_client \
+    -connect "$tls_management_connect" -servername "$tls_management_name" \
+    -CAfile "$tls_ca_bundle" -verify_return_error </dev/null 2>/dev/null |
+    openssl x509 -noout -fingerprint -sha256
+}
+
+install -o root -g root -m 0600 "$tls_candidate_certificate" "$tls_stage/cert"
+install -o root -g root -m 0600 "$tls_candidate_private_key" "$tls_stage/key"
+openssl x509 -in "$tls_stage/cert" -noout -checkend 86400
+openssl pkey -in "$tls_stage/key" -check -noout
+openssl x509 -in "$tls_previous_dir/management-tls.pem" -noout -checkend 86400
+openssl pkey -in "$tls_previous_dir/management-tls.pem" -check -noout
+openssl verify -purpose sslserver -CAfile "$tls_ca_bundle" "$tls_stage/cert"
+openssl verify -purpose sslserver -CAfile "$tls_ca_bundle" \
+  "$tls_previous_dir/management-tls.pem"
+if python3 - "$tls_management_name" <<'PY'
+import ipaddress
+import sys
+
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1) from None
+PY
+then
+  openssl x509 -in "$tls_stage/cert" -noout -checkip "$tls_management_name"
+  openssl x509 -in "$tls_previous_dir/management-tls.pem" -noout \
+    -checkip "$tls_management_name"
+else
+  openssl x509 -in "$tls_stage/cert" -noout -checkhost "$tls_management_name"
+  openssl x509 -in "$tls_previous_dir/management-tls.pem" -noout \
+    -checkhost "$tls_management_name"
+fi
+tls_cert_public=$(openssl x509 -in "$tls_stage/cert" -pubkey -noout |
+  openssl pkey -pubin -outform DER | sha256sum | awk '{print $1}')
+tls_key_public=$(openssl pkey -in "$tls_stage/key" -pubout -outform DER |
+  sha256sum | awk '{print $1}')
+test "$tls_cert_public" = "$tls_key_public"
+tls_previous_cert_public=$(openssl x509 \
+  -in "$tls_previous_dir/management-tls.pem" -pubkey -noout |
+  openssl pkey -pubin -outform DER | sha256sum | awk '{print $1}')
+tls_previous_key_public=$(openssl pkey \
+  -in "$tls_previous_dir/management-tls.pem" -pubout -outform DER |
+  sha256sum | awk '{print $1}')
+test "$tls_previous_cert_public" = "$tls_previous_key_public"
+tls_candidate_fingerprint=$(openssl x509 -in "$tls_stage/cert" \
+  -noout -fingerprint -sha256)
+tls_previous_fingerprint=$(openssl x509 \
+  -in "$tls_previous_dir/management-tls.pem" -noout -fingerprint -sha256)
+
+cat "$tls_stage/cert" "$tls_stage/key" >"$tls_stage/management-tls.pem"
+chown root:root "$tls_stage/management-tls.pem"
+chmod 0600 "$tls_stage/management-tls.pem"
+rm -f "$tls_stage/cert" "$tls_stage/key"
+tls_fsync "$tls_stage/management-tls.pem" "$tls_stage"
+tls_fsync "$tls_control_root"
+
+tls_committed=0
+tls_restore() {
+  tls_status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  tls_recovery_status=0
+  rm -f "$tls_next_link"
+  tls_observed_target=$(readlink "$tls_current_link" 2>/dev/null)
+  if [ "$tls_observed_target" != "$tls_previous_target" ]; then
+    ln -s "$tls_previous_target" "$tls_next_link"
+    mv -Tf "$tls_next_link" "$tls_current_link"
+    tls_fsync "$tls_control_root"
+  fi
+  tls_restart_and_wait || tls_recovery_status=1
+  curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+    --cacert "$tls_ca_bundle" \
+    --output /dev/null "$tls_management_url" || tls_recovery_status=1
+  tls_served=$(tls_served_fingerprint) || tls_recovery_status=1
+  test "$tls_served" = "$tls_previous_fingerprint" || tls_recovery_status=1
+  if [ "$tls_recovery_status" -ne 0 ]; then
+    tls_status=1
+  fi
+  if [ "$tls_committed" -eq 0 ] && [ "$tls_status" -eq 0 ]; then
+    tls_status=1
+  fi
+  exit "$tls_status"
+}
+trap tls_restore EXIT HUP INT TERM
+
+ln -s "$tls_candidate_target" "$tls_next_link"
+mv -Tf "$tls_next_link" "$tls_current_link"
+tls_fsync "$tls_control_root"
+tls_restart_and_wait
+curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+  --cacert "$tls_ca_bundle" \
+  --dump-header - --output /dev/null "$tls_management_url" |
+  grep -Fi 'strict-transport-security: max-age=31536000' >/dev/null
+tls_served=$(tls_served_fingerprint)
+test "$tls_served" = "$tls_candidate_fingerprint"
+tls_committed=1
+trap - EXIT HUP INT TERM
+printf 'TLS rotation succeeded; retain previous pair at %s until observation completes\n' \
+  "$tls_previous_dir"
+```
+
+After the observation window, securely remove only the printed, exact previous
+directory after confirming that it is no longer the symlink target. The
+candidate directory is now the active pair and must remain. The single symlink
+rename switches both files atomically. A failure or handled signal after that
+switch restores the prior target and restarts it; a power loss leaves either
+the complete prior pair or the complete prevalidated candidate pair, never a
+mixed certificate/key pair. Neither path creates a plaintext listener.
 
 `rtsp-proxy-media@<node-id>.service`, the per-node renderer and the scoped
 `rtsp-proxy-node-runtime.socket`/helper implement the Phase C runtime. The

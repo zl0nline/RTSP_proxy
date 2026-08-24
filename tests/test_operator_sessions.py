@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Barrier
 from uuid import UUID
 
@@ -1348,6 +1349,47 @@ def test_control_api_requires_secure_cookie_rbac_and_csrf() -> None:
     assert missing_csrf.headers["x-request-id"] == str(events[2].audit_context.request_id)
     assert logged_out.headers["x-request-id"] == str(events[3].audit_context.request_id)
     assert repeated_logout.headers["x-request-id"] == str(events[4].audit_context.request_id)
+
+
+def test_management_hsts_covers_authentication_and_authorization_rejections() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:viewer@example.test",
+        display_name="Viewer",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW)
+    sessions = OperatorSessionControl(
+        store=store,
+        token_factory=iter(("s" * 43, "c" * 43)).__next__,
+    )
+    issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    client = TestClient(
+        create_app(
+            Settings(
+                role=RuntimeRole.WEB,
+                management_tls_certificate_file=Path("/run/credentials/management-tls.crt"),
+                management_tls_private_key_file=Path("/run/credentials/management-tls.key"),
+            ),
+            operator_sessions=sessions,
+        ),
+        base_url="https://management.example.test",
+    )
+
+    anonymous = client.get("/api/v1/nodes")
+    denied = client.get(
+        "/api/v1/operators",
+        headers={"Cookie": f"__Host-rtsp_proxy_session={issued.session_token}"},
+    )
+
+    assert anonymous.status_code == 401
+    assert denied.status_code == 403
+    assert anonymous.headers["strict-transport-security"] == "max-age=31536000"
+    assert denied.headers["strict-transport-security"] == "max-age=31536000"
 
 
 def test_mutating_control_endpoint_is_fenced_before_handler() -> None:

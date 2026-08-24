@@ -6,6 +6,7 @@ import platform
 import socket
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from threading import Thread
 from time import sleep
@@ -297,6 +298,78 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
 
     assert str(settings.http_host) == "127.0.0.2"
     assert settings.http_port == 8080
+
+
+def test_management_lan_bind_requires_a_complete_tls_identity(tmp_path: Path) -> None:
+    certificate = tmp_path / "management-tls.crt"
+    private_key = tmp_path / "management-tls.key"
+
+    with pytest.raises(ValidationError, match="management_tls_required_for_non_loopback"):
+        Settings(role=RuntimeRole.WEB, http_host=IPv4Address("192.0.2.10"))
+    with pytest.raises(ValidationError, match="management_tls_configuration_incomplete"):
+        Settings(
+            role=RuntimeRole.WEB,
+            management_tls_certificate_file=certificate,
+        )
+    with pytest.raises(ValidationError, match="management_tls_file_must_be_absolute"):
+        Settings(
+            role=RuntimeRole.WEB,
+            management_tls_certificate_file=Path("management-tls.crt"),
+            management_tls_private_key_file=Path("management-tls.key"),
+        )
+
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        http_host=IPv4Address("192.0.2.10"),
+        management_tls_certificate_file=certificate,
+        management_tls_private_key_file=private_key,
+    )
+
+    assert settings.management_tls_certificate_file == certificate
+    assert settings.management_tls_private_key_file == private_key
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        IPv4Address("0.0.0.0"),
+        IPv4Address("255.255.255.255"),
+        IPv6Address("::"),
+        IPv4Address("224.0.0.1"),
+        IPv6Address("ff02::1"),
+    ),
+)
+def test_management_listener_requires_one_specific_interface_address(
+    host: IPv4Address | IPv6Address,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError, match="management_host_must_be_specific"):
+        Settings(
+            role=RuntimeRole.WEB,
+            http_host=host,
+            management_tls_certificate_file=tmp_path / "management-tls.crt",
+            management_tls_private_key_file=tmp_path / "management-tls.key",
+        )
+
+
+def test_management_hsts_covers_unexpected_server_errors(tmp_path: Path) -> None:
+    app = create_app(
+        Settings(
+            role=RuntimeRole.WEB,
+            management_tls_certificate_file=tmp_path / "management-tls.crt",
+            management_tls_private_key_file=tmp_path / "management-tls.key",
+        )
+    )
+
+    @app.get("/unexpected-error")
+    def unexpected_error() -> None:
+        raise RuntimeError("operator-visible details must not escape")
+
+    response = TestClient(app, raise_server_exceptions=False).get("/unexpected-error")
+
+    assert response.status_code == 500
+    assert response.headers["Strict-Transport-Security"] == "max-age=31536000"
+    assert "operator-visible" not in response.text
 
 
 def test_operator_login_configuration_is_all_or_nothing_and_https_only(
@@ -864,10 +937,18 @@ def test_console_entrypoints_enforce_role_and_pass_validated_apps_to_uvicorn(
     from rtsp_proxy.migrate import upgrade_database
 
     upgrade_database(postgres_database_url)
-    uvicorn_calls: list[tuple[object, str, int]] = []
+    uvicorn_calls: list[tuple[object, str, int, str | None, str | None]] = []
 
-    def run_server(app: object, *, host: str, port: int, **_kwargs: object) -> None:
-        uvicorn_calls.append((app, host, port))
+    def run_server(
+        app: object,
+        *,
+        host: str,
+        port: int,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
+        **_kwargs: object,
+    ) -> None:
+        uvicorn_calls.append((app, host, port, ssl_certfile, ssl_keyfile))
         with TestClient(app) as client:  # type: ignore[arg-type]
             assert client.get("/health/live").status_code == 200
 
@@ -889,9 +970,46 @@ def test_console_entrypoints_enforce_role_and_pass_validated_apps_to_uvicorn(
     monkeypatch.setenv("RTSP_PROXY_HTTP_HOST", "127.0.0.2")
     monkeypatch.setenv("RTSP_PROXY_HTTP_PORT", "9080")
     run_web()
-    assert uvicorn_calls[-1][1:] == ("127.0.0.2", 9080)
+    assert uvicorn_calls[-1][1:] == ("127.0.0.2", 9080, None, None)
+
+    certificate = tmp_path / "management-tls.crt"
+    private_key = tmp_path / "management-tls.key"
+    monkeypatch.setenv("RTSP_PROXY_HTTP_HOST", "192.0.2.10")
+    monkeypatch.setenv("RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE", str(certificate))
+    monkeypatch.setenv("RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE", str(private_key))
+    run_web()
+    assert uvicorn_calls[-1][1:] == (
+        "192.0.2.10",
+        9080,
+        str(certificate),
+        str(private_key),
+    )
+
+    monkeypatch.setenv(
+        "RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE",
+        "/tmp/operator-controlled-certificate",
+    )
+    monkeypatch.setenv(
+        "RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE",
+        "/tmp/operator-controlled-private-key",
+    )
+    trusted_certificate = Path("/run/credentials/rtsp-proxy-web/management-tls.crt")
+    trusted_private_key = Path("/run/credentials/rtsp-proxy-web/management-tls.key")
+    run_web(
+        management_tls_certificate_file=trusted_certificate,
+        management_tls_private_key_file=trusted_private_key,
+    )
+    assert uvicorn_calls[-1][1:] == (
+        "192.0.2.10",
+        9080,
+        str(trusted_certificate),
+        str(trusted_private_key),
+    )
 
     monkeypatch.setenv("RTSP_PROXY_ROLE", "worker")
+    monkeypatch.setenv("RTSP_PROXY_HTTP_HOST", "127.0.0.2")
+    monkeypatch.delenv("RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE")
+    monkeypatch.delenv("RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE")
     monkeypatch.setenv("RTSP_PROXY_SMTP_HOST", "smtp.example.test")
     monkeypatch.setenv("RTSP_PROXY_SMTP_USERNAME", "mailer")
     monkeypatch.setenv(
@@ -901,7 +1019,7 @@ def test_console_entrypoints_enforce_role_and_pass_validated_apps_to_uvicorn(
     monkeypatch.setenv("RTSP_PROXY_SMTP_FROM_ADDRESS", "proxy@example.test")
     monkeypatch.setenv("RTSP_PROXY_SMTP_TO_ADDRESS", "operator@example.test")
     run_background(["--expected-role", "worker"])
-    assert uvicorn_calls[-1][1:] == ("127.0.0.2", 9080)
+    assert uvicorn_calls[-1][1:] == ("127.0.0.2", 9080, None, None)
 
 
 def test_background_entrypoint_fails_closed_when_config_changes_instance_role() -> None:

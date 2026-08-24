@@ -2623,8 +2623,17 @@ def test_systemd_web_entrypoint_wires_the_persistent_node_control(
         host: str,
         port: int,
         access_log: bool,
+        ssl_certfile: str | None,
+        ssl_keyfile: str | None,
     ) -> None:
-        launched.update(app=app, host=host, port=port, access_log=access_log)
+        launched.update(
+            app=app,
+            host=host,
+            port=port,
+            access_log=access_log,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
+        )
 
     monkeypatch.setattr("rtsp_proxy.runtime.uvicorn.run", capture_run)
 
@@ -2633,6 +2642,8 @@ def test_systemd_web_entrypoint_wires_the_persistent_node_control(
     assert launched["host"] == "127.0.0.1"
     assert launched["port"] == 8000
     assert launched["access_log"] is False
+    assert launched["ssl_certfile"] is None
+    assert launched["ssl_keyfile"] is None
     response = TestClient(cast(FastAPI, launched["app"])).post(
         "/api/v1/nodes",
         json={"name": "entrypoint-node"},

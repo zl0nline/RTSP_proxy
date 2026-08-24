@@ -26,7 +26,7 @@ from rtsp_proxy.access import (
     PepperVerifier,
     load_pepper_verifier,
 )
-from rtsp_proxy.app import create_app, create_media_auth_app
+from rtsp_proxy.app import ManagementHstsBoundary, create_app, create_media_auth_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.health import RoleReadinessProvider
@@ -84,6 +84,8 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_ROLE": "role",
     "RTSP_PROXY_HTTP_HOST": "http_host",
     "RTSP_PROXY_HTTP_PORT": "http_port",
+    "RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE": "management_tls_certificate_file",
+    "RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE": "management_tls_private_key_file",
     "RTSP_PROXY_AUTH_HOST": "auth_host",
     "RTSP_PROXY_AUTH_PORT": "auth_port",
     "RTSP_PROXY_AUTH_DATABASE_TIMEOUT_SECONDS": "auth_database_timeout_seconds",
@@ -1041,15 +1043,54 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
     return store
 
 
-def run_web() -> None:
-    settings = load_settings()
+def run_web(
+    *,
+    management_tls_certificate_file: Path | None = None,
+    management_tls_private_key_file: Path | None = None,
+) -> None:
+    if (management_tls_certificate_file is None) != (management_tls_private_key_file is None):
+        raise ConfigurationError("management_tls_configuration_incomplete")
+    environment = dict(os.environ)
+    if management_tls_certificate_file is not None:
+        assert management_tls_private_key_file is not None
+        environment["RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE"] = str(
+            management_tls_certificate_file
+        )
+        environment["RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE"] = str(
+            management_tls_private_key_file
+        )
+    settings = load_settings(environment)
     if settings.role is not RuntimeRole.WEB:
         raise ConfigurationError("web_role_required")
+    application: Any = _create_runtime_app(settings)
+    if settings.management_tls_certificate_file is not None:
+        application = ManagementHstsBoundary(application)
     uvicorn.run(
-        _create_runtime_app(settings),
+        application,
         host=str(settings.http_host),
         port=settings.http_port,
         access_log=False,
+        ssl_certfile=(
+            None
+            if settings.management_tls_certificate_file is None
+            else str(settings.management_tls_certificate_file)
+        ),
+        ssl_keyfile=(
+            None
+            if settings.management_tls_private_key_file is None
+            else str(settings.management_tls_private_key_file)
+        ),
+    )
+
+
+def run_web_cli(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the RTSP Proxy management HTTPS server")
+    parser.add_argument("--management-tls-certificate-file", type=Path)
+    parser.add_argument("--management-tls-private-key-file", type=Path)
+    arguments = parser.parse_args(argv)
+    run_web(
+        management_tls_certificate_file=arguments.management_tls_certificate_file,
+        management_tls_private_key_file=arguments.management_tls_private_key_file,
     )
 
 
