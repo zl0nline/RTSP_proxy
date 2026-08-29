@@ -87,12 +87,15 @@ def _stop_and_reap(unit: str, *, user_manager: bool, pid: int | None, port: int)
     reap_deadline = time.monotonic() + 5
     while time.monotonic() < reap_deadline:
         try:
-            active = subprocess.run(
-                _systemctl(user_manager, "is-active", "--quiet", unit),
-                check=False,
-                capture_output=True,
-                timeout=2,
-            ).returncode == 0
+            active = (
+                subprocess.run(
+                    _systemctl(user_manager, "is-active", "--quiet", unit),
+                    check=False,
+                    capture_output=True,
+                    timeout=2,
+                ).returncode
+                == 0
+            )
         except subprocess.TimeoutExpired:
             active = True
         if not active and not _process_is_live(pid) and not _port_has_listener(port):
@@ -115,7 +118,22 @@ def _wait_for_main_pid(unit: str, *, user_manager: bool) -> int:
         if result.returncode == 0 and value.isdigit() and int(value) > 0:
             return int(value)
         time.sleep(0.05)
-    raise AssertionError("management_https_systemd_service_not_ready")
+    journal = subprocess.run(
+        [
+            "journalctl",
+            *(["--user-unit", unit] if user_manager else ["--unit", unit]),
+            "--no-pager",
+            "--lines=50",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    diagnostics = (journal.stdout + journal.stderr).strip()
+    raise AssertionError(
+        "management_https_systemd_service_not_ready" + (f"\n{diagnostics}" if diagnostics else "")
+    )
 
 
 def _credential_directory(unit: str, *, user_manager: bool) -> Path:
@@ -286,8 +304,13 @@ def test_systemd_loadcredential_serves_verified_management_https(tmp_path: Path)
             f"--property=LoadCredential=management-tls.pem:{credential_bundle}",
         ]
     )
+    configured_service_uid: int | None = None
     if not user_manager:
-        runner.append("--property=DynamicUser=yes")
+        service_uid_text = os.environ.get("RTSP_PROXY_SYSTEMD_SERVICE_UID", "")
+        if not service_uid_text.isdigit() or int(service_uid_text) <= 0:
+            raise AssertionError("management_https_systemd_service_uid_required")
+        configured_service_uid = int(service_uid_text)
+        runner.append(f"--property=User={configured_service_uid}")
     runner.extend(
         [
             "/bin/sh",
@@ -296,9 +319,9 @@ def test_systemd_loadcredential_serves_verified_management_https(tmp_path: Path)
                 'export PYTHONPATH="$1/src" '
                 'RTSP_PROXY_ROLE="web" RTSP_PROXY_HTTP_HOST="127.0.0.1" '
                 'RTSP_PROXY_HTTP_PORT="$2" '
-                'RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE='
+                "RTSP_PROXY_MANAGEMENT_TLS_CERTIFICATE_FILE="
                 '"/tmp/operator-controlled-certificate" '
-                'RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE='
+                "RTSP_PROXY_MANAGEMENT_TLS_PRIVATE_KEY_FILE="
                 '"/tmp/operator-controlled-private-key"; '
                 'exec "$3" -c "from rtsp_proxy.runtime import run_web_cli; '
                 'run_web_cli()" '
@@ -321,6 +344,8 @@ def test_systemd_loadcredential_serves_verified_management_https(tmp_path: Path)
         service_uid = int(
             next(line for line in status.splitlines() if line.startswith("Uid:")).split()[1]
         )
+        if configured_service_uid is not None:
+            assert service_uid == configured_service_uid
         credentials_root = _credential_directory(unit, user_manager=user_manager)
         for name in ("management-tls.pem",):
             credential = credentials_root / name

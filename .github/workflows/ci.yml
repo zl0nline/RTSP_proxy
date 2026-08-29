@@ -114,8 +114,10 @@ jobs:
           sudo touch /etc/rtsp-proxy/mediamtx/mediamtx.yml
           sudo touch /etc/rtsp-proxy/node-runtime.env
           systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.socket
+          service_uid="$(id -u)"
           sudo env \
             RTSP_PROXY_RUN_SYSTEMD_HTTPS_CONTRACT=1 \
+            RTSP_PROXY_SYSTEMD_SERVICE_UID="$service_uid" \
             PYTHONPATH="$PWD/src" \
             "$PWD/.venv/bin/python" -m pytest -q \
             tests/contract/test_management_https_systemd.py
