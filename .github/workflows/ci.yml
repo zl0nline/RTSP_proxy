@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            clang libbpf-dev linux-tools-common postgresql
+            clang libbpf-dev linux-tools-common "linux-tools-$(uname -r)" postgresql
           echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
 
       - name: Install locked dependencies
