@@ -1,8 +1,8 @@
 # Phase G exact connect-guard contract
 
 - Date: 2026-08-30
-- Status: parameterized implementation, direct-Linux amd64 contract and
-  independent Spec/Standards review green; native amd64/arm64 CI pending
+- Status: parameterized implementation, direct-Linux amd64 contract,
+  independent Spec/Standards review and privileged native amd64/arm64 CI green
 - Production decision: NO-GO
 
 ## Scope
@@ -27,7 +27,10 @@ The direct-Linux run on `grob` used Linux 7.0, systemd 259, cgroup v2, bpftool
 7.7/libbpf 1.7 and clang 21. It passed both target families and left no scoped
 kernel or filesystem residue. The predecessor mechanism prototype is retained
 on branch `prototype/phase-g-connect-guard` at commit `f984814` as required by
-the prototype workflow.
+the prototype workflow. The packaged build and privileged contract then passed
+in the amd64 and arm64 `test` jobs, while all seven jobs completed successfully in
+[CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424)
+at commit `bb3790b`.
 
 ## Deliberately excluded
 

@@ -1279,9 +1279,10 @@ impact is measured.
   type/default/constraint/index/privilege readiness and pinned ffconcat TCP/timeout builder
   (compatibility mechanism only);
 - [x] versioned exact-tuple cgroup `connect4`/`connect6` map ABI and privileged
-  attach-before-release/ownership-safe cleanup contract (direct-Linux amd64 and
-  independent review green; native amd64/arm64 CI pending; executor still
-  disabled);
+  attach-before-release/ownership-safe cleanup contract (direct-Linux amd64,
+  independent review and privileged amd64/arm64
+  [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424)
+  green; executor still disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;

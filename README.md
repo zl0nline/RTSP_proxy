@@ -99,12 +99,15 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   This is not a
 >   production source-probe runner. ADR 0004 remains Proposed: a narrow root
 >   broker and system-manager transient unit still need to integrate the now
->   implemented exact cgroup `IP:port` guard with attach/readback/run canaries;
+>   implemented and privileged amd64/arm64-CI-green exact cgroup `IP:port`
+>   guard with attach/readback/run canaries;
 >   no-redirect ffprobe build and privileged amd64/arm64 evidence are still
 >   mandatory. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
 >   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
->   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md).
+>   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),
+>   whose native matrix passed in
+>   [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
