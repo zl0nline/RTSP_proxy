@@ -66,7 +66,12 @@ control requests fail closed, while established RTSP sessions continue. OIDC
 outage blocks new normal logins; already-issued sessions remain valid until
 their bounded expiry and break-glass is the audited recovery path. PostgreSQL
 gets a separate small session pool/budget so browser traffic cannot exhaust the
-node lifecycle pool.
+node lifecycle pool. Dashboard reads and SSE reconnects use independent durable
+per-account buckets. A stream authorizes before replay; one read-only batch
+refreshes all active session epochs at most once per second and every state
+delivery passes an in-memory epoch fence. With a 750-millisecond batch deadline,
+role/scope downgrade stays below the two-second ceiling without per-push SQL
+reads or session-touch writes and cannot drain an already queued camera event.
 
 ## Alternatives
 
@@ -97,9 +102,12 @@ node lifecycle pool.
 - [x] Shared-boundary RBAC/scope/no-oracle denial classes, representative
   semantic targets and a recursively generated matrix for all 48 protected
   route-method pairs present at that commit are complete; the later node-action
-  router expands the current local inventory to 57 pairs. Future
-  export/SSE/bulk routes must enter the matrix and add their surface-specific
-  evidence before activation
+  and camera administration routers expanded the published inventory to 72
+  pairs. The current one-camera snapshot/SSE and live-diagnostics delta enters
+  the matrix at 75 pairs with its own scope, pre-delivery authz,
+  resume/backpressure and separate read/reconnect-bucket evidence.
+  Future export/bulk routes must enter the matrix and add their
+  surface-specific evidence before activation
 - [x] Browser cookie/security-header/leak and accessibility E2E
 
 ## Rollout and rollback

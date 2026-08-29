@@ -49,6 +49,7 @@ from rtsp_proxy.health import (
     normalize_readiness_results,
 )
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.live_updates import CameraLiveDiagnostics, CameraLiveUpdates, CameraLiveUpdateSource
 from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.node_dashboard import node_dashboard_router
 from rtsp_proxy.node_operator import (
@@ -125,13 +126,19 @@ MANAGEMENT_HSTS = "max-age=31536000"
 
 
 class ManagementHstsBoundary:
-    """Set one exact HSTS policy on every management HTTP response."""
+    """Set HSTS and bound actual socket writes for management SSE responses."""
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, *, live_send_timeout_seconds: float = 5) -> None:
+        if not 0.1 <= live_send_timeout_seconds <= 10:
+            raise ValueError("live_send_timeout_invalid")
         self._app = app
+        self._live_send_timeout_seconds = live_send_timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        live_stream = False
+
         async def send_with_hsts(message: Message) -> None:
+            nonlocal live_stream
             if scope["type"] == "http" and message["type"] == "http.response.start":
                 headers = [
                     (name, value)
@@ -140,9 +147,22 @@ class ManagementHstsBoundary:
                 ]
                 headers.append((b"strict-transport-security", MANAGEMENT_HSTS.encode("ascii")))
                 message = {**message, "headers": headers}
-            await send(message)
+                live_stream = any(
+                    name.lower() == b"content-type"
+                    and value.lower().startswith(b"text/event-stream")
+                    for name, value in headers
+                )
+            if live_stream:
+                with anyio.fail_after(self._live_send_timeout_seconds):
+                    await send(message)
+            else:
+                await send(message)
 
-        await self._app(scope, receive, send_with_hsts)
+        try:
+            await self._app(scope, receive, send_with_hsts)
+        except TimeoutError:
+            if not live_stream:
+                raise
 
 
 def _lifecycle_busy() -> HTTPException:
@@ -406,6 +426,17 @@ class CameraRuntimeResponse(BaseModel):
     reader_limit_violated: bool
 
 
+class CameraLiveDiagnosticsResponse(BaseModel):
+    active_subscriptions: int
+    tracked_cameras: int
+    opened_subscriptions_total: int
+    resume_requests_total: int
+    resync_required_total: int
+    rejected_subscriptions_total: int
+    slow_consumer_disconnects_total: int
+    authz_disconnects_total: int
+
+
 class AccessPolicyUpdateRequest(BaseModel):
     internet_cidrs: list[str] = Field(default_factory=list, max_length=128)
     local_cidrs: list[str] = Field(default_factory=list, max_length=128)
@@ -629,6 +660,7 @@ def create_app(
     access_policy_control: AccessPolicyControl | None = None,
     access_grant_control: AccessGrantControl | None = None,
     fleet_snapshots: SnapshotReader | None = None,
+    camera_live_updates: CameraLiveUpdateSource | None = None,
     operator_sessions: OperatorSessionControl | None = None,
     operator_login: OidcLoginControl | None = None,
     break_glass: BreakGlassControl | None = None,
@@ -638,13 +670,40 @@ def create_app(
     startup: Callable[[], None] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
+    resolved_camera_live_updates = camera_live_updates
+    if (
+        resolved_camera_live_updates is None
+        and fleet_snapshots is not None
+        and camera_control is not None
+    ):
+        resolved_camera_live_updates = CameraLiveUpdates(
+            reader=fleet_snapshots,
+            resolve_targets=camera_control.live_targets,
+            authorize_sessions=(
+                None
+                if operator_sessions is None
+                else operator_sessions.live_authorization_epochs
+            ),
+            poll_interval_seconds=min(30, settings.collector_interval_seconds),
+            metric_interval_seconds=settings.collector_interval_seconds,
+            max_snapshot_age_seconds=fleet_snapshot_max_age_seconds,
+            clock=clock,
+        )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        live_updates_started = False
         try:
             if startup is not None:
                 startup()
+            if resolved_camera_live_updates is not None:
+                await resolved_camera_live_updates.start()
+                live_updates_started = True
             yield
         finally:
+            if live_updates_started:
+                assert resolved_camera_live_updates is not None
+                await resolved_camera_live_updates.stop()
             if shutdown is not None:
                 shutdown()
 
@@ -860,6 +919,7 @@ def create_app(
             action_bucket = _operator_action_bucket(
                 audit_context.action,
                 audit_context.http_method,
+                request.url.path,
             )
             if action_bucket is not None:
                 try:
@@ -892,7 +952,11 @@ def create_app(
             request.state.operator_principal = principal
             result = await call_next(request)
             assert isinstance(result, Response)
-            result.headers["Cache-Control"] = "no-store"
+            result.headers["Cache-Control"] = (
+                "no-store, no-cache, must-revalidate"
+                if result.headers.get("Content-Type", "").startswith("text/event-stream")
+                else "no-store"
+            )
             return audited_response(result)
 
     if settings.management_tls_certificate_file is not None:
@@ -937,6 +1001,17 @@ def create_app(
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
+    @app.get("/assets/dashboard.js", include_in_schema=False)
+    def dashboard_script() -> Response:
+        from importlib.resources import files
+
+        script = files("rtsp_proxy").joinpath("assets/dashboard.js").read_text(encoding="utf-8")
+        return PlainTextResponse(
+            script,
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
     @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
     def dashboard_page(request: Request) -> Response:
         principal = _dashboard_principal(request, operator_sessions)
@@ -959,6 +1034,7 @@ def create_app(
                     and principal.allows(OperatorPermission.CONTROL_MUTATE)
                     and 43 <= len(request.cookies.get("__Host-rtsp_proxy_csrf", "")) <= 1024
                 ),
+                poll_interval_seconds=settings.dashboard_poll_interval_seconds,
             )
         )
 
@@ -997,8 +1073,10 @@ def create_app(
             access_policy_control=access_policy_control,
             access_grant_control=access_grant_control,
             operator_sessions=operator_sessions,
+            live_updates=resolved_camera_live_updates,
             recent_mfa_seconds=settings.operator_recent_mfa_seconds,
             secret_reveal_seconds=access_secret_reveal_seconds,
+            poll_interval_seconds=settings.dashboard_poll_interval_seconds,
         )
     )
     app.include_router(node_dashboard_router(node_control=node_control, settings=settings))
@@ -1160,6 +1238,18 @@ def create_app(
                 for node in snapshot.nodes
             ],
         )
+
+    @app.get(
+        "/api/v1/dashboard/live-status",
+        response_model=CameraLiveDiagnosticsResponse,
+    )
+    def dashboard_live_status() -> CameraLiveDiagnostics:
+        if resolved_camera_live_updates is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "camera_live_updates_unavailable"},
+            )
+        return resolved_camera_live_updates.diagnostics()
 
     @app.get("/api/v1/operator/session", response_model=OperatorSessionResponse)
     def operator_session(request: Request) -> OperatorSessionResponse:
@@ -2990,7 +3080,7 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
             if request.method in {"GET", "HEAD", "OPTIONS"}
             else OperatorPermission.CONTROL_MUTATE
         )
-    if path.startswith("/dashboard") or path in {
+    if path.startswith("/dashboard") or path.startswith("/api/v1/dashboard/") or path in {
         "/api/v1/operator/session",
         "/api/v1/dashboard/snapshot",
     }:
@@ -3070,7 +3160,14 @@ def _operator_scope_for_request(request: Request) -> str | None:
 def _operator_action_bucket(
     action: str,
     http_method: str,
+    path: str,
 ) -> OperatorActionBucket | None:
+    if http_method == "GET" and path.endswith("/events"):
+        return OperatorActionBucket.LIVE_RECONNECT
+    if http_method == "GET" and (
+        path.startswith("/dashboard") or path.startswith("/api/v1/dashboard/")
+    ):
+        return OperatorActionBucket.DASHBOARD_READ
     if http_method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return None
     if action in {"camera.grant_issue", "camera.grant_rotate"}:
@@ -3099,7 +3196,11 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
             "operator.session_logout" if method in {"POST", "DELETE"} else "operator.session_read"
         )
         return action, "session", "self"
-    if path in {"/dashboard", "/api/v1/dashboard/snapshot"}:
+    if path in {
+        "/dashboard",
+        "/api/v1/dashboard/snapshot",
+        "/api/v1/dashboard/live-status",
+    }:
         return "dashboard.read", "dashboard", "server"
     if path == "/dashboard/nodes/new" or path == "/dashboard/nodes":
         return "node.create", "node", "collection"
@@ -3188,6 +3289,8 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
                 )
             action = {
                 "": "camera.read",
+                "live": "camera.live_read",
+                "events": "camera.live_read",
                 "edit": "camera.update",
                 "move": "camera.move",
                 "moves/preview": "camera.move_preview",

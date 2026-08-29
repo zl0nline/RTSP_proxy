@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, insert, text
 from sqlalchemy.exc import OperationalError
 
 from rtsp_proxy.database import PostgresNodeStore, camera_placements, cameras
-from rtsp_proxy.identifiers import generate_public_id
+from rtsp_proxy.identifiers import PublicId, generate_public_id
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.nodes import (
     CameraCatalogQuery,
@@ -210,6 +210,32 @@ def test_camera_detail_projection_is_secret_free_and_adapter_consistent(
         assert detail.node_port == 12000
         assert not hasattr(detail, "source_url")
         assert camera_control.detail(UUID(int=0)) is None
+    finally:
+        close = getattr(store, "close", None)
+        if close is not None:
+            close()
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_camera_live_targets_are_one_bounded_secret_free_batch(
+    persistent: bool,
+    postgres_database_url: str,
+) -> None:
+    camera_control, store = _catalog(
+        persistent=persistent,
+        postgres_database_url=postgres_database_url,
+    )
+    try:
+        targets = camera_control.live_targets((CAMERA_IDS[0], CAMERA_IDS[2]))
+
+        assert targets == {
+            CAMERA_IDS[0]: (PublicId.parse(PUBLIC_IDS[0]), NODE_IDS[0]),
+            CAMERA_IDS[2]: (PublicId.parse(PUBLIC_IDS[2]), NODE_IDS[1]),
+        }
+        with pytest.raises(ValueError, match="camera_live_target_batch_invalid"):
+            camera_control.live_targets(())
+        with pytest.raises(ValueError, match="camera_live_target_batch_invalid"):
+            camera_control.live_targets((CAMERA_IDS[0], CAMERA_IDS[0]))
     finally:
         close = getattr(store, "close", None)
         if close is not None:

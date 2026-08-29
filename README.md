@@ -35,11 +35,13 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   representative semantic targets:
 >   identity source, scope and correlation ID are audit/outbox-bound and
 >   PostgreSQL append failures fail closed without partial revocation.
->   The generated matrix covers all 72 protected route-method pairs, including
->   camera access administration and camera registration. The registration
->   slice is independently reviewed and green in native amd64/arm64 CI plus the
->   external Chromium job. Future export/SSE/bulk routes must extend the matrix
->   before activation.
+>   The generated matrix now covers all 75 protected route-method pairs,
+>   including camera access, camera registration, one-camera live snapshot/SSE
+>   and bounded live diagnostics. The published 72-route registration slice is
+>   independently reviewed and green in native amd64/arm64 CI plus the external
+>   Chromium job; the 75-route live-update delta is locally/direct-Linux green
+>   and awaits independent review/native CI. Future export/bulk routes must
+>   extend the matrix before activation.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
 >   server-side templates/OIDC/session/CSRF/logout tests remain identical in the
@@ -70,6 +72,17 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   root-systemd contract on both server architectures. Exact evidence is
 >   recorded in
 >   [`docs/evidence/phase-f-management-https-contract.md`](docs/evidence/phase-f-management-https-contract.md).
+> - Phase-F dashboard live updates: **implemented and functionally green on
+>   direct Linux amd64; independent review/native CI pending**. Server overview
+>   polls the persisted aggregate snapshot at a configurable 5–30 seconds
+>   (default 10). A camera detail uses one bounded SSE stream per operator
+>   session with a 15-second heartbeat, authorization before replay and a shared
+>   batched epoch fence before every state delivery (one-second cadence plus a
+>   750-millisecond deadline), bounded to a two-second revocation ceiling,
+>   `resync_required`, slow-consumer disconnect and bounded polling fallback.
+>   The browser never reads MediaMTX directly. Exact local/Linux scope and open
+>   gates are recorded in
+>   [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](docs/evidence/phase-f-dashboard-live-updates-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).
@@ -393,7 +406,7 @@ The historical generated negative coverage for 48 protected route-method pairs
 including nested included-router prefixes, прошла оба независимых review и все
 семь jobs в commit `39b29814d726d9020c1d19100521b4dfe729b91e`
 ([run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
-Будущие export/SSE/bulk routes должны расширить эту матрицу до активации.
+Будущие export/bulk routes должны расширить эту матрицу до активации.
 The prior published inventory contained 57 protected route-method pairs after
 the first node-action UI slice; it passed both independent reviews and all seven
 jobs in [run 32693949200](https://github.com/zl0nline/RTSP_proxy/actions/runs/32693949200).
@@ -464,6 +477,25 @@ commit `32ac6138777e460846a1caed1e46174138ebc9d5` in
 [run 33253244053](https://github.com/zl0nline/RTSP_proxy/actions/runs/33253244053).
 The exact boundary is recorded in
 [`docs/evidence/phase-f-management-https-contract.md`](docs/evidence/phase-f-management-https-contract.md).
+The live dashboard delta raises the generated protected inventory from the
+published 72 pairs to 75. Overview state uses only the persisted aggregate
+snapshot and polls every 10 seconds by default (server-enforced 5–30 seconds).
+A camera detail opens at most one SSE stream per operator session with bounded
+history/resume, `resync_required`, a 15-second heartbeat, initial authorization
+and a shared batched in-memory epoch fence before every delivery with a
+two-second revocation ceiling. Snapshot
+reads and reconnects use separate durable buckets; browser requests are
+single-flight with a five-second timeout and bounded backoff. Per-camera bitrate
+is computed in the collector from monotonic elapsed time; wall-clock timestamps
+are freshness metadata only, and freshness/reset/gap markers fail closed. A
+camera move clears prior-node history, emits `resync_required` and starts an
+exact new-node live epoch; one bounded secret-free placement batch discovers
+it without another browser lookup. Shutdown waits for bounded snapshot/authz workers
+before closing their stores. It
+passed the full local suite and a real HTTPS Chromium workflow on
+direct Linux amd64; independent review and native CI are still pending. Exact
+scope is recorded in
+[`docs/evidence/phase-f-dashboard-live-updates-contract.md`](docs/evidence/phase-f-dashboard-live-updates-contract.md).
 Phase F остаётся в работе до завершения остальных операторских workflows.
 Наличие load harness и
 зелёного functional CI не

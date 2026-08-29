@@ -368,11 +368,53 @@ Typed control config includes:
 - PostgreSQL pools;
 - node API/metrics loopback ranges;
 - drain timeout;
+- dashboard aggregate polling interval (5–30 seconds, default 10);
 - SMTP recipients/delivery policy;
 - architecture-specific release manifest.
 
 Unknown fields, invalid/overlapping ranges, non-loopback node management binds
 and architecture/digest mismatch fail before readiness.
+
+## Dashboard live updates
+
+The server overview polls only `/api/v1/dashboard/snapshot`; it does not fan out
+to media nodes in the request path. Set
+`RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS` to an integer from 5 through 30.
+The same interval is used by the one-camera view only after its SSE connection
+has failed three times. Browser polling has one request in flight, a five-second
+deadline and bounded backoff. The server enforces a separate durable
+per-account dashboard-read bucket.
+
+Each authenticated operator session can own at most one camera EventSource.
+The direct Uvicorn TLS deployment requires no extra component: responses carry
+`X-Accel-Buffering: no`, a 15-second heartbeat and no-store cache policy. An
+authorization check runs before replay. Before every delivery the stream uses
+an in-memory epoch fence refreshed for all active sessions by one read-only SQL
+batch at most once per second; its 750-millisecond deadline keeps the complete
+revocation ceiling below two seconds without a query or write per event.
+EventSource receives a
+five-second reconnect floor, backed by a separate durable one-attempt-per-five-
+seconds account bucket and exact `Retry-After` on 429. If an
+operator later adds a reverse proxy, its validated configuration must disable
+response buffering, preserve `Last-Event-ID`, allow streaming responses and set
+the idle timeout above the heartbeat interval. Such a reverse proxy is not part
+of the current supported deployment evidence; keep direct Uvicorn TLS until its
+exact config has passed the same resume/heartbeat/slow-client contract.
+
+`GET /api/v1/dashboard/live-status` exposes bounded internal counters for
+active/tracked streams, resume/resync, admission rejection, slow consumers and
+authz disconnects. It is protected by the dashboard-read RBAC/audit boundary
+and must not be published as an anonymous metrics endpoint. Browser code reads
+only aggregate control-plane routes; node API/metrics stay on loopback.
+
+The live adapter shares one bounded single-flight snapshot read across
+concurrent requests, indexes every path once per snapshot and expires inactive
+camera channels after five minutes. Per-camera bitrate is calculated by the
+collector from monotonic elapsed time and persisted ready for projection;
+wall-clock observation time is freshness metadata only. Counter reset or a gap
+longer than two collector intervals is returned as an explicit marker with no
+derived rate. Absence of the additive `path_metrics` signal from an N−1 writer
+is `unknown`, not idle, and every path is bound to exact node plus public ID.
 
 ## Node lifecycle
 
@@ -625,6 +667,24 @@ After revision 0018 commits, rollback to application 0.9.0 (maximum schema
 0017) is **NO-GO**. Fix forward with verified 0.10.0 artifacts or restore the
 pre-0018 PostgreSQL backup with the control plane stopped. Do not downgrade the
 live schema.
+
+Application release `0.11.0` adds the additive
+`0019_dashboard_rate_limits` constraint extension for independent
+`dashboard_read` and `live_reconnect` buckets. Roll every WEB/background
+process to 0.11.0 while PostgreSQL remains at 0018. During this bridge existing
+dashboard reads remain available, but the new SSE endpoint fails closed with a
+bounded 503. Per-path live detail is serialized in a node-level `path_metrics`
+extension, leaving the old aggregate `metrics` object byte-shape compatible for
+the N−1 WEB reader.
+
+After all processes run 0.11.0, apply migration 0019 once and restart WEB one
+instance at a time. Smoke a normal dashboard read, one camera snapshot, one SSE
+open, then require an immediate reconnect to return 429 with `Retry-After: 5`.
+The first post-restart normal read must create only the `dashboard_read` row;
+the stream creates the independent `live_reconnect` row. After revision 0019
+commits, rollback to application 0.10.0 (maximum schema 0018) is **NO-GO**. Fix
+forward with verified 0.11.0 artifacts or restore the pre-0019 PostgreSQL backup
+with the control plane stopped.
 
 The five WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as

@@ -1184,7 +1184,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'operator_action_rate_limits', 'camera_registration_requests')"
             )
         )
-    assert revision == "0018_camera_registration_keys"
+    assert revision == "0019_dashboard_rate_limits"
     assert table_count == 10
 
 
@@ -1422,7 +1422,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0018_camera_registration_keys"
+            "0019_dashboard_rate_limits"
         )
 
 
@@ -1455,7 +1455,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0018_camera_registration_keys"
+            "0019_dashboard_rate_limits"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})

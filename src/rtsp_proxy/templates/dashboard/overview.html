@@ -1,14 +1,14 @@
 {% extends "dashboard/base.html" %}
 {% block title %}Обзор сервера — RTSP Proxy{% endblock %}
 {% block content %}
-<main id="main-content">
+<main id="main-content" data-dashboard-poll-ms="{{ poll_interval_ms }}" data-dashboard-snapshot-url="/api/v1/dashboard/snapshot" data-dashboard-generated-at="{{ snapshot.generated_at.isoformat() }}">
   <div class="page-heading">
     <div>
       <p class="eyebrow">Один Linux-сервер</p>
       <h1>Состояние RTSP-нод</h1>
     </div>
     <div>
-      <p class="updated">Снимок: <time datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
+      <p class="updated">Снимок: <time data-dashboard-updated datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
       {% if can_manage_nodes %}<a class="button-link" href="/dashboard/nodes/new">Создать ноду</a>{% endif %}
     </div>
   </div>
@@ -16,18 +16,18 @@
   <section class="summary-grid" aria-label="Сводка сервера">
     <article class="summary-card">
       <span>Ноды</span>
-      <strong>{{ snapshot.configured_nodes }} / {{ snapshot.max_nodes }}</strong>
+      <strong data-summary-nodes>{{ snapshot.configured_nodes }} / {{ snapshot.max_nodes }}</strong>
       <small>настроено / максимум</small>
     </article>
     <article class="summary-card">
       <span>Камеры</span>
-      <strong>{{ snapshot.registered_cameras }} / {{ snapshot.nodes | sum(attribute='camera_capacity') }}</strong>
+      <strong data-summary-cameras>{{ snapshot.registered_cameras }} / {{ snapshot.nodes | sum(attribute='camera_capacity') }}</strong>
       <small>зарегистрировано / ёмкость</small>
     </article>
     <article class="summary-card">
       <span>Внешние порты</span>
-      <strong>{{ snapshot.external_ports_used }}</strong>
-      <small>свободно {{ snapshot.external_ports_free }}</small>
+      <strong data-summary-ports>{{ snapshot.external_ports_used }}</strong>
+      <small data-summary-ports-free>свободно {{ snapshot.external_ports_free }}</small>
     </article>
   </section>
 
@@ -37,7 +37,7 @@
         <p class="eyebrow">Media plane</p>
         <h2 id="nodes-title">Ноды сервера</h2>
       </div>
-      <span class="count">{{ snapshot.configured_nodes }}</span>
+      <span class="count" data-dashboard-node-count>{{ snapshot.configured_nodes }}</span>
     </div>
     {% if snapshot.nodes %}
     <div class="table-scroll" tabindex="0" aria-label="Прокручиваемая таблица нод">
@@ -56,28 +56,27 @@
         </thead>
         <tbody>
           {% for node in snapshot.nodes %}
-          <tr>
+          <tr data-node-id="{{ node.node_id }}">
             <th scope="row">
               <a href="/dashboard/nodes/{{ node.node_id }}">{{ node.name }}</a>
               <small class="node-id">{{ node.node_id }}</small>
             </th>
             <td><code>{{ node.external_port }}</code></td>
             <td>
-              <span class="status status-{{ node.health.value }}">{{ node.health.value }}</span>
-              <small>{{ node.runtime_state.value }} · {{ node.scrape_status.value }}</small>
-              {% if node.metric_observed_at %}
+              <span class="status status-{{ node.health.value }}" data-node-health>{{ node.health.value }}</span>
+              <small data-node-runtime>{{ node.runtime_state.value }} · {{ node.scrape_status.value }}</small>
               <small>
-                {% if node.scrape_status.value == 'stale' %}Метрики устарели · {% else %}Метрики · {% endif %}
-                <time datetime="{{ node.metric_observed_at.isoformat() }}">{{ node.metric_observed_at | dashboard_time }}</time>
+                <span data-node-metric-state>{% if node.scrape_status.value == 'stale' %}Метрики устарели{% elif node.scrape_status.value in ['fresh', 'idle'] %}Метрики{% else %}Метрики недоступны{% endif %}</span> ·
+                <time data-node-metric-observed{% if node.metric_observed_at %} datetime="{{ node.metric_observed_at.isoformat() }}"{% endif %}>{{ node.metric_observed_at | dashboard_time if node.metric_observed_at else '—' }}</time>
               </small>
-              {% endif %}
+              <small data-node-counter-state>{% if node.counters_reset %}Счётчики перезапущены{% elif node.scrape_status.value in ['fresh', 'idle'] %}Счётчики непрерывны{% else %}Состояние счётчиков неизвестно{% endif %}</small>
             </td>
-            <td>{{ node.registered_cameras }} / {{ node.camera_capacity }}</td>
+            <td data-node-cameras>{{ node.registered_cameras }} / {{ node.camera_capacity }}</td>
             {% set metrics_fresh = node.metrics and node.scrape_status.value in ['fresh', 'idle'] %}
-            <td>{{ node.metrics.active_sources if metrics_fresh else '—' }}</td>
-            <td>{{ node.metrics.occupied_streams if metrics_fresh else '—' }}</td>
-            <td>{{ node.received_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</td>
-            <td>{{ node.sent_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</td>
+            <td data-node-sources>{{ node.metrics.active_sources if metrics_fresh else '—' }}</td>
+            <td data-node-occupied>{{ node.metrics.occupied_streams if metrics_fresh else '—' }}</td>
+            <td data-node-received>{{ node.received_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</td>
+            <td data-node-sent>{{ node.sent_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</td>
           </tr>
           {% endfor %}
         </tbody>

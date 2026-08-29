@@ -29,8 +29,9 @@ from rtsp_proxy.reconcile import (
 )
 
 DASHBOARD_CSP: Final = (
-    "default-src 'none'; style-src 'self'; base-uri 'none'; "
-    "form-action 'self'; frame-ancestors 'none'"
+    "default-src 'none'; style-src 'self'; script-src 'self'; "
+    "connect-src 'self'; base-uri 'none'; form-action 'self'; "
+    "frame-ancestors 'none'"
 )
 
 
@@ -90,6 +91,7 @@ def render_overview(
     snapshot: FleetSnapshot,
     principal: OperatorPrincipal,
     can_manage_nodes: bool = False,
+    poll_interval_seconds: int = 10,
 ) -> str:
     return (
         _environment()
@@ -98,6 +100,7 @@ def render_overview(
             snapshot=snapshot,
             principal=principal,
             can_manage_nodes=can_manage_nodes,
+            poll_interval_ms=poll_interval_seconds * 1000,
         )
     )
 
@@ -247,6 +250,8 @@ def render_camera_detail(
     can_mutate: bool,
     can_move: bool,
     can_manage_access: bool = False,
+    live_updates_enabled: bool = False,
+    poll_interval_seconds: int = 10,
 ) -> str:
     return (
         _environment()
@@ -258,6 +263,8 @@ def render_camera_detail(
             can_mutate=can_mutate,
             can_move=can_move,
             can_manage_access=can_manage_access,
+            live_updates_enabled=live_updates_enabled,
+            poll_interval_ms=poll_interval_seconds * 1000,
         )
     )
 

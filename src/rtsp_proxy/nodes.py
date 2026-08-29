@@ -1741,6 +1741,15 @@ class InMemoryNodeStore:
                 camera for camera in self._cameras if camera.state is not CameraState.DELETED
             )
 
+    def get_cameras(self, camera_ids: tuple[UUID, ...]) -> tuple[CameraPlacement, ...]:
+        selected = frozenset(camera_ids)
+        with self._lock:
+            return tuple(
+                camera
+                for camera in self._cameras
+                if camera.id in selected and camera.state is not CameraState.DELETED
+            )
+
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         with self._lock:
             node_names = {node.id: node.name for node in self._nodes}
@@ -3517,6 +3526,25 @@ class CameraControl:
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         return self._store.list_cameras()
 
+    def live_targets(
+        self,
+        camera_ids: tuple[UUID, ...],
+    ) -> dict[UUID, tuple[PublicId, UUID]]:
+        if (
+            not 1 <= len(camera_ids) <= 256
+            or len(frozenset(camera_ids)) != len(camera_ids)
+            or any(camera_id.version != 4 for camera_id in camera_ids)
+        ):
+            raise ValueError("camera_live_target_batch_invalid")
+        try:
+            placements = self._store.get_cameras(camera_ids)
+        except Exception:
+            raise CameraCatalogUnavailable("camera_live_targets_unavailable") from None
+        return {
+            camera.id: (camera.public_id, camera.node_id)
+            for camera in placements
+        }
+
     def catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         try:
             return self._store.camera_catalog(query)
@@ -3772,6 +3800,8 @@ class CameraStore(Protocol):
     ) -> tuple[MediaNode, ...]: ...
 
     def list_cameras(self) -> tuple[CameraPlacement, ...]: ...
+
+    def get_cameras(self, camera_ids: tuple[UUID, ...]) -> tuple[CameraPlacement, ...]: ...
 
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage: ...
 

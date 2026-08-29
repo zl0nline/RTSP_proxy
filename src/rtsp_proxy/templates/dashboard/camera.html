@@ -32,6 +32,23 @@
     </dl>
   </section>
 
+  {% if live_updates_enabled %}
+  <section class="panel" aria-labelledby="camera-live-title" data-camera-live data-live-url="/dashboard/cameras/{{ camera.id }}/events" data-snapshot-url="/dashboard/cameras/{{ camera.id }}/live" data-poll-interval-ms="{{ poll_interval_ms }}">
+    <div class="panel-heading">
+      <h2 id="camera-live-title">Текущее состояние потока</h2>
+      <span class="status status-unknown" data-live-connection>Подключение…</span>
+    </div>
+    <dl class="detail-list" aria-live="polite">
+      <div><dt>Источник</dt><dd data-live-source>—</dd></div>
+      <div><dt>Downstream</dt><dd data-live-occupied>—</dd></div>
+      <div><dt>Входящий bitrate</dt><dd data-live-received>—</dd></div>
+      <div><dt>Исходящий bitrate</dt><dd data-live-sent>—</dd></div>
+      <div><dt>Снимок</dt><dd><time data-live-observed>—</time></dd></div>
+    </dl>
+    <p class="detail-note" data-live-note>Данные поступают из агрегированного снимка collector; браузер не обращается к API медианоды.</p>
+  </section>
+  {% endif %}
+
   {% if can_mutate and camera.state.value in ["enabled", "disabled"] %}
   <section class="panel camera-actions" aria-labelledby="camera-actions-title">
     <div class="panel-heading"><h2 id="camera-actions-title">Управление камерой</h2></div>

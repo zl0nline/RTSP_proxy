@@ -79,7 +79,12 @@ in
 That later evidence also includes the recursively generated matrix for all 48
 protected route-method pairs present at its commit, green in CI run
 [`32680412385`](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385).
-Physical-hardware capacity and the 24-hour soak remain open. Revision-fenced
+The later aggregate overview polling and one-camera SSE projection is tracked
+in
+[`phase-f-dashboard-live-updates-contract.md`](phase-f-dashboard-live-updates-contract.md);
+its local/direct-Linux functional gate is green while independent review/native
+CI and completed-probe/capacity evidence remain open. Physical-hardware
+capacity and the 24-hour soak remain open. Revision-fenced
 break-glass rotation with atomic
 session revocation and an accepted/rejected notification drill passed
 independent Spec/Standards review and all six native amd64/arm64 jobs at commit

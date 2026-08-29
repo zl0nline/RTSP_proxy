@@ -23,6 +23,8 @@ The browser scenario proves:
 - server, node, bounded camera catalog and secret-free camera detail rendering;
 - CSRF-protected node registration through the production dashboard router,
   including the persisted result redirect;
+- CSRF-protected camera registration and camera access-grant issue followed by
+  automatic return to the secret-free inventory;
 - occupied single-reader disable preview, cancellation, fresh confirmation and
   successful apply through the production confirmation seam;
 - focus on the autofocus confirmation heading and a labelled assertive alert
@@ -76,7 +78,13 @@ targets is complete and recorded in
 The published recursively generated negative matrix covered all 48 protected
 route-method pairs in that surface and passed run
 [`32680412385`](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385).
-Future export/SSE/bulk routes must extend it before activation. Phase F remains
+The newer camera live-update delta adds exact connected/occupied projection to
+the same real Chromium workflow and raises the generated protected inventory to
+75 pairs. Its local/direct-Linux evidence is recorded separately in
+[`phase-f-dashboard-live-updates-contract.md`](phase-f-dashboard-live-updates-contract.md);
+it is not retroactively attributed to the historical CI run above.
+
+Future export/bulk routes must extend the inventory before activation. Phase F remains
 **IN PROGRESS** for the remaining operator workflows. Phase G
 physical hardware capacity, fault/WAN evidence and the 24-hour soak, followed
 by Phase H pilot rollout, also remain open. Production is therefore **NO-GO**.

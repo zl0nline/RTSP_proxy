@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     node_runtime_timeout_seconds: float = Field(default=60, gt=1, le=60)
     reconcile_interval_seconds: float = Field(default=1, ge=0.1, le=60)
     collector_interval_seconds: float = Field(default=5, ge=1, le=60)
+    dashboard_poll_interval_seconds: int = Field(default=10, ge=5, le=30)
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     operator_recent_mfa_seconds: int = Field(default=300, ge=30, le=900)
     node_release_id: str = Field(

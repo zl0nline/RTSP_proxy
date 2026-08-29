@@ -4,8 +4,9 @@ from datetime import timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
+import anyio
 from fastapi import APIRouter, Request, Response, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from rtsp_proxy.access import (
     AccessGrantControl,
@@ -31,6 +32,14 @@ from rtsp_proxy.dashboard import (
     render_unavailable,
 )
 from rtsp_proxy.dashboard_forms import DashboardForm, DashboardFormInvalid
+from rtsp_proxy.live_updates import (
+    CameraLiveEventResponse,
+    CameraLiveTarget,
+    CameraLiveUpdateSource,
+    LiveStreamLimitReached,
+    LiveUpdateUnavailable,
+    parse_last_event_id,
+)
 from rtsp_proxy.media import MediaNodeError
 from rtsp_proxy.node_operator import node_mutation_context
 from rtsp_proxy.nodes import (
@@ -83,8 +92,10 @@ def camera_dashboard_router(
     access_policy_control: AccessPolicyControl | None,
     access_grant_control: AccessGrantControl | None,
     operator_sessions: OperatorSessionControl | None,
+    live_updates: CameraLiveUpdateSource | None,
     recent_mfa_seconds: int,
     secret_reveal_seconds: int,
+    poll_interval_seconds: int,
 ) -> APIRouter:
     """Build the complete secret-free camera dashboard surface."""
 
@@ -255,8 +266,87 @@ def camera_dashboard_router(
                     and access_grant_control is not None
                     and principal.allows(OperatorPermission.ACCESS_ADMIN)
                 ),
+                live_updates_enabled=live_updates is not None,
+                poll_interval_seconds=poll_interval_seconds,
             )
         )
+
+    @router.get(
+        "/dashboard/cameras/{camera_id}/live",
+        include_in_schema=False,
+    )
+    async def camera_live_snapshot(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        camera = await _camera_item_async(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        if live_updates is None:
+            return _live_unavailable()
+        try:
+            event = await live_updates.current(_live_target(camera))
+        except LiveUpdateUnavailable:
+            return _live_unavailable()
+        return JSONResponse(
+            content=dict(event.data),
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @router.get(
+        "/dashboard/cameras/{camera_id}/events",
+        include_in_schema=False,
+    )
+    async def camera_live_events(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        try:
+            parse_last_event_id(request.headers.get("Last-Event-ID"))
+        except ValueError:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": {"code": "live_event_id_invalid"}},
+                headers={"Cache-Control": "no-store"},
+            )
+        camera = await _camera_item_async(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
+        if live_updates is None or operator_sessions is None:
+            return _live_unavailable()
+        session_token = request.cookies.get("__Host-rtsp_proxy_session", "")
+        audit_context = request.state.operator_audit_context
+
+        async def authorize() -> int:
+            current = await anyio.to_thread.run_sync(
+                lambda: operator_sessions.authenticate(
+                    session_token=session_token,
+                    permission=OperatorPermission.CONTROL_READ,
+                    required_scope=f"camera:{camera_id}",
+                    audit_context=audit_context,
+                ),
+                abandon_on_cancel=True,
+            )
+            return current.authz_version
+
+        try:
+            subscription = await live_updates.open(
+                target=_live_target(camera),
+                session_id=principal.session_id,
+                authz_version=principal.authz_version,
+                authorize=authorize,
+                last_event_id=request.headers.get("Last-Event-ID"),
+            )
+        except LiveStreamLimitReached:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": {"code": "live_stream_limit"}},
+                headers={"Cache-Control": "no-store", "Retry-After": "5"},
+            )
+        except LiveUpdateUnavailable:
+            return _live_unavailable()
+
+        return CameraLiveEventResponse(subscription)
 
     @router.get(
         "/dashboard/cameras/{camera_id}/access",
@@ -1151,6 +1241,33 @@ def _camera_item(
         ),
         status_code=status.HTTP_404_NOT_FOUND,
         principal=principal,
+    )
+
+
+async def _camera_item_async(
+    camera_control: CameraControl | None,
+    camera_id: UUID,
+    principal: OperatorPrincipal,
+) -> CameraCatalogItem | Response:
+    return await anyio.to_thread.run_sync(
+        lambda: _camera_item(camera_control, camera_id, principal),
+        abandon_on_cancel=True,
+    )
+
+
+def _live_target(camera: CameraCatalogItem) -> CameraLiveTarget:
+    return CameraLiveTarget(
+        camera_id=camera.id,
+        public_id=camera.public_id,
+        node_id=camera.node_id,
+    )
+
+
+def _live_unavailable() -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": {"code": "camera_live_updates_unavailable"}},
+        headers={"Cache-Control": "no-store", "Retry-After": "5"},
     )
 
 

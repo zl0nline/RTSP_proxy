@@ -153,7 +153,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         },
         "schema_compatibility": {
             "minimum": "0012_operator_sessions",
-            "maximum": "0018_camera_registration_keys",
+            "maximum": "0019_dashboard_rate_limits",
         },
         "config_schema_version": 1,
     }
@@ -358,7 +358,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert {manifest.release_id for manifest in manifests} == {"0.10.0"}
+    assert {manifest.release_id for manifest in manifests} == {"0.11.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
 
 

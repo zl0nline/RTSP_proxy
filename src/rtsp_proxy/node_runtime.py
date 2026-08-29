@@ -1609,6 +1609,7 @@ class _PathMetricPayload(BaseModel):
     public_id: str = Field(min_length=26, max_length=26)
     received_bytes_total: int = Field(ge=0)
     sent_bytes_total: int = Field(ge=0)
+    ready: bool | None = None
 
 
 class _MediaMetricsPayload(BaseModel):
@@ -1959,6 +1960,7 @@ class UnixMediaNodeClient:
                     public_id=item.public_id,
                     received_bytes_total=item.received_bytes_total,
                     sent_bytes_total=item.sent_bytes_total,
+                    ready=item.ready,
                 )
                 for item in response.metrics.path_counters
             )
@@ -2694,6 +2696,7 @@ class UnixNodeSupervisorServer:
                         "public_id": counter.public_id,
                         "received_bytes_total": counter.received_bytes_total,
                         "sent_bytes_total": counter.sent_bytes_total,
+                        "ready": counter.ready,
                     }
                     for counter in result.sample.path_counters
                 ],

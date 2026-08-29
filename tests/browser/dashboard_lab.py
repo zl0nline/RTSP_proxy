@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import html
+import json
 import secrets
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
@@ -10,7 +13,7 @@ from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from rtsp_proxy.access import (
     AccessGrant,
@@ -40,6 +43,7 @@ from rtsp_proxy.observability import (
     NodeMetricSample,
     NodeScrapeStatus,
     NodeSnapshot,
+    PathMetricCounters,
 )
 from rtsp_proxy.operator_access import (
     InMemoryOperatorSessionStore,
@@ -184,6 +188,7 @@ class _LabMediaNodes:
 
 
 def build_lab_app(*, origin: str) -> Any:
+    metric_transition_reads = 0
     now = datetime.now(UTC)
     node = MediaNode(
         id=NODE_ID,
@@ -205,6 +210,10 @@ def build_lab_app(*, origin: str) -> Any:
         store=node_store,
         new_camera_id=camera_ids.__next__,
         new_public_id=public_ids.__next__,
+        # The full Chromium accessibility/evidence workflow intentionally runs
+        # longer than the production freshness window. This lab exercises the
+        # UI flow, not stale-node admission, so keep its fixture eligible.
+        management_freshness_seconds=300,
     )
     camera = cameras.create_camera(
         name="Front entrance",
@@ -255,6 +264,15 @@ def build_lab_app(*, origin: str) -> Any:
                         occupied_streams=1,
                         received_bytes_total=1000,
                         sent_bytes_total=1000,
+                        path_counters=(
+                            PathMetricCounters(
+                                str(camera.public_id),
+                                1000,
+                                1000,
+                                ready=True,
+                            ),
+                        ),
+                        occupied_public_ids=(str(camera.public_id),),
                     ),
                     metric_observed_at=now,
                     received_bitrate_bps=1000.0,
@@ -297,7 +315,7 @@ def build_lab_app(*, origin: str) -> Any:
     )
     access_store = _LabAccessStore()
     app = create_app(
-        Settings(role=RuntimeRole.WEB),
+        Settings(role=RuntimeRole.WEB, dashboard_poll_interval_seconds=30),
         camera_control=cameras,
         camera_mutation_control=mutations,
         fleet_snapshots=observations,
@@ -331,6 +349,112 @@ def build_lab_app(*, origin: str) -> Any:
     @app.get("/lab/idp/token", include_in_schema=False)
     def lab_token() -> RedirectResponse:
         return RedirectResponse("/lab/idp/authorize", status_code=303)
+
+    @app.get("/lab/delayed-dashboard", include_in_schema=False)
+    def delayed_dashboard() -> HTMLResponse:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<script src=\"/assets/dashboard.js\" defer></script></head><body>"
+            "<main data-dashboard-poll-ms=\"5000\" "
+            "data-dashboard-snapshot-url=\"/lab/delayed-snapshot\" "
+            "data-dashboard-generated-at=\"initial\">"
+            "<span data-summary-nodes>original</span><span data-summary-cameras>original</span>"
+            "<span data-summary-ports>original</span><span data-summary-ports-free>original</span>"
+            "<span data-dashboard-node-count>1</span><time data-dashboard-updated></time>"
+            f"<div data-node-id=\"{NODE_ID}\"><span data-node-health>original</span>"
+            "<span data-node-runtime>original</span><span data-node-cameras>original</span>"
+            "<span data-node-sources>original</span><span data-node-occupied>original</span>"
+            "<span data-node-received>original</span><span data-node-sent>original</span>"
+            "<time data-node-metric-observed>original</time>"
+            "<span data-node-counter-state>original</span></div></main></body></html>"
+        )
+
+    @app.get("/lab/delayed-snapshot", include_in_schema=False)
+    def delayed_snapshot() -> StreamingResponse:
+        payload = json.dumps(
+            {
+                "configured_nodes": 1,
+                "max_nodes": 50,
+                "registered_cameras": 1,
+                "external_ports_used": 1,
+                "external_ports_free": 999,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "nodes": [
+                    {
+                        "node_id": str(NODE_ID),
+                        "health": "healthy",
+                        "runtime_state": "changed-after-timeout",
+                        "scrape_status": "fresh",
+                        "registered_cameras": 1,
+                        "camera_capacity": 100,
+                        "metrics": {"active_sources": 1, "occupied_streams": 1},
+                        "received_bitrate_bps": 1_000,
+                        "sent_bitrate_bps": 1_000,
+                        "metric_observed_at": datetime.now(UTC).isoformat(),
+                        "counters_reset": True,
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        async def body() -> AsyncIterator[bytes]:
+            await asyncio.sleep(10)
+            yield payload
+
+        return StreamingResponse(body(), media_type="application/json")
+
+    @app.get("/lab/metric-transition-dashboard", include_in_schema=False)
+    def metric_transition_dashboard() -> HTMLResponse:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<script src=\"/assets/dashboard.js\" defer></script></head><body>"
+            "<main data-dashboard-poll-ms=\"5000\" "
+            "data-dashboard-snapshot-url=\"/lab/metric-transition-snapshot\" "
+            "data-dashboard-generated-at=\"initial\">"
+            "<span data-summary-nodes>1 / 50</span><span data-summary-cameras>1 / 100</span>"
+            "<span data-summary-ports>1</span><span data-summary-ports-free>999</span>"
+            "<span data-dashboard-node-count>1</span><time data-dashboard-updated></time>"
+            f"<div data-node-id=\"{NODE_ID}\"><span data-node-health>healthy</span>"
+            "<span data-node-runtime>running · fresh</span><span data-node-cameras>1 / 100</span>"
+            "<span data-node-metric-state>Метрики</span>"
+            "<span data-node-sources>1</span><span data-node-occupied>1</span>"
+            "<span data-node-received>1000</span><span data-node-sent>1000</span>"
+            "<time data-node-metric-observed>initial</time>"
+            "<span data-node-counter-state>Счётчики непрерывны</span></div></main></body></html>"
+        )
+
+    @app.get("/lab/metric-transition-snapshot", include_in_schema=False)
+    def metric_transition_snapshot() -> JSONResponse:
+        nonlocal metric_transition_reads
+        metric_transition_reads += 1
+        reset = metric_transition_reads >= 2
+        scrape_status = "fresh" if reset else "stale"
+        return JSONResponse(
+            {
+                "configured_nodes": 1,
+                "max_nodes": 50,
+                "registered_cameras": 1,
+                "external_ports_used": 1,
+                "external_ports_free": 999,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "nodes": [
+                    {
+                        "node_id": str(NODE_ID),
+                        "health": "healthy",
+                        "runtime_state": "running",
+                        "scrape_status": scrape_status,
+                        "registered_cameras": 1,
+                        "camera_capacity": 100,
+                        "metrics": {"active_sources": 1, "occupied_streams": 1},
+                        "received_bitrate_bps": 1_000,
+                        "sent_bitrate_bps": 1_000,
+                        "metric_observed_at": datetime.now(UTC).isoformat(),
+                        "counters_reset": reset,
+                    }
+                ],
+            }
+        )
 
     return app
 

@@ -361,6 +361,65 @@ def test_collector_detects_one_path_reset_hidden_by_another_path_growth() -> Non
     assert snapshot.counters_reset
     assert snapshot.received_bitrate_bps is None
     assert snapshot.sent_bitrate_bps is None
+    assert snapshot.metrics is not None
+    reset_path, continuous_path = snapshot.metrics.path_counters
+    assert reset_path.counters_reset
+    assert reset_path.received_bitrate_bps is None
+    assert not continuous_path.counters_reset
+    assert continuous_path.received_bitrate_bps == 320
+
+
+def test_collector_computes_per_path_rates_from_monotonic_time_only() -> None:
+    node = _node(FIRST_NODE_ID, port=10000)
+    samples = (
+        NodeMetricSample(
+            1,
+            0,
+            100,
+            200,
+            path_counters=(
+                PathMetricCounters("aaaaaaaaaaaaaaaaaaaaaaaaaa", 100, 200, ready=True),
+            ),
+            occupied_public_ids=(),
+        ),
+        NodeMetricSample(
+            1,
+            0,
+            1_100,
+            2_200,
+            path_counters=(
+                PathMetricCounters("aaaaaaaaaaaaaaaaaaaaaaaaaa", 1_100, 2_200, ready=True),
+            ),
+            occupied_public_ids=(),
+        ),
+    )
+    wall_time = NOW
+    monotonic_time = 100.0
+    collector = FleetCollector(
+        nodes=InMemoryNodeStore(nodes=(node,)),
+        metrics=SequencedMetricSource(list(samples)),
+        observations=InMemoryObservabilityStore(),
+        incidents=IncidentControl(store=InMemoryObservabilityStore()),
+        max_nodes=50,
+        external_port_capacity=1000,
+        clock=lambda: wall_time,
+        monotonic_clock=lambda: monotonic_time,
+        collection_interval_seconds=5,
+    )
+
+    first = collector.run_once().nodes[0]
+    assert first.metrics is not None
+    assert first.metrics.path_counters[0].received_bitrate_bps is None
+    wall_time -= timedelta(hours=1)
+    monotonic_time += 5
+    flowing = collector.run_once().nodes[0]
+
+    assert flowing.metrics is not None
+    path = flowing.metrics.path_counters[0]
+    assert path.received_bitrate_bps == 1_600
+    assert path.sent_bitrate_bps == 3_200
+    assert not path.counters_reset
+    assert not path.metric_gap
 
 
 def test_collector_resets_rates_when_the_media_process_generation_changes() -> None:
@@ -623,7 +682,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
     restricted = create_engine(restricted_url)
     with restricted.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0018_camera_registration_keys"
+            "0019_dashboard_rate_limits"
         )
         assert not connection.scalar(
             text("SELECT pg_has_role(current_user, 'rtsp_proxy_observability_hostile', 'MEMBER')")
@@ -781,21 +840,70 @@ def test_postgres_fleet_snapshot_round_trip_preserves_typed_metric_state(
     store = PostgresObservabilityStore(postgres_database_url)
     expected = FleetCollector(
         nodes=InMemoryNodeStore(nodes=(_node(FIRST_NODE_ID, port=10000),)),
-        metrics=SequencedMetricSource([NodeMetricSample(0, 0, 100, 200)]),
+        metrics=SequencedMetricSource(
+            [
+                NodeMetricSample(
+                    0,
+                    0,
+                    0,
+                    0,
+                    path_counters=(
+                        PathMetricCounters(
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            0,
+                            0,
+                            ready=False,
+                        ),
+                    ),
+                    occupied_public_ids=(),
+                )
+            ]
+        ),
         observations=store,
         incidents=IncidentControl(store=InMemoryObservabilityStore(), clock=lambda: NOW),
         max_nodes=50,
         external_port_capacity=1000,
         clock=lambda: NOW,
     ).run_once()
+    inspector = create_engine(postgres_database_url, hide_parameters=True)
     try:
         actual = store.current_snapshot()
+        with inspector.connect() as connection:
+            raw_payload = connection.scalar(
+                text("SELECT payload FROM fleet_snapshots WHERE singleton = true")
+            )
     finally:
+        inspector.dispose()
         store.close()
 
     assert actual == expected
     assert actual is not None
     assert actual.nodes[0].scrape_status is NodeScrapeStatus.IDLE
+    assert actual.nodes[0].metrics is not None
+    assert actual.nodes[0].metrics.path_counters[0].ready is False
+    assert isinstance(raw_payload, dict)
+    raw_node = raw_payload["nodes"][0]
+    assert set(raw_node["metrics"]) == {
+        "active_sources",
+        "occupied_streams",
+        "received_bytes_total",
+        "sent_bytes_total",
+    }
+    assert raw_node["path_metrics"] == {
+        "occupied_public_ids": [],
+        "path_counters": [
+                {
+                    "counters_reset": False,
+                    "metric_gap": False,
+                    "public_id": "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "ready": False,
+                    "received_bitrate_bps": None,
+                    "received_bytes_total": 0,
+                    "sent_bitrate_bps": None,
+                    "sent_bytes_total": 0,
+                }
+        ],
+    }
 
 
 def test_notifier_database_operations_are_bounded_by_statement_timeout(
@@ -974,8 +1082,13 @@ paths_outbound_bytes{name="bbbbbbbbbbbbbbbbbbbbbbbbbi",state="notReady"} 0
         received_bytes_total=12_000,
         sent_bytes_total=8_000,
         path_counters=(
-            PathMetricCounters("aaaaaaaaaaaaaaaaaaaaaaaaaa", 12_000, 8_000),
-            PathMetricCounters("bbbbbbbbbbbbbbbbbbbbbbbbbi", 0, 0),
+            PathMetricCounters(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+                12_000,
+                8_000,
+                ready=True,
+            ),
+            PathMetricCounters("bbbbbbbbbbbbbbbbbbbbbbbbbi", 0, 0, ready=False),
         ),
         occupied_public_ids=("aaaaaaaaaaaaaaaaaaaaaaaaaa",),
     )

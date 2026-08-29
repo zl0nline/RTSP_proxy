@@ -11,6 +11,9 @@ browser_no_sandbox=${RTSP_PROXY_BROWSER_NO_SANDBOX:-0}
 cleanup() {
   local status=$?
   trap - EXIT
+  if [[ "$status" -ne 0 && -f "$work_dir/server.log" ]]; then
+    sed -n '1,240p' "$work_dir/server.log" >&2
+  fi
   agent-browser --session "$session" close >/dev/null 2>&1 || true
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" >/dev/null 2>&1 || true
@@ -215,7 +218,7 @@ require_active ".skip-link"
 require_contrast "body" 4.5
 require_contrast 'a[href="/dashboard/cameras"]' 4.5
 browser snapshot -i -c >"$artifact_dir/02-dashboard.snapshot.txt"
-browser screenshot --full "$artifact_dir/02-dashboard.png" >/dev/null
+browser screenshot "$artifact_dir/02-dashboard.png" >/dev/null
 
 keyboard_activate 'a[href="/dashboard/nodes/new"]'
 require_url_contains "/dashboard/nodes/new"
@@ -245,6 +248,21 @@ require_url_contains "/dashboard/cameras"
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 require_body_text "rtsp://<server-address>:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa"
+require_body_text "Текущее состояние потока"
+for _attempt in $(seq 1 40); do
+  live_ready=$(browser eval "(() =>
+    document.querySelector('[data-live-connection]')?.textContent.trim() === 'Live'
+      && document.querySelector('[data-live-occupied]')?.textContent.trim() === 'занят'
+  )()")
+  if [[ "$live_ready" == "true" ]]; then
+    break
+  fi
+  browser wait 100 >/dev/null
+done
+if [[ "$live_ready" != "true" ]]; then
+  printf 'camera live projection did not reach connected/occupied state\n' >&2
+  exit 1
+fi
 require_secret_absent "rtsp://source-secret-canary.invalid/private"
 keyboard_activate 'a[href$="/access"]'
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
@@ -277,7 +295,7 @@ fi
 require_contrast ".danger-button" 4.5
 require_secret_absent "rtsp://source-secret-canary.invalid/private"
 browser snapshot -i -c >"$artifact_dir/03-confirmation.snapshot.txt"
-browser screenshot --full "$artifact_dir/03-confirmation.png" >/dev/null
+browser screenshot "$artifact_dir/03-confirmation.png" >/dev/null
 
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
 keyboard_activate 'form[action$="/mutations/preview"] button'
@@ -295,7 +313,38 @@ require_url_contains "/dashboard"
 require_body_text "Требуется вход оператора"
 require_secret_absent "rtsp://source-secret-canary.invalid/private"
 browser snapshot -i -c >"$artifact_dir/04-logged-out.snapshot.txt"
-browser screenshot --full "$artifact_dir/04-logged-out.png" >/dev/null
+browser screenshot "$artifact_dir/04-logged-out.png" >/dev/null
+
+browser open "$origin/lab/delayed-dashboard" >/dev/null
+browser wait 12000 >/dev/null
+delayed_body_unchanged=$(browser eval \
+  "document.querySelector('[data-node-runtime]')?.textContent.trim() === 'original'")
+if [[ "$delayed_body_unchanged" != "true" ]]; then
+  printf 'dashboard accepted a JSON body after its five-second deadline\n' >&2
+  exit 1
+fi
+
+browser open "$origin/lab/metric-transition-dashboard" >/dev/null
+browser wait 6000 >/dev/null
+stale_state=$(browser eval "(() =>
+  document.querySelector('[data-node-metric-state]')?.textContent.trim() === 'Метрики устарели'
+    && document.querySelector('[data-node-counter-state]')?.textContent.trim()
+      === 'Состояние счётчиков неизвестно'
+)()")
+if [[ "$stale_state" != "true" ]]; then
+  printf 'dashboard did not fail closed on stale metric continuity\n' >&2
+  exit 1
+fi
+browser wait 6000 >/dev/null
+reset_state=$(browser eval "(() =>
+  document.querySelector('[data-node-metric-state]')?.textContent.trim() === 'Метрики'
+    && document.querySelector('[data-node-counter-state]')?.textContent.trim()
+      === 'Счётчики перезапущены'
+)()")
+if [[ "$reset_state" != "true" ]]; then
+  printf 'dashboard did not render the fresh reset transition\n' >&2
+  exit 1
+fi
 
 page_errors=$(browser errors)
 if [[ -n "$page_errors" && "$page_errors" != *"No page errors"* ]]; then
@@ -315,4 +364,4 @@ fi
 uv run python "$repo_root/tools/e2e/verify_dashboard_browser_artifacts.py" \
   "$artifact_dir"
 
-printf 'browser E2E passed: OIDC, node registration, access grant, keyboard focus, occupied confirmation, logout\n'
+printf 'browser E2E passed: OIDC, live updates, metric transitions, delayed-body timeout, access, confirmation, logout\n'

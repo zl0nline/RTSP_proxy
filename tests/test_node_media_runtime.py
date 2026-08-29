@@ -180,6 +180,7 @@ def test_node_metrics_round_trip_binds_generation_and_path_counters() -> None:
                         "public_id": str(PUBLIC_ID),
                         "received_bytes_total": 100,
                         "sent_bytes_total": 200,
+                        "ready": True,
                     }
                 ],
                 "occupied_public_ids": [str(PUBLIC_ID)],
@@ -210,7 +211,9 @@ def test_node_metrics_round_trip_binds_generation_and_path_counters() -> None:
             1,
             100,
             200,
-            path_counters=(PathMetricCounters(str(PUBLIC_ID), 100, 200),),
+            path_counters=(
+                PathMetricCounters(str(PUBLIC_ID), 100, 200, ready=True),
+            ),
             occupied_public_ids=(str(PUBLIC_ID),),
         ),
         process_id=123,

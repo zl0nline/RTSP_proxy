@@ -953,6 +953,31 @@ rollback-verified. All seven jobs passed at commit
 [CI run 33253244053](https://github.com/zl0nline/RTSP_proxy/actions/runs/33253244053),
 including the real root-systemd contract on both server architectures; see
 [`docs/evidence/phase-f-management-https-contract.md`](evidence/phase-f-management-https-contract.md).
+The bounded live-dashboard slice is implemented and green in the full local
+suite plus a real HTTPS Chromium workflow on direct Linux amd64; independent
+review and native CI are pending. The overview polls only the persisted
+aggregate snapshot every 10 seconds by default with a server-enforced 5–30
+second range. A camera detail has one bounded SSE stream per operator session,
+15-second heartbeat, authorization before replay and a shared one-second
+read-only batch of session epochs; an in-memory fence runs before every state
+delivery and the 750-millisecond batch deadline keeps revocation below two
+seconds. History/resume, `resync_required`,
+slow-client/write deadlines and bounded polling fallback. Snapshot reads and
+SSE reconnects use separate durable account buckets; clients use one in-flight
+request with a five-second deadline and bounded backoff. The server shares one
+bounded single-flight snapshot refresh, indexes paths once per snapshot, expires
+inactive channels and persists per-path bitrate derived from monotonic elapsed
+time. Wall-clock observation time is freshness metadata only; counter resets,
+metric gaps, missing N−1 detail and wrong-node path evidence fail closed.
+Camera placement changes discard queued/history state from the previous node,
+emit `resync_required` and immediately start an exact new-node epoch. One
+bounded secret-free placement batch over active SSE cameras discovers the move
+without another browser request. Shutdown
+waits for tracked bounded snapshot/authz workers before closing their stores.
+The browser never reads a media-node API or metric endpoint. The completed
+probe event and production load/cardinality evidence remain open; exact scope
+is recorded in
+[`docs/evidence/phase-f-dashboard-live-updates-contract.md`](evidence/phase-f-dashboard-live-updates-contract.md).
 The camera access-administration slice is also implemented locally: it renders
 the two independent internet/local CIDR policies, a bounded secret-free grant
 inventory, recent-MFA issue/rotate/revoke forms and a one-time no-store RTSP
@@ -1084,7 +1109,7 @@ route-method pairs, including nested included-router prefixes, and passed both
 reviews plus all seven jobs at commit
 `39b29814d726d9020c1d19100521b4dfe729b91e`
 ([CI run 32680412385](https://github.com/zl0nline/RTSP_proxy/actions/runs/32680412385)).
-Future export/SSE/bulk routes remain activation-gated until they enter that
+Future export/bulk routes remain activation-gated until they enter that
 inventory and add their surface-specific security evidence.
 The prior published inventory contained 57 protected route-method pairs after
 the first node-action router slice. It passed independent Spec/Standards review
@@ -1114,6 +1139,9 @@ published camera-registration slice brings it to 72; independent review and all
 seven native/external CI jobs passed at commit
 `a7f2324a5354969fd773f70fc6f13b04247e51b3` in
 [CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524).
+The local live-update delta brings the current generated inventory to 75 by
+adding one-camera snapshot/SSE and bounded live diagnostics. Its direct-Linux
+functional gate is green; review/native CI publication is pending.
 Both
 dashboard and JSON API require exact desired revision/source state. Port change
 and DRAINING reconfigure/restart additionally require recent MFA plus the
@@ -1141,10 +1169,10 @@ No Phase-F completion claim is made yet.
 - [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
-- [x] recursively generated route-method negative matrix (current 63-route
-  node-operation surface and current 70-route access surface independently
-  reviewed, published and CI-green);
-  future export/SSE/bulk routes must extend it before activation;
+- [x] recursively generated route-method negative matrix (published 72-route
+  registration surface independently reviewed/CI-green; current 75-route live
+  surface locally/direct-Linux green and awaiting review/native CI);
+  future export/bulk routes must extend it before activation;
 - [x] camera-scoped access dashboard/API list, two-level ACL edit and
   recent-MFA grant issue/rotate/revoke with one-time no-store secret output,
   30-second auto-clear, durable sensitive-read audit, separate action-rate
@@ -1165,6 +1193,14 @@ No Phase-F completion claim is made yet.
   [CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524); see
   [`docs/evidence/phase-f-camera-registration-dashboard-contract.md`](evidence/phase-f-camera-registration-dashboard-contract.md));
 - [x] metrics collector and bounded queries;
+- [x] aggregate overview polling and one-camera SSE with bounded resume,
+  pre-replay/batched pre-delivery authz epoch fencing, two-second revocation
+  ceiling, backpressure/write timeout, single-flight indexed refresh,
+  collector-owned monotonic per-path bitrate, durable read/reconnect buckets,
+  move-scoped live epochs, fail-closed freshness/reset state, owned worker
+  shutdown, resync and bounded polling fallback
+  (local/direct-Linux functional evidence green; independent re-review and
+  native CI pending; completed-probe event and capacity evidence remain open);
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
 - [x] browser E2E for OIDC/login, confirmations, keyboard accessibility and

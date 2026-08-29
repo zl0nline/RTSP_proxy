@@ -293,11 +293,22 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
             "RTSP_PROXY_ROLE": "web",
             "RTSP_PROXY_HTTP_HOST": "127.0.0.2",
             "RTSP_PROXY_HTTP_PORT": "8080",
+            "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "15",
         }
     )
 
     assert str(settings.http_host) == "127.0.0.2"
     assert settings.http_port == 8080
+    assert settings.dashboard_poll_interval_seconds == 15
+
+
+@pytest.mark.parametrize("poll_interval", (4, 31))
+def test_dashboard_poll_interval_is_bounded(poll_interval: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            role=RuntimeRole.WEB,
+            dashboard_poll_interval_seconds=poll_interval,
+        )
 
 
 def test_management_lan_bind_requires_a_complete_tls_identity(tmp_path: Path) -> None:
@@ -1127,7 +1138,7 @@ def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
         "0015_camera_name_contract",
         "0016_node_registration_keys",
         "0017_access_grant_keys",
-        "0018_camera_registration_keys",
+        "0019_dashboard_rate_limits",
     ],
 )
 def test_collector_remains_ready_across_declared_schema_bridge(

@@ -1,7 +1,9 @@
 # Phase F operator security-audit contract
 
 - Last reviewed: 2026-08-24
-- Status: current protected route-method matrix complete; Phase F remains in progress
+- Status: published 72-pair matrix complete; current 75-pair live-update matrix
+  locally/direct-Linux green and awaiting independent review/native CI; Phase F
+  remains in progress
 - Commits: denial/logout implementation `ef0e1f3fdfb74c174ac0dffa9f88213291ab19b5`;
   generated matrix `39b29814d726d9020c1d19100521b4dfe729b91e`;
   current 63-pair matrix `466e72feb6c5401dd4b281baabc07095b7173669`
@@ -14,7 +16,8 @@
 This evidence covers the shared operator HTTP boundary: authentication
 failures, CSRF/permission/scope denials and logout, plus the representative
 semantic targets listed below. A generated inventory additionally covers every
-current protected route-method pair. Future export, SSE or bulk-operation
+current protected route-method pair. The current camera snapshot/SSE and live
+diagnostics routes are included. Future export or bulk-operation
 routes are not covered until they are added to the inventory and pass their own
 scope/no-oracle, redaction, rate/admission and durable-audit tests.
 
@@ -79,11 +82,18 @@ executed that exact commit and all seven jobs passed; its review and Linux
 evidence are recorded in
 [`phase-f-node-disruption-contract.md`](phase-f-node-disruption-contract.md).
 
+The camera-access and camera-registration publications later raised the
+protected inventory to 70 and 72 pairs respectively. The current live-update
+delta raises it to 75 with one-camera snapshot/SSE and bounded internal live
+diagnostics. Its full local and direct-Linux Chromium gates are green; exact
+scope and still-open review/CI gates are recorded in
+[`phase-f-dashboard-live-updates-contract.md`](phase-f-dashboard-live-updates-contract.md).
+
 ## Remaining gates
 
 Phase F remains **IN PROGRESS** until the remaining operator workflows are
 available without direct database, `systemctl` or MediaMTX access. Any future
-export, SSE or bulk surface must enter the generated inventory and add its
+export or bulk surface must enter the generated inventory and add its
 consensus-required scope/no-oracle, redaction, rate/admission and durable-audit
 evidence before activation. Phase G
 physical capacity/fault/WAN/24-hour evidence and Phase H rollout are also open;

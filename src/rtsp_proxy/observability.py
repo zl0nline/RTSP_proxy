@@ -10,7 +10,7 @@ import stat
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from enum import StrEnum
@@ -72,13 +72,45 @@ class PathMetricCounters:
     public_id: str
     received_bytes_total: int
     sent_bytes_total: int
+    ready: bool | None = None
+    received_bitrate_bps: float | None = None
+    sent_bitrate_bps: float | None = None
+    counters_reset: bool = False
+    metric_gap: bool = False
 
     def __post_init__(self) -> None:
         try:
             PublicId.parse(self.public_id)
         except InvalidPublicId:
             raise ValueError("path_metric_public_id_invalid") from None
-        if self.received_bytes_total < 0 or self.sent_bytes_total < 0:
+        if (
+            self.received_bytes_total < 0
+            or self.sent_bytes_total < 0
+            or (self.ready is not None and not isinstance(self.ready, bool))
+            or (
+                self.received_bitrate_bps is not None
+                and (
+                    not math.isfinite(self.received_bitrate_bps)
+                    or self.received_bitrate_bps < 0
+                )
+            )
+            or (
+                self.sent_bitrate_bps is not None
+                and (
+                    not math.isfinite(self.sent_bitrate_bps)
+                    or self.sent_bitrate_bps < 0
+                )
+            )
+            or not isinstance(self.counters_reset, bool)
+            or not isinstance(self.metric_gap, bool)
+            or (
+                (self.counters_reset or self.metric_gap)
+                and (
+                    self.received_bitrate_bps is not None
+                    or self.sent_bitrate_bps is not None
+                )
+            )
+        ):
             raise ValueError("path_metric_counter_invalid")
 
 
@@ -125,8 +157,19 @@ class NodeMetricSample:
             != self.received_bytes_total
             or sum(counter.sent_bytes_total for counter in self.path_counters)
             != self.sent_bytes_total
+            or (
+                all(counter.ready is not None for counter in self.path_counters)
+                and sum(counter.ready is True for counter in self.path_counters)
+                != self.active_sources
+            )
         ):
             raise ValueError("path_metric_aggregate_invalid")
+        if self.occupied_public_ids is not None and any(
+            counter.ready is False
+            for counter in self.path_counters
+            if counter.public_id in self.occupied_public_ids
+        ):
+            raise ValueError("occupied_public_ids_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -839,12 +882,8 @@ class FleetCollector:
         counters_reset = False
         with self._history_lock:
             previous = self._metric_history.get(node.id)
-            self._metric_history[node.id] = (
-                _node_process_generation(node),
-                observed_monotonic,
-                observed_at,
-                metric_sample,
-            )
+        metric_gap = False
+        elapsed: float | None = None
         if previous is not None:
             elapsed = observed_monotonic - previous[1]
             received_delta = metric_sample.received_bytes_total - previous[3].received_bytes_total
@@ -852,18 +891,36 @@ class FleetCollector:
             counters_reset = previous[0] != _node_process_generation(node) or _path_counters_reset(
                 previous[3], metric_sample
             )
-            if elapsed > self._collection_interval_seconds * 2:
-                return self._node_snapshot(
-                    node,
-                    status=NodeScrapeStatus.STALE,
-                    reason="node_metrics_gap",
-                    metrics=metric_sample,
-                    metric_observed_at=observed_at,
-                    counters_reset=counters_reset,
-                )
+            metric_gap = elapsed > self._collection_interval_seconds * 2
             if elapsed > 0 and not counters_reset:
                 received_bitrate = received_delta * 8 / elapsed
                 sent_bitrate = sent_delta * 8 / elapsed
+        metric_sample = _with_path_metric_rates(
+            metric_sample,
+            previous=None if previous is None else previous[3],
+            elapsed=elapsed,
+            process_reset=(
+                previous is not None
+                and previous[0] != _node_process_generation(node)
+            ),
+            metric_gap=metric_gap,
+        )
+        with self._history_lock:
+            self._metric_history[node.id] = (
+                _node_process_generation(node),
+                observed_monotonic,
+                observed_at,
+                metric_sample,
+            )
+        if metric_gap:
+            return self._node_snapshot(
+                node,
+                status=NodeScrapeStatus.STALE,
+                reason="node_metrics_gap",
+                metrics=metric_sample,
+                metric_observed_at=observed_at,
+                counters_reset=counters_reset,
+            )
         scrape_status = (
             NodeScrapeStatus.IDLE
             if metric_sample.active_sources == 0 and metric_sample.occupied_streams == 0
@@ -1450,7 +1507,12 @@ class PostgresObservabilityStore:
                     scrape_status=NodeScrapeStatus(item["scrape_status"]),
                     scrape_reason=item["scrape_reason"],
                     metrics=(
-                        None if item["metrics"] is None else NodeMetricSample(**item["metrics"])
+                        None
+                        if item["metrics"] is None
+                        else _metric_sample_from_payload(
+                            item["metrics"],
+                            path_metrics=item.get("path_metrics"),
+                        )
                     ),
                     metric_observed_at=(
                         None
@@ -1576,9 +1638,109 @@ def _snapshot_payload(snapshot: FleetSnapshot) -> dict[str, object]:
         if node["metric_observed_at"] is not None:
             node["metric_observed_at"] = node["metric_observed_at"].isoformat()
         if node["metrics"] is not None:
-            node["metrics"].pop("path_counters", None)
-            node["metrics"].pop("occupied_public_ids", None)
+            node["path_metrics"] = {
+                "path_counters": node["metrics"].pop("path_counters"),
+                "occupied_public_ids": node["metrics"].pop("occupied_public_ids"),
+            }
     return payload
+
+
+def _metric_sample_from_payload(
+    payload: object,
+    *,
+    path_metrics: object = None,
+) -> NodeMetricSample:
+    if not isinstance(payload, dict):
+        raise ValueError("fleet_snapshot_invalid")
+    required = {
+        "active_sources",
+        "occupied_streams",
+        "received_bytes_total",
+        "sent_bytes_total",
+    }
+    optional = {"path_counters", "occupied_public_ids"}
+    if not required.issubset(payload) or set(payload) - required - optional:
+        raise ValueError("fleet_snapshot_invalid")
+    if any(type(payload[key]) is not int for key in required):
+        raise ValueError("fleet_snapshot_invalid")
+    embedded_detail = bool(set(payload) & optional)
+    if path_metrics is not None:
+        if embedded_detail or not isinstance(path_metrics, dict) or set(path_metrics) != optional:
+            raise ValueError("fleet_snapshot_invalid")
+        raw_paths = path_metrics["path_counters"]
+        raw_occupied = path_metrics["occupied_public_ids"]
+    else:
+        raw_paths = payload.get("path_counters", ())
+        raw_occupied = payload.get("occupied_public_ids")
+    if not isinstance(raw_paths, list | tuple) or (
+        raw_occupied is not None and not isinstance(raw_occupied, list | tuple)
+    ):
+        raise ValueError("fleet_snapshot_invalid")
+    if raw_occupied is not None and any(not isinstance(item, str) for item in raw_occupied):
+        raise ValueError("fleet_snapshot_invalid")
+    paths = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, dict):
+            raise ValueError("fleet_snapshot_invalid")
+        path_required = {"public_id", "received_bytes_total", "sent_bytes_total"}
+        path_optional = {
+            "ready",
+            "received_bitrate_bps",
+            "sent_bitrate_bps",
+            "counters_reset",
+            "metric_gap",
+        }
+        if not path_required.issubset(raw_path) or set(raw_path) - path_required - path_optional:
+            raise ValueError("fleet_snapshot_invalid")
+        public_id = raw_path["public_id"]
+        received_bytes = raw_path["received_bytes_total"]
+        sent_bytes = raw_path["sent_bytes_total"]
+        ready = raw_path.get("ready")
+        received_bitrate = raw_path.get("received_bitrate_bps")
+        sent_bitrate = raw_path.get("sent_bitrate_bps")
+        counters_reset = raw_path.get("counters_reset", False)
+        metric_gap = raw_path.get("metric_gap", False)
+        if (
+            not isinstance(public_id, str)
+            or type(received_bytes) is not int
+            or type(sent_bytes) is not int
+            or (ready is not None and not isinstance(ready, bool))
+            or (
+                received_bitrate is not None
+                and type(received_bitrate) not in {int, float}
+            )
+            or (
+                sent_bitrate is not None
+                and type(sent_bitrate) not in {int, float}
+            )
+            or not isinstance(counters_reset, bool)
+            or not isinstance(metric_gap, bool)
+        ):
+            raise ValueError("fleet_snapshot_invalid")
+        paths.append(
+            PathMetricCounters(
+                public_id=public_id,
+                received_bytes_total=received_bytes,
+                sent_bytes_total=sent_bytes,
+                ready=ready,
+                received_bitrate_bps=(
+                    None if received_bitrate is None else float(received_bitrate)
+                ),
+                sent_bitrate_bps=None if sent_bitrate is None else float(sent_bitrate),
+                counters_reset=counters_reset,
+                metric_gap=metric_gap,
+            )
+        )
+    return NodeMetricSample(
+        active_sources=payload["active_sources"],
+        occupied_streams=payload["occupied_streams"],
+        received_bytes_total=payload["received_bytes_total"],
+        sent_bytes_total=payload["sent_bytes_total"],
+        path_counters=tuple(paths),
+        occupied_public_ids=(
+            None if raw_occupied is None else tuple(raw_occupied)
+        ),
+    )
 
 
 def parse_mediamtx_path_metrics(payload: bytes) -> NodeMetricSample:
@@ -1659,7 +1821,12 @@ def parse_mediamtx_path_metrics(payload: bytes) -> NodeMetricSample:
         received_bytes_total=sum(inbound.values()),
         sent_bytes_total=sum(outbound.values()),
         path_counters=tuple(
-            PathMetricCounters(str(public_id), inbound[public_id], outbound[public_id])
+            PathMetricCounters(
+                str(public_id),
+                inbound[public_id],
+                outbound[public_id],
+                ready=seen_paths[public_id] == "ready",
+            )
             for public_id in sorted(path_ids, key=str)
         ),
         occupied_public_ids=tuple(
@@ -1689,6 +1856,59 @@ def _path_counters_reset(previous: NodeMetricSample, current: NodeMetricSample) 
         current.received_bytes_total < previous.received_bytes_total
         or current.sent_bytes_total < previous.sent_bytes_total
     )
+
+
+def _with_path_metric_rates(
+    current: NodeMetricSample,
+    *,
+    previous: NodeMetricSample | None,
+    elapsed: float | None,
+    process_reset: bool,
+    metric_gap: bool,
+) -> NodeMetricSample:
+    previous_paths = (
+        {}
+        if previous is None
+        else {counter.public_id: counter for counter in previous.path_counters}
+    )
+    paths = []
+    for counter in current.path_counters:
+        prior = previous_paths.get(counter.public_id)
+        counter_reset = bool(
+            process_reset
+            or (
+                prior is not None
+                and (
+                    counter.received_bytes_total < prior.received_bytes_total
+                    or counter.sent_bytes_total < prior.sent_bytes_total
+                )
+            )
+        )
+        received_rate: float | None = None
+        sent_rate: float | None = None
+        if (
+            prior is not None
+            and elapsed is not None
+            and elapsed > 0
+            and not counter_reset
+            and not metric_gap
+        ):
+            received_rate = (
+                counter.received_bytes_total - prior.received_bytes_total
+            ) * 8 / elapsed
+            sent_rate = (
+                counter.sent_bytes_total - prior.sent_bytes_total
+            ) * 8 / elapsed
+        paths.append(
+            replace(
+                counter,
+                received_bitrate_bps=received_rate,
+                sent_bitrate_bps=sent_rate,
+                counters_reset=counter_reset,
+                metric_gap=metric_gap,
+            )
+        )
+    return replace(current, path_counters=tuple(paths))
 
 
 def _node_process_generation(node: MediaNode) -> tuple[object, ...]:

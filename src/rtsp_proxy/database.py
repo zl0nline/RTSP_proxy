@@ -641,6 +641,7 @@ class PostgresNodeStore:
             ("0015_camera_name_contract",),
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
+            ("0018_camera_registration_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -667,6 +668,7 @@ class PostgresNodeStore:
         if revisions not in (
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
+            ("0018_camera_registration_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -692,6 +694,7 @@ class PostgresNodeStore:
             ("0015_camera_name_contract",),
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
+            ("0018_camera_registration_keys",),
             (APPLICATION_SCHEMA,),
         )
 
@@ -2333,6 +2336,18 @@ class PostgresNodeStore:
                 ).mappings()
             )
 
+    def get_cameras(self, camera_ids: tuple[UUID, ...]) -> tuple[CameraPlacement, ...]:
+        with self._engine.connect() as connection:
+            return tuple(
+                _camera_placement(row)
+                for row in connection.execute(
+                    self._camera_query().where(
+                        cameras.c.id.in_(camera_ids),
+                        cameras.c.state != CameraState.DELETED.value,
+                    )
+                ).mappings()
+            )
+
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         statement = self._camera_catalog_query()
         if query.after is not None:
@@ -2491,6 +2506,7 @@ class PostgresNodeStore:
             ("0015_camera_name_contract",),
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
+            ("0018_camera_registration_keys",),
             (APPLICATION_SCHEMA,),
         ):
             raise CameraCatalogUnavailable("camera_catalog_unavailable")
@@ -4102,13 +4118,17 @@ def _classify_access_grant_request(
 
 def _require_access_grant_idempotency_schema(connection: Connection) -> None:
     revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
-    if revisions not in (("0017_access_grant_keys",), (APPLICATION_SCHEMA,)):
+    if revisions not in (
+        ("0017_access_grant_keys",),
+        ("0018_camera_registration_keys",),
+        (APPLICATION_SCHEMA,),
+    ):
         raise AccessGrantSchemaUnavailable("access_grant_schema_unavailable")
 
 
 def _require_camera_registration_idempotency_schema(connection: Connection) -> None:
     revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
-    if revisions != (APPLICATION_SCHEMA,):
+    if revisions not in (("0018_camera_registration_keys",), (APPLICATION_SCHEMA,)):
         raise NodeRuntimeUnavailable("camera_registration_schema_unavailable")
 
 

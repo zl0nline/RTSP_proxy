@@ -5,7 +5,7 @@ import hmac
 import json
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -16,6 +16,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import SQLAlchemyError
+
+from rtsp_proxy.release import APPLICATION_SCHEMA
 
 
 class OperatorRole(StrEnum):
@@ -81,6 +83,7 @@ _AUDIT_ACTIONS = frozenset(
         "camera.grant_revoke",
         "camera.grant_rotate",
         "camera.list",
+        "camera.live_read",
         "camera.move",
         "camera.move_preview",
         "camera.move_read",
@@ -140,6 +143,7 @@ _AUDIT_RESOURCE_TYPES = frozenset(
     }
 )
 _AUDIT_RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MAX_LIVE_SESSION_BATCH = 256
 
 
 class OperatorAuthenticationRequired(RuntimeError):
@@ -157,6 +161,8 @@ class OperatorSessionUnavailable(RuntimeError):
 class OperatorActionBucket(StrEnum):
     ACCESS_MUTATION = "access_mutation"
     CAMERA_MUTATION = "camera_mutation"
+    DASHBOARD_READ = "dashboard_read"
+    LIVE_RECONNECT = "live_reconnect"
     SECRET_ISSUE = "secret_issue"
 
 
@@ -168,6 +174,14 @@ class OperatorActionRateLimited(RuntimeError):
 
 class OperatorConflict(RuntimeError):
     """An operator account mutation lost its revision fence."""
+
+
+def _validate_live_session_ids(session_ids: tuple[UUID, ...]) -> None:
+    if (
+        len(session_ids) > _MAX_LIVE_SESSION_BATCH
+        or len(session_ids) != len(set(session_ids))
+    ):
+        raise ValueError("operator_live_session_batch_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +421,8 @@ class AuthenticatedOperatorSession:
 
 
 class OperatorSessionStore(Protocol):
+    def supports_dashboard_rate_limits(self) -> bool: ...
+
     def get_account(self, account_id: UUID) -> OperatorAccount | None: ...
 
     def create_account(self, account: OperatorAccount) -> None: ...
@@ -440,6 +456,11 @@ class OperatorSessionStore(Protocol):
         self,
         token_sha256: str,
     ) -> AuthenticatedOperatorSession | OperatorSessionFailure: ...
+
+    def read_authorization_epochs(
+        self,
+        session_ids: tuple[UUID, ...],
+    ) -> Mapping[UUID, int]: ...
 
     def touch_authorized_session(
         self,
@@ -511,6 +532,9 @@ class InMemoryOperatorSessionStore:
     def get_account(self, account_id: UUID) -> OperatorAccount | None:
         with self._lock:
             return self._accounts.get(account_id)
+
+    def supports_dashboard_rate_limits(self) -> bool:
+        return True
 
     def create_account(self, account: OperatorAccount) -> None:
         if account.authz_version != 1:
@@ -617,6 +641,20 @@ class InMemoryOperatorSessionStore:
                 None,
             )
             return self._evaluate(session, now=self._now())
+
+    def read_authorization_epochs(
+        self,
+        session_ids: tuple[UUID, ...],
+    ) -> Mapping[UUID, int]:
+        _validate_live_session_ids(session_ids)
+        with self._lock:
+            now = self._now()
+            epochs: dict[UUID, int] = {}
+            for session_id in session_ids:
+                evaluated = self._evaluate(self._sessions.get(session_id), now=now)
+                if isinstance(evaluated, AuthenticatedOperatorSession):
+                    epochs[session_id] = evaluated.account.authz_version
+            return epochs
 
     def touch_authorized_session(
         self,
@@ -850,6 +888,16 @@ class PostgresOperatorSessionStore:
                 connection.execute(text("SELECT id FROM operator_sessions LIMIT 0"))
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
+
+    def supports_dashboard_rate_limits(self) -> bool:
+        try:
+            with self._engine.connect() as connection:
+                revisions = tuple(
+                    connection.scalars(text("SELECT version_num FROM alembic_version"))
+                )
+        except SQLAlchemyError:
+            raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
+        return revisions == (APPLICATION_SCHEMA,)
 
     def claim_operator_action(
         self,
@@ -1167,6 +1215,30 @@ class PostgresOperatorSessionStore:
         assert isinstance(now, datetime)
         return _evaluate_joined_row(row, now=now)
 
+    def read_authorization_epochs(
+        self,
+        session_ids: tuple[UUID, ...],
+    ) -> Mapping[UUID, int]:
+        _validate_live_session_ids(session_ids)
+        if not session_ids:
+            return {}
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(
+                    text(
+                        "SELECT s.id, a.authz_version FROM operator_sessions AS s "
+                        "JOIN operator_accounts AS a ON a.id = s.account_id "
+                        "WHERE s.id = ANY(:session_ids) AND s.revoked_at IS NULL "
+                        "AND clock_timestamp() < s.idle_expires_at "
+                        "AND clock_timestamp() < s.absolute_expires_at "
+                        "AND a.enabled AND a.authz_version = s.authz_version"
+                    ),
+                    {"session_ids": list(session_ids)},
+                ).mappings()
+                return {row["id"]: int(row["authz_version"]) for row in rows}
+        except SQLAlchemyError:
+            raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
+
     def touch_authorized_session(
         self,
         session_id: UUID,
@@ -1379,6 +1451,7 @@ class OperatorSessionControl:
         secret_issue_limit_per_minute: int = 10,
         access_mutation_limit_per_minute: int = 60,
         camera_mutation_limit_per_minute: int = 60,
+        dashboard_read_limit_per_minute: int = 600,
     ) -> None:
         if (
             idle_timeout <= timedelta(0)
@@ -1387,6 +1460,7 @@ class OperatorSessionControl:
             or not 1 <= secret_issue_limit_per_minute <= 600
             or not 1 <= access_mutation_limit_per_minute <= 3600
             or not 1 <= camera_mutation_limit_per_minute <= 3600
+            or not 1 <= dashboard_read_limit_per_minute <= 3600
         ):
             raise ValueError("operator_session_timing_invalid")
         self._store = store
@@ -1394,10 +1468,13 @@ class OperatorSessionControl:
         self._session_id_factory = session_id_factory
         self._idle_timeout = idle_timeout
         self._absolute_timeout = absolute_timeout
+        self._dashboard_rate_limits_available = store.supports_dashboard_rate_limits()
         self._action_limits = {
-            OperatorActionBucket.SECRET_ISSUE: secret_issue_limit_per_minute,
-            OperatorActionBucket.ACCESS_MUTATION: access_mutation_limit_per_minute,
-            OperatorActionBucket.CAMERA_MUTATION: camera_mutation_limit_per_minute,
+            OperatorActionBucket.SECRET_ISSUE: (secret_issue_limit_per_minute, 60),
+            OperatorActionBucket.ACCESS_MUTATION: (access_mutation_limit_per_minute, 60),
+            OperatorActionBucket.CAMERA_MUTATION: (camera_mutation_limit_per_minute, 60),
+            OperatorActionBucket.DASHBOARD_READ: (dashboard_read_limit_per_minute, 60),
+            OperatorActionBucket.LIVE_RECONNECT: (1, 5),
         }
 
     def issue(
@@ -1522,6 +1599,14 @@ class OperatorSessionControl:
             authenticated_at=session.last_seen_at,
         )
 
+    def live_authorization_epochs(
+        self,
+        session_ids: tuple[UUID, ...],
+    ) -> Mapping[UUID, int]:
+        """Read all active live-session epochs in one bounded, read-only operation."""
+
+        return self._store.read_authorization_epochs(session_ids)
+
     def revoke(
         self,
         session_token: str,
@@ -1641,11 +1726,22 @@ class OperatorSessionControl:
         principal: OperatorPrincipal,
         bucket: OperatorActionBucket,
     ) -> None:
+        if (
+            not self._dashboard_rate_limits_available
+            and bucket is OperatorActionBucket.DASHBOARD_READ
+        ):
+            return
+        if (
+            not self._dashboard_rate_limits_available
+            and bucket is OperatorActionBucket.LIVE_RECONNECT
+        ):
+            raise OperatorSessionUnavailable("operator_action_bucket_unavailable")
+        limit, window_seconds = self._action_limits[bucket]
         retry_after = self._store.claim_operator_action(
             account_id=principal.account_id,
             bucket=bucket,
-            limit=self._action_limits[bucket],
-            window_seconds=60,
+            limit=limit,
+            window_seconds=window_seconds,
         )
         if retry_after:
             raise OperatorActionRateLimited(retry_after)

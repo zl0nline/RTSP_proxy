@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -28,6 +30,14 @@ from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.live_updates import (
+    CameraLiveDiagnostics,
+    CameraLiveEvent,
+    CameraLiveEventType,
+    CameraLiveStream,
+    CameraLiveTarget,
+    CameraLiveUpdateSource,
+)
 from rtsp_proxy.media import MediaPathConfig
 from rtsp_proxy.nodes import (
     CameraCatalogItem,
@@ -376,6 +386,94 @@ class StaticCameraCatalog:
     ) -> None:
         assert expected_revision == 3
         self.enabled_calls.append((camera_id, enabled))
+
+
+class EventLoopRejectingCameraCatalog(StaticCameraCatalog):
+    def __init__(self) -> None:
+        super().__init__()
+        self.detail_calls = 0
+
+    def detail(self, camera_id: UUID) -> CameraCatalogItem | None:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        self.detail_calls += 1
+        return super().detail(camera_id)
+
+
+class FiniteLiveStream:
+    def __init__(self, events: tuple[CameraLiveEvent, ...]) -> None:
+        self._events = iter(events)
+        self.closed = False
+        self.slow_consumer = False
+
+    def __aiter__(self) -> AsyncIterator[CameraLiveEvent]:
+        return self
+
+    async def __anext__(self) -> CameraLiveEvent:
+        try:
+            return next(self._events)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FiniteLiveUpdates:
+    def __init__(self) -> None:
+        self.event = CameraLiveEvent(
+            event_type=CameraLiveEventType.STATE,
+            event_id=42,
+            data={
+                "camera_id": str(CAMERA_ID),
+                "node_id": str(NODE_ID),
+                "observed_at": NOW.isoformat(),
+                "occupied": True,
+                "received_bitrate_bps": 1_600.0,
+                "scrape_status": "fresh",
+                "sent_bitrate_bps": 3_200.0,
+                "source_state": "ready",
+            },
+        )
+        self.opened: list[tuple[CameraLiveTarget, UUID, int, str | None]] = []
+        self.authorizers: list[Callable[[], Awaitable[int]]] = []
+        self.stream: FiniteLiveStream | None = None
+
+    def diagnostics(self) -> CameraLiveDiagnostics:
+        return CameraLiveDiagnostics(
+            active_subscriptions=0,
+            tracked_cameras=1,
+            opened_subscriptions_total=len(self.opened),
+            resume_requests_total=len(self.opened),
+            resync_required_total=0,
+            rejected_subscriptions_total=0,
+            slow_consumer_disconnects_total=0,
+            authz_disconnects_total=0,
+        )
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def current(self, target: CameraLiveTarget) -> CameraLiveEvent:
+        assert target.camera_id == CAMERA_ID
+        return self.event
+
+    async def open(
+        self,
+        *,
+        target: CameraLiveTarget,
+        session_id: UUID,
+        authz_version: int,
+        authorize: Callable[[], Awaitable[int]],
+        last_event_id: str | None = None,
+    ) -> CameraLiveStream:
+        self.authorizers.append(authorize)
+        self.opened.append((target, session_id, authz_version, last_event_id))
+        self.stream = FiniteLiveStream((self.event,))
+        return self.stream
 
 
 class RecordingAccessPolicies:
@@ -946,7 +1044,9 @@ def _authenticated_dashboard(
     secret_issue_limit_per_minute: int = 10,
     access_mutation_limit_per_minute: int = 60,
     camera_mutation_limit_per_minute: int = 60,
+    dashboard_read_limit_per_minute: int = 600,
     secret_reveal_seconds: int = 30,
+    live_updates: CameraLiveUpdateSource | None = None,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
@@ -971,6 +1071,7 @@ def _authenticated_dashboard(
         secret_issue_limit_per_minute=secret_issue_limit_per_minute,
         access_mutation_limit_per_minute=access_mutation_limit_per_minute,
         camera_mutation_limit_per_minute=camera_mutation_limit_per_minute,
+        dashboard_read_limit_per_minute=dashboard_read_limit_per_minute,
     )
     issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
     session_clock[0] = authenticated_at
@@ -988,6 +1089,7 @@ def _authenticated_dashboard(
             access_grant_control=cast(Any, access_grant_control),
             node_control=cast(Any, node_control),
             access_secret_reveal_seconds=secret_reveal_seconds,
+            camera_live_updates=live_updates,
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
@@ -1065,6 +1167,23 @@ def test_dashboard_requires_operator_session_and_never_caches() -> None:
     assert "Требуется вход оператора" in response.text
 
 
+def test_dashboard_reads_have_a_separate_durable_per_account_bucket() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        dashboard_read_limit_per_minute=1,
+    )
+
+    first = client.get("/dashboard", headers=headers)
+    limited = client.get("/api/v1/dashboard/snapshot", headers=headers)
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "60"
+    assert limited.json() == {"detail": {"code": "operator_action_rate_limited"}}
+
+
 def test_dashboard_authentication_failure_offers_oidc_login_when_configured() -> None:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,
@@ -1138,12 +1257,13 @@ def test_dashboard_renders_bounded_fleet_snapshot_with_semantic_security_contrac
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["content-security-policy"] == (
-        "default-src 'none'; style-src 'self'; base-uri 'none'; "
-        "form-action 'self'; frame-ancestors 'none'"
+        "default-src 'none'; style-src 'self'; script-src 'self'; "
+        "connect-src 'self'; base-uri 'none'; form-action 'self'; "
+        "frame-ancestors 'none'"
     )
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert '<main id="main-content">' in response.text
+    assert '<main id="main-content"' in response.text
     assert '<table aria-label="Ноды сервера">' in response.text
     assert "1 / 50" in response.text
     assert "80 / 100" in response.text
@@ -1155,6 +1275,12 @@ def test_dashboard_renders_bounded_fleet_snapshot_with_semantic_security_contrac
     assert "edge <north>" not in response.text
     assert "Дежурный <script>" not in response.text
     assert 'href="/dashboard/nodes/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"' in response.text
+    assert 'data-dashboard-poll-ms="10000"' in response.text
+    assert "data-node-metric-observed" in response.text
+    assert "data-node-metric-state" in response.text
+    assert "data-node-counter-state" in response.text
+    assert "Счётчики непрерывны" in response.text
+    assert '<script src="/assets/dashboard.js" defer></script>' in response.text
 
 
 def test_dashboard_exposes_pending_and_stale_snapshot_as_accessible_degraded_state() -> None:
@@ -1230,6 +1356,7 @@ def test_dashboard_suppresses_retained_stale_metrics_and_shows_observation_time(
 
     assert response.status_code == 200
     assert "Метрики устарели" in response.text
+    assert "Состояние счётчиков неизвестно" in response.text
     assert "14.08.2026 11:58:00 UTC" in response.text
     assert ">64<" not in response.text
     assert ">12<" not in response.text
@@ -1257,7 +1384,8 @@ def test_dashboard_distinguishes_confirmed_idle_zero_from_unknown_metrics() -> N
     detail = client.get(f"/dashboard/nodes/{NODE_ID}", headers=headers)
 
     assert overview.status_code == 200
-    assert overview.text.count("<td>0</td>") == 2
+    assert "<td data-node-sources>0</td>" in overview.text
+    assert "<td data-node-occupied>0</td>" in overview.text
     assert "running · idle" in overview.text
     assert detail.status_code == 200
     assert detail.text.count("<strong>0</strong>") == 2
@@ -2283,6 +2411,7 @@ def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None
 
     root = client.get("/", follow_redirects=False)
     stylesheet = client.get("/assets/dashboard.css")
+    script = client.get("/assets/dashboard.js")
     disabled_dashboard = client.get("/dashboard")
 
     assert root.status_code == 303
@@ -2291,6 +2420,17 @@ def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None
     assert stylesheet.headers["content-type"].startswith("text/css")
     assert "@media (prefers-reduced-motion: reduce)" in stylesheet.text
     assert "focus-visible" in stylesheet.text
+    assert script.status_code == 200
+    assert script.headers["content-type"].startswith("text/javascript")
+    assert "EventSource" in script.text
+    assert "AbortController" in script.text
+    assert "return await response.json()" in script.text
+    assert "data-node-metric-observed" in script.text
+    assert "data-node-metric-state" in script.text
+    assert "data-node-counter-state" in script.text
+    assert "setInterval" not in script.text
+    assert "Math.min(30000" in script.text
+    assert "innerHTML" not in script.text
     assert disabled_dashboard.status_code == 503
     assert disabled_dashboard.headers["content-type"].startswith("text/html")
     assert "Сессии операторов не настроены" in disabled_dashboard.text
@@ -2840,7 +2980,8 @@ def test_camera_create_rate_limit_precedes_postgres_intent_reservation(
         assert ledger_count == 1
         assert camera_count == 1
         assert [(str(row.bucket), int(row.used)) for row in rate_rows] == [
-            ("camera_mutation", 1)
+            ("camera_mutation", 1),
+            ("dashboard_read", 1),
         ]
         assert rate_payload["reason_code"] == "operator_rate_limited"
         assert rate_payload["action"] == "camera.create"
@@ -3495,12 +3636,17 @@ def test_camera_catalog_requires_control_read_and_fails_closed() -> None:
     assert "Некорректный запрос каталога" in invalid.text
 
 
-def test_postgres_dashboard_catalog_and_detail_remain_available_on_schema_0015(
+@pytest.mark.parametrize(
+    "schema_revision",
+    ("0015_camera_name_contract", "0018_camera_registration_keys"),
+)
+def test_postgres_dashboard_catalog_and_detail_remain_available_on_rolling_schema(
     postgres_database_url: str,
+    schema_revision: str,
 ) -> None:
     migration = Config("alembic.ini")
     migration.set_main_option("sqlalchemy.url", postgres_database_url)
-    command.upgrade(migration, "0015_camera_name_contract")
+    command.upgrade(migration, schema_revision)
     store = PostgresNodeStore(postgres_database_url)
     node_control = NodeControl(
         store=store,
@@ -3532,15 +3678,19 @@ def test_postgres_dashboard_catalog_and_detail_remain_available_on_schema_0015(
     client, headers = _authenticated_dashboard(
         observations=None,
         camera_control=camera_control,
+        live_updates=FiniteLiveUpdates(),
     )
 
     try:
         catalog = client.get("/dashboard/cameras", headers=headers)
         detail = client.get(f"/dashboard/cameras/{CAMERA_ID}", headers=headers)
+        live = client.get(f"/dashboard/cameras/{CAMERA_ID}/live", headers=headers)
 
         assert catalog.status_code == 200
         assert "Bridge camera" in catalog.text
         assert detail.status_code == 200
+        assert live.status_code == 200
+        assert live.json()["source_state"] == "ready"
         assert "Bridge camera" in detail.text
         assert "camera.internal" not in catalog.text
         assert "camera.internal" not in detail.text
@@ -3573,6 +3723,117 @@ def test_camera_detail_is_authenticated_escaped_and_secret_free() -> None:
     assert "admin:secret" not in response.text
     assert missing.status_code == 404
     assert "Камера не найдена" in missing.text
+
+
+def test_camera_detail_live_snapshot_and_sse_use_the_bounded_aggregated_source() -> None:
+    catalog = StaticCameraCatalog()
+    updates = FiniteLiveUpdates()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        live_updates=updates,
+    )
+    base = f"/dashboard/cameras/{CAMERA_ID}"
+
+    detail = client.get(base, headers=headers)
+    snapshot = client.get(f"{base}/live", headers=headers)
+    stream = client.get(
+        f"{base}/events",
+        headers={**headers, "Last-Event-ID": "41", "Accept": "text/event-stream"},
+    )
+    diagnostics = client.get("/api/v1/dashboard/live-status", headers=headers)
+
+    assert detail.status_code == 200
+    assert f'data-live-url="{base}/events"' in detail.text
+    assert f'data-snapshot-url="{base}/live"' in detail.text
+    assert 'data-poll-interval-ms="10000"' in detail.text
+    assert "Текущее состояние потока" in detail.text
+    assert snapshot.status_code == 200
+    assert snapshot.json() == updates.event.data
+    assert stream.status_code == 200
+    assert stream.headers["content-type"].startswith("text/event-stream")
+    assert stream.headers["cache-control"] == "no-store, no-cache, must-revalidate"
+    assert stream.headers["x-accel-buffering"] == "no"
+    assert stream.content == b"retry: 5000\n\n" + updates.event.encode()
+    assert diagnostics.status_code == 200
+    assert diagnostics.json() == {
+        "active_subscriptions": 0,
+        "authz_disconnects_total": 0,
+        "opened_subscriptions_total": 1,
+        "rejected_subscriptions_total": 0,
+        "resume_requests_total": 1,
+        "resync_required_total": 0,
+        "slow_consumer_disconnects_total": 0,
+        "tracked_cameras": 1,
+    }
+    assert updates.opened[0][0] == CameraLiveTarget(
+        camera_id=CAMERA_ID,
+        public_id=PublicId.parse("a" * 25 + "a"),
+        node_id=NODE_ID,
+    )
+    assert updates.opened[0][2:] == (1, "41")
+
+    async def reauthorize() -> int:
+        return await updates.authorizers[0]()
+
+    assert asyncio.run(reauthorize()) == 1
+    assert updates.stream is not None and updates.stream.closed
+    assert catalog.source_url not in stream.text
+
+
+def test_async_live_routes_offload_the_synchronous_camera_catalog() -> None:
+    catalog = EventLoopRejectingCameraCatalog()
+    updates = FiniteLiveUpdates()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, catalog),
+        live_updates=updates,
+    )
+    base = f"/dashboard/cameras/{CAMERA_ID}"
+
+    snapshot = client.get(f"{base}/live", headers=headers)
+    stream = client.get(f"{base}/events", headers=headers)
+
+    assert snapshot.status_code == 200
+    assert stream.status_code == 200
+    assert catalog.detail_calls == 2
+
+
+def test_camera_sse_rejects_noncanonical_resume_ids_before_opening_a_stream() -> None:
+    updates = FiniteLiveUpdates()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        live_updates=updates,
+    )
+
+    response = client.get(
+        f"/dashboard/cameras/{CAMERA_ID}/events",
+        headers={**headers, "Last-Event-ID": "01"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "live_event_id_invalid"}}
+    assert updates.opened == []
+
+
+def test_camera_sse_reconnect_has_a_separate_durable_five_second_bucket() -> None:
+    updates = FiniteLiveUpdates()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        live_updates=updates,
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}/events"
+
+    first = client.get(path, headers=headers)
+    limited = client.get(path, headers=headers)
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "5"
+    assert limited.json() == {"detail": {"code": "operator_action_rate_limited"}}
+    assert len(updates.opened) == 1
 
 
 def test_camera_detail_requires_control_read_and_fails_closed() -> None:
@@ -3637,8 +3898,9 @@ def test_camera_access_dashboard_is_bounded_secret_free_and_explains_two_level_a
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["content-security-policy"] == (
-        "default-src 'none'; style-src 'self'; base-uri 'none'; "
-        "form-action 'self'; frame-ancestors 'none'"
+        "default-src 'none'; style-src 'self'; script-src 'self'; "
+        "connect-src 'self'; base-uri 'none'; form-action 'self'; "
+        "frame-ancestors 'none'"
     )
     assert "Доступ к потоку" in response.text
     assert "Интернет" in response.text

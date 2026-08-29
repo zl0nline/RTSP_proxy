@@ -12,6 +12,8 @@ from threading import Barrier
 from uuid import UUID
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -150,6 +152,24 @@ def test_postgres_operator_action_rate_buckets_are_durable_and_independent(
         limit=1,
         window_seconds=60,
     )
+    first_dashboard_read = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.DASHBOARD_READ,
+        limit=1,
+        window_seconds=60,
+    )
+    first_live_reconnect = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.LIVE_RECONNECT,
+        limit=1,
+        window_seconds=5,
+    )
+    limited_live_reconnect = store.claim_operator_action(
+        account_id=ACCOUNT_ID,
+        bucket=OperatorActionBucket.LIVE_RECONNECT,
+        limit=1,
+        window_seconds=5,
+    )
 
     with engine.connect() as connection:
         persisted = [
@@ -165,13 +185,95 @@ def test_postgres_operator_action_rate_buckets_are_durable_and_independent(
     store.close()
     engine.dispose()
 
-    assert first_secret == first_mutation == first_camera_mutation == 0
+    assert (
+        first_secret
+        == first_mutation
+        == first_camera_mutation
+        == first_dashboard_read
+        == first_live_reconnect
+        == 0
+    )
     assert 1 <= limited_secret <= 60
+    assert 1 <= limited_live_reconnect <= 5
     assert persisted == [
         ("access_mutation", 1),
         ("camera_mutation", 1),
+        ("dashboard_read", 1),
+        ("live_reconnect", 1),
         ("secret_issue", 1),
     ]
+
+
+def test_dashboard_rate_limit_bridge_keeps_reads_available_before_0019(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0018_camera_registration_keys")
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operator_accounts "
+                "(id, identity_source, subject, display_name, roles, scopes, "
+                "authz_version, enabled) VALUES "
+                "(:id, 'oidc', 'bridge@example.test', 'Bridge operator', "
+                "ARRAY['viewer']::varchar[], ARRAY['server:*']::varchar[], 1, true)"
+            ),
+            {"id": ACCOUNT_ID},
+        )
+    principal = OperatorPrincipal(
+        account_id=ACCOUNT_ID,
+        session_id=UUID("62000000-0000-4000-8000-000000000006"),
+        identity_source=OperatorIdentitySource.OIDC,
+        subject="bridge@example.test",
+        display_name="Bridge operator",
+        roles=frozenset({OperatorRole.VIEWER}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        mfa_verified_at=NOW,
+        authenticated_at=NOW,
+    )
+    old_schema_store = PostgresOperatorSessionStore(postgres_database_url)
+    old_schema_control = OperatorSessionControl(
+        store=old_schema_store,
+        token_factory=lambda: "t" * 43,
+    )
+    try:
+        old_schema_control.admit_action(
+            principal=principal,
+            bucket=OperatorActionBucket.DASHBOARD_READ,
+        )
+        with pytest.raises(OperatorSessionUnavailable):
+            old_schema_control.admit_action(
+                principal=principal,
+                bucket=OperatorActionBucket.LIVE_RECONNECT,
+            )
+    finally:
+        old_schema_store.close()
+
+    command.upgrade(migration, "head")
+    current_store = PostgresOperatorSessionStore(postgres_database_url)
+    current_control = OperatorSessionControl(
+        store=current_store,
+        token_factory=lambda: "t" * 43,
+    )
+    try:
+        current_control.admit_action(
+            principal=principal,
+            bucket=OperatorActionBucket.DASHBOARD_READ,
+        )
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT used FROM operator_action_rate_limits "
+                    "WHERE account_id=:account_id AND bucket='dashboard_read'"
+                ),
+                {"account_id": ACCOUNT_ID},
+            ) == 1
+    finally:
+        current_store.close()
+        engine.dispose()
 
 
 def test_postgres_first_operator_action_bucket_claim_is_concurrency_safe(
@@ -785,6 +887,12 @@ def test_parallel_safe_requests_share_one_session_without_spurious_logout() -> N
     assert len(principals) == 32
     assert {principal.session_id for principal in principals} == {issued.session.id}
 
+    assert control.live_authorization_epochs((issued.session.id,)) == {
+        issued.session.id: 1
+    }
+    control.revoke(issued.session_token)
+    assert control.live_authorization_epochs((issued.session.id,)) == {}
+
 
 def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
     postgres_database_url: str,
@@ -876,6 +984,9 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
     assert denial_audit.payload["http_method"] == "INTERNAL"
 
     reopened = PostgresOperatorSessionStore(postgres_database_url)
+    assert reopened.read_authorization_epochs((issued.session.id,)) == {
+        issued.session.id: 1
+    }
     principal = OperatorSessionControl(
         store=reopened,
         token_factory=lambda: "unused" * 8,
@@ -896,6 +1007,7 @@ def test_postgres_session_is_opaque_durable_and_authoritatively_fenced(
         context=MUTATION_CONTEXT,
     )
     assert updated.authz_version == 2
+    assert reopened.read_authorization_epochs((issued.session.id,)) == {}
     with pytest.raises(OperatorAuthenticationRequired, match="operator_session_stale"):
         OperatorSessionControl(
             store=reopened,
@@ -1552,7 +1664,7 @@ def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -
         ),
     )
     route_methods = _protected_route_method_matrix(anonymous_app.routes)
-    assert len(route_methods) == 72
+    assert len(route_methods) == 75
 
     node_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")

@@ -116,6 +116,7 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_NODE_RUNTIME_TIMEOUT_SECONDS": "node_runtime_timeout_seconds",
     "RTSP_PROXY_RECONCILE_INTERVAL_SECONDS": "reconcile_interval_seconds",
     "RTSP_PROXY_COLLECTOR_INTERVAL_SECONDS": "collector_interval_seconds",
+    "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "dashboard_poll_interval_seconds",
     "RTSP_PROXY_CONFIRMATION_SECRET": "confirmation_secret",
     "RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS": "operator_recent_mfa_seconds",
     "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
