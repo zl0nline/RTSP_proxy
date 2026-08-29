@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -352,11 +351,19 @@ def test_child_is_owned_before_cgroup_write(tmp_path: Path) -> None:
 def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.fail("probe BPF contract requires a root Linux test process")
-    bpftool = shutil.which("bpftool")
+    bpftool_raw = os.environ.get("RTSP_PROXY_BPFTOOL", "")
+    bpftool_path = Path(bpftool_raw)
     object_raw = os.environ.get("RTSP_PROXY_PROBE_GUARD_BPF_OBJECT", "")
     object_path = Path(object_raw)
-    if bpftool is None or not object_path.is_absolute() or not object_path.is_file():
-        pytest.fail("absolute BPF object and bpftool are required")
+    if (
+        not bpftool_path.is_absolute()
+        or not bpftool_path.is_file()
+        or not os.access(bpftool_path, os.X_OK)
+        or not object_path.is_absolute()
+        or not object_path.is_file()
+    ):
+        pytest.fail("absolute executable bpftool and BPF object are required")
+    bpftool = str(bpftool_path)
 
     allowed_port, denied_port = _free_adjacent_ports()
     listeners: list[socket.socket] = []

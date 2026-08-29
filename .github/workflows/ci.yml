@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            clang libbpf-dev linux-tools-common "linux-tools-$(uname -r)" postgresql
+            clang libbpf-dev linux-tools-generic postgresql
           echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
 
       - name: Install locked dependencies
@@ -152,12 +152,21 @@ jobs:
             fi
           }
           trap cleanup_bpffs EXIT
+          mapfile -t bpftool_candidates < <(
+            find /usr/lib/linux-tools -mindepth 2 -maxdepth 2 \
+              -type f -name bpftool -print | sort --version-sort
+          )
+          test "${#bpftool_candidates[@]}" -gt 0
+          bpftool_path="${bpftool_candidates[-1]}"
+          test -x "$bpftool_path"
+          "$bpftool_path" version
           mkdir -p .artifacts/probe
           tools/probe/build_connect_guard.sh \
             "$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o"
           sudo env \
             PYTHONPATH="$PWD/src" \
             RTSP_PROXY_RUN_PROBE_BPF_CONTRACT=1 \
+            RTSP_PROXY_BPFTOOL="$bpftool_path" \
             RTSP_PROXY_PROBE_GUARD_BPF_OBJECT="$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o" \
             "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
             tests/contract/test_probe_connect_guard.py
