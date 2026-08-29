@@ -98,11 +98,13 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   privileges. The completed-probe SSE/dashboard projection is secret-free.
 >   This is not a
 >   production source-probe runner. ADR 0004 remains Proposed: a narrow root
->   broker, system-manager transient unit, exact cgroup `IP:port` guard,
+>   broker and system-manager transient unit still need to integrate the now
+>   implemented exact cgroup `IP:port` guard with attach/readback/run canaries;
 >   no-redirect ffprobe build and privileged amd64/arm64 evidence are still
 >   mandatory. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
->   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md).
+>   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
+>   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).

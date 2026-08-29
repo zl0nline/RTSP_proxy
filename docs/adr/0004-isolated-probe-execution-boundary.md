@@ -40,6 +40,24 @@ the Linux spike compares a systemd socket-activated helper with a continuously
 running worker. A transient helper that requires broad sudo or D-Bus authority
 from the web process is not acceptable.
 
+The address-and-port enforcement primitive is selected more narrowly after the
+2026-08-29/30 amd64 spike: the root boundary attaches project-owned cgroup
+`connect4` and `connect6` programs configured with one versioned map value for
+exactly one literal address family, address and port. A trusted launcher remains
+blocked until the map is populated, both programs are attached and read back,
+and a behavioural canary passes. Missing, malformed, wrong-family and
+wrong-port state denies the connect. systemd `IPAddressDeny=any` plus one
+literal `IPAddressAllow=` remains defense in depth, not the exact-port control.
+
+The throwaway mechanism proof is retained outside `main` at
+[`prototype/phase-g-connect-guard`](https://github.com/zl0nline/RTSP_proxy/tree/prototype/phase-g-connect-guard/tools/prototypes/phase_g_connect_guard)
+(`f984814`). On `grob`, systemd admitted two ports on each allowed loopback
+address; attaching the programs before the run gate preserved the chosen port
+and denied the second for IPv4 and IPv6, followed by explicit detach and zero
+pin/cgroup/process residue. The parameterized ABI and native contract live in
+the production tree, but this ADR remains Proposed until the broker, credential
+transport, no-redirect ffprobe and both-architecture failure matrix pass.
+
 ## Evidence required before Accepted
 
 - native Linux amd64 and arm64 `/proc` tests prove source credentials are not

@@ -1278,6 +1278,10 @@ impact is measured.
 - [x] generation-bound durable resolve-once literal/site/CIDR admission, exact
   type/default/constraint/index/privilege readiness and pinned ffconcat TCP/timeout builder
   (compatibility mechanism only);
+- [x] versioned exact-tuple cgroup `connect4`/`connect6` map ABI and privileged
+  attach-before-release/ownership-safe cleanup contract (direct-Linux amd64 and
+  independent review green; native amd64/arm64 CI pending; executor still
+  disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;

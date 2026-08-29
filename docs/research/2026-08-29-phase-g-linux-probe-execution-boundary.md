@@ -44,6 +44,17 @@ supposedly denied loopback and external `connect_ex` calls succeeded. This is
 negative evidence for the user-manager boundary; it is not evidence about the
 system manager, which still requires a privileged behavioural test.
 
+A follow-up system-manager spike on the same host answered the exact-port
+question positively. A `DynamicUser` transient service with systemd's literal
+loopback allow rules reached two listeners on each allowed IPv4/IPv6 address.
+The next service was held behind a run gate while root attached project-owned
+cgroup `connect4` and `connect6` programs; after release it reached only the
+configured port and the second port failed for both families. Explicit detach
+left no project BPF pin, transient unit, cgroup, runtime directory or process.
+The throwaway primary source is branch `prototype/phase-g-connect-guard`, commit
+`f984814`. This validates the kernel mechanism on amd64, not the production
+broker, credential/no-redirect boundary or arm64 parity.
+
 ## Primary-source findings
 
 ### `StartTransientUnit` and `systemd-run --pipe`

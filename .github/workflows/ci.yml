@@ -35,7 +35,8 @@ jobs:
       - name: Install native PostgreSQL test server
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends postgresql
+          sudo apt-get install --yes --no-install-recommends \
+            clang libbpf-dev linux-tools-common postgresql
           echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
 
       - name: Install locked dependencies
@@ -137,6 +138,18 @@ jobs:
           sudo nft --json list table inet rtsp_proxy | \
             jq --exit-status '.nftables[] | select(.table.comment == "rtsp-proxy-owned:v1")'
           sudo nft delete table inet rtsp_proxy
+
+      - name: Verify exact cgroup probe connect guard
+        run: |
+          mkdir -p .artifacts/probe
+          tools/probe/build_connect_guard.sh \
+            "$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o"
+          sudo env \
+            PYTHONPATH="$PWD/src" \
+            RTSP_PROXY_RUN_PROBE_BPF_CONTRACT=1 \
+            RTSP_PROXY_PROBE_GUARD_BPF_OBJECT="$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o" \
+            "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
+            tests/contract/test_probe_connect_guard.py
 
   browser-e2e:
     # This is an external Chromium-client gate. agent-browser does not publish
