@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -16,6 +16,7 @@ from starlette.types import Message, Scope
 from rtsp_proxy.app import ManagementHstsBoundary
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.live_updates import (
+    CameraLiveEvent,
     CameraLiveEventResponse,
     CameraLiveEventType,
     CameraLiveTarget,
@@ -105,12 +106,15 @@ class MutableLiveTargets:
     def __init__(self, targets: dict[UUID, tuple[PublicId, UUID]]) -> None:
         self.targets = targets
         self.calls: list[tuple[UUID, ...]] = []
+        self.failure = False
 
     def __call__(
         self,
         camera_ids: tuple[UUID, ...],
     ) -> dict[UUID, tuple[PublicId, UUID]]:
         self.calls.append(camera_ids)
+        if self.failure:
+            raise RuntimeError("placement store unavailable")
         return {
             camera_id: self.targets[camera_id]
             for camera_id in camera_ids
@@ -399,6 +403,35 @@ def test_live_target_and_last_event_id_are_canonical_and_bounded() -> None:
         updates.parse_last_event_id("9" * 21)
     assert updates.parse_last_event_id(None) is None
     assert updates.parse_last_event_id("42") == 42
+
+    with pytest.raises(ValueError, match="live_send_timeout_invalid"):
+        CameraLiveEventResponse(cast(Any, object()), send_timeout_seconds=0)
+    with pytest.raises(ValueError, match="camera_live_target_invalid"):
+        CameraLiveTarget(camera_id=UUID(int=0), public_id=PUBLIC_ID, node_id=NODE_ID)
+    with pytest.raises(ValueError, match="live_event_id_invalid"):
+        CameraLiveEvent(CameraLiveEventType.STATE, {}, event_id=0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"poll_interval_seconds": 0},
+        {"heartbeat_seconds": 0},
+        {"reauthorize_seconds": 0},
+        {"authorize_timeout_seconds": 0},
+        {"history_size": 0},
+        {"subscriber_queue_size": 0},
+        {"max_subscriptions": 0},
+        {"max_tracked_cameras": 0},
+        {"max_snapshot_age_seconds": 0.5},
+        {"refresh_wait_timeout_seconds": 0},
+        {"metric_interval_seconds": 0},
+        {"channel_ttl_seconds": 0},
+    ],
+)
+def test_live_updates_reject_unbounded_runtime_settings(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match=r"live_.*_invalid"):
+        _updates(MutableSnapshotReader(None), **cast(Any, kwargs))
 
 
 @async_case
@@ -847,6 +880,47 @@ async def test_live_refresh_discovers_move_and_starts_new_epoch_for_subscriber()
     )
     assert (await anext(resumed)).event_type is CameraLiveEventType.RESYNC_REQUIRED
     await resumed.aclose()
+    await subscription.aclose()
+
+
+@async_case
+async def test_live_target_batch_missing_failure_and_recovery_are_fail_closed() -> None:
+    targets = MutableLiveTargets({CAMERA_ID: (PUBLIC_ID, NODE_ID)})
+    updates = _updates(
+        MutableSnapshotReader(_snapshot()),
+        resolve_targets=targets,
+        subscriber_queue_size=4,
+    )
+
+    async def authorize() -> int:
+        return 1
+
+    subscription = await updates.open(
+        target=_target(),
+        session_id=SESSION_ID,
+        authz_version=1,
+        authorize=authorize,
+    )
+    await anext(subscription)
+
+    targets.targets.clear()
+    await updates.refresh_once()
+    assert (await anext(subscription)).data == {"reason": "camera_target_unavailable"}
+    missing = await anext(subscription)
+    assert missing.data["source_state"] == "unavailable"
+    assert missing.data["observed_at"] is None
+
+    targets.targets[CAMERA_ID] = (PUBLIC_ID, NODE_ID)
+    await updates.refresh_once()
+    assert (await anext(subscription)).data == {"reason": "camera_node_changed"}
+    assert (await anext(subscription)).data["source_state"] == "ready"
+
+    targets.failure = True
+    await updates.refresh_once()
+    assert (await anext(subscription)).data == {"reason": "camera_target_unavailable"}
+    failed = await anext(subscription)
+    assert failed.data["source_state"] == "unavailable"
+    assert failed.data["scrape_status"] == "unavailable"
     await subscription.aclose()
 
 
