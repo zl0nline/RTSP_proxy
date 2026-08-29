@@ -153,8 +153,8 @@ jobs:
           }
           trap cleanup_bpffs EXIT
           mapfile -t bpftool_candidates < <(
-            find /usr/lib/linux-tools -mindepth 2 -maxdepth 2 \
-              -type f -name bpftool -print | sort --version-sort
+            find /usr/lib -mindepth 2 -maxdepth 2 -type f \
+              -path '/usr/lib/linux-tools-*/bpftool' -print | sort --version-sort
           )
           test "${#bpftool_candidates[@]}" -gt 0
           bpftool_path="${bpftool_candidates[-1]}"
