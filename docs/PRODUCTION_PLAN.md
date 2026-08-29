@@ -941,13 +941,17 @@ dispatcher, digest-only PostgreSQL operator sessions, authoritative
 with exact MFA claims, and durable break-glass TOTP audit/email admission are
 implemented locally. Live OIDC discovery/claims compatibility is polled through
 bounded readiness and emits one durable failure/recovery alert per transition.
-The management HTTPS slice is implemented, independently reviewed and validated
-on direct Linux amd64. WEB rejects wildcard, IPv4 limited-broadcast and
+The management HTTPS slice is implemented, independently reviewed and green on
+direct Linux plus native amd64/arm64 CI. WEB rejects wildcard, IPv4
+limited-broadcast and
 multicast binds, requires TLS for management-LAN exposure, and applies exact
 HSTS even to early denials and sanitized server errors. The systemd unit passes
 one immutable combined PEM through `LoadCredential`; the operator rotation
 transaction is lock-serialized, durable, generation/fingerprint-bound and
-rollback-verified. Native amd64/arm64 CI publication is still pending; see
+rollback-verified. All seven jobs passed at commit
+`32ac6138777e460846a1caed1e46174138ebc9d5` in
+[CI run 33253244053](https://github.com/zl0nline/RTSP_proxy/actions/runs/33253244053),
+including the real root-systemd contract on both server architectures; see
 [`docs/evidence/phase-f-management-https-contract.md`](evidence/phase-f-management-https-contract.md).
 The camera access-administration slice is also implemented locally: it renders
 the two independent internet/local CIDR policies, a bounded secret-free grant

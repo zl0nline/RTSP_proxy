@@ -1,19 +1,19 @@
 # Phase F management HTTPS contract
 
 - Last reviewed: 2026-08-29
-- Status: implementation, local/direct-Linux validation and independent review complete; native CI pending
+- Status: implementation, independent review and native amd64/arm64 CI complete
 - Deployment: direct Linux/systemd, no Docker
-- Server architectures: architecture-neutral application contract; amd64 direct-Linux passed, amd64/arm64 CI pending
+- Server architectures: amd64 direct-Linux passed; amd64/arm64 native CI passed
 - Media transport: ordinary `rtsp://` with interleaved TCP; unchanged by this slice
 
 ## Evidence boundary
 
-This slice implements and independently reviews the production
-management-listener HTTPS boundary, but still awaits the root-systemd native
-amd64/arm64 publication run. It does not close Phase F, qualify server capacity
-or change the external camera transport. Live dashboard updates, the complete
-resource/incident operator projection, Phase G hardware/WAN/fault/24-hour
-evidence and rollout remain Production **NO-GO** gates.
+This slice implements, independently reviews and publishes the production
+management-listener HTTPS boundary on native Linux amd64 and arm64. It does not
+close Phase F, qualify server capacity or change the external camera transport.
+Live dashboard updates, the complete resource/incident operator projection,
+Phase G hardware/WAN/fault/24-hour evidence and rollout remain Production
+**NO-GO** gates.
 
 ## Implemented contract
 
@@ -62,7 +62,7 @@ The final implementation passed:
 No sudo credential was read, stored or logged during the remote validation. The
 temporary test directory and transient unit were removed after the run.
 
-## Independent review and publication gate
+## Independent review and publication
 
 Independent Spec and Standards reviews found no remaining High or Medium issue
 in the frozen implementation/runbook slice. The final review seam required a
@@ -70,8 +70,12 @@ successful nonempty baseline systemd `InvocationID`, a different active
 invocation after restart, and exact served-certificate fingerprints for both
 forward activation and rollback.
 
-Native root-systemd execution on Linux amd64 and arm64 remains a publication
-gate and is wired into the existing CI matrix. This document must be updated
-with the exact commit and successful run before the slice is described as
-native dual-architecture CI complete. Phase F remains **IN PROGRESS** and
-Production remains **NO-GO**.
+The final implementation and both CI-remediation diffs passed independent Spec
+and Standards review without remaining High or Medium findings. On commit
+`32ac6138777e460846a1caed1e46174138ebc9d5`, all seven jobs passed in
+[CI run 33253244053](https://github.com/zl0nline/RTSP_proxy/actions/runs/33253244053).
+The amd64 and arm64 application jobs each executed the opt-in native
+root-systemd suite (two tests passed on each architecture), proving the fixed
+service UID, protected combined-PEM `LoadCredential`, verified CA/IP-SAN HTTPS,
+HSTS, plaintext rejection and bounded cleanup. Phase F remains **IN PROGRESS**
+and Production remains **NO-GO**.
