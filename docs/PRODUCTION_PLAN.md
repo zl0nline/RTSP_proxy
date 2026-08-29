@@ -953,9 +953,11 @@ rollback-verified. All seven jobs passed at commit
 [CI run 33253244053](https://github.com/zl0nline/RTSP_proxy/actions/runs/33253244053),
 including the real root-systemd contract on both server architectures; see
 [`docs/evidence/phase-f-management-https-contract.md`](evidence/phase-f-management-https-contract.md).
-The bounded live-dashboard slice is implemented and green in the full local
-suite plus a real HTTPS Chromium workflow on direct Linux amd64; independent
-review and native CI are pending. The overview polls only the persisted
+The bounded live-dashboard slice is implemented, independently reviewed and
+green in the full local/direct-Linux suites plus all seven native/external CI
+jobs at commit `a77db2daead18cc15afa5a497fdd9c5ca1a217f0` in
+[CI run 33265832444](https://github.com/zl0nline/RTSP_proxy/actions/runs/33265832444).
+The overview polls only the persisted
 aggregate snapshot every 10 seconds by default with a server-enforced 5–30
 second range. A camera detail has one bounded SSE stream per operator session,
 15-second heartbeat, authorization before replay and a shared one-second
@@ -1139,9 +1141,11 @@ published camera-registration slice brings it to 72; independent review and all
 seven native/external CI jobs passed at commit
 `a7f2324a5354969fd773f70fc6f13b04247e51b3` in
 [CI run 32743179524](https://github.com/zl0nline/RTSP_proxy/actions/runs/32743179524).
-The local live-update delta brings the current generated inventory to 75 by
-adding one-camera snapshot/SSE and bounded live diagnostics. Its direct-Linux
-functional gate is green; review/native CI publication is pending.
+The published live-update delta brings the current generated inventory to 75
+by adding one-camera snapshot/SSE and bounded live diagnostics. Independent
+review, direct-Linux validation and all seven native/external CI jobs are green
+at commit `a77db2daead18cc15afa5a497fdd9c5ca1a217f0` in
+[CI run 33265832444](https://github.com/zl0nline/RTSP_proxy/actions/runs/33265832444).
 Both
 dashboard and JSON API require exact desired revision/source state. Port change
 and DRAINING reconfigure/restart additionally require recent MFA plus the
@@ -1169,9 +1173,9 @@ No Phase-F completion claim is made yet.
 - [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
   shared-boundary authentication/authorization-denial/logout classes with
   representative semantic targets;
-- [x] recursively generated route-method negative matrix (published 72-route
-  registration surface independently reviewed/CI-green; current 75-route live
-  surface locally/direct-Linux green and awaiting review/native CI);
+- [x] recursively generated route-method negative matrix (the 75-route live
+  surface is independently reviewed and green in direct-Linux plus all seven
+  native/external CI jobs);
   future export/bulk routes must extend it before activation;
 - [x] camera-scoped access dashboard/API list, two-level ACL edit and
   recent-MFA grant issue/rotate/revoke with one-time no-store secret output,
@@ -1199,8 +1203,9 @@ No Phase-F completion claim is made yet.
   collector-owned monotonic per-path bitrate, durable read/reconnect buckets,
   move-scoped live epochs, fail-closed freshness/reset state, owned worker
   shutdown, resync and bounded polling fallback
-  (local/direct-Linux functional evidence green; independent re-review and
-  native CI pending; completed-probe event and capacity evidence remain open);
+  (independent review, local/direct-Linux functional evidence and all seven
+  native/external CI jobs green; completed-probe event and capacity evidence
+  remain open);
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
 - [x] browser E2E for OIDC/login, confirmations, keyboard accessibility and

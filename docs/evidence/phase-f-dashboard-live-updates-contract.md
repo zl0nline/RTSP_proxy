@@ -1,8 +1,8 @@
 # Phase F dashboard live-update contract
 
 - Last reviewed: 2026-08-29
-- Status: implementation and direct-Linux functional validation complete;
-  independent review and native CI pending
+- Status: implementation, independent review, direct-Linux validation and
+  native/external CI complete for this bounded slice
 - Deployment: direct Linux/systemd, no Docker
 - Server architectures: architecture-neutral Python/ASGI contract for amd64 and arm64
 - Media transport: ordinary `rtsp://` over interleaved TCP; unchanged by this slice
@@ -108,7 +108,8 @@ resume/resync/rejection, slow-client and authz disconnect outcomes.
 
 ## Functional validation
 
-The final review-fix local application gate passed with `957 passed, 20 skipped`.
+The final local application gate passed with `970 passed, 20 skipped` and
+`90.04%` coverage against the unchanged 90% floor.
 Ruff, strict
 mypy over `src` and `tests`, JavaScript syntax, shell syntax and diff hygiene
 were green.
@@ -128,6 +129,18 @@ screenshots and four semantic
 snapshots remained bounded and secret-canary free. Ubuntu's AppArmor policy required the
 repository's explicit no-sandbox switch only for this disposable external
 browser; the deployed server never launches Chromium.
+
+The implementation and the coverage-only remediation both passed independent
+Spec and Standards review without High or Medium findings. The published
+implementation is commit
+[`21ce96ee4db43db6901bac923c50a314a9e0d2db`](https://github.com/zl0nline/RTSP_proxy/commit/21ce96ee4db43db6901bac923c50a314a9e0d2db);
+the final test-only remediation is commit
+[`a77db2daead18cc15afa5a497fdd9c5ca1a217f0`](https://github.com/zl0nline/RTSP_proxy/commit/a77db2daead18cc15afa5a497fdd9c5ca1a217f0).
+All seven jobs passed in
+[CI run 33265832444](https://github.com/zl0nline/RTSP_proxy/actions/runs/33265832444):
+application/coverage, migrations, packaging, systemd and nftables checks on
+amd64 and arm64; patched MediaMTX and native RTSP/RTP load contracts on both
+architectures; and the external HTTPS Chromium workflow on amd64.
 
 ## Remaining gates
 

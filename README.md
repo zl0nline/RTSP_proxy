@@ -39,8 +39,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   including camera access, camera registration, one-camera live snapshot/SSE
 >   and bounded live diagnostics. The published 72-route registration slice is
 >   independently reviewed and green in native amd64/arm64 CI plus the external
->   Chromium job; the 75-route live-update delta is locally/direct-Linux green
->   and awaits independent review/native CI. Future export/bulk routes must
+>   Chromium job; the 75-route live-update delta is also independently reviewed
+>   and green in all seven native/external CI jobs. Future export/bulk routes must
 >   extend the matrix before activation.
 >   The browser is an external management client, so the real-Chromium job runs
 >   on amd64 because the pinned driver has no Linux arm64 browser bundle;
@@ -72,8 +72,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   root-systemd contract on both server architectures. Exact evidence is
 >   recorded in
 >   [`docs/evidence/phase-f-management-https-contract.md`](docs/evidence/phase-f-management-https-contract.md).
-> - Phase-F dashboard live updates: **implemented and functionally green on
->   direct Linux amd64; independent review/native CI pending**. Server overview
+> - Phase-F dashboard live updates: **implemented, independently reviewed and
+>   green on direct Linux plus native amd64/arm64 CI**. Server overview
 >   polls the persisted aggregate snapshot at a configurable 5–30 seconds
 >   (default 10). A camera detail uses one bounded SSE stream per operator
 >   session with a 15-second heartbeat, authorization before replay and a shared
@@ -81,7 +81,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   750-millisecond deadline), bounded to a two-second revocation ceiling,
 >   `resync_required`, slow-consumer disconnect and bounded polling fallback.
 >   The browser never reads MediaMTX directly. Exact local/Linux scope and open
->   gates are recorded in
+>   gates are recorded in [CI run 33265832444](https://github.com/zl0nline/RTSP_proxy/actions/runs/33265832444)
+>   and
 >   [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](docs/evidence/phase-f-dashboard-live-updates-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
@@ -490,10 +491,12 @@ is computed in the collector from monotonic elapsed time; wall-clock timestamps
 are freshness metadata only, and freshness/reset/gap markers fail closed. A
 camera move clears prior-node history, emits `resync_required` and starts an
 exact new-node live epoch; one bounded secret-free placement batch discovers
-it without another browser lookup. Shutdown waits for bounded snapshot/authz workers
-before closing their stores. It
-passed the full local suite and a real HTTPS Chromium workflow on
-direct Linux amd64; independent review and native CI are still pending. Exact
+it without another browser lookup. Shutdown waits for bounded snapshot/authz
+workers before closing their stores. It passed independent Spec/Standards
+review, the full local and direct-Linux suites, and all seven native/external CI
+jobs at commit `a77db2daead18cc15afa5a497fdd9c5ca1a217f0` in
+[CI run 33265832444](https://github.com/zl0nline/RTSP_proxy/actions/runs/33265832444).
+Exact
 scope is recorded in
 [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](docs/evidence/phase-f-dashboard-live-updates-contract.md).
 Phase F остаётся в работе до завершения остальных операторских workflows.
