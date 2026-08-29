@@ -25,6 +25,7 @@ from rtsp_proxy.nodes import (
     CameraRevisionConflict,
     CameraState,
     EligibleNodeMissing,
+    InvalidCameraSource,
     MediaNode,
     NodeCameraCapacityReached,
     NodeDisruptionConfirmationContext,
@@ -32,8 +33,14 @@ from rtsp_proxy.nodes import (
     NodeNotFound,
     NodeState,
     ReconcileStore,
+    probe_endpoint_requires_readmission,
     validate_camera_name,
     validate_camera_source_url,
+)
+from rtsp_proxy.probe_security import (
+    AdmittedProbeEndpoint,
+    ProbeEndpointAdmission,
+    ProbeEndpointRejected,
 )
 
 
@@ -61,6 +68,7 @@ class CameraMutationStore(CameraMoveStore, Protocol):
         name: str,
         source_url: str,
         expected_revision: int | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement: ...
 
     def set_camera_enabled(
@@ -808,10 +816,12 @@ class CameraMutationControl:
         store: CameraMutationStore,
         media_nodes: MediaNodeClientFactory,
         confirmations: ConfirmationTokenService,
+        probe_endpoint_admission: ProbeEndpointAdmission | None = None,
     ) -> None:
         self._store = store
         self._media_nodes = media_nodes
         self._confirmations = confirmations
+        self._probe_endpoint_admission = probe_endpoint_admission
 
     def preview(
         self,
@@ -868,13 +878,24 @@ class CameraMutationControl:
         confirmation_token: str | None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
+        source_url = validate_camera_source_url(source_url)
         camera = self._camera(camera_id, expected_revision=expected_revision)
+        probe_endpoint = (
+            self._admit_probe_endpoint(source_url)
+            if probe_endpoint_requires_readmission(
+                camera,
+                source_url=source_url,
+                admission=self._probe_endpoint_admission,
+            )
+            else None
+        )
         if camera.source_url == source_url and confirmation_token is None:
             return self._store.update_camera(
                 camera_id,
                 name=name,
                 source_url=source_url,
                 expected_revision=camera.desired_revision,
+                probe_endpoint=probe_endpoint,
             )
         with self._fence(
             camera,
@@ -888,7 +909,16 @@ class CameraMutationControl:
                 name=name,
                 source_url=source_url,
                 expected_revision=camera.desired_revision,
+                probe_endpoint=probe_endpoint,
             )
+
+    def _admit_probe_endpoint(self, source_url: str) -> AdmittedProbeEndpoint | None:
+        if self._probe_endpoint_admission is None:
+            return None
+        try:
+            return self._probe_endpoint_admission.admit(source_url)
+        except ProbeEndpointRejected:
+            raise InvalidCameraSource("camera_source_endpoint_rejected") from None
 
     def disable(
         self,

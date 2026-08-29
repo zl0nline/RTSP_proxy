@@ -23,6 +23,7 @@ from rtsp_proxy.observability import (
     PathMetricCounters,
     SnapshotReader,
 )
+from rtsp_proxy.probes import ProbeObservation, ProbeObservationReader
 
 _MAX_EVENT_ID: Final = 9_999_999_999_999_999_999
 _T = TypeVar("_T")
@@ -30,6 +31,8 @@ _T = TypeVar("_T")
 
 class CameraLiveEventType(StrEnum):
     STATE = "state"
+    PROBE_COMPLETED = "probe_completed"
+    PROBE_CLEARED = "probe_cleared"
     HEARTBEAT = "heartbeat"
     AUTHZ_EPOCH = "authz_epoch"
     RESYNC_REQUIRED = "resync_required"
@@ -219,6 +222,10 @@ class _CameraChannel:
     last_access: float = 0
     last_snapshot_generated_at: datetime | None = None
     target_available: bool = True
+    latest_state: CameraLiveEvent | None = None
+    latest_probe_event: CameraLiveEvent | None = None
+    latest_probe_completed_at: datetime | None = None
+    latest_probe_observation_id: UUID | None = None
 
 
 class CameraLiveSubscription:
@@ -317,6 +324,9 @@ class CameraLiveSubscription:
             return False
         return True
 
+    def _has_capacity(self) -> bool:
+        return not self._closed and self._queue.qsize() < self._queue.maxsize
+
     def _start_new_epoch(self, event: CameraLiveEvent) -> bool:
         if self._closed:
             return False
@@ -340,9 +350,8 @@ class CameraLiveUpdates:
         self,
         *,
         reader: SnapshotReader,
-        resolve_targets: Callable[
-            [tuple[UUID, ...]], Mapping[UUID, tuple[PublicId, UUID]]
-        ]
+        probe_observations: ProbeObservationReader | None = None,
+        resolve_targets: Callable[[tuple[UUID, ...]], Mapping[UUID, tuple[PublicId, UUID]]]
         | None = None,
         authorize_sessions: Callable[[tuple[UUID, ...]], Mapping[UUID, int]] | None = None,
         poll_interval_seconds: float = 5,
@@ -388,6 +397,7 @@ class CameraLiveUpdates:
         if not 1 <= channel_ttl_seconds <= 3600:
             raise ValueError("live_channel_ttl_invalid")
         self._reader = reader
+        self._probe_observations = probe_observations
         self._resolve_targets = resolve_targets
         self._authorize_sessions = authorize_sessions
         self._poll_interval_seconds = poll_interval_seconds
@@ -559,7 +569,9 @@ class CameraLiveUpdates:
             self._observe_channel(channel, self._latest_index)
             if not channel.history:
                 raise LiveUpdateUnavailable("live_snapshot_unavailable")
-            return channel.history[-1]
+            if channel.latest_state is None:
+                raise LiveUpdateUnavailable("live_snapshot_unavailable")
+            return channel.latest_state
 
     async def refresh_once(self) -> None:
         await self._await_refresh()
@@ -592,6 +604,7 @@ class CameraLiveUpdates:
 
     async def _refresh_from_reader(self) -> None:
         resolve_targets = self._resolve_targets
+        probe_observations = self._probe_observations
         async with self._lock:
             active_camera_ids = tuple(
                 sorted(
@@ -603,22 +616,33 @@ class CameraLiveUpdates:
                     key=lambda camera_id: camera_id.int,
                 )
             )
-        try:
-            snapshot = await self._run_owned_sync(self._reader.current_snapshot)
-            resolved_targets = (
-                {}
-                if not active_camera_ids or resolve_targets is None
-                else await self._run_owned_sync(
-                    lambda: resolve_targets(active_camera_ids)
+        snapshot_result, targets_result, probes_result = await asyncio.gather(
+            self._run_owned_sync(self._reader.current_snapshot),
+            self._run_owned_sync(
+                lambda: (
+                    {}
+                    if not active_camera_ids or resolve_targets is None
+                    else resolve_targets(active_camera_ids)
                 )
-            )
-        except Exception:
-            snapshot = None
-            resolved_targets = None
+            ),
+            self._run_owned_sync(
+                lambda: (
+                    {}
+                    if not active_camera_ids or probe_observations is None
+                    else probe_observations.latest_for(active_camera_ids)
+                )
+            ),
+            return_exceptions=True,
+        )
+        snapshot = None if isinstance(snapshot_result, BaseException) else snapshot_result
+        resolved_targets = None if isinstance(targets_result, BaseException) else targets_result
+        latest_probes = None if isinstance(probes_result, BaseException) else probes_result
         async with self._lock:
             if active_camera_ids and resolve_targets is not None:
                 self._observe_authoritative_targets(active_camera_ids, resolved_targets)
             self._observe(snapshot)
+            if latest_probes is not None:
+                self._observe_probe_results(active_camera_ids, latest_probes)
             self._snapshot_loaded = True
             self._refresh_completed_at = self._monotonic()
 
@@ -725,6 +749,10 @@ class CameraLiveUpdates:
         channel.history.clear()
         channel.previous_projection = None
         channel.last_snapshot_generated_at = None
+        channel.latest_state = None
+        channel.latest_probe_event = None
+        channel.latest_probe_completed_at = None
+        channel.latest_probe_observation_id = None
         resync = _resync_event(reason=reason)
         for session_id, subscription in tuple(channel.subscribers.items()):
             self._resync_required_total += 1
@@ -764,10 +792,7 @@ class CameraLiveUpdates:
         channel: _CameraChannel,
         index: _SnapshotIndex | None,
     ) -> None:
-        if (
-            index is not None
-            and channel.last_snapshot_generated_at == index.snapshot.generated_at
-        ):
+        if index is not None and channel.last_snapshot_generated_at == index.snapshot.generated_at:
             return
         projection = _project_camera(
             channel,
@@ -785,8 +810,69 @@ class CameraLiveUpdates:
             data=projection.data,
         )
         channel.previous_projection = projection
-        channel.last_snapshot_generated_at = (
-            None if index is None else index.snapshot.generated_at
+        channel.latest_state = event
+        channel.last_snapshot_generated_at = None if index is None else index.snapshot.generated_at
+        channel.history.append(event)
+        for session_id, subscription in tuple(channel.subscribers.items()):
+            if not subscription._offer(event):
+                self._slow_consumer_disconnects_total += 1
+                channel.subscribers.pop(session_id, None)
+                self._session_subscriptions.pop(session_id, None)
+                self._authorization_epochs.pop(session_id, None)
+
+    def _observe_probe_results(
+        self,
+        camera_ids: tuple[UUID, ...],
+        observations: Mapping[UUID, ProbeObservation],
+    ) -> None:
+        if set(observations).difference(camera_ids):
+            return
+        for camera_id in camera_ids:
+            channel = self._channels.get(camera_id)
+            observation = observations.get(camera_id)
+            if channel is None or not channel.target_available:
+                continue
+            if observation is None:
+                self._clear_probe_result(channel)
+                continue
+            target = observation.target
+            if (
+                target.camera_id != camera_id
+                or target.public_id != channel.target.public_id
+                or target.node_id != channel.target.node_id
+            ):
+                self._clear_probe_result(channel)
+                continue
+            if channel.latest_probe_observation_id == observation.observation_id:
+                continue
+            event = CameraLiveEvent(
+                event_type=CameraLiveEventType.PROBE_COMPLETED,
+                event_id=self._allocate_event_id(),
+                data=_probe_data(observation),
+            )
+            self._discard_probe_history(channel)
+            channel.latest_probe_event = event
+            channel.latest_probe_completed_at = observation.completed_at
+            channel.latest_probe_observation_id = observation.observation_id
+            channel.history.append(event)
+            for session_id, subscription in tuple(channel.subscribers.items()):
+                if not subscription._offer(event):
+                    self._slow_consumer_disconnects_total += 1
+                    channel.subscribers.pop(session_id, None)
+                    self._session_subscriptions.pop(session_id, None)
+                    self._authorization_epochs.pop(session_id, None)
+
+    def _clear_probe_result(self, channel: _CameraChannel) -> None:
+        if channel.latest_probe_event is None:
+            return
+        channel.latest_probe_event = None
+        channel.latest_probe_completed_at = None
+        channel.latest_probe_observation_id = None
+        self._discard_probe_history(channel)
+        event = CameraLiveEvent(
+            event_type=CameraLiveEventType.PROBE_CLEARED,
+            event_id=self._allocate_event_id(),
+            data={"reason": "generation_changed"},
         )
         channel.history.append(event)
         for session_id, subscription in tuple(channel.subscribers.items()):
@@ -795,6 +881,17 @@ class CameraLiveUpdates:
                 channel.subscribers.pop(session_id, None)
                 self._session_subscriptions.pop(session_id, None)
                 self._authorization_epochs.pop(session_id, None)
+
+    @staticmethod
+    def _discard_probe_history(channel: _CameraChannel) -> None:
+        retained = tuple(
+            event
+            for event in channel.history
+            if event.event_type
+            not in {CameraLiveEventType.PROBE_COMPLETED, CameraLiveEventType.PROBE_CLEARED}
+        )
+        channel.history.clear()
+        channel.history.extend(retained)
 
     def _allocate_event_id(self) -> int:
         event_id = self._next_event_id
@@ -811,8 +908,10 @@ class CameraLiveUpdates:
     ) -> None:
         history = tuple(channel.history)
         if resume_from is None:
-            if history:
-                subscription._offer(history[-1])
+            if channel.latest_state is not None:
+                subscription._offer(channel.latest_state)
+            if channel.latest_probe_event is not None and subscription._has_capacity():
+                subscription._offer(channel.latest_probe_event)
             return
         if not history:
             self._resync_required_total += 1
@@ -862,8 +961,7 @@ class CameraLiveUpdates:
         expired = tuple(
             camera_id
             for camera_id, channel in self._channels.items()
-            if not channel.subscribers
-            and now - channel.last_access >= self._channel_ttl_seconds
+            if not channel.subscribers and now - channel.last_access >= self._channel_ttl_seconds
         )
         for camera_id in expired:
             self._channels.pop(camera_id, None)
@@ -871,9 +969,7 @@ class CameraLiveUpdates:
     def _evict_inactive_channel(self) -> None:
         if len(self._channels) < self._max_tracked_cameras:
             return
-        inactive = tuple(
-            channel for channel in self._channels.values() if not channel.subscribers
-        )
+        inactive = tuple(channel for channel in self._channels.values() if not channel.subscribers)
         if not inactive:
             return
         oldest = min(inactive, key=lambda channel: channel.last_access)
@@ -950,18 +1046,10 @@ def _project_camera(
 
     if path is None:
         target_node = index.nodes.get(target.node_id)
-        status = (
-            NodeScrapeStatus.UNAVAILABLE
-            if target_node is None
-            else target_node.scrape_status
-        )
+        status = NodeScrapeStatus.UNAVAILABLE if target_node is None else target_node.scrape_status
         detail_available = target.node_id in index.path_metrics_available
         source_state = (
-            (
-                CameraSourceState.UNAVAILABLE
-                if detail_available
-                else CameraSourceState.UNKNOWN
-            )
+            (CameraSourceState.UNAVAILABLE if detail_available else CameraSourceState.UNKNOWN)
             if status in {NodeScrapeStatus.FRESH, NodeScrapeStatus.IDLE}
             else (
                 CameraSourceState.STALE
@@ -1001,9 +1089,10 @@ def _project_camera(
         else path.public_id in node.metrics.occupied_public_ids
     )
     observed_at = node.metric_observed_at
-    metric_gap = observed_at is None or (
-        snapshot.generated_at - observed_at
-    ).total_seconds() > 2 * metric_interval_seconds
+    metric_gap = (
+        observed_at is None
+        or (snapshot.generated_at - observed_at).total_seconds() > 2 * metric_interval_seconds
+    )
     counters_reset = path.counters_reset
     metric_gap = metric_gap or path.metric_gap
     received_rate = path.received_bitrate_bps
@@ -1078,6 +1167,23 @@ def _state_data(
     }
 
 
+def _probe_data(observation: ProbeObservation) -> Mapping[str, object]:
+    duration_ms = int((observation.completed_at - observation.started_at).total_seconds() * 1000)
+    return {
+        "attempt": observation.attempt,
+        "audio_codec": observation.audio_codec,
+        "completed_at": observation.completed_at.isoformat(),
+        "duration_ms": duration_ms,
+        "failure_class": (
+            None if observation.failure_class is None else observation.failure_class.value
+        ),
+        "method": observation.method.value,
+        "observation_id": str(observation.observation_id),
+        "outcome": observation.outcome.value,
+        "video_codec": observation.video_codec,
+    }
+
+
 def _index_snapshot(snapshot: FleetSnapshot) -> _SnapshotIndex:
     nodes = {node.node_id: node for node in snapshot.nodes}
     paths: dict[tuple[UUID, str], PathMetricCounters] = {}
@@ -1095,10 +1201,7 @@ def _index_snapshot(snapshot: FleetSnapshot) -> _SnapshotIndex:
         snapshot=snapshot,
         nodes=nodes,
         paths=paths,
-        path_nodes={
-            public_id: frozenset(node_ids)
-            for public_id, node_ids in path_nodes.items()
-        },
+        path_nodes={public_id: frozenset(node_ids) for public_id, node_ids in path_nodes.items()},
         path_metrics_available=frozenset(path_metrics_available),
     )
 
@@ -1113,12 +1216,7 @@ def _resync_event(*, reason: str = "history_gap") -> CameraLiveEvent:
 def parse_last_event_id(value: str | None) -> int | None:
     if value is None or value == "":
         return None
-    if (
-        len(value) > 19
-        or not value.isascii()
-        or not value.isdecimal()
-        or value.startswith("0")
-    ):
+    if len(value) > 19 or not value.isascii() or not value.isdecimal() or value.startswith("0"):
         raise ValueError("live_event_id_invalid")
     parsed = int(value)
     if not 1 <= parsed <= _MAX_EVENT_ID:

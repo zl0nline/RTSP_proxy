@@ -69,6 +69,8 @@ from rtsp_proxy.operator_identity import (
     Rs256OidcClaimsVerifier,
     read_operator_secret_file,
 )
+from rtsp_proxy.probe_security import BoundedGetentResolver, ProbeEndpointAdmission
+from rtsp_proxy.probes import PostgresProbeObservationStore
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
     CameraMoveReconciler,
@@ -117,6 +119,8 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_RECONCILE_INTERVAL_SECONDS": "reconcile_interval_seconds",
     "RTSP_PROXY_COLLECTOR_INTERVAL_SECONDS": "collector_interval_seconds",
     "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "dashboard_poll_interval_seconds",
+    "RTSP_PROXY_PROBE_SOURCE_CIDRS": "probe_source_cidrs",
+    "RTSP_PROXY_PROBE_SOURCE_SITE_KEY": "probe_source_site_key",
     "RTSP_PROXY_CONFIRMATION_SECRET": "confirmation_secret",
     "RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS": "operator_recent_mfa_seconds",
     "RTSP_PROXY_NODE_RELEASE_ID": "node_release_id",
@@ -337,6 +341,11 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             management_freshness_seconds=settings.node_management_freshness_seconds,
         )
     )
+    probe_endpoint_admission = ProbeEndpointAdmission(
+        site_key=settings.probe_source_site_key,
+        allowed_networks=settings.probe_source_cidrs,
+        resolve=BoundedGetentResolver(),
+    )
     mutation_control = (
         None
         if media_factory is None or settings.confirmation_secret is None
@@ -347,6 +356,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
                 secret=settings.confirmation_secret.encode("utf-8"),
                 lifetime_seconds=30,
             ),
+            probe_endpoint_admission=probe_endpoint_admission,
         )
     )
     assert settings.database_url is not None
@@ -358,11 +368,22 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         if store.schema_supports_operator_login()
         else None
     )
+    probe_observations = (
+        PostgresProbeObservationStore(
+            settings.database_url,
+            source_policy_sha256=probe_endpoint_admission.policy_sha256,
+            statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+        )
+        if store.schema_is_current()
+        else None
+    )
     try:
         operator_security = (
             _open_operator_security(settings) if settings.operator_auth_enabled else None
         )
     except Exception:
+        if probe_observations is not None:
+            probe_observations.close()
         if observability is not None:
             observability.close()
         store.close()
@@ -404,10 +425,14 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
                 operator_security.close()
         finally:
             try:
-                if observability is not None:
-                    observability.close()
+                if probe_observations is not None:
+                    probe_observations.close()
             finally:
-                store.close()
+                try:
+                    if observability is not None:
+                        observability.close()
+                finally:
+                    store.close()
 
     readiness_checks: dict[str, Callable[[], None]] = {
         "database": store.assert_schema_compatible,
@@ -417,6 +442,11 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         store.assert_schema_compatible
         if operator_security is None
         else operator_health_state.assert_ready
+    )
+    readiness_checks["probe_observations"] = (
+        store.assert_schema_compatible
+        if probe_observations is None
+        else probe_observations.assert_ready
     )
 
     return create_app(
@@ -428,6 +458,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             new_camera_id=uuid4,
             new_public_id=generate_public_id,
             management_freshness_seconds=settings.node_management_freshness_seconds,
+            probe_endpoint_admission=probe_endpoint_admission,
             ensure_automatic_capacity=(
                 None
                 if node_runtime is None
@@ -451,6 +482,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             )
         ),
         fleet_snapshots=observability,
+        probe_observations=probe_observations,
         fleet_snapshot_max_age_seconds=settings.collector_interval_seconds * 3,
         operator_sessions=(None if operator_security is None else operator_security.sessions),
         operator_login=None if operator_security is None else operator_security.login,

@@ -173,7 +173,18 @@ Control-plane process, converging PostgreSQL desired state и configured state
 ## Probe
 
 Bounded observation source/path/node health. Probe не должен занимать или
-вытеснять единственный downstream reader slot.
+вытеснять единственный downstream reader slot. Deep health
+`UNKNOWN/HEALTHY/SUSPECT/UNHEALTHY/RECOVERING`, freshness
+`FRESH/STALE/OVERDUE` и administrative overlay — независимые измерения.
+Scheduler overload делает observation stale/overdue, но сам по себе не делает
+camera unhealthy. `source_probe` и `path_probe` имеют разные hard budgets;
+`path_probe` запрещён, пока source pull активен. Camera source create/update
+однократно и с bounded DNS timeout проверяет явно настроенную site/CIDR policy,
+затем атомарно сохраняет approved literal IP:port, policy digest и opaque
+endpoint generation; пустая policy означает deny-all. Probe job принимает
+только эту generation и hostname не резолвит. Source executor не является частью
+WEB/reconciler и требует отдельной
+принятой Linux execution boundary.
 
 ## Capacity envelope
 

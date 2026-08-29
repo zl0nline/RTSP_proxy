@@ -10,8 +10,10 @@
 ## Evidence boundary
 
 This slice implements the bounded real-time UI model agreed in issue #7. It
-does not close Phase F, implement a probe-result event source, qualify the
-10,000-camera cardinality budget or publish production capacity evidence.
+does not close Phase F, qualify the 10,000-camera cardinality budget or publish
+production capacity evidence. The later schema-0020 Phase-G foundation defines
+a separate probe-result event source but remains outside this reviewed Phase-F
+result.
 
 The browser never contacts a MediaMTX API or metrics endpoint. Both overview
 polling and camera live state read the collector's persisted aggregate
@@ -144,10 +146,13 @@ architectures; and the external HTTPS Chromium workflow on amd64.
 
 ## Remaining gates
 
-The completed-probe SSE event remains unavailable until the production probe
-result source exists. Polling/SSE capacity, query/cardinality budgets at the
-50×100 and optional 100×100 profiles, reverse-proxy timeout/buffering evidence,
-physical hardware fault/WAN tests and the 24-hour soak remain open. A future
+The schema-0020 Phase-G foundation now defines a completed-probe SSE event from
+a generation-fenced, secret-free durable result source. It is a separate local
+slice awaiting independent review/native CI and has no production source-probe
+executor; therefore it does not change this evidence result. Polling/SSE
+capacity, query/cardinality budgets at the 50×100 and optional 100×100
+profiles, reverse-proxy timeout/buffering evidence, physical hardware
+fault/WAN tests and the 24-hour soak remain open. A future
 reverse proxy must preserve the 15-second heartbeat, disable response buffering
 and allow a client-write timeout longer than the heartbeat; direct Uvicorn TLS
 is the currently supported deployment boundary.

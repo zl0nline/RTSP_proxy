@@ -977,8 +977,11 @@ bounded secret-free placement batch over active SSE cameras discovers the move
 without another browser request. Shutdown
 waits for tracked bounded snapshot/authz workers before closing their stores.
 The browser never reads a media-node API or metric endpoint. The completed
-probe event and production load/cardinality evidence remain open; exact scope
-is recorded in
+probe event source is implemented locally by the Phase-G schema-0020
+foundation: it reads only generation-fenced, secret-free durable observations.
+No production source executor is enabled, and independent review/native CI plus
+production load/cardinality evidence remain open. Exact live-update scope is
+recorded in
 [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](evidence/phase-f-dashboard-live-updates-contract.md).
 The camera access-administration slice is also implemented locally: it renders
 the two independent internet/local CIDR policies, a bounded secret-free grant
@@ -1204,8 +1207,9 @@ No Phase-F completion claim is made yet.
   move-scoped live epochs, fail-closed freshness/reset state, owned worker
   shutdown, resync and bounded polling fallback
   (independent review, local/direct-Linux functional evidence and all seven
-  native/external CI jobs green; completed-probe event and capacity evidence
-  remain open);
+  native/external CI jobs green; the schema-0020 completed-probe projection is
+  a separate Phase-G foundation awaiting its own review/CI, and capacity
+  evidence remains open);
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
 - [x] browser E2E for OIDC/login, confirmations, keyboard accessibility and
@@ -1223,8 +1227,56 @@ Exit: operator workflows complete without direct DB/systemctl/MediaMTX access.
 
 ### Phase G — probes and production evidence
 
-- isolated probe boundary ADR 0004;
-- source/path probe budgets respecting one-reader slot;
+Status: **IN PROGRESS / PRODUCTION NO-GO**. The local foundation implements a
+bounded single-flight scheduler, hard global/per-node/per-site and independent
+SOURCE/PATH caps with typed diagnostics, controlled
+borrowing from the spike 4/3/3 class reservations, pending routine-to-manual
+promotion, reservation-first deadline aging and bounded lease/backoff. Every claim repeats
+admission from a current batch before execution; occupied/session-constrained
+work is removed without a side effect; PATH is also forbidden while source pull
+is active. SOURCE and PATH health stay independent,
+and infrastructure/output failures are `INCONCLUSIVE`: they affect freshness,
+not camera health. Schema 0020 stores only the latest immutable, DB-clock-bounded
+normalized observation. PATH results additionally bind exact node applied
+revision and PID/start/boot/release identity; stale placement/revision/process
+results are cleared from live replay. Camera create/source update uses a bounded,
+concurrency-limited Linux NSS resolver, validates every normalized A/AAAA address
+against one explicit site key and its configured source CIDRs, then atomically
+persists literal IP, port, site/policy digest, URL digest and an opaque endpoint
+generation. The default empty CIDR set is deny-all. A policy change invalidates
+prior admissions until explicit source re-registration.
+Probe work carries that generation and never resolves a hostname. Admission hides credentials plus
+path/query material from diagnostics, pins one literal
+`rtsp://` destination and generates the pinned TCP/microsecond-timeout ffconcat
+input without persisting source URL or credentials.
+
+Re-registration is executable through the ordinary camera update seam: when
+the endpoint row is missing or its policy digest differs, resubmitting the same
+source URL performs a new bounded admission, increments the camera revision and
+atomically replaces the endpoint generation. It is not treated as a no-op and
+does not require an artificial URL change.
+
+The completed-probe SSE/dashboard event consumes only that safe store. It does
+not imply that a deployable executor exists. Research proved that a user-manager
+unit is not an enforcement boundary and that `IPAddressAllow=` cannot restrict
+the destination port. ADR 0004 therefore remains Proposed until a narrow root
+broker, system-manager transient service, root-attached cgroup
+`connect4`/`connect6` tuple guard, controlled no-redirect ffprobe build and
+credential/log/cleanup canaries pass on native Linux amd64 and arm64. The fixed
+4/3/3 weights and concurrency values remain spike hypotheses until media-plane
+impact is measured.
+
+- [x] bounded scheduler/result/state foundation with claim-time one-reader and
+  source-session admission, controlled reservations and separate
+  SOURCE/PATH/INCONCLUSIVE semantics;
+- [x] additive schema-0020 durable observation and secret-free dashboard/SSE
+  projection (local implementation; review/native CI pending);
+- [x] generation-bound durable resolve-once literal/site/CIDR admission, exact
+  type/default/constraint/index/privilege readiness and pinned ffconcat TCP/timeout builder
+  (compatibility mechanism only);
+- [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
+- [ ] implement the broker/executor, periodic risk-based producer and durable
+  health-state orchestration;
 - per-node 100-camera matrix;
 - multi-node server ladder and 24h soak;
 - chaos/failure/email/restore game days;

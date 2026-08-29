@@ -11,11 +11,12 @@
 This slice implements, independently reviews and publishes the production
 management-listener HTTPS boundary on native Linux amd64 and arm64. It does not
 close Phase F, qualify server capacity or change the external camera transport.
-Live dashboard polling/SSE is now functionally green on direct Linux and awaits
-its independent review/native CI publication. The completed-probe event, full
-resource/incident operator projection, Phase G hardware/WAN/fault/24-hour
-evidence and rollout remain Production **NO-GO** gates. Its exact separate
-boundary is recorded in
+Live dashboard polling/SSE is independently reviewed and green in native CI.
+The schema-0020 completed-probe projection is a separate local Phase-G
+foundation awaiting review/native CI; its production executor does not exist.
+Full resource/incident operator projection, Phase G hardware/WAN/fault/24-hour
+evidence and rollout remain Production **NO-GO** gates. The exact live boundary
+is recorded in
 [`phase-f-dashboard-live-updates-contract.md`](phase-f-dashboard-live-updates-contract.md).
 
 ## Implemented contract

@@ -18,6 +18,12 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.probe_security import (
+    AdmittedProbeEndpoint,
+    ProbeEndpointAdmission,
+    ProbeEndpointIdentity,
+    ProbeEndpointRejected,
+)
 
 
 class NodeState(StrEnum):
@@ -504,6 +510,8 @@ class CameraPlacement:
     state: CameraState = CameraState.ENABLED
     desired_revision: int = 1
     applied_revision: int = 0
+    probe_endpoint: ProbeEndpointIdentity | None = None
+    probe_endpoint_schema_supported: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +571,10 @@ class CameraCatalogPage:
 
 class CameraCatalogUnavailable(RuntimeError):
     """The bounded, secret-free camera catalog cannot be read safely."""
+
+
+class ProbeEndpointSchemaUnavailable(RuntimeError):
+    """A validated source endpoint cannot be persisted by the active schema."""
 
 
 PortChoice = Callable[[tuple[int, ...]], int]
@@ -1499,6 +1511,7 @@ class InMemoryNodeStore:
         public_id: PublicId,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -1531,6 +1544,7 @@ class InMemoryNodeStore:
                 node_id=selected.id,
                 node_port=selected.external_port,
                 placement_mode=PlacementMode.AUTOMATIC,
+                probe_endpoint=probe_endpoint_identity(source_url, probe_endpoint),
             )
             self._cameras.append(placement)
             selected_index = self._nodes.index(selected)
@@ -1550,6 +1564,7 @@ class InMemoryNodeStore:
         node_id: UUID,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -1574,6 +1589,7 @@ class InMemoryNodeStore:
                 node_id=selected.id,
                 node_port=selected.external_port,
                 placement_mode=PlacementMode.MANUAL,
+                probe_endpoint=probe_endpoint_identity(source_url, probe_endpoint),
             )
             self._cameras.append(placement)
             selected_index = self._nodes.index(selected)
@@ -1594,6 +1610,7 @@ class InMemoryNodeStore:
         idempotency: CameraRegistrationIdempotency,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraRegistrationResult:
         with self._lock:
             key = (idempotency.actor_session_id, idempotency.key)
@@ -1625,6 +1642,7 @@ class InMemoryNodeStore:
                     public_id=public_id,
                     management_freshness_seconds=management_freshness_seconds,
                     mutation_context=mutation_context,
+                    probe_endpoint=probe_endpoint,
                 )
             else:
                 camera = self.place_camera_manually(
@@ -1635,6 +1653,7 @@ class InMemoryNodeStore:
                     node_id=node_id,
                     management_freshness_seconds=management_freshness_seconds,
                     mutation_context=mutation_context,
+                    probe_endpoint=probe_endpoint,
                 )
             self._camera_registration_requests[key] = (
                 idempotency.actor_account_id,
@@ -1837,6 +1856,7 @@ class InMemoryNodeStore:
         name: str,
         source_url: str,
         expected_revision: int | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -1859,13 +1879,24 @@ class InMemoryNodeStore:
             self._require_no_active_camera_move(camera_id)
             if self._node_has_prepared_port_change(camera.node_id):
                 raise CameraLifecycleConflict("node_port_change_in_progress")
-            if camera.name == name and camera.source_url == source_url:
+            source_changed = camera.source_url != source_url
+            readmission_requested = probe_endpoint is not None
+            endpoint_identity = (
+                probe_endpoint_identity(source_url, probe_endpoint)
+                if source_changed or readmission_requested
+                else camera.probe_endpoint
+            )
+            endpoint_changed = source_changed or (
+                readmission_requested and endpoint_identity != camera.probe_endpoint
+            )
+            if camera.name == name and not source_changed and not endpoint_changed:
                 return camera
             updated = replace(
                 camera,
                 name=name,
                 source_url=source_url,
                 desired_revision=camera.desired_revision + 1,
+                probe_endpoint=endpoint_identity,
             )
             self._cameras[self._cameras.index(camera)] = updated
             return updated
@@ -3428,12 +3459,14 @@ class CameraControl:
         management_freshness_seconds: int = 30,
         ensure_automatic_capacity: Callable[[NodeMutationContext | None], MediaNode]
         | None = None,
+        probe_endpoint_admission: ProbeEndpointAdmission | None = None,
     ) -> None:
         self._store = store
         self._new_camera_id = new_camera_id
         self._new_public_id = new_public_id
         self._management_freshness_seconds = management_freshness_seconds
         self._ensure_automatic_capacity = ensure_automatic_capacity
+        self._probe_endpoint_admission = probe_endpoint_admission
 
     def create_camera(
         self,
@@ -3457,6 +3490,7 @@ class CameraControl:
                 return existing.camera
         camera_id = self._new_camera_id()
         public_id = PublicId.parse(self._new_public_id())
+        probe_endpoint = self._admit_probe_endpoint(validated_source_url)
         if idempotency is not None:
             try:
                 return self._store.place_camera_idempotently(
@@ -3468,6 +3502,7 @@ class CameraControl:
                     idempotency=idempotency,
                     management_freshness_seconds=self._management_freshness_seconds,
                     mutation_context=mutation_context,
+                    probe_endpoint=probe_endpoint,
                 ).camera
             except EligibleNodeMissing:
                 if node_id is not None or self._ensure_automatic_capacity is None:
@@ -3482,6 +3517,7 @@ class CameraControl:
                     idempotency=idempotency,
                     management_freshness_seconds=self._management_freshness_seconds,
                     mutation_context=mutation_context,
+                    probe_endpoint=probe_endpoint,
                 ).camera
         if node_id is not None:
             return self._store.place_camera_manually(
@@ -3492,6 +3528,7 @@ class CameraControl:
                 node_id=node_id,
                 management_freshness_seconds=self._management_freshness_seconds,
                 mutation_context=mutation_context,
+                probe_endpoint=probe_endpoint,
             )
         try:
             return self._store.place_camera_automatically(
@@ -3501,6 +3538,7 @@ class CameraControl:
                 public_id=public_id,
                 management_freshness_seconds=self._management_freshness_seconds,
                 mutation_context=mutation_context,
+                probe_endpoint=probe_endpoint,
             )
         except EligibleNodeMissing:
             if self._ensure_automatic_capacity is None:
@@ -3513,6 +3551,7 @@ class CameraControl:
             public_id=public_id,
             management_freshness_seconds=self._management_freshness_seconds,
             mutation_context=mutation_context,
+            probe_endpoint=probe_endpoint,
         )
 
     def creation_targets(self) -> tuple[MediaNode, ...]:
@@ -3569,12 +3608,32 @@ class CameraControl:
         source_url: str,
         expected_revision: int | None = None,
     ) -> CameraPlacement:
+        current = self._store.get_camera(camera_id)
+        probe_endpoint = (
+            self._admit_probe_endpoint(source_url)
+            if current is None
+            or probe_endpoint_requires_readmission(
+                current,
+                source_url=source_url,
+                admission=self._probe_endpoint_admission,
+            )
+            else None
+        )
         return self._store.update_camera(
             camera_id,
             name=validate_camera_name(name),
             source_url=source_url,
             expected_revision=expected_revision,
+            probe_endpoint=probe_endpoint,
         )
+
+    def _admit_probe_endpoint(self, source_url: str) -> AdmittedProbeEndpoint | None:
+        if self._probe_endpoint_admission is None:
+            return None
+        try:
+            return self._probe_endpoint_admission.admit(source_url)
+        except ProbeEndpointRejected:
+            raise InvalidCameraSource("camera_source_endpoint_rejected") from None
 
     def set_camera_enabled(
         self,
@@ -3763,6 +3822,7 @@ class CameraStore(Protocol):
         idempotency: CameraRegistrationIdempotency,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraRegistrationResult: ...
 
     def lookup_camera_registration(
@@ -3779,6 +3839,7 @@ class CameraStore(Protocol):
         public_id: PublicId,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement: ...
 
     def place_camera_manually(
@@ -3791,6 +3852,7 @@ class CameraStore(Protocol):
         node_id: UUID,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement: ...
 
     def list_camera_creation_targets(
@@ -3816,6 +3878,7 @@ class CameraStore(Protocol):
         name: str,
         source_url: str,
         expected_revision: int | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement: ...
 
     def set_camera_enabled(
@@ -3950,6 +4013,36 @@ def validate_camera_source_url(value: str) -> str:
     if parsed.username is not None or parsed.password is not None or parsed.query:
         raise InvalidCameraSource("camera_source_secret_reference_required")
     return value
+
+
+def probe_endpoint_identity(
+    source_url: str,
+    endpoint: AdmittedProbeEndpoint | None,
+) -> ProbeEndpointIdentity | None:
+    if endpoint is None:
+        return None
+    expected = hashlib.sha256(source_url.encode()).hexdigest()
+    if endpoint.identity.source_url_sha256 != expected:
+        raise InvalidCameraSource("camera_source_endpoint_mismatch")
+    return endpoint.identity
+
+
+def probe_endpoint_requires_readmission(
+    camera: CameraPlacement,
+    *,
+    source_url: str,
+    admission: ProbeEndpointAdmission | None,
+) -> bool:
+    if admission is None:
+        return False
+    if camera.source_url != source_url:
+        return True
+    if not camera.probe_endpoint_schema_supported:
+        return False
+    return (
+        camera.probe_endpoint is None
+        or camera.probe_endpoint.policy_sha256 != admission.policy_sha256
+    )
 
 
 def validate_camera_name(value: str) -> str:

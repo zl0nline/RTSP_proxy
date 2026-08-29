@@ -82,9 +82,10 @@ protected route-method pairs present at its commit, green in CI run
 The later aggregate overview polling and one-camera SSE projection is tracked
 in
 [`phase-f-dashboard-live-updates-contract.md`](phase-f-dashboard-live-updates-contract.md);
-its local/direct-Linux functional gate is green while independent review/native
-CI and completed-probe/capacity evidence remain open. Physical-hardware
-capacity and the 24-hour soak remain open. Revision-fenced
+its independent review/native CI gate is green. A later schema-0020 Phase-G
+foundation implements the separate completed-probe projection locally, while
+its own review/CI, production executor and capacity evidence remain open.
+Physical-hardware capacity and the 24-hour soak remain open. Revision-fenced
 break-glass rotation with atomic
 session revocation and an accepted/rejected notification drill passed
 independent Spec/Standards review and all six native amd64/arm64 jobs at commit

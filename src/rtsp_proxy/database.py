@@ -7,6 +7,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
+from ipaddress import ip_address
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -26,12 +27,13 @@ from sqlalchemy import (
     delete,
     func,
     insert,
+    literal,
     or_,
     select,
     text,
     update,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, CIDR, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, CIDR, INET, JSONB
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -94,15 +96,18 @@ from rtsp_proxy.nodes import (
     PlacementMode,
     PortBindable,
     PortChoice,
+    ProbeEndpointSchemaUnavailable,
     camera_move_is_terminal,
     camera_placement_fingerprint,
     is_node_eligible,
+    probe_endpoint_identity,
     select_port_with_bounded_recheck,
     validate_camera_name,
     validate_camera_source_url,
     validate_runtime_observation,
 )
-from rtsp_proxy.release import APPLICATION_SCHEMA
+from rtsp_proxy.probe_security import AdmittedProbeEndpoint, ProbeEndpointIdentity
+from rtsp_proxy.release import APPLICATION_SCHEMA, PREVIOUS_APPLICATION_SCHEMA
 
 metadata = MetaData()
 
@@ -212,6 +217,47 @@ cameras = Table(
     CheckConstraint("state IN ('enabled', 'disabled', 'deleting', 'deleted')"),
     CheckConstraint("desired_revision >= 1"),
     CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+)
+
+camera_probe_endpoints = Table(
+    "camera_probe_endpoints",
+    metadata,
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("admitted_revision", BigInteger, nullable=False),
+    Column("endpoint_generation", Uuid(as_uuid=True), nullable=False, unique=True),
+    Column("endpoint_address", INET, nullable=False),
+    Column("endpoint_port", Integer, nullable=False),
+    Column("site_key", String(64), nullable=False),
+    Column("policy_sha256", String(64), nullable=False),
+    Column("source_sha256", String(64), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    ),
+    CheckConstraint("admitted_revision >= 1", name="ck_camera_probe_endpoints_revision"),
+    CheckConstraint(
+        "endpoint_port BETWEEN 1 AND 65535",
+        name="ck_camera_probe_endpoints_port",
+    ),
+    CheckConstraint(
+        "site_key ~ '^[a-z0-9][a-z0-9._-]{0,63}$'",
+        name="ck_camera_probe_endpoints_site_key",
+    ),
+    CheckConstraint(
+        "policy_sha256 ~ '^[0-9a-f]{64}$'",
+        name="ck_camera_probe_endpoints_policy_sha256",
+    ),
+    CheckConstraint(
+        "source_sha256 ~ '^[0-9a-f]{64}$'",
+        name="ck_camera_probe_endpoints_sha256",
+    ),
 )
 
 camera_registration_requests = Table(
@@ -642,6 +688,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
@@ -669,16 +716,37 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
             raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     def schema_is_current(self) -> bool:
         try:
-            self.assert_schema_current()
-        except DatabaseSchemaMismatch:
+            with self._engine.connect() as connection:
+                return self._schema_is_current(connection)
+        except SQLAlchemyError:
+            raise DatabaseSchemaMismatch("database_schema_mismatch") from None
+
+    @staticmethod
+    def _schema_is_current(connection: Connection) -> bool:
+        revisions = tuple(
+            connection.scalars(text("SELECT version_num FROM alembic_version"))
+        )
+        if revisions == (APPLICATION_SCHEMA,):
+            return True
+        if revisions in (
+            ("0012_operator_sessions",),
+            ("0013_operator_login",),
+            ("0014_camera_catalog_projection",),
+            ("0015_camera_name_contract",),
+            ("0016_node_registration_keys",),
+            ("0017_access_grant_keys",),
+            ("0018_camera_registration_keys",),
+            (PREVIOUS_APPLICATION_SCHEMA,),
+        ):
             return False
-        return True
+        raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     def schema_supports_operator_login(self) -> bool:
         try:
@@ -695,6 +763,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         )
 
@@ -1999,6 +2068,7 @@ class PostgresNodeStore:
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
         registration_idempotency: CameraRegistrationIdempotency | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -2051,6 +2121,7 @@ class PostgresNodeStore:
                 placement_mode=PlacementMode.AUTOMATIC,
                 mutation_context=mutation_context,
                 registration_idempotency=registration_idempotency,
+                probe_endpoint=probe_endpoint,
             )
 
     def place_camera_manually(
@@ -2064,6 +2135,7 @@ class PostgresNodeStore:
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
         registration_idempotency: CameraRegistrationIdempotency | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -2101,6 +2173,7 @@ class PostgresNodeStore:
                 placement_mode=PlacementMode.MANUAL,
                 mutation_context=mutation_context,
                 registration_idempotency=registration_idempotency,
+                probe_endpoint=probe_endpoint,
             )
 
     def place_camera_idempotently(
@@ -2114,6 +2187,7 @@ class PostgresNodeStore:
         idempotency: CameraRegistrationIdempotency,
         management_freshness_seconds: int = 30,
         mutation_context: NodeMutationContext | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraRegistrationResult:
         with self._camera_registration_guard(idempotency) as guard:
             previous = (
@@ -2149,6 +2223,7 @@ class PostgresNodeStore:
                     management_freshness_seconds=management_freshness_seconds,
                     mutation_context=mutation_context,
                     registration_idempotency=idempotency,
+                    probe_endpoint=probe_endpoint,
                 )
             else:
                 camera = self.place_camera_manually(
@@ -2160,6 +2235,7 @@ class PostgresNodeStore:
                     management_freshness_seconds=management_freshness_seconds,
                     mutation_context=mutation_context,
                     registration_idempotency=idempotency,
+                    probe_endpoint=probe_endpoint,
                 )
             return CameraRegistrationResult(camera=camera, replayed=False)
 
@@ -2278,7 +2354,7 @@ class PostgresNodeStore:
             raise NodeRuntimeUnavailable("camera_registration_state_invalid")
         row = (
             connection.execute(
-                self._camera_query().where(
+                self._camera_query(connection).where(
                     cameras.c.id == _uuid(previous["camera_id"]),
                     cameras.c.state != CameraState.DELETED.value,
                 )
@@ -2332,7 +2408,9 @@ class PostgresNodeStore:
             return tuple(
                 _camera_placement(row)
                 for row in connection.execute(
-                    self._camera_query().where(cameras.c.state != CameraState.DELETED.value)
+                    self._camera_query(connection).where(
+                        cameras.c.state != CameraState.DELETED.value
+                    )
                 ).mappings()
             )
 
@@ -2341,7 +2419,7 @@ class PostgresNodeStore:
             return tuple(
                 _camera_placement(row)
                 for row in connection.execute(
-                    self._camera_query().where(
+                    self._camera_query(connection).where(
                         cameras.c.id.in_(camera_ids),
                         cameras.c.state != CameraState.DELETED.value,
                     )
@@ -2407,7 +2485,7 @@ class PostgresNodeStore:
         with self._engine.connect() as connection:
             row = (
                 connection.execute(
-                    self._camera_query().where(
+                    self._camera_query(connection).where(
                         cameras.c.id == camera_id,
                         cameras.c.state != CameraState.DELETED.value,
                     )
@@ -2429,7 +2507,9 @@ class PostgresNodeStore:
             return tuple(
                 _camera_placement(row)
                 for row in connection.execute(
-                    self._camera_query().where(camera_placements.c.node_id == node_id)
+                    self._camera_query(connection).where(
+                        camera_placements.c.node_id == node_id
+                    )
                 ).mappings()
             )
 
@@ -2455,9 +2535,30 @@ class PostgresNodeStore:
         with self._engine.connect() as connection:
             return tuple(_camera_move(row) for row in connection.execute(statement).mappings())
 
-    @staticmethod
-    def _camera_query() -> Select[tuple[object, ...]]:
-        return (
+    def _camera_query(self, connection: Connection) -> Select[tuple[object, ...]]:
+        endpoint_supported = self._schema_is_current(connection)
+        endpoint_columns = (
+            (
+                camera_probe_endpoints.c.endpoint_generation.label(
+                    "probe_endpoint_generation"
+                ),
+                camera_probe_endpoints.c.endpoint_address.label("probe_endpoint_address"),
+                camera_probe_endpoints.c.endpoint_port.label("probe_endpoint_port"),
+                camera_probe_endpoints.c.site_key.label("probe_endpoint_site_key"),
+                camera_probe_endpoints.c.policy_sha256.label("probe_policy_sha256"),
+                camera_probe_endpoints.c.source_sha256.label("probe_source_sha256"),
+            )
+            if endpoint_supported
+            else (
+                literal(None).label("probe_endpoint_generation"),
+                literal(None).label("probe_endpoint_address"),
+                literal(None).label("probe_endpoint_port"),
+                literal(None).label("probe_endpoint_site_key"),
+                literal(None).label("probe_policy_sha256"),
+                literal(None).label("probe_source_sha256"),
+            )
+        )
+        query = (
             select(
                 cameras.c.id,
                 cameras.c.name,
@@ -2466,6 +2567,8 @@ class PostgresNodeStore:
                 cameras.c.state,
                 cameras.c.desired_revision,
                 cameras.c.applied_revision,
+                literal(endpoint_supported).label("probe_endpoint_schema_supported"),
+                *endpoint_columns,
                 camera_placements.c.node_id,
                 camera_placements.c.placement_mode,
                 camera_placements.c.generation.label("placement_generation"),
@@ -2475,6 +2578,12 @@ class PostgresNodeStore:
             .join(media_nodes, media_nodes.c.id == camera_placements.c.node_id)
             .order_by(cameras.c.id)
         )
+        if endpoint_supported:
+            query = query.outerjoin(
+                camera_probe_endpoints,
+                camera_probe_endpoints.c.camera_id == cameras.c.id,
+            )
+        return query
 
     @staticmethod
     def _camera_catalog_query() -> Select[tuple[object, ...]]:
@@ -2507,6 +2616,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
             raise CameraCatalogUnavailable("camera_catalog_unavailable")
@@ -2548,6 +2658,7 @@ class PostgresNodeStore:
         name: str,
         source_url: str,
         expected_revision: int | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
         source_url = validate_camera_source_url(source_url)
@@ -2556,7 +2667,7 @@ class PostgresNodeStore:
             self._lock_placements(connection)
             current = (
                 connection.execute(
-                    self._camera_query()
+                    self._camera_query(connection)
                     .where(cameras.c.id == camera_id)
                     .with_for_update(of=cameras)
                 )
@@ -2577,9 +2688,26 @@ class PostgresNodeStore:
                 )
             self._require_no_active_camera_move(connection, camera_id)
             self._require_no_active_port_change(connection, camera.node_id)
-            if camera.name == name and camera.source_url == source_url:
+            source_changed = camera.source_url != source_url
+            readmission_requested = probe_endpoint is not None
+            endpoint_identity = (
+                probe_endpoint_identity(source_url, probe_endpoint)
+                if source_changed or readmission_requested
+                else camera.probe_endpoint
+            )
+            endpoint_changed = source_changed or (
+                readmission_requested and endpoint_identity != camera.probe_endpoint
+            )
+            if (
+                camera.name == name
+                and camera.source_url == source_url
+                and not endpoint_changed
+            ):
                 return camera
             desired_revision = camera.desired_revision + 1
+            endpoint_supported = self._schema_is_current(connection)
+            if readmission_requested and not endpoint_supported:
+                raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
             connection.execute(
                 update(cameras)
                 .where(cameras.c.id == camera_id)
@@ -2589,6 +2717,20 @@ class PostgresNodeStore:
                     desired_revision=desired_revision,
                 )
             )
+            if endpoint_changed and endpoint_supported:
+                connection.execute(
+                    delete(camera_probe_endpoints).where(
+                        camera_probe_endpoints.c.camera_id == camera_id
+                    )
+                )
+                if endpoint_identity is not None:
+                    connection.execute(
+                        insert(camera_probe_endpoints).values(
+                            camera_id=camera_id,
+                            admitted_revision=desired_revision,
+                            **_probe_endpoint_values(endpoint_identity),
+                        )
+                    )
             _record_normative_event(
                 connection,
                 aggregate_type="camera",
@@ -2614,6 +2756,8 @@ class PostgresNodeStore:
                 state=camera.state,
                 desired_revision=desired_revision,
                 applied_revision=camera.applied_revision,
+                probe_endpoint=(endpoint_identity if endpoint_supported else None),
+                probe_endpoint_schema_supported=endpoint_supported,
             )
 
     def set_camera_enabled(
@@ -2628,7 +2772,7 @@ class PostgresNodeStore:
             self._lock_placements(connection)
             current = (
                 connection.execute(
-                    self._camera_query()
+                    self._camera_query(connection)
                     .where(cameras.c.id == camera_id)
                     .with_for_update(of=cameras)
                 )
@@ -2692,7 +2836,7 @@ class PostgresNodeStore:
             self._lock_placements(connection)
             current = (
                 connection.execute(
-                    self._camera_query()
+                    self._camera_query(connection)
                     .where(cameras.c.id == camera_id)
                     .with_for_update(of=cameras)
                 )
@@ -2760,7 +2904,7 @@ class PostgresNodeStore:
             self._lock_placements(connection)
             current = (
                 connection.execute(
-                    self._camera_query()
+                    self._camera_query(connection)
                     .where(cameras.c.id == camera_id)
                     .with_for_update(of=(cameras, camera_placements))
                 )
@@ -2906,7 +3050,7 @@ class PostgresNodeStore:
                 raise CameraNotFound("camera_move_not_found")
             camera_row = (
                 connection.execute(
-                    self._camera_query()
+                    self._camera_query(connection)
                     .where(cameras.c.id == move_row["camera_id"])
                     .with_for_update(of=(cameras, camera_placements))
                 )
@@ -3251,7 +3395,7 @@ class PostgresNodeStore:
         with self._engine.begin() as connection:
             current = (
                 connection.execute(
-                    self._camera_query()
+                    self._camera_query(connection)
                     .where(
                         cameras.c.id == camera_id,
                         cameras.c.desired_revision == desired_revision,
@@ -3375,7 +3519,12 @@ class PostgresNodeStore:
         placement_mode: PlacementMode,
         mutation_context: NodeMutationContext | None = None,
         registration_idempotency: CameraRegistrationIdempotency | None = None,
+        probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
+        endpoint_identity = probe_endpoint_identity(source_url, probe_endpoint)
+        endpoint_supported = self._schema_is_current(connection)
+        if endpoint_identity is not None and not endpoint_supported:
+            raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
         connection.execute(insert(public_id_tombstones).values(public_id=str(public_id)))
         connection.execute(
             insert(cameras).values(
@@ -3388,6 +3537,14 @@ class PostgresNodeStore:
                 applied_revision=0,
             )
         )
+        if endpoint_identity is not None and endpoint_supported:
+            connection.execute(
+                insert(camera_probe_endpoints).values(
+                    camera_id=camera_id,
+                    admitted_revision=1,
+                    **_probe_endpoint_values(endpoint_identity),
+                )
+            )
         connection.execute(
             insert(camera_access_policies).values(
                 camera_id=camera_id,
@@ -3478,6 +3635,8 @@ class PostgresNodeStore:
             state=CameraState.ENABLED,
             desired_revision=1,
             applied_revision=0,
+            probe_endpoint=(endpoint_identity if endpoint_supported else None),
+            probe_endpoint_schema_supported=endpoint_supported,
         )
 
     def get_access_policy(self, camera_id: UUID) -> AccessPolicy | None:
@@ -3959,6 +4118,19 @@ def _uuid(value: object) -> UUID:
 
 
 def _camera_placement(row: RowMapping) -> CameraPlacement:
+    endpoint_generation = row["probe_endpoint_generation"]
+    endpoint = (
+        None
+        if endpoint_generation is None
+        else ProbeEndpointIdentity(
+            generation=_uuid(endpoint_generation),
+            address=ip_address(str(row["probe_endpoint_address"])),
+            port=int(row["probe_endpoint_port"]),
+            site_key=str(row["probe_endpoint_site_key"]),
+            policy_sha256=str(row["probe_policy_sha256"]),
+            source_url_sha256=str(row["probe_source_sha256"]),
+        )
+    )
     return CameraPlacement(
         id=_uuid(row["id"]),
         name=str(row["name"]),
@@ -3971,7 +4143,22 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
         state=CameraState(str(row["state"])),
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),
+        probe_endpoint=endpoint,
+        probe_endpoint_schema_supported=bool(row["probe_endpoint_schema_supported"]),
     )
+
+
+def _probe_endpoint_values(endpoint: ProbeEndpointIdentity | None) -> dict[str, object]:
+    if endpoint is None:
+        raise ValueError("probe_endpoint_missing")
+    return {
+        "endpoint_generation": endpoint.generation,
+        "endpoint_address": str(endpoint.address),
+        "endpoint_port": endpoint.port,
+        "site_key": endpoint.site_key,
+        "policy_sha256": endpoint.policy_sha256,
+        "source_sha256": endpoint.source_url_sha256,
+    }
 
 
 def _camera_catalog_item(row: RowMapping) -> CameraCatalogItem:
@@ -4121,6 +4308,7 @@ def _require_access_grant_idempotency_schema(connection: Connection) -> None:
     if revisions not in (
         ("0017_access_grant_keys",),
         ("0018_camera_registration_keys",),
+        (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):
         raise AccessGrantSchemaUnavailable("access_grant_schema_unavailable")
@@ -4128,7 +4316,11 @@ def _require_access_grant_idempotency_schema(connection: Connection) -> None:
 
 def _require_camera_registration_idempotency_schema(connection: Connection) -> None:
     revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
-    if revisions not in (("0018_camera_registration_keys",), (APPLICATION_SCHEMA,)):
+    if revisions not in (
+        ("0018_camera_registration_keys",),
+        (PREVIOUS_APPLICATION_SCHEMA,),
+        (APPLICATION_SCHEMA,),
+    ):
         raise NodeRuntimeUnavailable("camera_registration_schema_unavailable")
 
 

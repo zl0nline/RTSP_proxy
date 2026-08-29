@@ -96,6 +96,11 @@ def test_ready_reports_a_stable_reason_without_dependency_details() -> None:
                 "status": "fail",
                 "reason": "readiness_check_missing",
             },
+            {
+                "name": "probe_observations",
+                "status": "fail",
+                "reason": "readiness_check_missing",
+            },
         ],
     }
 
@@ -125,6 +130,11 @@ def test_ready_fails_closed_until_the_role_dependencies_are_wired() -> None:
                 "status": "fail",
                 "reason": "session_store_provider_missing",
             },
+            {
+                "name": "probe_observations",
+                "status": "fail",
+                "reason": "probe_observations_provider_missing",
+            },
         ],
     }
 
@@ -132,7 +142,10 @@ def test_ready_fails_closed_until_the_role_dependencies_are_wired() -> None:
 @pytest.mark.parametrize(
     ("role", "required_checks"),
     [
-        (RuntimeRole.WEB, {"database", "schema", "session_store"}),
+        (
+            RuntimeRole.WEB,
+            {"database", "schema", "session_store", "probe_observations"},
+        ),
         (RuntimeRole.AUTH, {"database", "schema", "pepper"}),
         (RuntimeRole.WORKER, {"database", "schema", "outbox"}),
         (RuntimeRole.RECONCILER, {"database", "schema", "media_adapter"}),
@@ -164,6 +177,7 @@ def test_unwired_readiness_names_the_dependencies_required_by_each_role(
                 DependencyResult(name="database", ready=True),
                 DependencyResult(name="schema", ready=True),
                 DependencyResult(name="session_store", ready=True),
+                DependencyResult(name="probe_observations", ready=True),
             ),
             "readiness_check_duplicate",
         ),
@@ -172,6 +186,7 @@ def test_unwired_readiness_names_the_dependencies_required_by_each_role(
                 DependencyResult(name="database", ready=True),
                 DependencyResult(name="schema", ready=True),
                 DependencyResult(name="session_store", ready=True),
+                DependencyResult(name="probe_observations", ready=True),
                 DependencyResult(name="unknown", ready=True),
             ),
             "readiness_check_unexpected",
@@ -210,6 +225,7 @@ def test_sync_readiness_probes_do_not_block_the_asgi_event_loop() -> None:
                     "database": bounded_blocking_probe,
                     "schema": bounded_blocking_probe,
                     "session_store": bounded_blocking_probe,
+                    "probe_observations": bounded_blocking_probe,
                 }
             ),
         )
@@ -284,6 +300,45 @@ def test_web_bridge_is_ready_with_operator_authentication_disabled(
         "database": "pass",
         "schema": "pass",
         "session_store": "pass",
+        "probe_observations": "pass",
+    }
+
+
+def test_current_web_readiness_fails_closed_on_probe_schema_drift(
+    postgres_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    monkeypatch.setenv("RTSP_PROXY_ROLE", "web")
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    app = create_app_from_environment()
+
+    with TestClient(app) as client:
+        ready = client.get("/health/ready")
+        assert ready.status_code == 200
+        assert {item["name"]: item["status"] for item in ready.json()["checks"]} == {
+            "database": "pass",
+            "schema": "pass",
+            "session_store": "pass",
+            "probe_observations": "pass",
+        }
+        engine = create_engine(postgres_database_url)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE probe_observations DROP CONSTRAINT "
+                    "ck_probe_observations_result"
+                )
+            )
+        drifted = client.get("/health/ready")
+
+    assert drifted.status_code == 503
+    assert drifted.json()["checks"][-1] == {
+        "name": "probe_observations",
+        "status": "fail",
+        "reason": "probe_observations_unavailable",
     }
 
 
@@ -294,12 +349,43 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
             "RTSP_PROXY_HTTP_HOST": "127.0.0.2",
             "RTSP_PROXY_HTTP_PORT": "8080",
             "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "15",
+            "RTSP_PROXY_PROBE_SOURCE_SITE_KEY": "moscow-a",
+            "RTSP_PROXY_PROBE_SOURCE_CIDRS": "10.50.0.0/16,2001:db8:50::/48",
         }
     )
 
     assert str(settings.http_host) == "127.0.0.2"
     assert settings.http_port == 8080
     assert settings.dashboard_poll_interval_seconds == 15
+    assert settings.probe_source_site_key == "moscow-a"
+    assert tuple(str(network) for network in settings.probe_source_cidrs) == (
+        "10.50.0.0/16",
+        "2001:db8:50::/48",
+    )
+
+
+def test_probe_source_policy_defaults_to_explicit_deny_all() -> None:
+    settings = Settings(role=RuntimeRole.WEB)
+
+    assert settings.probe_source_site_key == "local"
+    assert settings.probe_source_cidrs == ()
+
+
+def test_probe_source_cidrs_have_one_canonical_nested_order() -> None:
+    first = load_settings(
+        {
+            "RTSP_PROXY_ROLE": "web",
+            "RTSP_PROXY_PROBE_SOURCE_CIDRS": "10.0.0.0/8,10.0.0.0/16",
+        }
+    )
+    second = load_settings(
+        {
+            "RTSP_PROXY_ROLE": "web",
+            "RTSP_PROXY_PROBE_SOURCE_CIDRS": "10.0.0.0/16,10.0.0.0/8",
+        }
+    )
+
+    assert first.probe_source_cidrs == second.probe_source_cidrs
 
 
 @pytest.mark.parametrize("poll_interval", (4, 31))
@@ -536,6 +622,7 @@ def test_web_runtime_wires_oidc_sessions_readiness_and_durable_flow_from_environ
         "database": "pass",
         "schema": "pass",
         "session_store": "pass",
+        "probe_observations": "pass",
     }
     assert redirect.status_code == 303
     assert redirect.headers["location"].startswith("https://idp.example.test/oauth2/authorize?")
@@ -1139,6 +1226,7 @@ def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
         "0016_node_registration_keys",
         "0017_access_grant_keys",
         "0019_dashboard_rate_limits",
+        "0020_probe_observations",
     ],
 )
 def test_collector_remains_ready_across_declared_schema_bridge(

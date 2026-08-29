@@ -2428,6 +2428,10 @@ def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None
     assert "data-node-metric-observed" in script.text
     assert "data-node-metric-state" in script.text
     assert "data-node-counter-state" in script.text
+    assert 'addEventListener("probe_completed"' in script.text
+    assert 'addEventListener("probe_cleared"' in script.text
+    assert 'probe.outcome === "inconclusive"' in script.text
+    assert "data-live-probe-result" in script.text
     assert "setInterval" not in script.text
     assert "Math.min(30000" in script.text
     assert "innerHTML" not in script.text
@@ -3748,6 +3752,8 @@ def test_camera_detail_live_snapshot_and_sse_use_the_bounded_aggregated_source()
     assert f'data-snapshot-url="{base}/live"' in detail.text
     assert 'data-poll-interval-ms="10000"' in detail.text
     assert "Текущее состояние потока" in detail.text
+    assert "Последняя глубокая проверка" in detail.text
+    assert "data-live-probe-result" in detail.text
     assert snapshot.status_code == 200
     assert snapshot.json() == updates.event.data
     assert stream.status_code == 200

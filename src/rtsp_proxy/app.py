@@ -86,6 +86,7 @@ from rtsp_proxy.nodes import (
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
     NodeState,
+    ProbeEndpointSchemaUnavailable,
 )
 from rtsp_proxy.observability import FleetSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import (
@@ -107,6 +108,7 @@ from rtsp_proxy.operator_identity import (
     OidcLoginRateLimited,
     OidcLoginUnavailable,
 )
+from rtsp_proxy.probes import ProbeObservationReader
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
     CameraMoveControl,
@@ -660,6 +662,7 @@ def create_app(
     access_policy_control: AccessPolicyControl | None = None,
     access_grant_control: AccessGrantControl | None = None,
     fleet_snapshots: SnapshotReader | None = None,
+    probe_observations: ProbeObservationReader | None = None,
     camera_live_updates: CameraLiveUpdateSource | None = None,
     operator_sessions: OperatorSessionControl | None = None,
     operator_login: OidcLoginControl | None = None,
@@ -678,6 +681,7 @@ def create_app(
     ):
         resolved_camera_live_updates = CameraLiveUpdates(
             reader=fleet_snapshots,
+            probe_observations=probe_observations,
             resolve_targets=camera_control.live_targets,
             authorize_sessions=(
                 None
@@ -2114,6 +2118,11 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "node_runtime_unavailable"},
             ) from None
+        except ProbeEndpointSchemaUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "probe_endpoint_schema_unavailable"},
+            ) from None
         except NodeRuntimeFailed as error:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -2174,6 +2183,11 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": str(error)},
+            ) from None
+        except ProbeEndpointSchemaUnavailable:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "probe_endpoint_schema_unavailable"},
             ) from None
         except CameraDisruptionConfirmationRequired:
             raise HTTPException(

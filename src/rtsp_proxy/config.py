@@ -7,7 +7,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import Field, IPvAnyAddress, field_validator, model_validator
+from pydantic import Field, IPvAnyAddress, IPvAnyNetwork, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import NoDecode
 
@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     reconcile_interval_seconds: float = Field(default=1, ge=0.1, le=60)
     collector_interval_seconds: float = Field(default=5, ge=1, le=60)
     dashboard_poll_interval_seconds: int = Field(default=10, ge=5, le=30)
+    probe_source_site_key: str = Field(
+        default="local",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    probe_source_cidrs: Annotated[tuple[IPvAnyNetwork, ...], NoDecode] = ()
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     operator_recent_mfa_seconds: int = Field(default=300, ge=30, le=900)
     node_release_id: str = Field(
@@ -136,6 +141,32 @@ class Settings(BaseSettings):
             except ValueError as error:
                 raise ValueError("node_port_reserved_invalid") from error
         return value
+
+    @field_validator("probe_source_cidrs", mode="before")
+    @classmethod
+    def parse_probe_source_cidrs(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
+
+    @field_validator("probe_source_cidrs")
+    @classmethod
+    def canonicalize_probe_source_cidrs(
+        cls,
+        value: tuple[IPvAnyNetwork, ...],
+    ) -> tuple[IPvAnyNetwork, ...]:
+        if len(value) > 128 or len(value) != len(set(value)):
+            raise ValueError("probe_source_cidrs_invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda network: (
+                    network.version,
+                    network.network_address.packed,
+                    network.prefixlen,
+                ),
+            )
+        )
 
     @field_validator("oidc_mfa_acr", "oidc_mfa_amr", mode="before")
     @classmethod

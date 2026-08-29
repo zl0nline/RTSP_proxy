@@ -84,6 +84,24 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   gates are recorded in [CI run 33265832444](https://github.com/zl0nline/RTSP_proxy/actions/runs/33265832444)
 >   and
 >   [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](docs/evidence/phase-f-dashboard-live-updates-contract.md).
+> - Phase-G probe foundation: **implemented locally; independent review and
+>   native CI pending**. It adds a bounded single-flight scheduler with hard
+>   server/node/site and separate SOURCE/PATH budgets, controlled class
+>   reservations, claim-time
+>   admission and reservation-safe deadline aging. PATH is forbidden while the
+>   source pull is active; PATH results are fenced by exact node
+>   applied-revision/PID/start/boot/release identity; schema 0020 keeps immutable,
+>   DB-clock-bounded durable observations. Camera create/source-update atomically
+>   stores a resolve-once, explicitly configured site/CIDR-approved literal
+>   endpoint generation; an empty CIDR list is deny-all. Schema readiness
+>   checks exact column types/defaults, constraint definitions, index shape and
+>   privileges. The completed-probe SSE/dashboard projection is secret-free.
+>   This is not a
+>   production source-probe runner. ADR 0004 remains Proposed: a narrow root
+>   broker, system-manager transient unit, exact cgroup `IP:port` guard,
+>   no-redirect ffprobe build and privileged amd64/arm64 evidence are still
+>   mandatory. See
+>   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).

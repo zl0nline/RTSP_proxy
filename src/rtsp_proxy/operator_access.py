@@ -17,7 +17,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 
-from rtsp_proxy.release import APPLICATION_SCHEMA
+from rtsp_proxy.release import APPLICATION_SCHEMA, PREVIOUS_APPLICATION_SCHEMA
 
 
 class OperatorRole(StrEnum):
@@ -897,7 +897,7 @@ class PostgresOperatorSessionStore:
                 )
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
-        return revisions == (APPLICATION_SCHEMA,)
+        return revisions in ((PREVIOUS_APPLICATION_SCHEMA,), (APPLICATION_SCHEMA,))
 
     def claim_operator_action(
         self,

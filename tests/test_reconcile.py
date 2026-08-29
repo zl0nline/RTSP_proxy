@@ -1244,10 +1244,12 @@ def test_camera_mutation_covers_noop_missing_node_and_failed_store_restore() -> 
             camera_id: UUID,
             *,
             name: str,
-            source_url: str,
-            expected_revision: int | None = None,
-        ) -> CameraPlacement:
-            raise CameraLifecycleConflict("camera_revision_conflict")
+                source_url: str,
+                expected_revision: int | None = None,
+                probe_endpoint: object | None = None,
+            ) -> CameraPlacement:
+                del probe_endpoint
+                raise CameraLifecycleConflict("camera_revision_conflict")
 
     rejecting = RejectUpdateStore(nodes=(running_node(NODE_A, 12000),))
     CameraControl(

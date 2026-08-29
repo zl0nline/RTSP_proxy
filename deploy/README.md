@@ -686,6 +686,35 @@ commits, rollback to application 0.10.0 (maximum schema 0018) is **NO-GO**. Fix
 forward with verified 0.11.0 artifacts or restore the pre-0019 PostgreSQL backup
 with the control plane stopped.
 
+Application release `0.12.0` adds the additive `camera_probe_endpoints` and
+`probe_observations` tables.
+Roll every WEB/background process to 0.12.0 while PostgreSQL remains at 0019;
+existing streaming, dashboard and live-update paths remain available, while the
+new probe-result reader stays disabled. Camera create and source-changing update
+return `503 probe_endpoint_schema_unavailable` during this bounded bridge so an
+approved endpoint can never be silently discarded. Name-only/admin operations
+remain available. After every process is on 0.12.0, apply
+migration 0020 once and restart the probe and WEB roles one instance at a time.
+Set `RTSP_PROXY_PROBE_SOURCE_SITE_KEY` and `RTSP_PROXY_PROBE_SOURCE_CIDRS` to the
+one site identity and its exact comma-separated camera/source networks before
+restart. Empty CIDRs are deny-all. New camera create/source-update resolves the
+hostname once through a bounded four-slot/two-second Linux NSS boundary, requires
+every A/AAAA answer inside that site policy and writes the chosen literal address,
+port, site/policy digest, URL digest and opaque generation in the same synchronous
+camera transaction. Pre-0020 cameras remain deliberately unadmitted: resubmit
+the existing source URL through the normal camera update operation. A missing
+endpoint or changed policy digest makes that otherwise identical request a
+meaningful revisioned re-admission; there is no automatic DNS backfill.
+Record one generation-matching lab result, move or revise that camera, and
+require the old result to disappear before accepting a new-generation result.
+The observation table contains no source URL, hostname, IP, port or credential.
+The separate endpoint-admission table intentionally contains the approved
+literal IP:port and policy digest, but no hostname, source URL, path/query,
+username or password.
+After revision 0020 commits, rollback to application 0.11.0 (maximum schema
+0019) is **NO-GO**. Fix forward with verified 0.12.0 artifacts or restore the
+pre-0020 PostgreSQL backup with the control plane stopped.
+
 The five WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
 `/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running

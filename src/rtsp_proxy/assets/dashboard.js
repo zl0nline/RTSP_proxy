@@ -168,6 +168,9 @@
   const received = live.querySelector("[data-live-received]");
   const sent = live.querySelector("[data-live-sent]");
   const observed = live.querySelector("[data-live-observed]");
+  const probeResult = live.querySelector("[data-live-probe-result]");
+  const probeDetail = live.querySelector("[data-live-probe-detail]");
+  const probeCompleted = live.querySelector("[data-live-probe-completed]");
   const note = live.querySelector("[data-live-note]");
   const streamUrl = live.dataset.liveUrl;
   const snapshotUrl = live.dataset.snapshotUrl;
@@ -229,6 +232,63 @@
     }
   };
 
+  const applyProbe = (probe) => {
+    if (!probe || typeof probe !== "object") {
+      return;
+    }
+    if (probeResult instanceof HTMLElement) {
+      const failureLabels = {
+        authentication: "ошибка авторизации",
+        codec: "неподдерживаемый codec",
+        connect_timeout: "таймаут подключения",
+        executor: "ошибка исполнителя",
+        output: "некорректный ответ",
+        transport: "ошибка транспорта",
+      };
+      const failure = failureLabels[probe.failure_class] || "ошибка";
+      probeResult.textContent = probe.outcome === "healthy"
+        ? "успешно"
+        : probe.outcome === "inconclusive"
+          ? `проверка не выполнена: ${failure}`
+          : failure;
+    }
+    if (probeDetail instanceof HTMLElement) {
+      const method = probe.method === "source" ? "источник" : probe.method === "path" ? "путь ноды" : "—";
+      const codecs = [probe.video_codec, probe.audio_codec]
+        .filter((codec) => typeof codec === "string")
+        .join(" + ");
+      const duration = Number.isInteger(probe.duration_ms) && probe.duration_ms >= 0
+        ? `${(probe.duration_ms / 1000).toLocaleString("ru-RU")} с`
+        : "—";
+      probeDetail.textContent = `${method} / ${codecs || "—"} / ${duration}`;
+    }
+    if (probeCompleted instanceof HTMLTimeElement) {
+      if (typeof probe.completed_at === "string") {
+        const timestamp = new Date(probe.completed_at);
+        probeCompleted.dateTime = probe.completed_at;
+        probeCompleted.textContent = Number.isNaN(timestamp.valueOf())
+          ? "—"
+          : timestamp.toLocaleString("ru-RU");
+      } else {
+        probeCompleted.removeAttribute("datetime");
+        probeCompleted.textContent = "—";
+      }
+    }
+  };
+
+  const clearProbe = () => {
+    if (probeResult instanceof HTMLElement) {
+      probeResult.textContent = "—";
+    }
+    if (probeDetail instanceof HTMLElement) {
+      probeDetail.textContent = "—";
+    }
+    if (probeCompleted instanceof HTMLTimeElement) {
+      probeCompleted.removeAttribute("datetime");
+      probeCompleted.textContent = "—";
+    }
+  };
+
   const pollOnce = async () => {
     if (!snapshotUrl) {
       return;
@@ -275,6 +335,20 @@
     } catch (_error) {
       setConnection("Некорректные данные", "failed");
     }
+  });
+  eventSource.addEventListener("probe_completed", (event) => {
+    try {
+      applyProbe(JSON.parse(event.data));
+      streamFailures = 0;
+      setConnection("Live", "healthy");
+    } catch (_error) {
+      setConnection("Некорректные данные", "failed");
+    }
+  });
+  eventSource.addEventListener("probe_cleared", () => {
+    clearProbe();
+    streamFailures = 0;
+    setConnection("Live", "healthy");
   });
   eventSource.addEventListener("heartbeat", () => {
     setConnection("Live", "healthy");

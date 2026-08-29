@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from ipaddress import ip_network
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from typing import Any, cast
@@ -68,6 +69,7 @@ from rtsp_proxy.phase_d_transition import (
     export_transition,
     restore_transition,
 )
+from rtsp_proxy.probe_security import ProbeEndpointAdmission
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
     CameraMutationControl,
@@ -676,6 +678,51 @@ def test_automatic_camera_placement_uses_registered_then_active_load() -> None:
     }
 
 
+def test_camera_create_fails_closed_when_bounded_endpoint_resolution_times_out() -> None:
+    node = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000001"),
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        management_observed_at=datetime.now(UTC),
+        config_compatible=True,
+        applied_revision=1,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+
+    def timed_out(_hostname: str) -> tuple[str, ...]:
+        raise TimeoutError("resolver detail must not cross the API")
+
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+        probe_endpoint_admission=ProbeEndpointAdmission(
+            site_key="site-a",
+            allowed_networks=(ip_network("10.40.0.0/24"),),
+            resolve=timed_out,
+        ),
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=control,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.example/main"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {"code": "camera_source_endpoint_rejected"}
+    assert store.list_cameras() == ()
+
+
 def test_automatic_placement_skips_a_manually_created_provisioning_node() -> None:
     store = InMemoryNodeStore(
         nodes=(
@@ -1181,11 +1228,12 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "('media_nodes', 'cameras', 'audit_events', 'outbox_messages', "
                 "'camera_access_policies', 'camera_access_grants', "
                 "'node_registration_requests', 'access_grant_issue_requests', "
-                "'operator_action_rate_limits', 'camera_registration_requests')"
+                "'operator_action_rate_limits', 'camera_registration_requests', "
+                "'probe_observations', 'camera_probe_endpoints')"
             )
         )
-    assert revision == "0019_dashboard_rate_limits"
-    assert table_count == 10
+    assert revision == "0020_probe_observations"
+    assert table_count == 12
 
 
 def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(
@@ -1422,7 +1470,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0019_dashboard_rate_limits"
+            "0020_probe_observations"
         )
 
 
@@ -1455,7 +1503,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0019_dashboard_rate_limits"
+            "0020_probe_observations"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})
@@ -2000,6 +2048,9 @@ def test_schema_check_sanitizes_database_connection_failures() -> None:
 
     with pytest.raises(DatabaseSchemaMismatch, match="database_schema_mismatch"):
         store.assert_schema_compatible()
+
+    with pytest.raises(DatabaseSchemaMismatch, match="database_schema_mismatch"):
+        store.schema_is_current()
 
 
 def test_control_plane_refuses_multiple_alembic_heads(

@@ -32,6 +32,14 @@ from rtsp_proxy.observability import (
     NodeSnapshot,
     PathMetricCounters,
 )
+from rtsp_proxy.probes import (
+    InMemoryProbeObservationStore,
+    ProbeMethod,
+    ProbeObservation,
+    ProbeOutcome,
+    ProbePriority,
+    ProbeTarget,
+)
 
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -122,6 +130,11 @@ class MutableLiveTargets:
         }
 
 
+class FailingProbeObservations:
+    def latest_for(self, _camera_ids: tuple[UUID, ...]) -> dict[UUID, ProbeObservation]:
+        raise RuntimeError("probe observation store unavailable")
+
+
 def _updates(
     reader: MutableSnapshotReader | BlockingSnapshotReader,
     *,
@@ -205,6 +218,42 @@ def _second_target() -> CameraLiveTarget:
     )
 
 
+def _probe_target() -> ProbeTarget:
+    return ProbeTarget(
+        camera_id=CAMERA_ID,
+        public_id=PUBLIC_ID,
+        node_id=NODE_ID,
+        site_key="site-a",
+        desired_revision=1,
+        placement_generation=1,
+        node_state=NodeState.RUNNING,
+        enabled=True,
+        maintenance=False,
+        occupied=False,
+        source_pull_active=False,
+        max_source_sessions=1,
+        source_endpoint_generation=UUID(
+            "70000000-0000-4000-8000-000000000001"
+        ),
+    )
+
+
+def _probe_observation() -> ProbeObservation:
+    return ProbeObservation(
+        observation_id=UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+        request_id=UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+        target=_probe_target(),
+        method=ProbeMethod.SOURCE,
+        priority=ProbePriority.ROUTINE,
+        outcome=ProbeOutcome.HEALTHY,
+        started_at=NOW + timedelta(seconds=1),
+        completed_at=NOW + timedelta(seconds=3),
+        attempt=1,
+        video_codec="h264",
+        audio_codec="opus",
+    )
+
+
 @async_case
 async def test_live_updates_project_and_coalesce_camera_runtime_state() -> None:
     reader = MutableSnapshotReader(_snapshot())
@@ -265,6 +314,115 @@ async def test_live_updates_project_and_coalesce_camera_runtime_state() -> None:
     assert authorized_versions == [7]
     assert epochs.calls == []
     await subscription.aclose()
+
+
+@async_case
+async def test_live_updates_emit_one_sanitized_completed_probe_event() -> None:
+    reader = MutableSnapshotReader(_snapshot())
+    probe_target = _probe_target()
+    observations = InMemoryProbeObservationStore({CAMERA_ID: probe_target})
+    updates = _updates(reader, probe_observations=observations)
+
+    async def authorize() -> int:
+        return 1
+
+    subscription = await updates.open(
+        target=_target(),
+        session_id=SESSION_ID,
+        authz_version=1,
+        authorize=authorize,
+    )
+    state = await anext(subscription)
+    assert state.event_type is CameraLiveEventType.STATE
+
+    assert observations.record_if_current(_probe_observation()) is True
+    await updates.refresh_once()
+    completed = await asyncio.wait_for(anext(subscription), timeout=1)
+    assert completed.event_type is CameraLiveEventType.PROBE_COMPLETED
+    assert completed.data == {
+        "attempt": 1,
+        "audio_codec": "opus",
+        "completed_at": (NOW + timedelta(seconds=3)).isoformat(),
+        "duration_ms": 2_000,
+        "failure_class": None,
+        "method": "source",
+        "observation_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "outcome": "healthy",
+        "video_codec": "h264",
+    }
+    assert "site_key" not in completed.data
+    assert "node_id" not in completed.data
+    assert (await updates.current(_target())).event_type is CameraLiveEventType.STATE
+
+    await updates.refresh_once()
+    assert updates.history_size_for(CAMERA_ID) == 2
+    await subscription.aclose()
+
+
+@async_case
+async def test_probe_result_failure_does_not_poison_media_state_refresh() -> None:
+    reader = MutableSnapshotReader(_snapshot())
+    updates = _updates(reader, probe_observations=FailingProbeObservations())
+
+    async def authorize() -> int:
+        return 1
+
+    subscription = await updates.open(
+        target=_target(),
+        session_id=SESSION_ID,
+        authz_version=1,
+        authorize=authorize,
+    )
+    await anext(subscription)
+    reader.snapshot = _snapshot(
+        generated_at=NOW + timedelta(seconds=5),
+        occupied=True,
+    )
+    await updates.refresh_once()
+    state = await asyncio.wait_for(anext(subscription), timeout=1)
+    assert state.event_type is CameraLiveEventType.STATE
+    assert state.data["occupied"] is True
+    await subscription.aclose()
+
+
+@async_case
+async def test_successful_probe_absence_clears_cached_generation_from_live_replay() -> None:
+    reader = MutableSnapshotReader(_snapshot())
+    probe_target = _probe_target()
+    observations = InMemoryProbeObservationStore({CAMERA_ID: probe_target})
+    updates = _updates(reader, probe_observations=observations)
+
+    async def authorize() -> int:
+        return 1
+
+    subscription = await updates.open(
+        target=_target(),
+        session_id=SESSION_ID,
+        authz_version=1,
+        authorize=authorize,
+    )
+    assert (await anext(subscription)).event_type is CameraLiveEventType.STATE
+    assert observations.record_if_current(_probe_observation()) is True
+    await updates.refresh_once()
+    assert (await anext(subscription)).event_type is CameraLiveEventType.PROBE_COMPLETED
+
+    observations.set_current_target(replace(probe_target, desired_revision=2))
+    await updates.refresh_once()
+    cleared = await asyncio.wait_for(anext(subscription), timeout=1)
+    assert cleared.event_type is CameraLiveEventType.PROBE_CLEARED
+    assert cleared.data == {"reason": "generation_changed"}
+    await subscription.aclose()
+
+    replay = await updates.open(
+        target=_target(),
+        session_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"),
+        authz_version=1,
+        authorize=authorize,
+    )
+    assert (await anext(replay)).event_type is CameraLiveEventType.STATE
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(anext(replay), timeout=0.01)
+    await replay.aclose()
 
 
 @async_case
@@ -331,6 +489,7 @@ async def test_live_updates_revalidate_authz_and_bound_one_stream_per_session() 
         heartbeat_seconds=0.01,
         reauthorize_seconds=0.01,
     )
+
     async def authorize() -> int:
         return 3
 
@@ -752,9 +911,7 @@ async def test_live_authorizes_before_replay_and_before_each_state_delivery() ->
 @async_case
 async def test_live_authorization_epoch_refresh_is_one_batch_for_all_sessions() -> None:
     now = [0.0]
-    session_ids = tuple(
-        UUID(f"00000000-0000-4000-8000-{index:012d}") for index in range(1, 17)
-    )
+    session_ids = tuple(UUID(f"00000000-0000-4000-8000-{index:012d}") for index in range(1, 17))
     epochs = MutableAuthorizationEpochs({session_id: 5 for session_id in session_ids})
     updates = _updates(
         MutableSnapshotReader(_snapshot()),
@@ -949,7 +1106,9 @@ async def test_live_rate_uses_metric_epoch_and_marks_reset_and_gap() -> None:
                     sent_bytes=4_000,
                     counters_reset=True,
                     metric_gap=True,
-                ).nodes[0].metrics,
+                )
+                .nodes[0]
+                .metrics,
             ),
         ),
     )

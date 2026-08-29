@@ -7,6 +7,7 @@ import pytest
 
 from rtsp_proxy.cli import main
 from rtsp_proxy.release import (
+    APPLICATION_SCHEMA,
     ReleaseManifest,
     ReleaseVerificationError,
     Sha256,
@@ -90,6 +91,16 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0018_camera_registration_idempotency.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0019_dashboard_rate_limits.py",
+    ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0020_probe_observations.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -153,7 +164,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         },
         "schema_compatibility": {
             "minimum": "0012_operator_sessions",
-            "maximum": "0019_dashboard_rate_limits",
+            "maximum": APPLICATION_SCHEMA,
         },
         "config_schema_version": 1,
     }
@@ -358,7 +369,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
-    assert {manifest.release_id for manifest in manifests} == {"0.11.0"}
+    assert {manifest.release_id for manifest in manifests} == {"0.12.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
 
 
