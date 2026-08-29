@@ -13,8 +13,13 @@ from ipaddress import (
     ip_address,
 )
 from threading import BoundedSemaphore
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 from uuid import UUID, uuid4
+
+from rtsp_proxy.probe_executor import (
+    probe_credential_component_valid,
+    serialize_probe_input,
+)
 
 _IpAddress = IPv4Address | IPv6Address
 _IpNetwork = IPv4Network | IPv6Network
@@ -31,8 +36,8 @@ class _ProbeCredential:
     password: str = field(repr=False)
 
     def __post_init__(self) -> None:
-        if not _credential_component_valid(self.username, maximum_bytes=64) or not (
-            _credential_component_valid(self.password, maximum_bytes=256)
+        if not probe_credential_component_valid(self.username, maximum_bytes=64) or not (
+            probe_credential_component_valid(self.password, maximum_bytes=256)
         ):
             raise ProbeEndpointRejected("probe_credential_invalid")
 
@@ -136,21 +141,15 @@ class AdmittedProbeEndpoint:
     def ffconcat_payload(self, *, io_timeout_microseconds: int = 5_000_000) -> bytes:
         if not 100_000 <= io_timeout_microseconds <= 30_000_000:
             raise ValueError("probe_io_timeout_invalid")
-        userinfo = ""
-        if self._credential is not None:
-            userinfo = (
-                f"{quote(self._credential.username, safe='')}:"
-                f"{quote(self._credential.password, safe='')}@"
-            )
-        target = (
-            f"rtsp://{userinfo}{_authority_host(self.identity.address)}:"
-            f"{self.port}{self._path_and_query}"
+        credential = self._credential
+        return serialize_probe_input(
+            address=self.identity.address,
+            port=self.port,
+            path_and_query=self._path_and_query,
+            username=None if credential is None else credential.username,
+            password=None if credential is None else credential.password,
+            io_timeout_microseconds=io_timeout_microseconds,
         )
-        return (
-            f"ffconcat version 1.0\nfile '{target}'\n"
-            "option rtsp_transport tcp\n"
-            f"option rw_timeout {io_timeout_microseconds}\n"
-        ).encode()
 
 
 class ProbeEndpointAdmission:
@@ -281,18 +280,6 @@ def _parse_credential(username: str | None, password: str | None) -> _ProbeCrede
     return _ProbeCredential(username=unquote(username), password=unquote(password))
 
 
-def _credential_component_valid(value: str, *, maximum_bytes: int) -> bool:
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeError:
-        return False
-    return (
-        bool(encoded)
-        and len(encoded) <= maximum_bytes
-        and not any(character in value for character in "\r\n\x00")
-    )
-
-
 def _literal_address(hostname: str) -> _IpAddress | None:
     if "%" in hostname:
         raise ProbeEndpointRejected("probe_endpoint_invalid")
@@ -333,7 +320,3 @@ def _address_forbidden(address: _IpAddress) -> bool:
 
 def _address_sort_key(address: _IpAddress) -> tuple[int, bytes]:
     return address.version, address.packed
-
-
-def _authority_host(address: _IpAddress) -> str:
-    return f"[{address}]" if isinstance(address, IPv6Address) else str(address)
