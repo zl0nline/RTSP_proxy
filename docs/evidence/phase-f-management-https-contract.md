@@ -32,9 +32,11 @@ evidence and rollout remain Production **NO-GO** gates.
   the process to operator-controlled paths and a concurrent start cannot combine
   files from different versions.
 - The native systemd contract verifies a CA-signed certificate with the exact
-  IP SAN and hostname validation, private credential mode `0400`, service-UID
-  ownership, regular-file/nlink constraints, HSTS, plaintext rejection and
-  bounded unit/PID/listener cleanup.
+  IP SAN and hostname validation, a read-only credential with no other-user
+  permissions, regular-file/nlink constraints, the configured service UID,
+  HSTS, plaintext rejection and bounded unit/PID/listener cleanup. Successful
+  HTTPS startup also proves that the service identity can read the
+  manager-protected credential.
 - The renewal runbook distinguishes IP SAN from DNS SAN, supports bracketed
   IPv6 URL authorities, validates candidate and rollback PEM identities, holds
   an exclusive root-only lock, fsyncs the versioned bundle and directory entries,

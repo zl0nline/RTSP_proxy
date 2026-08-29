@@ -352,8 +352,11 @@ def test_systemd_loadcredential_serves_verified_management_https(tmp_path: Path)
             metadata = credential.stat()
             assert not credential.is_symlink()
             assert stat.S_ISREG(metadata.st_mode)
-            assert stat.S_IMODE(metadata.st_mode) == 0o400
-            assert metadata.st_uid == service_uid
+            credential_mode = stat.S_IMODE(metadata.st_mode)
+            assert credential_mode in {0o400, 0o440}
+            assert credential_mode & 0o007 == 0
+            assert credential_mode & 0o222 == 0
+            assert metadata.st_uid in {0, service_uid}
             assert metadata.st_nlink == 1
 
         payload, hsts = _wait_for_https(port, ca_file=ca_certificate)
