@@ -108,6 +108,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),
 >   whose native matrix passed in
 >   [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424).
+>   The canonical sealed-memfd input primitive is also reviewed and native
+>   amd64/arm64 green in
+>   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877),
+>   but descriptor transfer and execution remain disabled; see its
+>   [evidence contract](docs/evidence/phase-g-sealed-probe-input-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).

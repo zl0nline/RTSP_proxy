@@ -1,8 +1,8 @@
 # Phase G sealed probe-input contract
 
 - Date: 2026-08-30
-- Status: implementation and direct-Linux amd64 contract green; independent
-  review and native amd64/arm64 CI pending
+- Status: implementation, direct-Linux amd64 contract, independent
+  Spec/Standards review and native amd64/arm64 CI green
 - Production decision: NO-GO
 
 ## Scope
@@ -30,6 +30,11 @@ immutable and readable without mutation; it also proved an otherwise identical
 unsealed memfd, a hostname target, a noncanonical timeout and a backslash path
 were rejected, and that interruption after descriptor creation did not leak
 the secret fd. The temporary test tree was removed afterward.
+
+The Linux-specific sealed-input suite then passed in the amd64 and arm64
+`test` jobs, while all seven jobs completed successfully in
+[CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
+at commit `3f7f400`.
 
 ## Deliberately excluded
 

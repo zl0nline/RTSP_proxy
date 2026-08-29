@@ -1285,8 +1285,9 @@ impact is measured.
   green; executor still disabled);
 - [x] anonymous canonical ffconcat input primitive with a 16 KiB cap,
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
-  independent review and native amd64/arm64 CI pending; descriptor transport
-  and executor still disabled);
+  independent review and native amd64/arm64
+  [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
+  green; descriptor transport and executor still disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;
