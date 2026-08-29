@@ -977,10 +977,12 @@ bounded secret-free placement batch over active SSE cameras discovers the move
 without another browser request. Shutdown
 waits for tracked bounded snapshot/authz workers before closing their stores.
 The browser never reads a media-node API or metric endpoint. The completed
-probe event source is implemented locally by the Phase-G schema-0020
-foundation: it reads only generation-fenced, secret-free durable observations.
-No production source executor is enabled, and independent review/native CI plus
-production load/cardinality evidence remain open. Exact live-update scope is
+probe event source is implemented by the independently reviewed Phase-G
+schema-0020 foundation and is green in all seven native/external jobs in
+[CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381):
+it reads only generation-fenced, secret-free durable observations. No production
+source executor is enabled; privileged executor evidence plus production
+load/cardinality evidence remain open. Exact live-update scope is
 recorded in
 [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](evidence/phase-f-dashboard-live-updates-contract.md).
 The camera access-administration slice is also implemented locally: it renders
@@ -1208,8 +1210,8 @@ No Phase-F completion claim is made yet.
   shutdown, resync and bounded polling fallback
   (independent review, local/direct-Linux functional evidence and all seven
   native/external CI jobs green; the schema-0020 completed-probe projection is
-  a separate Phase-G foundation awaiting its own review/CI, and capacity
-  evidence remains open);
+  a separately reviewed and CI-green Phase-G foundation, while the production
+  executor and capacity evidence remain open);
 - [x] incident outbox, failure email and recovery confirmation;
 - [x] SMTP retry/dedupe with explicit ambiguous terminal outcome;
 - [x] browser E2E for OIDC/login, confirmations, keyboard accessibility and
@@ -1227,7 +1229,8 @@ Exit: operator workflows complete without direct DB/systemctl/MediaMTX access.
 
 ### Phase G — probes and production evidence
 
-Status: **IN PROGRESS / PRODUCTION NO-GO**. The local foundation implements a
+Status: **IN PROGRESS / PRODUCTION NO-GO**. The independently reviewed and
+native-CI-green foundation implements a
 bounded single-flight scheduler, hard global/per-node/per-site and independent
 SOURCE/PATH caps with typed diagnostics, controlled
 borrowing from the spike 4/3/3 class reservations, pending routine-to-manual
@@ -1270,7 +1273,8 @@ impact is measured.
   source-session admission, controlled reservations and separate
   SOURCE/PATH/INCONCLUSIVE semantics;
 - [x] additive schema-0020 durable observation and secret-free dashboard/SSE
-  projection (local implementation; review/native CI pending);
+  projection (independent Spec/Standards review PASS; all seven jobs green in
+  [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381));
 - [x] generation-bound durable resolve-once literal/site/CIDR admission, exact
   type/default/constraint/index/privilege readiness and pinned ffconcat TCP/timeout builder
   (compatibility mechanism only);

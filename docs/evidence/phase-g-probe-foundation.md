@@ -1,10 +1,15 @@
 # Phase G probe foundation
 
 - Date: 2026-08-29
-- Status: local implementation; independent review and native CI pending
+- Status: implemented; independent Spec/Standards review PASS; native CI green
+- Commit: `446b6a325d13fd60569214296e3862c7f45ee836`
+- CI: [run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381)
+  — all seven jobs passed, including application,
+  MediaMTX/release and pull/load contracts on amd64 and arm64 plus external
+  Chromium E2E
 - Deployment: direct Linux/systemd, no Docker
-- Server architectures: identical Python contract for amd64 and arm64; native
-  executor evidence pending
+- Server architectures: foundation contract green on amd64 and arm64; native
+  privileged executor evidence pending
 - Production decision: NO-GO
 
 ## Evidence boundary
