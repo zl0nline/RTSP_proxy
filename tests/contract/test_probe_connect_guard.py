@@ -82,18 +82,37 @@ def _managed_resources() -> Iterator[_OwnedResources]:
 
 
 def _run(*arguments: str) -> str:
-    return subprocess.run(
+    completed = subprocess.run(
         arguments,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=15,
-    ).stdout.strip()
+    )
+    if completed.returncode != 0:
+        diagnostic = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            f"probe_guard_command_failed:{Path(arguments[0]).name}:"
+            f"{arguments[1]}:{diagnostic or 'no_diagnostic'}"
+        )
+    return completed.stdout.strip()
 
 
 def _mkdir_owned(path: Path, resources: _OwnedResources) -> None:
     path.mkdir()
     resources.own(f"directory {path}", path.rmdir)
+
+
+def test_command_failure_exposes_native_diagnostic() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=r"probe_guard_command_failed:python(?:3(?:\.\d+)?)?:-c:load denied",
+    ):
+        _run(
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('load denied\\n'); raise SystemExit(2)",
+        )
 
 
 def _listener(family: socket.AddressFamily, host: str, port: int) -> socket.socket:

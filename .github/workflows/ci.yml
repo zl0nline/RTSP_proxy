@@ -141,6 +141,17 @@ jobs:
 
       - name: Verify exact cgroup probe connect guard
         run: |
+          mounted_bpffs=0
+          if ! mountpoint --quiet /sys/fs/bpf; then
+            sudo mount --type bpf bpffs /sys/fs/bpf
+            mounted_bpffs=1
+          fi
+          cleanup_bpffs() {
+            if [[ "$mounted_bpffs" == 1 ]]; then
+              sudo umount /sys/fs/bpf
+            fi
+          }
+          trap cleanup_bpffs EXIT
           mkdir -p .artifacts/probe
           tools/probe/build_connect_guard.sh \
             "$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o"
