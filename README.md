@@ -97,10 +97,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   checks exact column types/defaults, constraint definitions, index shape and
 >   privileges. The completed-probe SSE/dashboard projection is secret-free.
 >   This is not a
->   production source-probe runner. ADR 0004 remains Proposed: a narrow root
->   broker and system-manager transient unit still need to integrate the now
->   implemented and privileged amd64/arm64-CI-green exact cgroup `IP:port`
->   guard with attach/readback/run canaries;
+>   production source-probe runner. ADR 0004 remains Proposed: the reviewed
+>   direct system-manager transient-unit primitive is now green on systemd 255
+>   and 259 and in privileged amd64/arm64 CI, but a narrow root broker still
+>   needs to integrate it with the already green exact cgroup `IP:port` guard
+>   and its attach/readback/run canaries;
 >   no-redirect ffprobe build and privileged amd64/arm64 evidence are still
 >   mandatory. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
@@ -117,6 +118,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   the root broker service and probe execution remain disabled. See the
 >   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md)
 >   and [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md).
+>   The direct transient-unit contract is independently reviewed and green in
+>   all seven jobs of
+>   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254),
+>   including its privileged amd64 and arm64 tests; see the
+>   [systemd contract](docs/evidence/phase-g-probe-systemd-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).

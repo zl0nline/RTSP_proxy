@@ -1296,6 +1296,13 @@ impact is measured.
   transport tests, green in
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
   broker service and executor still disabled);
+- [x] direct system-manager transient-unit primitive with a fixed property
+  allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
+  immutable input plus release gate, 64 KiB output cap and exact collection
+  (direct Linux systemd 259 and independently reviewed; privileged systemd 255
+  amd64/arm64 tests green in
+  [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
+  root broker, BPF transaction and real ffprobe execution still disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;

@@ -104,14 +104,16 @@ credential-bearing nested URL.
 
 Before any source executor is enabled, the project still requires:
 
-1. a narrow root-owned authenticated broker that constructs a fixed
-   system-manager transient service rather than exposing `manage-units`;
+1. a narrow root-owned authenticated broker that invokes the now validated
+   fixed system-manager transient-service primitive rather than exposing
+   `manage-units`;
 2. a root-attached cgroup `connect4`/`connect6` guard proving the exact admitted
    IP and port before credentials/run release;
 3. a controlled, provenance-retained ffprobe build that refuses RTSP redirects,
    forces quiet output and returns only a size-bounded allowlisted result;
-4. pipe or sealed-memfd secret transport plus `/proc`, journal, cancellation,
-   cleanup and resource-exhaustion tests; and
+4. integration of the reviewed sealed-memfd, AF_UNIX/SCM_RIGHTS and direct
+   transient-unit primitives with `/proc`, journal, cancellation, cleanup and
+   resource-exhaustion tests; and
 5. the complete privileged native matrix on amd64 and arm64, followed by the
    100-camera-per-node, multi-node, WAN/fault and 24-hour capacity evidence.
 
