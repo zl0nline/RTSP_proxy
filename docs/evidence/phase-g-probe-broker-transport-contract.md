@@ -1,8 +1,8 @@
 # Phase G probe-broker transport contract
 
 - Date: 2026-08-30
-- Status: implementation, direct-Linux amd64 contract and independent Spec/
-  Standards review green; native amd64/arm64 CI pending
+- Status: implementation, direct-Linux amd64 contract, independent Spec/
+  Standards review and native amd64/arm64 CI green
 - Production decision: NO-GO
 
 ## Scope
@@ -37,6 +37,12 @@ request deadlines, one absolute sender/receiver I/O deadline,
 slow-drip and expires-during-read rejection, interruption during descriptor
 registration and result handoff, grouped ownership failures, and `/proc/self/fd`
 leak checks. The temporary test tree was removed afterward.
+
+[CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698)
+completed successfully at commit `ebdd15dc9e826812c40a9f65466cfbfd68f119c6`:
+all seven jobs passed, and both Linux architecture jobs ran the public transport
+tests as part of `1108 passed, 21 skipped` with 90.03% total coverage. This is
+evidence for the transport primitive only; it is not broker/executor evidence.
 
 ## Deliberately excluded
 

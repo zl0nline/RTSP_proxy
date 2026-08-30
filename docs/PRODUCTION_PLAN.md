@@ -1292,8 +1292,10 @@ impact is measured.
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
   receiver ownership-safe cleanup (direct-Linux amd64 and independent Spec/
-  Standards review green; native amd64/arm64 CI pending; broker service and
-  executor still disabled);
+  Standards review green; all seven jobs, including the amd64/arm64 full-suite
+  transport tests, green in
+  [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
+  broker service and executor still disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;

@@ -110,10 +110,11 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424).
 >   The canonical sealed-memfd input primitive is also reviewed and native
 >   amd64/arm64 green in
->   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877),
->   A separate AF_UNIX/`SCM_RIGHTS` transport primitive is direct-Linux amd64
->   and independent-review green, with native amd64/arm64 CI still pending; the
->   root broker service and probe execution remain disabled. See the
+>   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877).
+>   The separate AF_UNIX/`SCM_RIGHTS` transport primitive is direct-Linux amd64,
+>   independent-review and native amd64/arm64 CI green in
+>   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
+>   the root broker service and probe execution remain disabled. See the
 >   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md)
 >   and [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
