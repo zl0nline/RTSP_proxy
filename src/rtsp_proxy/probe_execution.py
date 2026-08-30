@@ -138,6 +138,28 @@ class _StartupRecovery(Protocol):
         """Remove receipt-owned guards only after every unit is gone."""
 
 
+class _UnitStartupReconciler(Protocol):
+    def reconcile_owned(self, *, timeout_seconds: float) -> int: ...
+
+
+class _GuardStartupReconciler(Protocol):
+    def reconcile_startup(self, *, timeout_seconds: float) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeExecutionStartupRecovery:
+    """Bind reserved systemd inventory to receipt-owned guard reconciliation."""
+
+    units: _UnitStartupReconciler
+    guards: _GuardStartupReconciler
+
+    def reconcile_units(self, *, timeout_seconds: float) -> int:
+        return self.units.reconcile_owned(timeout_seconds=timeout_seconds)
+
+    def reconcile_guards(self, *, timeout_seconds: float) -> int:
+        return self.guards.reconcile_startup(timeout_seconds=timeout_seconds)
+
+
 class _ResultDecoder(Protocol):
     def decode(self, payload: bytes) -> ProbeExecutionResult:
         """Return only a bounded, typed, secret-free probe result."""

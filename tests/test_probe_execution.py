@@ -13,7 +13,11 @@ import pytest
 
 from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
 from rtsp_proxy.probe_connect_guard import ProbeConnectGuardLease
-from rtsp_proxy.probe_execution import ProbeExecutionBroker, ProbeExecutionError
+from rtsp_proxy.probe_execution import (
+    ProbeExecutionBroker,
+    ProbeExecutionError,
+    ProbeExecutionStartupRecovery,
+)
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
 from rtsp_proxy.probe_ownership import OwnershipLedger
 from rtsp_proxy.probe_systemd import ProbeTransientDescriptors, ProbeTransientLease
@@ -303,6 +307,28 @@ class _Recovery:
         if self.error is not None:
             raise self.error
         return self.guard_unresolved
+
+
+class _UnitStartupReconciler:
+    def __init__(self, events: list[str], remaining: int) -> None:
+        self.events = events
+        self.remaining = remaining
+
+    def reconcile_owned(self, *, timeout_seconds: float) -> int:
+        assert timeout_seconds > 0
+        self.events.append("units")
+        return self.remaining
+
+
+class _GuardStartupReconciler:
+    def __init__(self, events: list[str], remaining: int) -> None:
+        self.events = events
+        self.remaining = remaining
+
+    def reconcile_startup(self, *, timeout_seconds: float) -> int:
+        assert timeout_seconds > 0
+        self.events.append("guards")
+        return self.remaining
 
 
 def _received_request() -> ReceivedProbeInput:
@@ -739,6 +765,18 @@ def test_probe_execution_requires_successful_unit_before_guard_startup_recovery(
 
     assert events == []
     received.close()
+
+
+def test_probe_execution_startup_adapter_keeps_unit_before_guard_order() -> None:
+    events: list[str] = []
+    recovery = ProbeExecutionStartupRecovery(
+        units=_UnitStartupReconciler(events, 0),
+        guards=_GuardStartupReconciler(events, 0),
+    )
+
+    assert recovery.reconcile_units(timeout_seconds=1.0) == 0
+    assert recovery.reconcile_guards(timeout_seconds=1.0) == 0
+    assert events == ["units", "guards"]
 
 
 def test_probe_execution_stays_disabled_while_startup_recovery_is_unresolved() -> None:

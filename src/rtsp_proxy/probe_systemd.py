@@ -177,6 +177,10 @@ class ProbeSystemdTransport(Protocol):
 
     def recover(self, unit_name: str, *, timeout_seconds: float) -> None: ...
 
+    def reconcile_owned(self, *, timeout_seconds: float) -> int:
+        """Collect one bounded batch from the reserved transient namespace."""
+        ...
+
 
 class SystemdProbeManager:
     """Translate the fixed policy into one bounded StartTransientUnit call."""

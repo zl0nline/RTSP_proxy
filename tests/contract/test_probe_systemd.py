@@ -269,3 +269,12 @@ def test_system_manager_cancels_and_collects_a_running_unit() -> None:
         fixture.manager.cancel(fixture.lease)
 
         assert time.monotonic() - started_at < 6
+
+
+def test_system_manager_reconciles_a_unit_left_by_a_previous_manager() -> None:
+    with _running_fixture("/probe-systemd-reconcile") as fixture:
+        _wait_for_properties(fixture.unit_name)
+        restarted = DbusNextSystemdTransport()
+
+        assert restarted.reconcile_owned(timeout_seconds=5.0) == 0
+        _wait_until_collected(fixture.unit_name)

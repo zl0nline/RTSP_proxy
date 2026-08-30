@@ -38,11 +38,14 @@ class _RecordingTransport(ProbeSystemdTransport):
         reply: ProbeSystemdReply | BaseException,
         *,
         recovery: BaseException | None = None,
+        reconcile_remaining: int = 0,
     ) -> None:
         self._reply = reply
         self.recovery = recovery
+        self.reconcile_remaining = reconcile_remaining
         self.calls: list[tuple[ProbeSystemdCall, float]] = []
         self.recoveries: list[tuple[str, float]] = []
+        self.reconciliations: list[float] = []
 
     def call(self, request: ProbeSystemdCall, *, timeout_seconds: float) -> ProbeSystemdReply:
         self.calls.append((request, timeout_seconds))
@@ -54,6 +57,10 @@ class _RecordingTransport(ProbeSystemdTransport):
         self.recoveries.append((unit_name, timeout_seconds))
         if self.recovery is not None:
             raise self.recovery
+
+    def reconcile_owned(self, *, timeout_seconds: float) -> int:
+        self.reconciliations.append(timeout_seconds)
+        return self.reconcile_remaining
 
 
 class _LeaseLedger:
