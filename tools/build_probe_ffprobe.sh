@@ -36,6 +36,10 @@ patch_sha256=$(jq --raw-output '.probe_ffprobe.patch_sha256' "$catalog")
 compiler=$(jq --raw-output '.probe_ffprobe.compiler' "$catalog")
 compiler_major=$(jq --raw-output '.probe_ffprobe.compiler_major' "$catalog")
 expected_version=$(jq --raw-output '.probe_ffprobe.version' "$catalog")
+expected_binary_sha256=$(
+    jq --exit-status --raw-output --arg arch "$architecture" \
+        '.probe_ffprobe.architectures[$arch].binary_sha256' "$catalog"
+)
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -54,6 +58,28 @@ if [ "$compiler" != "gcc" ]; then
     echo "unsupported probe ffprobe compiler: $compiler" >&2
     exit 1
 fi
+if ! command -v dpkg-query >/dev/null 2>&1; then
+    echo "probe ffprobe requires the catalog-pinned Ubuntu build environment" >&2
+    exit 1
+fi
+packages_file=$(mktemp)
+trap 'rm -f -- "$packages_file"' EXIT HUP INT TERM
+jq --raw-output \
+    '.probe_ffprobe.build_environment.packages | to_entries[] | [.key, .value] | @tsv' \
+    "$catalog" > "$packages_file"
+tab=$(printf '\t')
+while IFS="$tab" read -r package expected_package_version; do
+    actual_package_version=$(
+        dpkg-query --show --showformat='${Version}' "$package" 2>/dev/null
+    ) || {
+        echo "probe ffprobe build package is missing: $package" >&2
+        exit 1
+    }
+    if [ "$actual_package_version" != "$expected_package_version" ]; then
+        echo "probe ffprobe requires $package=$expected_package_version" >&2
+        exit 1
+    fi
+done < "$packages_file"
 actual_compiler_major=$(gcc -dumpfullversion | awk -F. '{print $1}')
 if [ "$actual_compiler_major" != "$compiler_major" ]; then
     echo "probe ffprobe requires gcc major $compiler_major" >&2
@@ -61,7 +87,7 @@ if [ "$actual_compiler_major" != "$compiler_major" ]; then
 fi
 
 build_root=$(mktemp -d)
-trap 'rm -rf -- "$build_root"' EXIT HUP INT TERM
+trap 'rm -rf -- "$build_root"; rm -f -- "$packages_file"' EXIT HUP INT TERM
 source_root="$build_root/ffmpeg"
 object_root="$build_root/build"
 flags_file="$build_root/configure-flags"
@@ -99,4 +125,9 @@ if [ "$actual_version" != "$expected_version" ]; then
     exit 1
 fi
 install -m 0755 "$object_root/ffprobe" "$output"
-printf '%s  %s\n' "$(sha256_of "$output")" "$output"
+actual_binary_sha256=$(sha256_of "$output")
+if [ "$actual_binary_sha256" != "$expected_binary_sha256" ]; then
+    echo "probe ffprobe binary SHA-256 mismatch" >&2
+    exit 1
+fi
+printf '%s  %s\n' "$actual_binary_sha256" "$output"

@@ -25,13 +25,23 @@
     }
   },
   "probe_ffprobe": {
-    "status": "source-only",
+    "status": "digest-pinned-native-candidate",
     "version": "9b6c896-rtsp-proxy.1",
     "source_repository": "https://github.com/FFmpeg/FFmpeg",
     "source_commit": "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b",
     "source_date_epoch": 1785458830,
     "compiler": "gcc",
     "compiler_major": 13,
+    "build_environment": {
+      "ubuntu_snapshot": "https://snapshot.ubuntu.com/ubuntu/20260829T120000Z/",
+      "packages": {
+        "binutils": "2.42-4ubuntu2.10",
+        "gcc": "4:13.2.0-7ubuntu1",
+        "gcc-13": "13.3.0-6ubuntu2~24.04.1",
+        "libc6-dev": "2.39-0ubuntu8.8",
+        "make": "4.3-4.1build2"
+      }
+    },
     "patch": "patches/ffmpeg-n8.1.2-34-g9b6c8969e0/0001-refuse-rtsp-redirects.patch",
     "patch_sha256": "66b3baf962f76e67ac90d863d55fbc404d2cd805a534463614aa79322b554dcf",
     "configure_flags": [
@@ -53,8 +63,15 @@
       "--extra-cflags=-O2 -fno-ident",
       "--extra-ldflags=-Wl,--build-id=none"
     ],
-    "provenance": "controlled source build candidate; architecture digests and native matrix pending",
-    "architectures": {}
+    "provenance": "controlled native source-build candidate with exact Ubuntu snapshot, toolchain package versions and architecture digests; release admission and executor integration pending",
+    "architectures": {
+      "amd64": {
+        "binary_sha256": "88352366809808ab26eadf2e3511ad762af548ca23a879501052b58361c15ea6"
+      },
+      "arm64": {
+        "binary_sha256": "ae21669da8f09d9401c35e7a3b9943846b7f56576c645c984c44a8b439a67589"
+      }
+    }
   },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260731",

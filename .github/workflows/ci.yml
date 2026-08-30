@@ -242,6 +242,31 @@ jobs:
       - name: Install locked Python dependencies
         run: uv sync --locked --all-groups
 
+      - name: Install pinned probe ffprobe build environment
+        run: |
+          snapshot=$(jq --raw-output \
+            '.probe_ffprobe.build_environment.ubuntu_snapshot' \
+            deploy/artifact-catalog.json)
+          sudo rm -f /etc/apt/sources.list
+          sudo find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
+            -type f -delete
+          sudo tee /etc/apt/sources.list.d/rtsp-proxy-snapshot.sources \
+            >/dev/null <<EOF
+          Types: deb
+          URIs: ${snapshot}
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get update
+          mapfile -t pinned_packages < <(
+            jq --raw-output \
+              '.probe_ffprobe.build_environment.packages | to_entries[] | .key + "=" + .value' \
+              deploy/artifact-catalog.json
+          )
+          sudo apt-get install --yes --allow-downgrades --no-install-recommends \
+            "${pinned_packages[@]}"
+
       - name: Build controlled no-redirect ffprobe (${{ matrix.arch }})
         run: |
           test "$(gcc -dumpfullversion | awk -F. '{print $1}')" = \
@@ -250,6 +275,13 @@ jobs:
           tools/build_probe_ffprobe.sh \
             "${{ matrix.arch }}" \
             .artifacts/probe-ffprobe/ffprobe
+          tools/build_probe_ffprobe.sh \
+            "${{ matrix.arch }}" \
+            .artifacts/probe-ffprobe/ffprobe.repeat
+          cmp --silent \
+            .artifacts/probe-ffprobe/ffprobe \
+            .artifacts/probe-ffprobe/ffprobe.repeat
+          rm -- .artifacts/probe-ffprobe/ffprobe.repeat
 
       - name: Verify controlled RTSP redirect refusal
         env:
