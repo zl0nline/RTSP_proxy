@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
+from rtsp_proxy.probe_broker import ProbeBrokerError, ProbeBrokerRequest, ReceivedProbeInput
 from rtsp_proxy.probe_connect_guard import ProbeConnectGuardLease
 from rtsp_proxy.probe_execution import (
     ProbeExecutionBroker,
@@ -588,7 +588,8 @@ def test_probe_execution_rejects_untrusted_wall_clock_or_deadline_window(
     with pytest.raises(ProbeExecutionError, match=reason):
         _broker([], wall_clock_ms=wall_clock).execute(received, timeout_seconds=5.0)
 
-    received.close()
+    with pytest.raises(ProbeBrokerError, match="probe_broker_descriptor_closed"):
+        _ = received.descriptor
 
 
 @pytest.mark.parametrize(
@@ -850,7 +851,7 @@ def test_startup_recovery_refuses_to_race_an_active_execution() -> None:
     assert not execution.is_alive()
 
 
-def test_only_one_cleanup_sweep_can_claim_a_pending_execution() -> None:
+def test_inflight_owned_cleanup_is_not_reported_as_unresolved_residue() -> None:
     events: list[str] = []
     systemd = _Systemd(
         events,
@@ -875,7 +876,7 @@ def test_only_one_cleanup_sweep_can_claim_a_pending_execution() -> None:
     sweep.start()
     assert cancel_started.wait(timeout=5.0)
 
-    assert broker.retry_pending_cleanup(timeout_seconds=1.0) == 1
+    assert broker.retry_pending_cleanup(timeout_seconds=1.0) == 0
     assert events.count("systemd.cancel") == 2
 
     cancel_release.set()

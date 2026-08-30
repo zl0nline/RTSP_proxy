@@ -63,10 +63,11 @@ clean-wheel launcher and passed the independent 90% coverage gate at 90.08%.
 
 ## Deliberately excluded
 
-There is still no installed root-owned broker socket/service and no production
-probe executor. The controlled no-redirect artifact, fixed quiet launcher and
-strict decoded-frame result contract now exist separately. The broker must
-authenticate the AF_UNIX peer, revalidate the site/CIDR policy, attach and read
-back both cgroup BPF hooks before releasing the gate, and prove their integrated
-end-to-end cancellation, restart and residue cleanup. ADR 0004 therefore remains
-Proposed, Phase G stays IN PROGRESS and Production remains NO-GO.
+An installed root-owned socket/service and production-shaped executor now exist
+as an unpromoted integrated candidate. The controlled no-redirect artifact,
+fixed quiet launcher and strict decoded-frame result contract remain separately
+proven; native amd64/arm64 CI must still prove that the broker authenticates its
+AF_UNIX peer, revalidates site/CIDR policy, attaches and reads back both cgroup
+BPF hooks before releasing the gate, and performs end-to-end cancellation,
+restart and residue cleanup. ADR 0004 therefore remains Proposed, Phase G stays
+IN PROGRESS and Production remains NO-GO.

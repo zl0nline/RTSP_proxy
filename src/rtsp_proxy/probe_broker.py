@@ -4,12 +4,14 @@ import array
 import json
 import math
 import os
+import select
 import socket
 import struct
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
 from types import TracebackType
 from uuid import UUID
@@ -18,14 +20,17 @@ from rtsp_proxy.probe_executor import (
     ProbeConnectGuardTarget,
     inspect_sealed_probe_input,
 )
+from rtsp_proxy.probes import ProbeExecutionResult, ProbeFailureClass, ProbeOutcome
 
 PROBE_BROKER_SCHEMA_VERSION = 1
 PROBE_BROKER_MAX_REQUEST_BYTES = 1_024
+PROBE_BROKER_MAX_RESPONSE_BYTES = 512
 PROBE_BROKER_MAX_DEADLINE_MS = 60_000
 _FRAME_HEADER = struct.Struct("!I")
 _PEER_CREDENTIALS = struct.Struct("=iII")
 _SO_PEERCRED = 17
 _MSG_CMSG_CLOEXEC = 0x40000000
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _unix_time_ms() -> int:
@@ -133,6 +138,136 @@ class ProbeBrokerRequest:
         return decoded
 
 
+@dataclass(frozen=True, slots=True)
+class ProbeBrokerResponse:
+    """One request-bound, normalized result returned by the root broker."""
+
+    request_id: UUID
+    endpoint_generation: UUID
+    result: ProbeExecutionResult
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.request_id, UUID)
+            or self.request_id.version != 4
+            or not isinstance(self.endpoint_generation, UUID)
+            or self.endpoint_generation.version != 4
+            or not isinstance(self.result, ProbeExecutionResult)
+        ):
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        _ = self._completed_at_unix_us()
+
+    def encode(self) -> bytes:
+        encoded = json.dumps(
+            {
+                "audio_codec": self.result.audio_codec,
+                "completed_at_unix_us": self._completed_at_unix_us(),
+                "endpoint_generation": str(self.endpoint_generation),
+                "failure_class": (
+                    None
+                    if self.result.failure_class is None
+                    else self.result.failure_class.value
+                ),
+                "outcome": self.result.outcome.value,
+                "request_id": str(self.request_id),
+                "schema_version": PROBE_BROKER_SCHEMA_VERSION,
+                "video_codec": self.result.video_codec,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        if len(encoded) > PROBE_BROKER_MAX_RESPONSE_BYTES:
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        return encoded
+
+    @classmethod
+    def decode(cls, payload: bytes) -> ProbeBrokerResponse:
+        if (
+            not isinstance(payload, bytes)
+            or not 1 <= len(payload) <= PROBE_BROKER_MAX_RESPONSE_BYTES
+        ):
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        try:
+            raw = json.loads(payload)
+        except (UnicodeError, ValueError):
+            raise ProbeBrokerError("probe_broker_response_invalid") from None
+        expected_keys = {
+            "audio_codec",
+            "completed_at_unix_us",
+            "endpoint_generation",
+            "failure_class",
+            "outcome",
+            "request_id",
+            "schema_version",
+            "video_codec",
+        }
+        if not isinstance(raw, dict) or set(raw) != expected_keys:
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        if (
+            type(raw["schema_version"]) is not int
+            or raw["schema_version"] != PROBE_BROKER_SCHEMA_VERSION
+            or type(raw["completed_at_unix_us"]) is not int
+            or not isinstance(raw["request_id"], str)
+            or not isinstance(raw["endpoint_generation"], str)
+            or not isinstance(raw["outcome"], str)
+            or (
+                raw["failure_class"] is not None
+                and not isinstance(raw["failure_class"], str)
+            )
+            or any(
+                codec is not None and not isinstance(codec, str)
+                for codec in (raw["video_codec"], raw["audio_codec"])
+            )
+        ):
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        try:
+            request_id = UUID(raw["request_id"])
+            endpoint_generation = UUID(raw["endpoint_generation"])
+            completed_at = _UNIX_EPOCH + timedelta(
+                microseconds=raw["completed_at_unix_us"]
+            )
+            result = ProbeExecutionResult(
+                outcome=ProbeOutcome(raw["outcome"]),
+                completed_at=completed_at,
+                failure_class=(
+                    None
+                    if raw["failure_class"] is None
+                    else ProbeFailureClass(raw["failure_class"])
+                ),
+                video_codec=raw["video_codec"],
+                audio_codec=raw["audio_codec"],
+            )
+            decoded = cls(
+                request_id=request_id,
+                endpoint_generation=endpoint_generation,
+                result=result,
+            )
+        except (OverflowError, RuntimeError, ValueError):
+            raise ProbeBrokerError("probe_broker_response_invalid") from None
+        if (
+            raw["request_id"] != str(request_id)
+            or raw["endpoint_generation"] != str(endpoint_generation)
+            or decoded.encode() != payload
+        ):
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        return decoded
+
+    def _completed_at_unix_us(self) -> int:
+        completed_at = self.result.completed_at
+        try:
+            normalized = completed_at.astimezone(UTC)
+            delta = normalized - _UNIX_EPOCH
+            completed_at_unix_us = (
+                (delta.days * 86_400 + delta.seconds) * 1_000_000
+                + delta.microseconds
+            )
+        except (OverflowError, TypeError, ValueError):
+            raise ProbeBrokerError("probe_broker_response_invalid") from None
+        if completed_at_unix_us < 1:
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        return completed_at_unix_us
+
+
 @dataclass(slots=True)
 class ReceivedProbeInput:
     """One authenticated request and its owned secret descriptor."""
@@ -224,6 +359,122 @@ def send_probe_broker_request(
         raise primary_error from None
     if cleanup_error is not None:
         raise cleanup_error from None
+
+
+def send_probe_broker_response(
+    connection: socket.socket,
+    response: ProbeBrokerResponse,
+    *,
+    timeout_seconds: float,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Send one bounded normalized response without ancillary descriptors."""
+
+    _require_unix_stream(connection)
+    _require_timeout(timeout_seconds)
+    if not isinstance(response, ProbeBrokerResponse):
+        raise ProbeBrokerError("probe_broker_response_invalid")
+    encoded = response.encode()
+    frame = _FRAME_HEADER.pack(len(encoded)) + encoded
+    try:
+        io_deadline = _start_io_deadline(
+            timeout_seconds=timeout_seconds,
+            monotonic=monotonic,
+        )
+        _set_remaining_timeout(
+            connection,
+            io_deadline=io_deadline,
+            monotonic=monotonic,
+        )
+        connection.sendall(frame)
+    except (OSError, TimeoutError):
+        raise ProbeBrokerError("probe_broker_unavailable") from None
+
+
+def receive_probe_broker_response(
+    connection: socket.socket,
+    *,
+    expected_request: ProbeBrokerRequest,
+    timeout_seconds: float,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> ProbeExecutionResult:
+    """Receive one request-bound result and reject any descriptor smuggling."""
+
+    _require_unix_stream(connection)
+    _require_response_wait_timeout(timeout_seconds)
+    if not isinstance(expected_request, ProbeBrokerRequest):
+        raise ProbeBrokerError("probe_broker_request_invalid")
+    response_deadline = _start_io_deadline(
+        timeout_seconds=timeout_seconds,
+        monotonic=monotonic,
+    )
+    remaining = _wait_until_readable(
+        connection,
+        io_deadline=response_deadline,
+        monotonic=monotonic,
+    )
+    io_deadline = _start_io_deadline(
+        timeout_seconds=min(5.0, remaining),
+        monotonic=monotonic,
+    )
+    descriptors: list[int] = []
+    try:
+        try:
+            header = _recv_exact(
+                connection,
+                _FRAME_HEADER.size,
+                descriptors,
+                io_deadline=io_deadline,
+                monotonic=monotonic,
+            )
+        except ProbeBrokerError as error:
+            if str(error) == "probe_broker_request_truncated":
+                raise ProbeBrokerError("probe_broker_response_truncated") from None
+            raise
+        (payload_size,) = _FRAME_HEADER.unpack(header)
+        if not 1 <= payload_size <= PROBE_BROKER_MAX_RESPONSE_BYTES:
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        try:
+            payload = _recv_exact(
+                connection,
+                payload_size,
+                descriptors,
+                io_deadline=io_deadline,
+                monotonic=monotonic,
+            )
+        except ProbeBrokerError as error:
+            if str(error) == "probe_broker_request_truncated":
+                raise ProbeBrokerError("probe_broker_response_truncated") from None
+            raise
+        if descriptors:
+            raise ProbeBrokerError("probe_broker_response_invalid")
+        response = ProbeBrokerResponse.decode(payload)
+        if (
+            response.request_id != expected_request.request_id
+            or response.endpoint_generation != expected_request.endpoint_generation
+        ):
+            raise ProbeBrokerError("probe_broker_response_mismatch")
+        try:
+            response_completed_at_us = response._completed_at_unix_us()
+            deadline_us = expected_request.deadline_unix_ms * 1_000
+        except (ArithmeticError, OverflowError):
+            raise ProbeBrokerError("probe_broker_response_invalid") from None
+        if response_completed_at_us > deadline_us:
+            raise ProbeBrokerError("probe_broker_response_mismatch")
+        return response.result
+    except BaseException as primary_error:
+        cleanup_errors: list[BaseException] = []
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "probe broker response and descriptor cleanup failed",
+                [primary_error, *cleanup_errors],
+            ) from None
+        raise
 
 
 def _send_probe_broker_request(
@@ -381,6 +632,16 @@ def _require_timeout(timeout_seconds: float) -> None:
         raise ProbeBrokerError("probe_broker_policy_invalid")
 
 
+def _require_response_wait_timeout(timeout_seconds: float) -> None:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or not 0.01 <= timeout_seconds <= PROBE_BROKER_MAX_DEADLINE_MS / 1_000
+    ):
+        raise ProbeBrokerError("probe_broker_policy_invalid")
+
+
 def _read_wall_clock_ms(wall_clock_ms: Callable[[], int]) -> int:
     try:
         observed = wall_clock_ms()
@@ -432,6 +693,47 @@ def _set_remaining_timeout(
         connection.settimeout(remaining)
     except (OSError, ValueError):
         raise ProbeBrokerError("probe_broker_unavailable") from None
+
+
+def _wait_until_readable(
+    connection: socket.socket,
+    *,
+    io_deadline: float,
+    monotonic: Callable[[], float],
+) -> float:
+    try:
+        observed = monotonic()
+        remaining = io_deadline - observed
+    except (ArithmeticError, OSError, TypeError, ValueError):
+        raise ProbeBrokerError("probe_broker_unavailable") from None
+    if (
+        isinstance(observed, bool)
+        or not isinstance(observed, (int, float))
+        or not math.isfinite(observed)
+        or not math.isfinite(remaining)
+        or remaining <= 0
+    ):
+        raise ProbeBrokerError("probe_broker_unavailable")
+    try:
+        readable, _, _ = select.select((connection,), (), (), remaining)
+    except (OSError, ValueError):
+        raise ProbeBrokerError("probe_broker_unavailable") from None
+    if readable != [connection]:
+        raise ProbeBrokerError("probe_broker_unavailable")
+    try:
+        observed_after_wait = monotonic()
+        remaining_after_wait = io_deadline - observed_after_wait
+    except (ArithmeticError, OSError, TypeError, ValueError):
+        raise ProbeBrokerError("probe_broker_unavailable") from None
+    if (
+        isinstance(observed_after_wait, bool)
+        or not isinstance(observed_after_wait, (int, float))
+        or not math.isfinite(observed_after_wait)
+        or not math.isfinite(remaining_after_wait)
+        or remaining_after_wait <= 0
+    ):
+        raise ProbeBrokerError("probe_broker_unavailable")
+    return remaining_after_wait
 
 
 def _require_peer(connection: socket.socket, *, expected_uid: int, expected_gid: int) -> None:

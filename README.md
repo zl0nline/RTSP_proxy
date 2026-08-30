@@ -99,9 +99,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   This is not a
 >   production source-probe runner. ADR 0004 remains Proposed: the reviewed
 >   direct system-manager transient-unit primitive is now green on systemd 255
->   and 259 and in privileged amd64/arm64 CI, but a narrow root broker still
->   needs to integrate it with the already green exact cgroup `IP:port` guard
->   and its attach/readback/run canaries;
+>   and 259 and in privileged amd64/arm64 CI. A narrow root-broker candidate now
+>   integrates it with the already green exact cgroup `IP:port` guard and its
+>   attach/readback/run canaries, but that full transaction is not yet CI-green;
 >   the exact-source no-redirect ffprobe is now reproducible, digest-pinned and
 >   release-admitted on amd64/arm64. Its fixed quiet launcher and strict
 >   decoded-frame result contract are independently reviewed and native
@@ -119,7 +119,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   The separate AF_UNIX/`SCM_RIGHTS` transport primitive is direct-Linux amd64,
 >   independent-review and native amd64/arm64 CI green in
 >   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
->   the root broker service and probe execution remain disabled. See the
+>   the root broker/executor exists only as an unpromoted integrated candidate;
+>   native amd64/arm64 transaction evidence and production scheduling remain
+>   disabled. See the
 >   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md)
 >   and [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md).
 >   The direct transient-unit contract is independently reviewed and green in

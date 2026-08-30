@@ -1288,7 +1288,8 @@ impact is measured.
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
   independent review and native amd64/arm64
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
-  green; broker service and executor still disabled);
+  green; the integrated broker candidate is now implemented but its native
+  amd64/arm64 transaction gate is still pending);
 - [x] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe as a
   distinct reproducible amd64/arm64 release artifact with immutable digests,
   ordinary RTSP/TCP plus redirect-refusal behavior and clean-wheel release
@@ -1308,17 +1309,20 @@ impact is measured.
   Standards review green; all seven jobs, including the amd64/arm64 full-suite
   transport tests, green in
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
-  broker service and executor still disabled);
+  the socket-activated broker/executor candidate is staged but not yet
+  promoted by integrated native CI);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
   immutable input plus release gate, 64 KiB output cap and exact collection
   (direct Linux systemd 259 and independently reviewed; privileged systemd 255
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
-  root broker and integrated BPF+ffprobe transaction still disabled);
+  the root-broker wiring exists as an unpromoted candidate and the integrated
+  BPF+ffprobe transaction is still pending);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
-- [ ] implement the broker/executor, periodic risk-based producer and durable
-  health-state orchestration;
+- [ ] promote the reviewed broker/executor after integrated native evidence,
+  then implement the periodic risk-based producer and durable health-state
+  orchestration;
 - per-node 100-camera matrix;
 - multi-node server ladder and 24h soak;
 - chaos/failure/email/restore game days;

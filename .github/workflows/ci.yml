@@ -101,6 +101,7 @@ jobs:
           RTSP_PROXY_ROLE=web .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.runtime import create_app_from_environment; assert create_app_from_environment().title == "RTSP Proxy Control Plane"'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.probe_connect_guard import _load_packaged_artifact_catalog; catalog = _load_packaged_artifact_catalog(); assert catalog.current_release_id == "0.1.0"'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_ffprobe_identity; amd64 = trusted_probe_ffprobe_identity("amd64"); arm64 = trusted_probe_ffprobe_identity("arm64"); assert amd64[0] == arm64[0] == "9b6c896-rtsp-proxy.1"; assert amd64[1] != arm64[1]'
+          .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_connect_guard_identity; amd64 = trusted_probe_connect_guard_identity("amd64"); arm64 = trusted_probe_connect_guard_identity("arm64"); assert amd64[0] == arm64[0] == "0.1.0"; assert amd64[1] == arm64[1]'
           launcher_stdout=$(mktemp)
           launcher_stderr=$(mktemp)
           if .artifacts/clean-venv/bin/rtsp-proxy-probe-launcher \
@@ -113,6 +114,18 @@ jobs:
           test "$launcher_status" -eq 70
           test ! -s "$launcher_stdout"
           test ! -s "$launcher_stderr"
+          broker_stdout=$(mktemp)
+          broker_stderr=$(mktemp)
+          if .artifacts/clean-venv/bin/rtsp-proxy-probe-broker \
+              </dev/null >"$broker_stdout" 2>"$broker_stderr"; then
+            echo "probe broker unexpectedly started without root" >&2
+            exit 1
+          else
+            broker_status=$?
+          fi
+          test "$broker_status" -eq 1
+          test ! -s "$broker_stdout"
+          test "$(cat "$broker_stderr")" = "probe_broker_linux_root_required"
 
       - name: Verify packaged migrations against native PostgreSQL
         run: |
@@ -354,7 +367,7 @@ jobs:
 
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})
-    needs: probe-ffprobe-contract
+    needs: [test, probe-ffprobe-contract]
     strategy:
       fail-fast: false
       matrix:
@@ -364,7 +377,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -379,6 +392,26 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
+      - name: Install pinned probe-broker host tool
+        run: |
+          sudo rm -f /etc/apt/sources.list
+          sudo find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
+            -type f -delete
+          sudo tee /etc/apt/sources.list.d/rtsp-proxy-snapshot.sources \
+            >/dev/null <<'EOF'
+          Types: deb
+          URIs: https://snapshot.ubuntu.com/ubuntu/20260829T120000Z/
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get update
+          sudo apt-get install --yes --allow-downgrades --no-install-recommends \
+            linux-tools-generic=6.8.0-138.138
+          test "$(dpkg-query --show --showformat='${Version}' linux-tools-generic)" = \
+            '6.8.0-138.138'
+          test -x /usr/lib/linux-tools-6.8.0-138/bpftool
+
       - name: Install pinned Go toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
@@ -390,6 +423,12 @@ jobs:
         with:
           name: probe-ffprobe-${{ matrix.arch }}
           path: .artifacts/probe-ffprobe
+
+      - name: Download verified probe connect guard (${{ matrix.arch }})
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: probe-connect-guard-${{ matrix.arch }}
+          path: .artifacts/probe-connect-guard
 
       - name: Build pinned patched MediaMTX (${{ matrix.arch }})
         run: |
@@ -428,6 +467,9 @@ jobs:
           install -m 0755 \
             .artifacts/probe-ffprobe/ffprobe \
             .artifacts/release/libexec/rtsp-proxy-probe/ffprobe
+          install -m 0644 \
+            .artifacts/probe-connect-guard/rtsp_probe_connect_guard.bpf.o \
+            .artifacts/release/libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o
           install -m 0644 uv.lock .artifacts/release/uv.lock
           install -m 0644 dist/rtsp_proxy-0.1.0-py3-none-any.whl .artifacts/release/dist/
           lock_sha256=$(sha256sum .artifacts/release/uv.lock | awk '{print $1}')
@@ -458,6 +500,81 @@ jobs:
             dist/rtsp_proxy-0.1.0-py3-none-any.whl
           .artifacts/release-venv/bin/rtsp-proxy-verify-release \
             --manifest .artifacts/release/release-manifest.json
+
+      - name: Verify installed root broker transaction
+        run: |
+          broker_release=/opt/rtsp-proxy/releases/probe-contract
+          broker_uv=$(command -v uv)
+          broker_python=$(uv python find 3.12)
+          broker_bpftool=/usr/lib/linux-tools-6.8.0-138/bpftool
+          mounted_bpffs=0
+          cleanup_broker() {
+            sudo systemctl stop rtsp-proxy-probe-broker.socket \
+              rtsp-proxy-probe-broker.service || true
+            sudo rm -f \
+              /run/systemd/system/rtsp-proxy-probe-broker.socket \
+              /run/systemd/system/rtsp-proxy-probe-broker.service \
+              /etc/rtsp-proxy/probe-broker.env \
+              /opt/rtsp-proxy/current
+            sudo rm -rf \
+              /opt/rtsp-proxy/releases/probe-contract \
+              /sys/fs/bpf/rtsp-proxy-probe-broker
+            sudo systemctl daemon-reload
+            if [[ "$mounted_bpffs" == 1 ]]; then
+              sudo umount /sys/fs/bpf
+            fi
+          }
+          trap cleanup_broker EXIT
+          if ! mountpoint --quiet /sys/fs/bpf; then
+            sudo mount --type bpf bpffs /sys/fs/bpf
+            mounted_bpffs=1
+          fi
+          if ! getent group rtsp-proxy >/dev/null; then
+            sudo groupadd --system rtsp-proxy
+          fi
+          if ! getent passwd rtsp-proxy >/dev/null; then
+            sudo useradd --system --gid rtsp-proxy --no-create-home \
+              --shell /usr/sbin/nologin rtsp-proxy
+          fi
+          sudo install -d -o root -g root -m 0755 \
+            /opt/rtsp-proxy/releases "$broker_release"
+          sudo cp -a .artifacts/release/. "$broker_release/"
+          sudo "$broker_uv" venv --python "$broker_python" "$broker_release/.venv"
+          sudo "$broker_uv" pip sync \
+            --python "$broker_release/.venv/bin/python" \
+            .artifacts/release-requirements.txt
+          sudo "$broker_uv" pip install \
+            --python "$broker_release/.venv/bin/python" \
+            --no-deps "$broker_release/dist/rtsp_proxy-0.1.0-py3-none-any.whl"
+          sudo chown -R root:root "$broker_release"
+          sudo chmod -R go-w "$broker_release"
+          sudo ln -s releases/probe-contract /opt/rtsp-proxy/current
+          sudo install -d -o root -g root -m 0755 /etc/rtsp-proxy
+          sudo install -o root -g root -m 0600 \
+            tests/fixtures/probe-broker.env /etc/rtsp-proxy/probe-broker.env
+          sudo install -d -o root -g root -m 0700 \
+            /sys/fs/bpf/rtsp-proxy-probe-broker
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/rtsp-proxy-probe-broker.socket \
+            /run/systemd/system/rtsp-proxy-probe-broker.socket
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/rtsp-proxy-probe-broker.service \
+            /run/systemd/system/rtsp-proxy-probe-broker.service
+          sudo systemctl daemon-reload
+          sudo systemd-analyze verify \
+            /run/systemd/system/rtsp-proxy-probe-broker.socket \
+            /run/systemd/system/rtsp-proxy-probe-broker.service
+          sudo systemctl start rtsp-proxy-probe-broker.socket
+          sudo env \
+            RTSP_PROXY_RUN_PROBE_BROKER_CONTRACT=1 \
+            RTSP_PROXY_BPFTOOL="$broker_bpftool" \
+            "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
+            tests/contract/test_probe_broker_service.py
+          sudo systemctl is-active --quiet rtsp-proxy-probe-broker.service
+          test -z "$(sudo find /sys/fs/bpf/rtsp-proxy-probe-broker \
+            -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -z "$(sudo find /run/rtsp-proxy-probe-broker/guard-ownership \
+            -mindepth 1 -maxdepth 1 -name '*.json' -print -quit)"
 
       - name: Verify effective listener contract
         env:

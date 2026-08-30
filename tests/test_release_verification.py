@@ -13,6 +13,7 @@ from rtsp_proxy.release import (
     Sha256,
     normalize_linux_arch,
     trusted_mediamtx_activation_identity,
+    trusted_probe_connect_guard_identity,
     trusted_probe_ffprobe_identity,
     verify_release,
 )
@@ -22,6 +23,7 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
     package_root = files("rtsp_proxy")
 
     assert package_root.joinpath("artifacts", "probe_ffprobe.json").is_file()
+    assert package_root.joinpath("artifacts", "probe_connect_guard.json").is_file()
     assert package_root.joinpath("migrations", "env.py").is_file()
     assert package_root.joinpath(
         "migrations",
@@ -133,11 +135,24 @@ def trust_test_probe_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def trust_test_probe_connect_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"test probe connect guard object"
+    monkeypatch.setattr(
+        "rtsp_proxy.release._trusted_probe_connect_guard_identity",
+        lambda _architecture: (
+            "0.1.0",
+            Sha256.model_validate(sha256(payload)),
+        ),
+    )
+
+
 def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
     mediamtx_payload = b"#!/bin/sh\nprintf 'v1.20.0-rtsp-proxy.2\\n'\n"
     ffmpeg_payload = b"#!/bin/sh\nprintf 'ffmpeg version test build\\n'\n"
     ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version test build\\n'\n"
     probe_ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version probe-test\\n'\n"
+    probe_guard_payload = b"test probe connect guard object"
     artifacts = {
         "uv.lock": b"lock",
         "dist/rtsp_proxy-0.1.0-py3-none-any.whl": wheel_payload,
@@ -145,6 +160,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         "bin/ffmpeg": ffmpeg_payload,
         "bin/ffprobe": ffprobe_payload,
         "libexec/rtsp-proxy-probe/ffprobe": probe_ffprobe_payload,
+        "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o": probe_guard_payload,
     }
     for relative_path, payload in artifacts.items():
         path = tmp_path / relative_path
@@ -154,7 +170,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             path.chmod(0o750)
 
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "release_id": "0.5.0",
         "git_commit": "a" * 40,
         "python": {
@@ -184,6 +200,12 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "binary": "libexec/rtsp-proxy-probe/ffprobe",
             "binary_sha256": sha256(probe_ffprobe_payload),
         },
+        "probe_connect_guard": {
+            "release_id": "0.1.0",
+            "linux_arch": "amd64",
+            "object": "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o",
+            "object_sha256": sha256(probe_guard_payload),
+        },
         "schema_compatibility": {
             "minimum": "0012_operator_sessions",
             "maximum": APPLICATION_SCHEMA,
@@ -206,6 +228,9 @@ def test_verified_release_exposes_only_validated_artifact_paths(tmp_path: Path) 
     assert release.ffmpeg_binary == tmp_path / "bin/ffmpeg"
     assert release.ffprobe_binary == tmp_path / "bin/ffprobe"
     assert release.probe_ffprobe_binary == tmp_path / "libexec/rtsp-proxy-probe/ffprobe"
+    assert release.probe_connect_guard_object == (
+        tmp_path / "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o"
+    )
 
 
 def test_controlled_probe_ffprobe_is_bound_to_packaged_trust(tmp_path: Path) -> None:
@@ -230,6 +255,30 @@ def test_packaged_probe_ffprobe_catalog_covers_both_linux_architectures(
 
     assert amd64_version == arm64_version == "9b6c896-rtsp-proxy.1"
     assert amd64_digest != arm64_digest
+
+
+def test_packaged_probe_connect_guard_catalog_covers_both_linux_architectures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    amd64_release, amd64_digest = trusted_probe_connect_guard_identity("amd64")
+    arm64_release, arm64_digest = trusted_probe_connect_guard_identity("arm64")
+
+    assert amd64_release == arm64_release == "0.1.0"
+    assert amd64_digest == arm64_digest
+
+
+def test_connect_guard_object_is_bound_to_packaged_trust(tmp_path: Path) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["probe_connect_guard"]["object_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="untrusted_probe_connect_guard_artifact",
+    ):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
 
 class _FakePackagedResource:
@@ -342,6 +391,18 @@ def test_probe_ffprobe_for_a_different_architecture_is_rejected(tmp_path: Path) 
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ReleaseVerificationError, match="probe_ffprobe_arch_mismatch"):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
+
+
+def test_probe_connect_guard_for_a_different_architecture_is_rejected(
+    tmp_path: Path,
+) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["probe_connect_guard"]["linux_arch"] = "arm64"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="probe_connect_guard_arch_mismatch"):
         verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
 
@@ -473,8 +534,15 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
     ]
 
     assert {manifest.mediamtx.linux_arch for manifest in manifests} == {"amd64", "arm64"}
+    assert {manifest.probe_connect_guard.linux_arch for manifest in manifests} == {
+        "amd64",
+        "arm64",
+    }
     assert {manifest.release_id for manifest in manifests} == {"0.12.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
+    assert {manifest.probe_connect_guard.release_id for manifest in manifests} == {
+        "0.1.0"
+    }
 
 
 def test_previous_application_manifest_is_not_claimed_as_rollback_after_0015(
@@ -498,6 +566,7 @@ def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:
         mediamtx_pin = catalog["mediamtx"]["architectures"][architecture]
         ffmpeg_pin = catalog["ffmpeg"]["architectures"][architecture]
         probe_ffprobe_pin = catalog["probe_ffprobe"]["architectures"][architecture]
+        probe_guard_pin = catalog["probe_connect_guard"]["architectures"][architecture]
 
         assert manifest.mediamtx.version == catalog["mediamtx"]["version"]
         assert manifest.mediamtx.binary_sha256.root == mediamtx_pin["binary_sha256"]
@@ -508,4 +577,12 @@ def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:
         assert (
             manifest.probe_ffprobe.binary_sha256.root
             == probe_ffprobe_pin["binary_sha256"]
+        )
+        assert (
+            manifest.probe_connect_guard.release_id
+            == catalog["probe_connect_guard"]["release_id"]
+        )
+        assert (
+            manifest.probe_connect_guard.object_sha256.root
+            == probe_guard_pin["object_sha256"]
         )

@@ -19,8 +19,10 @@ snapshot/toolchain. The build normalizes source paths, rebuilds twice and
 requires byte-identical output. Architecture-specific SHA-256 digests are
 bound in both `deploy/artifact-catalog.json` and the packaged trust catalog.
 
-Release schema v3 stages the artifact only at
-`libexec/rtsp-proxy-probe/ffprobe`. The installed candidate wheel's own
+Release schema v4 stages the controlled binary at
+`libexec/rtsp-proxy-probe/ffprobe` and the separately verified connect-guard
+object at `libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o`. The
+installed candidate wheel's own
 verifier checks architecture, version, packaged digest, release-manifest
 digest, on-disk checksum and version output. CI run 33325835101 rebuilt and
 exercised the controlled binary on amd64 and arm64, then installed the wheel in
@@ -72,11 +74,11 @@ remaining High/Medium issue in this slice.
 
 ## Deliberately excluded
 
-The root-owned authenticated broker service is still absent and the launcher
-is not reachable from production scheduling. The complete transaction still
-needs to prove, on native amd64 and arm64, that the exact cgroup connect guard
-is attached and read back before gate release, the real staged controlled
-binary returns an allowlisted result, deadlines/cancellation collect the unit,
-and repeated failure/restart leaves no descriptor, unit, cgroup or BPF residue.
-ADR 0004 remains Proposed, Phase G remains IN PROGRESS and Production remains
-NO-GO.
+The root-owned authenticated socket-activated broker and executor are now an
+implemented integrated candidate, but they are not reachable from production
+scheduling and have not yet passed the mandatory native amd64/arm64 transaction
+gate. That gate must prove that the exact cgroup connect guard is attached and
+read back before release, the staged controlled binary returns an allowlisted
+result, deadlines/cancellation collect the unit, and repeated failure/restart
+leaves no descriptor, unit, cgroup or BPF residue. ADR 0004 remains Proposed,
+Phase G remains IN PROGRESS and Production remains NO-GO.

@@ -159,6 +159,57 @@ class _ProbeConnectGuardArtifactCatalog:
         return matches[0]
 
 
+def trusted_probe_connect_guard_release_identity(
+    machine: str,
+) -> tuple[str, str]:
+    """Return the current activation release and object digest for one arch."""
+
+    catalog = _load_packaged_artifact_catalog()
+    architecture = _linux_architecture(machine)
+    matches = tuple(
+        release
+        for release in catalog.releases
+        if release.release_id == catalog.current_release_id
+        and release.architecture == architecture
+        and release.activation_compatible
+    )
+    if len(matches) != 1:
+        raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid")
+    release = matches[0]
+    return release.release_id, release.object_sha256
+
+
+def trusted_probe_connect_guard_artifact_identity(
+    *,
+    bpftool_path: Path,
+    object_path: Path,
+) -> ProbeConnectGuardArtifactIdentity:
+    """Bind the actual host tool and release object to the packaged catalog."""
+
+    catalog = _load_packaged_artifact_catalog()
+    architecture = _linux_architecture(platform.machine())
+    matches = tuple(
+        release
+        for release in catalog.releases
+        if release.release_id == catalog.current_release_id
+        and release.architecture == architecture
+        and release.activation_compatible
+    )
+    if len(matches) != 1:
+        raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid")
+    release = matches[0]
+    try:
+        identity = ProbeConnectGuardArtifactIdentity(
+            bpftool_sha256=_sha256_path(bpftool_path),
+            object_sha256=_sha256_path(object_path),
+            ipv4_program_tag=release.ipv4_program_tag,
+            ipv6_program_tag=release.ipv6_program_tag,
+        )
+        catalog.activation_release(identity, architecture=architecture)
+    except (OSError, ProbeConnectGuardError):
+        raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid") from None
+    return identity
+
 @dataclass(frozen=True, slots=True)
 class ProbeConnectGuardScope:
     """Exact kernel scope owned by one probe request."""

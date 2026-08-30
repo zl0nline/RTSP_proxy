@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+
+pytestmark = [
+    pytest.mark.contract,
+    pytest.mark.skipif(
+        os.environ.get("RTSP_PROXY_RUN_PROBE_BROKER_CONTRACT") != "1",
+        reason="installed root probe broker contract is opt-in",
+    ),
+    pytest.mark.skipif(sys.platform != "linux", reason="Linux root broker contract"),
+]
+
+_BROKER_UNIT = "rtsp-proxy-probe-broker.service"
+_BROKER_CLIENT = Path("tests/fixtures/probe_broker_client.py").resolve()
+_PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
+_OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
+_SECRET_CANARY = "probe-broker-secret-canary"
+
+
+def _service_property(name: str) -> str:
+    observed = subprocess.run(
+        ["systemctl", "show", _BROKER_UNIT, f"--property={name}", "--value"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    return observed.stdout.strip()
+
+
+def _run_client(
+    request_id: UUID,
+    endpoint_generation: UUID,
+    address: str,
+    port: int,
+    *,
+    drop_privileges: bool = True,
+) -> subprocess.Popen[bytes]:
+    interpreter = "/opt/rtsp-proxy/current/.venv/bin/python"
+    arguments = [
+        interpreter,
+        str(_BROKER_CLIENT),
+        str(request_id),
+        str(endpoint_generation),
+        address,
+        str(port),
+    ]
+    if drop_privileges:
+        setpriv = shutil.which("setpriv")
+        if setpriv is None:
+            pytest.fail("setpriv is required for the broker peer contract")
+        arguments = [
+            setpriv,
+            "--reuid=rtsp-proxy",
+            "--regid=rtsp-proxy",
+            "--clear-groups",
+            *arguments,
+        ]
+    return subprocess.Popen(
+        arguments,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+
+
+def _wait_until(predicate: object, *, failure: str, timeout: float = 10) -> None:
+    assert callable(predicate)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    pytest.fail(failure)
+
+
+def _unit_is_collected(unit_name: str) -> bool:
+    observed = subprocess.run(
+        ["systemctl", "show", unit_name, "--property=LoadState", "--value"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    return observed.returncode != 0 or observed.stdout.strip() == "not-found"
+
+
+def _guard_attach_types(bpftool: str, cgroup: Path) -> set[str]:
+    observed = subprocess.run(
+        [bpftool, "-j", "cgroup", "show", str(cgroup)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    decoded = json.loads(observed.stdout)
+    assert isinstance(decoded, list)
+    return {
+        item["attach_type"]
+        for item in decoded
+        if isinstance(item, dict) and isinstance(item.get("attach_type"), str)
+    }
+
+
+def _serve_h264(
+    listener: socket.socket,
+    *,
+    port: int,
+    connected: threading.Event,
+    allow_responses: threading.Event,
+    requests: list[str],
+    errors: list[BaseException],
+) -> None:
+    try:
+        connection, _address = listener.accept()
+        connected.set()
+        assert allow_responses.wait(timeout=10)
+        connection.settimeout(5)
+        pending = b""
+        with connection:
+            while True:
+                while b"\r\n\r\n" not in pending:
+                    part = connection.recv(4_096)
+                    if not part:
+                        return
+                    pending += part
+                request, pending = pending.split(b"\r\n\r\n", 1)
+                lines = request.split(b"\r\n")
+                request_line = lines[0]
+                requests.append(request_line.decode("ascii"))
+                method = request_line.split(b" ", 1)[0]
+                cseq = next(
+                    line.split(b":", 1)[1].strip()
+                    for line in lines
+                    if line.lower().startswith(b"cseq:")
+                )
+                body = b""
+                if method == b"OPTIONS":
+                    headers = b"Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n"
+                elif method == b"DESCRIBE":
+                    body = (
+                        "v=0\r\n"
+                        "o=- 0 0 IN IP4 127.0.0.1\r\n"
+                        "s=probe\r\n"
+                        "t=0 0\r\n"
+                        "a=control:*\r\n"
+                        "m=video 0 RTP/AVP 96\r\n"
+                        "c=IN IP4 127.0.0.1\r\n"
+                        "a=rtpmap:96 H264/90000\r\n"
+                        "a=fmtp:96 packetization-mode=1;"
+                        "sprop-parameter-sets=Z0LQC4xpyAeEQjU=,aM48gA==\r\n"
+                        "a=control:trackID=0\r\n"
+                    ).encode("ascii")
+                    headers = (
+                        b"Content-Type: application/sdp\r\n"
+                        b"Content-Base: rtsp://127.0.0.1:"
+                        + str(port).encode("ascii")
+                        + b"/live/\r\n"
+                    )
+                elif method == b"SETUP":
+                    headers = (
+                        b"Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+                        b"Session: test-session;timeout=60\r\n"
+                    )
+                elif method == b"PLAY":
+                    headers = b"Session: test-session\r\nRange: npt=0.000-\r\n"
+                else:
+                    headers = b"Session: test-session\r\n"
+                connection.sendall(
+                    b"RTSP/1.0 200 OK\r\nCSeq: "
+                    + cseq
+                    + b"\r\nServer: rtsp-proxy-test\r\n"
+                    + headers
+                    + b"Content-Length: "
+                    + str(len(body)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + body
+                )
+                if method == b"PLAY":
+                    payloads = (
+                        bytes.fromhex("6742d00b8c69c807844235"),
+                        bytes.fromhex("68ce3c80"),
+                        bytes.fromhex("65b8000409fffff87a28000827fc"),
+                    )
+                    for sequence, payload in enumerate(payloads, start=1):
+                        rtp = struct.pack(
+                            "!BBHII",
+                            0x80,
+                            (0x80 if sequence == len(payloads) else 0) | 96,
+                            sequence,
+                            3_600,
+                            0x12345678,
+                        ) + payload
+                        connection.sendall(b"$\x00" + struct.pack("!H", len(rtp)) + rtp)
+                        time.sleep(0.04)
+                    time.sleep(0.2)
+                    return
+    except BaseException as error:
+        errors.append(error)
+        connected.set()
+
+
+def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    bpftool = os.environ.get("RTSP_PROXY_BPFTOOL", "")
+    if not Path(bpftool).is_absolute() or not Path(bpftool).is_file():
+        pytest.fail("exact bpftool path is required")
+    current_release = Path("/opt/rtsp-proxy/current")
+    assert current_release.is_symlink()
+    assert current_release.resolve() == Path("/opt/rtsp-proxy/releases/probe-contract")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+    request_id = uuid4()
+    endpoint_generation = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    cgroup = Path("/sys/fs/cgroup/rtsp-probe.slice") / unit_name
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    connected = threading.Event()
+    allow_responses = threading.Event()
+    requests: list[str] = []
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_h264,
+        args=(listener,),
+        kwargs={
+            "port": port,
+            "connected": connected,
+            "allow_responses": allow_responses,
+            "requests": requests,
+            "errors": errors,
+        },
+        daemon=True,
+    )
+    server.start()
+    client = _run_client(request_id, endpoint_generation, "127.0.0.1", port)
+    try:
+        assert connected.wait(timeout=10)
+        assert errors == []
+        _wait_until(cgroup.is_dir, failure="probe cgroup was not created")
+        assert scope.is_dir()
+        assert receipt.is_file()
+        assert _guard_attach_types(bpftool, cgroup) == {
+            "cgroup_inet4_connect",
+            "cgroup_inet6_connect",
+        }
+        allow_responses.set()
+        stdout, stderr = client.communicate(timeout=15)
+    finally:
+        allow_responses.set()
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        listener.close()
+    assert errors == []
+    assert server.is_alive() is False
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": None,
+        "outcome": "healthy",
+        "video_codec": "h264",
+    }
+    assert _service_property("LimitCORE") == "0"
+    assert _service_property("MemoryMax") == str(256 * 1024 * 1024)
+    assert _service_property("MemorySwapMax") == "0"
+    assert _service_property("TasksMax") == "64"
+    assert _service_property("LimitNOFILE") == "256"
+    assert _service_property("CPUQuotaPerSecUSec") == "2s"
+    assert requests == [
+        f"OPTIONS rtsp://127.0.0.1:{port}/live RTSP/1.0",
+        f"DESCRIBE rtsp://127.0.0.1:{port}/live RTSP/1.0",
+        f"SETUP rtsp://127.0.0.1:{port}/live/trackID=0 RTSP/1.0",
+        f"PLAY rtsp://127.0.0.1:{port}/live/ RTSP/1.0",
+    ]
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="probe unit residue remained")
+    _wait_until(lambda: not scope.exists(), failure="probe BPF pin residue remained")
+    assert not receipt.exists()
+    journal = subprocess.run(
+        ["journalctl", "--unit", _BROKER_UNIT, "--no-pager", "--output=cat"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert _SECRET_CANARY not in journal.stdout + journal.stderr
+
+
+def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    for drop_privileges, address in ((False, "127.0.0.1"), (True, "127.0.0.2")):
+        request_id = uuid4()
+        unit_name = f"rtsp-probe-{request_id.hex}.service"
+        client = _run_client(
+            request_id,
+            uuid4(),
+            address,
+            9,
+            drop_privileges=drop_privileges,
+        )
+        stdout, stderr = client.communicate(timeout=5)
+
+        assert client.returncode == 1
+        assert stdout == b""
+        assert stderr == b"probe_broker_client_failed\n"
+        assert _unit_is_collected(unit_name)
+        assert not (_PIN_ROOT / request_id.hex).exists()
+        assert not (_OWNERSHIP_ROOT / f"{request_id.hex}.json").exists()

@@ -372,8 +372,31 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
     assert "Verify native release manifest end to end" in workflow
     assert ".artifacts/release-venv/bin/rtsp-proxy-verify-release" in workflow
     assert "trusted_probe_ffprobe_identity" in workflow
+    assert "trusted_probe_connect_guard_identity" in workflow
     assert "Download controlled probe ffprobe" in workflow
+    assert "Download verified probe connect guard" in workflow
     assert ".artifacts/release/libexec/rtsp-proxy-probe/ffprobe" in workflow
+    assert (
+        ".artifacts/release/libexec/rtsp-proxy-probe/"
+        "rtsp_probe_connect_guard.bpf.o"
+    ) in workflow
+    assert "Verify installed root broker transaction" in workflow
+    assert "tests/contract/test_probe_broker_service.py" in workflow
+
+
+def test_release_and_runtime_connect_guard_catalogs_are_exactly_aligned() -> None:
+    deployment = json.loads(
+        Path("deploy/artifact-catalog.json").read_text(encoding="utf-8")
+    )["probe_connect_guard"]
+    runtime = json.loads(
+        Path("src/rtsp_proxy/artifacts/probe_connect_guard.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    release = runtime["releases"][runtime["current_release_id"]]
+
+    assert deployment["release_id"] == runtime["current_release_id"]
+    assert deployment["architectures"] == release["architectures"]
 
 
 def test_native_ci_enforces_coverage_with_an_independent_exit_gate() -> None:

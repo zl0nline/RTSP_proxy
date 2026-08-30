@@ -46,10 +46,11 @@ evidence for the transport primitive only; it is not broker/executor evidence.
 
 ## Deliberately excluded
 
-There is still no socket-activated root broker service and no probe is executed.
-Filesystem ownership for the production socket, caller-name-to-UID resolution,
-site/CIDR revalidation by the root boundary, system-manager transient-unit
-properties, BPF attach/readback/run gating, descriptor handoff to a DynamicUser
-launcher, no-redirect ffprobe, bounded output and cancellation/residue evidence
-remain mandatory. ADR 0004 therefore stays Proposed, the executor stays disabled
-and Phase G remains IN PROGRESS / Production NO-GO.
+A socket-activated root broker and executor are now implemented as an
+unpromoted integrated candidate. They add filesystem ownership for the socket,
+fixed-name-to-UID peer resolution, root-owned site/CIDR revalidation,
+system-manager transient properties, BPF attach/readback/run gating and bounded
+normalized responses. Native amd64/arm64 CI still has to prove the complete
+descriptor handoff, controlled no-redirect ffprobe execution, cancellation,
+restart and zero-residue transaction before promotion. ADR 0004 therefore stays
+Proposed and Phase G remains IN PROGRESS / Production NO-GO.

@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "release_id": "0.12.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
@@ -28,6 +28,12 @@
     "linux_arch": "amd64",
     "binary": "libexec/rtsp-proxy-probe/ffprobe",
     "binary_sha256": "f4daff8216f93062965b4947982cafe50cf97363c4e7b01c66f455e7a37463f3"
+  },
+  "probe_connect_guard": {
+    "release_id": "0.1.0",
+    "linux_arch": "amd64",
+    "object": "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o",
+    "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece"
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",

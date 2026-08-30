@@ -1,0 +1,55 @@
+[Unit]
+Description=RTSP Proxy privileged isolated source-probe broker
+Requires=rtsp-proxy-probe-broker.socket
+After=rtsp-proxy-probe-broker.socket dbus.service
+RequiresMountsFor=/sys/fs/bpf
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/rtsp-proxy/probe-broker.env
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /run/rtsp-proxy-probe-broker/guard-ownership
+ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-probe-broker
+TimeoutStartSec=40s
+TimeoutStopSec=75s
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=64
+LimitNOFILE=256
+LimitCORE=0
+CPUQuota=200%
+
+RuntimeDirectory=rtsp-proxy-probe-broker
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+ReadWritePaths=/sys/fs/bpf/rtsp-proxy-probe-broker /run/rtsp-proxy-probe-broker
+ReadOnlyPaths=/opt/rtsp-proxy/current
+
+[Install]
+WantedBy=multi-user.target

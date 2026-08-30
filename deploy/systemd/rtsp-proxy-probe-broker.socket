@@ -1,0 +1,14 @@
+[Unit]
+Description=RTSP Proxy isolated source-probe broker socket
+
+[Socket]
+ListenStream=/run/rtsp-proxy-probe-broker/control.sock
+SocketUser=root
+SocketGroup=rtsp-proxy
+SocketMode=0660
+DirectoryMode=0755
+Backlog=128
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

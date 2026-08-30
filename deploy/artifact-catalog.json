@@ -77,6 +77,29 @@
       }
     }
   },
+  "probe_connect_guard": {
+    "status": "digest-pinned-native-candidate",
+    "release_id": "0.1.0",
+    "provenance": "CO-RE cgroup connect4/connect6 object built from the reviewed repository source and admitted with architecture-specific bpftool identities",
+    "architectures": {
+      "amd64": {
+        "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece",
+        "bpftool_sha256": [
+          "92eaf7a8341f2bbb1a61323e2d3882adb74057338c43a8f67c3f7d14a6fe8a93"
+        ],
+        "ipv4_program_tag": "63abbb99bcda9919",
+        "ipv6_program_tag": "9fa3ee2d14abef2a"
+      },
+      "arm64": {
+        "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece",
+        "bpftool_sha256": [
+          "b7f52227fcb546f62d30351ab69f9e651712e37fae09daea9c38f90638265243"
+        ],
+        "ipv4_program_tag": "63abbb99bcda9919",
+        "ipv6_program_tag": "9fa3ee2d14abef2a"
+      }
+    }
+  },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260731",
     "release_tag": "autobuild-2026-07-31-14-10",

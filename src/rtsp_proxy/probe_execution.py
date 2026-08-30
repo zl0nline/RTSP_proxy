@@ -261,14 +261,13 @@ class ProbeExecutionBroker:
             raise ProbeExecutionError("probe_execution_request_invalid")
         timeout = self._validate_timeout(timeout_seconds)
         request = received.request
-        deadline = self._execution_deadline(request, timeout_seconds=timeout)
         ownership = _ExecutionOwnership(received=received)
         ownership.operation_lock.acquire()
         try:
             return self._execute_claimed(
                 request,
                 ownership,
-                deadline=deadline,
+                timeout_seconds=timeout,
             )
         finally:
             try:
@@ -281,7 +280,7 @@ class ProbeExecutionBroker:
         request: ProbeBrokerRequest,
         ownership: _ExecutionOwnership,
         *,
-        deadline: float,
+        timeout_seconds: float,
     ) -> ProbeExecutionResult:
         received = ownership.received
         primary_error: BaseException | None = None
@@ -295,6 +294,10 @@ class ProbeExecutionBroker:
                 if len(self._active) >= _MAX_EXECUTION_RECORDS:
                     raise ProbeExecutionError("probe_execution_capacity_exhausted")
                 self._active[request.request_id] = ownership
+            deadline = self._execution_deadline(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
             self._channels.create_owned(
                 received,
                 publish=ownership.channels.publish,
@@ -337,7 +340,14 @@ class ProbeExecutionBroker:
         with self._active_lock:
             owns_record = self._active.get(request.request_id) is ownership
         if not owns_record:
-            self._raise_failures(primary_error, [])
+            cleanup_errors: list[BaseException] = []
+            if not ownership.received_closed:
+                try:
+                    ownership.received.close()
+                    ownership.received_closed = True
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            self._raise_failures(primary_error, cleanup_errors)
             raise ProbeExecutionError("probe_execution_failed")
         with self._active_lock:
             if self._active.get(request.request_id) is ownership:
@@ -567,7 +577,7 @@ class ProbeExecutionBroker:
     def _unresolved_cleanup_count(self) -> int:
         with self._active_lock:
             return sum(
-                ownership.state != "executing"
+                ownership.state == "cleanup_pending"
                 for ownership in self._active.values()
             )
 

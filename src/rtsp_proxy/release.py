@@ -11,6 +11,11 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
+from rtsp_proxy.probe_connect_guard import (
+    ProbeConnectGuardError,
+    trusted_probe_connect_guard_release_identity,
+)
+
 APPLICATION_SCHEMA = "0020_probe_observations"
 PREVIOUS_APPLICATION_SCHEMA = "0019_dashboard_rate_limits"
 MINIMUM_APPLICATION_SCHEMA = "0012_operator_sessions"
@@ -67,6 +72,15 @@ class ProbeFfprobeArtifact(BaseModel):
     binary_sha256: Sha256
 
 
+class ProbeConnectGuardArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    release_id: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
+    linux_arch: LinuxArch
+    object: str = Field(min_length=1)
+    object_sha256: Sha256
+
+
 class SchemaCompatibility(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -77,13 +91,14 @@ class SchemaCompatibility(BaseModel):
 class ReleaseManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(ge=3, le=3)
+    schema_version: int = Field(ge=4, le=4)
     release_id: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
     git_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     python: PythonArtifact
     mediamtx: MediaMtxArtifact
     ffmpeg: FfmpegArtifact
     probe_ffprobe: ProbeFfprobeArtifact
+    probe_connect_guard: ProbeConnectGuardArtifact
     schema_compatibility: SchemaCompatibility
     config_schema_version: int = Field(ge=1)
 
@@ -97,6 +112,7 @@ class VerifiedRelease:
     ffmpeg_binary: Path
     ffprobe_binary: Path
     probe_ffprobe_binary: Path
+    probe_connect_guard_object: Path
 
 
 class ReleaseVerificationError(ValueError):
@@ -200,6 +216,24 @@ def trusted_probe_ffprobe_identity(machine: str) -> tuple[str, Sha256]:
     return _trusted_probe_ffprobe_identity(normalize_linux_arch(machine))
 
 
+def _trusted_probe_connect_guard_identity(
+    architecture: LinuxArch,
+) -> tuple[str, Sha256]:
+    try:
+        release_id, digest = trusted_probe_connect_guard_release_identity(
+            architecture.value
+        )
+        return release_id, Sha256.model_validate(digest)
+    except (ProbeConnectGuardError, ValidationError):
+        raise ReleaseVerificationError("trusted_artifact_catalog_invalid") from None
+
+
+def trusted_probe_connect_guard_identity(machine: str) -> tuple[str, Sha256]:
+    """Return the connect-guard object identity for one Linux architecture."""
+
+    return _trusted_probe_connect_guard_identity(normalize_linux_arch(machine))
+
+
 def normalize_linux_arch(machine: str) -> LinuxArch:
     canonical = machine.strip().lower()
     aliases = {
@@ -230,6 +264,8 @@ def verify_release(
         raise ReleaseVerificationError("linux_arch_mismatch")
     if manifest.probe_ffprobe.linux_arch != expected_arch:
         raise ReleaseVerificationError("probe_ffprobe_arch_mismatch")
+    if manifest.probe_connect_guard.linux_arch != expected_arch:
+        raise ReleaseVerificationError("probe_connect_guard_arch_mismatch")
     trusted_version, trusted_digest = _trusted_mediamtx_identity(
         manifest.mediamtx.linux_arch,
         manifest.mediamtx.release_id,
@@ -254,6 +290,14 @@ def verify_release(
         or manifest.probe_ffprobe.binary_sha256 != trusted_probe_digest
     ):
         raise ReleaseVerificationError("untrusted_probe_ffprobe_artifact")
+    trusted_guard_release, trusted_guard_digest = _trusted_probe_connect_guard_identity(
+        manifest.probe_connect_guard.linux_arch,
+    )
+    if (
+        manifest.probe_connect_guard.release_id != trusted_guard_release
+        or manifest.probe_connect_guard.object_sha256 != trusted_guard_digest
+    ):
+        raise ReleaseVerificationError("untrusted_probe_connect_guard_artifact")
     if manifest.config_schema_version != CONFIG_SCHEMA_VERSION:
         raise ReleaseVerificationError("config_schema_mismatch")
     if (
@@ -272,6 +316,11 @@ def verify_release(
         manifest.probe_ffprobe.binary,
         "probe_ffprobe.binary",
     )
+    probe_connect_guard = _artifact_path(
+        root,
+        manifest.probe_connect_guard.object,
+        "probe_connect_guard.object",
+    )
 
     _verify_checksum(lock, manifest.python.lock_sha256, "python.lock")
     _verify_checksum(wheel, manifest.python.wheel_sha256, "python.wheel")
@@ -282,6 +331,11 @@ def verify_release(
         probe_ffprobe,
         manifest.probe_ffprobe.binary_sha256,
         "probe_ffprobe.binary",
+    )
+    _verify_checksum(
+        probe_connect_guard,
+        manifest.probe_connect_guard.object_sha256,
+        "probe_connect_guard.object",
     )
 
     _verify_version(mediamtx, ("--version",), manifest.mediamtx.version, "mediamtx.binary")
@@ -302,6 +356,7 @@ def verify_release(
         ffmpeg_binary=ffmpeg,
         ffprobe_binary=ffprobe,
         probe_ffprobe_binary=probe_ffprobe,
+        probe_connect_guard_object=probe_connect_guard,
     )
 
 
