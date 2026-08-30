@@ -183,6 +183,10 @@ class _GuardRecord:
     scope: ProbeConnectGuardScope
     state: str = "installing"
     lease: ProbeConnectGuardLease | None = None
+    ownership: OwnershipLedger[ProbeConnectGuardLease] | None = field(
+        default=None,
+        repr=False,
+    )
     operation_lock: Lock = field(default_factory=Lock, repr=False)
     cleanup_attempt_order: int = 0
 
@@ -1892,6 +1896,8 @@ class ProbeConnectGuardManager:
             if remaining:
                 raise ProbeConnectGuardError("probe_guard_reconcile_required")
         operation_acquired = False
+        published_owned = False
+        publication_uncertain = False
         try:
             record.operation_lock.acquire()
             operation_acquired = True
@@ -1927,19 +1933,26 @@ class ProbeConnectGuardManager:
                     record.state = "active"
                 if ownership is None:
                     return lease
+                record.ownership = ownership
                 try:
                     ownership.publish(lease)
-                except BaseException:
-                    if ownership.owns(lease):
-                        raise
+                except BaseException as publish_error:
+                    try:
+                        published_owned = ownership.owns(lease)
+                    except BaseException as ownership_error:
+                        publication_uncertain = True
+                        raise BaseExceptionGroup(
+                            "probe guard lease publication ownership is uncertain",
+                            [
+                                _sanitize_cleanup_error(publish_error),
+                                _sanitize_cleanup_error(ownership_error),
+                            ],
+                        ) from None
                     raise
+                published_owned = True
                 return None
             except BaseException as primary_error:
-                if (
-                    ownership is not None
-                    and record.lease is not None
-                    and ownership.owns(record.lease)
-                ):
+                if published_owned or publication_uncertain:
                     raise
                 self._cleanup_failed_install(
                     record,
@@ -1949,7 +1962,10 @@ class ProbeConnectGuardManager:
                 )
         finally:
             if operation_acquired:
-                self._release_operation(record, preserve_active=True)
+                self._release_operation(
+                    record,
+                    preserve_active=ownership is None or published_owned,
+                )
 
     def release(
         self,
@@ -1995,7 +2011,11 @@ class ProbeConnectGuardManager:
                 or record.lease is not lease
                 or (
                     record.state != "active"
-                    and not (ownership is not None and record.state == "released")
+                    and not (
+                        ownership is not None
+                        and record.ownership is ownership
+                        and record.state in {"cleanup_pending", "released"}
+                    )
                 )
             ):
                 raise ProbeConnectGuardError("probe_guard_lease_invalid")
@@ -2011,7 +2031,9 @@ class ProbeConnectGuardManager:
                     or (
                         record.state != "active"
                         and not (
-                            ownership is not None and record.state == "released"
+                            ownership is not None
+                            and record.ownership is ownership
+                            and record.state in {"cleanup_pending", "released"}
                         )
                     )
                 ):
@@ -2078,7 +2100,7 @@ class ProbeConnectGuardManager:
                     (
                         record
                         for record in self._active.values()
-                        if record.state == "cleanup_pending"
+                        if record.state in {"cleanup_pending", "released"}
                     ),
                     key=lambda record: record.cleanup_attempt_order,
                 )[: self._CLEANUP_RETRY_MAX_SCOPES]
@@ -2096,8 +2118,20 @@ class ProbeConnectGuardManager:
                     with self._lock:
                         if (
                             self._active.get(record.scope.unit_name) is not record
-                            or record.state != "cleanup_pending"
+                            or record.state not in {"cleanup_pending", "released"}
                         ):
+                            continue
+                        if record.ownership is not None and record.lease is not None:
+                            try:
+                                caller_owns = record.ownership.owns(record.lease)
+                            except BaseException as error:
+                                if not isinstance(error, Exception):
+                                    interruptions.append(error)
+                                continue
+                            if caller_owns:
+                                continue
+                        if record.state == "released":
+                            del self._active[record.scope.unit_name]
                             continue
                         record.state = "cleaning"
                     try:
@@ -2245,7 +2279,8 @@ class ProbeConnectGuardManager:
     def _pending_count(self) -> int:
         with self._lock:
             return sum(
-                record.state == "cleanup_pending" for record in self._active.values()
+                record.state in {"cleanup_pending", "released"}
+                for record in self._active.values()
             )
 
     def _remaining(self, deadline: float) -> float:

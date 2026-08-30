@@ -61,10 +61,12 @@ class _LeaseLedger:
         *,
         interrupt: str | None = None,
         release_interrupt: str | None = None,
+        owns_interrupt: bool = False,
     ) -> None:
         self.value: ProbeTransientLease | None = None
         self.interrupt = interrupt
         self.release_interrupt = release_interrupt
+        self.owns_interrupt = owns_interrupt
 
     def publish(self, value: ProbeTransientLease) -> None:
         if self.interrupt == "before_publish":
@@ -74,6 +76,9 @@ class _LeaseLedger:
             raise KeyboardInterrupt("publish interrupted after ownership")
 
     def owns(self, value: ProbeTransientLease) -> bool:
+        if self.owns_interrupt:
+            self.owns_interrupt = False
+            raise KeyboardInterrupt("ownership inspection interrupted")
         return self.value is value
 
     def release(self, value: ProbeTransientLease) -> None:
@@ -408,6 +413,17 @@ def _start_with_output_pipe() -> tuple[
     return manager, transport, lease, output_read_fd, output_write_fd
 
 
+def _assert_one_bounded_recovery(
+    transport: _RecordingTransport,
+    *,
+    maximum_seconds: float,
+) -> None:
+    assert len(transport.recoveries) == 1
+    unit_name, timeout_seconds = transport.recoveries[0]
+    assert unit_name == "rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service"
+    assert 0 < timeout_seconds <= maximum_seconds
+
+
 def test_systemd_manager_reads_bounded_output_and_collects_the_unit() -> None:
     manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
     try:
@@ -427,9 +443,7 @@ def test_systemd_manager_reads_bounded_output_and_collects_the_unit() -> None:
                 output_fd=output_read_fd,
                 timeout_seconds=1.0,
             )
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=1.0)
     finally:
         os.close(output_read_fd)
         if output_write_fd >= 0:
@@ -456,9 +470,7 @@ def test_systemd_manager_stops_the_unit_on_output_overflow() -> None:
                 output_fd=output_read_fd,
                 timeout_seconds=1.0,
             )
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=1.0)
     finally:
         os.close(output_read_fd)
         writer.join(timeout=1)
@@ -468,15 +480,15 @@ def test_systemd_manager_stops_the_unit_on_output_overflow() -> None:
 def test_systemd_manager_stops_the_unit_on_output_timeout() -> None:
     manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
     try:
-        with pytest.raises(ProbeSystemdError, match="probe_transient_output_timeout"):
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
             manager.read_output(
                 lease,
                 output_fd=output_read_fd,
                 timeout_seconds=0.01,
             )
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        assert transport.recoveries == []
+        assert manager.retry_pending_cleanup() == 0
+        _assert_one_bounded_recovery(transport, maximum_seconds=7.0)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
@@ -493,9 +505,7 @@ def test_systemd_manager_rejects_empty_output_and_collects_the_unit() -> None:
                 output_fd=output_read_fd,
                 timeout_seconds=1.0,
             )
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=1.0)
     finally:
         os.close(output_read_fd)
         if output_write_fd >= 0:
@@ -511,9 +521,7 @@ def test_systemd_manager_rejects_a_non_reader_output_descriptor_and_stops() -> N
                 output_fd=output_write_fd,
                 timeout_seconds=1.0,
             )
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=1.0)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
@@ -527,9 +535,7 @@ def test_systemd_manager_cancels_only_an_active_exact_unit() -> None:
         manager.cancel(lease)
         with pytest.raises(ProbeSystemdError, match="probe_transient_lease_invalid"):
             manager.cancel(lease)
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=7.0)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
@@ -550,9 +556,7 @@ def test_systemd_manager_rejects_output_from_an_unrelated_pipe() -> None:
                 timeout_seconds=1.0,
             )
 
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=1.0)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
@@ -693,9 +697,7 @@ def test_systemd_manager_recovers_when_interrupted_after_start_reply() -> None:
         with pytest.raises(KeyboardInterrupt):
             manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
 
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=7.0)
         transport._reply = ProbeSystemdReply(
             job_path="/org/freedesktop/systemd1/job/43"
         )
@@ -737,9 +739,7 @@ def test_systemd_manager_recovers_after_an_invalid_start_reply(job_path: str) ->
                 timeout_seconds=1.0,
             )
 
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=7.0)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
@@ -859,6 +859,189 @@ def test_systemd_manager_makes_collected_handoff_retryable(
         os.close(output_write_fd)
 
 
+def test_systemd_manager_releases_operation_when_ownership_check_is_interrupted(
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    ledger = _LeaseLedger(interrupt="after_publish", owns_interrupt=True)
+    try:
+        with pytest.raises(BaseExceptionGroup) as interrupted:
+            manager.start_owned(
+                _request(),
+                descriptors=ProbeTransientDescriptors(
+                    run_gate_fd=100,
+                    sealed_input_fd=101,
+                    output_read_fd=output_read_fd,
+                    output_write_fd=output_write_fd,
+                ),
+                timeout_seconds=1.0,
+                ownership=ledger,
+            )
+        assert any(
+            isinstance(error, KeyboardInterrupt)
+            for error in interrupted.value.exceptions
+        )
+        lease = ledger.value
+        assert lease is not None
+
+        manager.ensure_collected(
+            lease,
+            timeout_seconds=1.0,
+            ownership=ledger,
+        )
+        assert ledger.value is None
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_owned_cleanup_retries_only_through_the_exact_ledger() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"),
+        recovery=TimeoutError("first cleanup failed"),
+    )
+    manager = SystemdProbeManager(transport=transport)
+    ledger = _LeaseLedger()
+    try:
+        manager.start_owned(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+            ownership=ledger,
+        )
+        lease = ledger.value
+        assert lease is not None
+
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
+            manager.ensure_collected(
+                lease,
+                timeout_seconds=0.5,
+                ownership=ledger,
+            )
+        assert ledger.value is lease
+        assert manager.retry_pending_cleanup() == 1
+        assert len(transport.recoveries) == 1
+
+        transport.recovery = None
+        manager.ensure_collected(
+            lease,
+            timeout_seconds=0.5,
+            ownership=ledger,
+        )
+        assert ledger.value is None
+        assert len(transport.recoveries) == 2
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_owned_cleanup_uses_the_callers_bounded_deadline() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    ledger = _LeaseLedger()
+    try:
+        manager.start_owned(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+            ownership=ledger,
+        )
+        lease = ledger.value
+        assert lease is not None
+
+        manager.ensure_collected(
+            lease,
+            timeout_seconds=0.25,
+            ownership=ledger,
+        )
+        assert 0 < transport.recoveries[-1][1] <= 0.25
+        with pytest.raises(
+            ProbeSystemdError,
+            match="probe_transient_timeout_invalid",
+        ):
+            manager.ensure_collected(
+                lease,
+                timeout_seconds=True,
+                ownership=ledger,
+            )
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_sweep_finalizes_a_released_terminal_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    ledger = _LeaseLedger()
+    manager.start_owned(
+        _request(),
+        descriptors=ProbeTransientDescriptors(
+            run_gate_fd=100,
+            sealed_input_fd=101,
+            output_read_fd=output_read_fd,
+            output_write_fd=output_write_fd,
+        ),
+        timeout_seconds=1.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+    original_remove = manager._remove_record
+
+    def interrupt_remove(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise KeyboardInterrupt("terminal removal interrupted")
+
+    monkeypatch.setattr(manager, "_remove_record", interrupt_remove)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="terminal removal interrupted"):
+            manager.ensure_collected(
+                lease,
+                timeout_seconds=1.0,
+                ownership=ledger,
+            )
+        assert ledger.value is None
+        monkeypatch.setattr(manager, "_remove_record", original_remove)
+        assert manager.retry_pending_cleanup() == 0
+
+        replacement = manager.start(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+        )
+        manager.cancel(replacement)
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
 @pytest.mark.parametrize("interruption", [False, True])
 def test_systemd_manager_recovers_after_an_unexpected_output_reader_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -883,9 +1066,7 @@ def test_systemd_manager_recovers_after_an_unexpected_output_reader_failure(
                 timeout_seconds=1.0,
             )
 
-        assert transport.recoveries == [
-            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
-        ]
+        _assert_one_bounded_recovery(transport, maximum_seconds=1.0)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)

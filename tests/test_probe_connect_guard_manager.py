@@ -17,7 +17,7 @@ from ipaddress import ip_address
 from multiprocessing.connection import Connection
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any, cast
+from typing import Any, Never, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -41,10 +41,12 @@ class _GuardLedger:
         *,
         publish_interrupt: str | None = None,
         release_interrupt: str | None = None,
+        owns_interrupt: bool = False,
     ) -> None:
         self.value: ProbeConnectGuardLease | None = None
         self.publish_interrupt = publish_interrupt
         self.release_interrupt = release_interrupt
+        self.owns_interrupt = owns_interrupt
 
     def publish(self, value: ProbeConnectGuardLease) -> None:
         if self.publish_interrupt == "before_publish":
@@ -54,6 +56,9 @@ class _GuardLedger:
             raise KeyboardInterrupt("guard publish interrupted after ownership")
 
     def owns(self, value: ProbeConnectGuardLease) -> bool:
+        if self.owns_interrupt:
+            self.owns_interrupt = False
+            raise KeyboardInterrupt("guard ownership inspection interrupted")
         return self.value is value
 
     def release(self, value: ProbeConnectGuardLease) -> None:
@@ -276,6 +281,123 @@ def test_guard_manager_makes_released_handoff_retryable(
         assert ledger.value is None
         assert backend.removed == [scope]
 
+    replacement = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    manager.release(replacement, timeout_seconds=3.0)
+
+
+def test_guard_manager_releases_operation_when_ownership_check_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger(
+        publish_interrupt="after_publish",
+        owns_interrupt=True,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as interrupted:
+        manager.install_owned(
+            request_id=scope.request_id,
+            unit_name=scope.unit_name,
+            cgroup_path=scope.cgroup_path,
+            target=scope.target,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert any(
+        isinstance(error, KeyboardInterrupt)
+        for error in interrupted.value.exceptions
+    )
+    lease = ledger.value
+    assert lease is not None
+
+    manager.ensure_released(
+        lease,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    assert ledger.value is None
+    assert backend.removed == [scope]
+
+
+def test_guard_owned_cleanup_retries_only_through_the_exact_ledger(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    manager.install_owned(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+    backend.remove_errors = [RuntimeError("first cleanup failed")]
+
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_cleanup_pending"):
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert ledger.value is lease
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 1
+    assert backend.removed == [scope]
+
+    manager.ensure_released(
+        lease,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    assert ledger.value is None
+    assert backend.removed == [scope, scope]
+
+
+def test_guard_sweep_finalizes_a_released_terminal_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    manager.install_owned(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+    original_remove = manager._remove_active_record
+
+    def interrupt_remove(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise KeyboardInterrupt("guard terminal removal interrupted")
+
+    monkeypatch.setattr(manager, "_remove_active_record", interrupt_remove)
+    with pytest.raises(KeyboardInterrupt, match="guard terminal removal interrupted"):
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert ledger.value is None
+    assert backend.removed == [scope]
+
+    monkeypatch.setattr(manager, "_remove_active_record", original_remove)
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 0
     replacement = manager.install(
         request_id=scope.request_id,
         unit_name=scope.unit_name,
