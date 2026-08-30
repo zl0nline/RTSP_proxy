@@ -41,6 +41,9 @@ from rtsp_proxy.probe_systemd_dbus import DbusNextSystemdTransport
 
 pytestmark = [pytest.mark.contract]
 
+_WRONG_IPV4_ADDRESS = "127.0.0.2"
+_WRONG_IPV6_ADDRESS = "fd00::2"
+
 _CHILD = """
 import json
 import socket
@@ -58,8 +61,10 @@ def connected(family, host, port):
 print(json.dumps({
     "allowed_ipv4": connected(socket.AF_INET, "127.0.0.1", allowed_port),
     "denied_ipv4": connected(socket.AF_INET, "127.0.0.1", denied_port),
+    "wrong_ipv4": connected(socket.AF_INET, "127.0.0.2", allowed_port),
     "allowed_ipv6": connected(socket.AF_INET6, "::1", allowed_port),
     "denied_ipv6": connected(socket.AF_INET6, "::1", denied_port),
+    "wrong_ipv6": connected(socket.AF_INET6, "fd00::2", allowed_port),
 }, sort_keys=True), flush=True)
 """
 
@@ -202,6 +207,28 @@ def _program_tags(
 def _mkdir_owned(path: Path, resources: _OwnedResources) -> None:
     path.mkdir()
     resources.own(f"directory {path}", path.rmdir)
+
+
+def _install_ipv6_loopback_alias(resources: _OwnedResources) -> None:
+    ip = "/usr/sbin/ip"
+    if not Path(ip).is_file():
+        raise RuntimeError("probe_guard_ip_tool_missing")
+    _run(ip, "-6", "address", "add", f"{_WRONG_IPV6_ADDRESS}/128", "dev", "lo")
+    def remove_alias() -> None:
+        _run(
+            ip,
+            "-6",
+            "address",
+            "delete",
+            f"{_WRONG_IPV6_ADDRESS}/128",
+            "dev",
+            "lo",
+        )
+
+    resources.own(
+        "IPv6 wrong-address loopback alias",
+        remove_alias,
+    )
 
 
 def test_command_failure_exposes_native_diagnostic() -> None:
@@ -520,9 +547,12 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
     ipv6_program = program_pins / "rtsp_probe_guard_ipv6"
     target_map = map_pins / "allowed_target"
     with _managed_resources() as resources:
+        _install_ipv6_loopback_alias(resources)
         for family, host in (
             (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET, _WRONG_IPV4_ADDRESS),
             (socket.AF_INET6, "::1"),
+            (socket.AF_INET6, _WRONG_IPV6_ADDRESS),
         ):
             for port in (allowed_port, denied_port):
                 listener = _listener(family, host, port)
@@ -603,8 +633,10 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
         assert _release(ipv4) == {
             "allowed_ipv4": True,
             "denied_ipv4": False,
+            "wrong_ipv4": False,
             "allowed_ipv6": False,
             "denied_ipv6": False,
+            "wrong_ipv6": False,
         }
 
         _map_update(
@@ -616,8 +648,10 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
         assert _release(ipv6) == {
             "allowed_ipv4": False,
             "denied_ipv4": False,
+            "wrong_ipv4": False,
             "allowed_ipv6": True,
             "denied_ipv6": False,
+            "wrong_ipv6": False,
         }
 
     assert not cgroup.exists()
@@ -637,21 +671,25 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
     [
         (
             "127.0.0.1",
-            {
-                "allowed_ipv4": True,
-                "denied_ipv4": False,
-                "allowed_ipv6": False,
-                "denied_ipv6": False,
-            },
+                {
+                    "allowed_ipv4": True,
+                    "denied_ipv4": False,
+                    "wrong_ipv4": False,
+                    "allowed_ipv6": False,
+                    "denied_ipv6": False,
+                    "wrong_ipv6": False,
+                },
         ),
         (
             "::1",
-            {
-                "allowed_ipv4": False,
-                "denied_ipv4": False,
-                "allowed_ipv6": True,
-                "denied_ipv6": False,
-            },
+                {
+                    "allowed_ipv4": False,
+                    "denied_ipv4": False,
+                    "wrong_ipv4": False,
+                    "allowed_ipv6": True,
+                    "denied_ipv6": False,
+                    "wrong_ipv6": False,
+                },
         ),
     ],
 )
@@ -684,9 +722,12 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
     stopping = threading.Event()
 
     with _managed_resources() as resources:
+        _install_ipv6_loopback_alias(resources)
         for family, host in (
             (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET, _WRONG_IPV4_ADDRESS),
             (socket.AF_INET6, "::1"),
+            (socket.AF_INET6, _WRONG_IPV6_ADDRESS),
         ):
             for port in (allowed_port, denied_port):
                 listener = _listener(family, host, port)
@@ -734,6 +775,10 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
                     ipv6_program_tag=ipv6_tag,
                 ),
             )
+        )
+        resources.own(
+            "probe guard coordinator",
+            (ownership_root / ".probe-connect-guard.lock").unlink,
         )
         lease: ProbeConnectGuardLease | None = None
 
@@ -809,10 +854,17 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     ownership_root = secure_root / "ownership"
 
     with _managed_resources() as resources:
+        _install_ipv6_loopback_alias(resources)
         stopping = threading.Event()
+        wrong_address = (
+            _WRONG_IPV4_ADDRESS
+            if target_family == socket.AF_INET
+            else _WRONG_IPV6_ADDRESS
+        )
         listeners = [
             _listener(target_family, target_host, allowed_port),
             _listener(target_family, target_host, denied_port),
+            _listener(target_family, wrong_address, allowed_port),
             _listener(alternate_family, alternate_host, allowed_port),
         ]
         threads: list[threading.Thread] = []
@@ -907,6 +959,10 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
                 ),
             )
         )
+        resources.own(
+            "probe guard coordinator",
+            (ownership_root / ".probe-connect-guard.lock").unlink,
+        )
         guard_lease: ProbeConnectGuardLease | None = None
 
         def release_guard() -> None:
@@ -935,6 +991,7 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
         transient_lease = None
         assert observed == {
             "allowed": True,
+            "wrong_address": False,
             "wrong_family": False,
             "wrong_port": False,
         }

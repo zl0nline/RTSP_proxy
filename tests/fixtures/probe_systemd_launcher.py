@@ -47,10 +47,12 @@ def main() -> int:
                 socket.AF_INET6 if family == socket.AF_INET else socket.AF_INET
             )
             alternate_host = "::1" if alternate_family == socket.AF_INET6 else "127.0.0.1"
+            wrong_address = "127.0.0.2" if family == socket.AF_INET else "fd00::2"
             results: dict[str, bool] = {}
             for label, connect_family, host, port in (
                 ("allowed", family, target.hostname, target.port),
                 ("wrong_port", family, target.hostname, target.port + 1),
+                ("wrong_address", family, wrong_address, target.port),
                 (
                     "wrong_family",
                     alternate_family,

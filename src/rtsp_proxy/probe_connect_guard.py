@@ -46,6 +46,14 @@ class ProbeConnectGuardInstallRejectedInterruption(BaseException):
         self.interruption = interruption
 
 
+class ProbeConnectGuardInstallReconcileRequired(ProbeConnectGuardError):
+    """A rejected install left receipt-proven state requiring reconciliation."""
+
+    def __init__(self, interruption: BaseException | None = None) -> None:
+        super().__init__("probe_guard_reconcile_required")
+        self.interruption = interruption
+
+
 @dataclass(frozen=True, slots=True)
 class ProbeConnectGuardArtifactIdentity:
     """Release-bound identities required before loading a guard object."""
@@ -286,10 +294,11 @@ class BpftoolProbeConnectGuardBackend:
         self._monotonic = monotonic
         self._scope_lock_guard = Lock()
         self._scope_locks: dict[UUID, int] = {}
+        self._root_descriptors = tuple(root_descriptors)
         self._root_finalizer = weakref.finalize(
             self,
             _close_backend_descriptors,
-            tuple(root_descriptors),
+            self._root_descriptors,
             self._scope_locks,
         )
         self._coordinator_path = self._ownership_root / self._COORDINATOR_NAME
@@ -352,12 +361,9 @@ class BpftoolProbeConnectGuardBackend:
                             ),
                             None,
                         )
-                        if interruption is not None:
-                            raise ProbeConnectGuardInstallRejectedInterruption(
-                                interruption
-                            ) from None
-                        raise ProbeConnectGuardInstallRejected(
-                            "probe_guard_already_active"
+                        retain_coordinator = False
+                        raise ProbeConnectGuardInstallReconcileRequired(
+                            interruption
                         ) from None
                     raise BaseExceptionGroup(
                         "probe guard ownership promotion and cleanup failed",
@@ -520,6 +526,7 @@ class BpftoolProbeConnectGuardBackend:
         scope: ProbeConnectGuardScope,
         *,
         budget: _CommandBudget,
+        allow_legacy_cleanup: bool = False,
     ) -> None:
         self._require_artifact_identity()
         paths = self._paths(scope)
@@ -528,12 +535,23 @@ class BpftoolProbeConnectGuardBackend:
                 return
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         ownership = self._ownership_from_receipt(paths.receipt)
-        if ownership.scope != scope or ownership.phase != 2:
+        if ownership.scope != scope or not (
+            (ownership.receipt_version == 3 and ownership.phase == 2)
+            or (
+                allow_legacy_cleanup
+                and ownership.receipt_version == 2
+                and ownership.phase == 1
+            )
+        ):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         if not _path_lexists(paths.scope):
             self._remove_receipt(paths.receipt)
             return
-        ownership = self._require_receipt(scope, paths.receipt)
+        ownership = self._require_receipt(
+            scope,
+            paths.receipt,
+            allow_legacy_cleanup=allow_legacy_cleanup,
+        )
         self._require_exact_partial_inventory(paths)
         program_ids: dict[str, int] = {}
         for attach_type, program_path in (
@@ -700,6 +718,7 @@ class BpftoolProbeConnectGuardBackend:
         ownership = self._ownership_from_receipt(path)
         if ownership.scope != scope or ownership.phase != 0:
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        reservation_nonce = _require_reservation_nonce(ownership)
         replacement = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
@@ -707,11 +726,11 @@ class BpftoolProbeConnectGuardBackend:
             phase=1,
             scope_device=scope_metadata.st_dev,
             scope_inode=scope_metadata.st_ino,
-            reservation_nonce=ownership.reservation_nonce,
+            reservation_nonce=reservation_nonce,
         )
         temporary = self._promotion_receipt_path(
             scope,
-            ownership.reservation_nonce,
+            reservation_nonce,
         )
         try:
             _write_exclusive_file(temporary, replacement, mode=0o600)
@@ -734,6 +753,7 @@ class BpftoolProbeConnectGuardBackend:
         if (
             ownership.scope != scope
             or ownership.phase != 1
+            or ownership.receipt_version != 3
             or not _owned_directory_metadata_valid(
                 scope_metadata,
                 owner_uid=self._owner_uid,
@@ -742,6 +762,7 @@ class BpftoolProbeConnectGuardBackend:
             or scope_metadata.st_ino != ownership.scope_inode
         ):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        reservation_nonce = _require_reservation_nonce(ownership)
         replacement = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
@@ -749,11 +770,11 @@ class BpftoolProbeConnectGuardBackend:
             phase=2,
             scope_device=ownership.scope_device,
             scope_inode=ownership.scope_inode,
-            reservation_nonce=ownership.reservation_nonce,
+            reservation_nonce=reservation_nonce,
         )
         temporary = self._promotion_receipt_path(
             scope,
-            ownership.reservation_nonce,
+            reservation_nonce,
         )
         try:
             _write_exclusive_file(temporary, replacement, mode=0o600)
@@ -768,11 +789,19 @@ class BpftoolProbeConnectGuardBackend:
         path: Path,
         *,
         require_current: bool = False,
+        allow_legacy_cleanup: bool = False,
     ) -> _GuardOwnership:
         ownership = self._ownership_from_receipt(path)
         if (
             ownership.scope != scope
-            or ownership.phase != 2
+            or not (
+                (ownership.receipt_version == 3 and ownership.phase == 2)
+                or (
+                    allow_legacy_cleanup
+                    and ownership.receipt_version == 2
+                    and ownership.phase == 1
+                )
+            )
             or (
                 require_current
                 and ownership.artifact_release.release_id
@@ -823,6 +852,9 @@ class BpftoolProbeConnectGuardBackend:
                         "probe_guard_ownership_invalid"
                     ) from None
         try:
+            if not isinstance(decoded, dict):
+                raise ValueError
+            version = decoded["version"]
             request_id = UUID(decoded["request_id"])
             target = ProbeConnectGuardTarget(
                 address=ip_address(decoded["address"]),
@@ -837,18 +869,14 @@ class BpftoolProbeConnectGuardBackend:
             phase = decoded["phase"]
             scope_device_raw = decoded["scope_device"]
             scope_inode_raw = decoded["scope_inode"]
-            reservation_nonce = decoded["reservation_nonce"]
             artifact_release_id = decoded["artifact_release_id"]
             if (
                 isinstance(phase, bool)
                 or not isinstance(phase, int)
-                or phase not in {0, 1, 2}
                 or not isinstance(scope_device_raw, str)
                 or not re.fullmatch(r"[0-9]{20}", scope_device_raw)
                 or not isinstance(scope_inode_raw, str)
                 or not re.fullmatch(r"[0-9]{20}", scope_inode_raw)
-                or not isinstance(reservation_nonce, str)
-                or not re.fullmatch(r"[0-9a-f]{32}", reservation_nonce)
                 or not isinstance(artifact_release_id, str)
                 or not re.fullmatch(
                     r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}",
@@ -862,38 +890,76 @@ class BpftoolProbeConnectGuardBackend:
                 artifact_release_id,
                 architecture=self._architecture,
             )
+            if version == 3:
+                reservation_nonce: str | None = decoded["reservation_nonce"]
+                if (
+                    phase not in {0, 1, 2}
+                    or not isinstance(reservation_nonce, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", reservation_nonce)
+                    or set(decoded)
+                    != {
+                        "address",
+                        "artifact_release_id",
+                        "cgroup_path",
+                        "object_sha256",
+                        "phase",
+                        "port",
+                        "request_id",
+                        "reservation_nonce",
+                        "scope_device",
+                        "scope_inode",
+                        "unit_name",
+                        "version",
+                    }
+                    or _receipt_bytes(
+                        scope,
+                        object_sha256=artifact_release.object_sha256,
+                        artifact_release_id=artifact_release.release_id,
+                        phase=phase,
+                        scope_device=scope_device,
+                        scope_inode=scope_inode,
+                        reservation_nonce=reservation_nonce,
+                    )
+                    != payload
+                ):
+                    raise ValueError
+            elif version == 2:
+                reservation_nonce = None
+                if (
+                    phase not in {0, 1}
+                    or set(decoded)
+                    != {
+                        "address",
+                        "artifact_release_id",
+                        "cgroup_path",
+                        "object_sha256",
+                        "phase",
+                        "port",
+                        "request_id",
+                        "scope_device",
+                        "scope_inode",
+                        "unit_name",
+                        "version",
+                    }
+                    or _receipt_bytes_v2(
+                        scope,
+                        object_sha256=artifact_release.object_sha256,
+                        artifact_release_id=artifact_release.release_id,
+                        phase=phase,
+                        scope_device=scope_device,
+                        scope_inode=scope_inode,
+                    )
+                    != payload
+                ):
+                    raise ValueError
+            else:
+                raise ValueError
         except (KeyError, TypeError, ValueError, RuntimeError):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
         if (
-            not isinstance(decoded, dict)
-            or set(decoded) != {
-                "address",
-                "artifact_release_id",
-                "cgroup_path",
-                "object_sha256",
-                "phase",
-                "port",
-                "request_id",
-                "reservation_nonce",
-                "scope_device",
-                "scope_inode",
-                "unit_name",
-                "version",
-            }
-            or decoded["version"] != 3
-            or decoded["object_sha256"] != artifact_release.object_sha256
-            or _receipt_bytes(
-                scope,
-                object_sha256=artifact_release.object_sha256,
-                artifact_release_id=artifact_release.release_id,
-                phase=phase,
-                scope_device=scope_device,
-                scope_inode=scope_inode,
-                reservation_nonce=reservation_nonce,
-            )
-            != payload
+            decoded["object_sha256"] != artifact_release.object_sha256
             or (phase == 0 and (scope_device != 0 or scope_inode != 0))
-            or (phase in {1, 2} and scope_inode == 0)
+            or (phase in {1, 2} and (scope_device == 0 or scope_inode == 0))
             or scope.request_id.version != 4
             or scope.unit_name != f"rtsp-probe-{scope.request_id.hex}.service"
             or not scope.cgroup_path.is_absolute()
@@ -907,6 +973,7 @@ class BpftoolProbeConnectGuardBackend:
             scope_inode=scope_inode,
             reservation_nonce=reservation_nonce,
             artifact_release=artifact_release,
+            receipt_version=version,
         )
 
     def _receipt_inventory(self) -> list[Path]:
@@ -973,6 +1040,7 @@ class BpftoolProbeConnectGuardBackend:
         ownership = self._ownership_from_receipt(receipt)
         if ownership.scope != scope:
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        reservation_nonce = _require_reservation_nonce(ownership)
         final_scope = self._paths(scope).scope
         candidates = [reservation_scope]
         if ownership.phase in {1, 2}:
@@ -1008,7 +1076,7 @@ class BpftoolProbeConnectGuardBackend:
             candidate.rmdir()
         temporary = self._promotion_receipt_path(
             scope,
-            ownership.reservation_nonce,
+            reservation_nonce,
         )
         temporary.unlink(missing_ok=True)
         self._remove_receipt(receipt)
@@ -1019,9 +1087,15 @@ class BpftoolProbeConnectGuardBackend:
         ownership: _GuardOwnership,
         receipt: Path,
     ) -> None:
+        if ownership.receipt_version == 2:
+            if _path_lexists(self._paths(ownership.scope).scope):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            self._remove_receipt(receipt)
+            return
+        reservation_nonce = _require_reservation_nonce(ownership)
         reservation_scope = self._reservation_scope_path(
             ownership.scope,
-            ownership.reservation_nonce,
+            reservation_nonce,
         )
         if _path_lexists(reservation_scope):
             metadata = reservation_scope.lstat()
@@ -1037,7 +1111,7 @@ class BpftoolProbeConnectGuardBackend:
             _fsync_directory(self._pin_root)
         temporary = self._promotion_receipt_path(
             ownership.scope,
-            ownership.reservation_nonce,
+            reservation_nonce,
         )
         temporary.unlink(missing_ok=True)
         self._remove_reserved_receipt(receipt)
@@ -1050,20 +1124,46 @@ class BpftoolProbeConnectGuardBackend:
         budget: _CommandBudget,
     ) -> None:
         paths = self._paths(ownership.scope)
-        reservation_scope = self._reservation_scope_path(
-            ownership.scope,
-            ownership.reservation_nonce,
+        reservation_scope = (
+            self._reservation_scope_path(
+                ownership.scope,
+                _require_reservation_nonce(ownership),
+            )
+            if ownership.receipt_version == 3
+            else None
         )
         if _path_lexists(paths.scope):
-            if _path_lexists(reservation_scope):
-                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
             metadata = paths.scope.lstat()
             inode_matches = (
                 metadata.st_dev == ownership.scope_device
                 and metadata.st_ino == ownership.scope_inode
             )
+            if reservation_scope is not None and _path_lexists(reservation_scope):
+                reservation_metadata = reservation_scope.lstat()
+                if (
+                    inode_matches
+                    or not _owned_directory_metadata_valid(
+                        reservation_metadata,
+                        owner_uid=self._owner_uid,
+                    )
+                    or reservation_metadata.st_dev != ownership.scope_device
+                    or reservation_metadata.st_ino != ownership.scope_inode
+                    or list(reservation_scope.iterdir())
+                ):
+                    raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+                reservation_scope.rmdir()
+                _fsync_directory(self._pin_root)
+                self._remove_receipt(receipt)
+                return
             if ownership.phase == 1:
                 if inode_matches:
+                    if ownership.receipt_version == 2:
+                        self._remove_owned(
+                            ownership.scope,
+                            budget=budget,
+                            allow_legacy_cleanup=True,
+                        )
+                        return
                     if (
                         not _owned_directory_metadata_valid(
                             metadata,
@@ -1083,7 +1183,7 @@ class BpftoolProbeConnectGuardBackend:
                 budget=budget,
             )
             return
-        if _path_lexists(reservation_scope):
+        if reservation_scope is not None and _path_lexists(reservation_scope):
             metadata = reservation_scope.lstat()
             if (
                 not _owned_directory_metadata_valid(
@@ -1133,6 +1233,7 @@ class BpftoolProbeConnectGuardBackend:
             if (
                 ownership.phase not in {0, 1, 2}
                 or ownership.scope.request_id.hex != match.group(1)
+                or ownership.receipt_version != 3
                 or ownership.reservation_nonce != match.group(2)
                 or not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_uid != self._owner_uid
@@ -1267,7 +1368,11 @@ class BpftoolProbeConnectGuardBackend:
             result = _run_command(
                 (bpftool_fd_path, *bound_arguments),
                 timeout_seconds=timeout_seconds,
-                pass_fds=(bpftool_descriptor, object_descriptor),
+                pass_fds=(
+                    *self._root_descriptors,
+                    bpftool_descriptor,
+                    object_descriptor,
+                ),
             )
         except BaseException as primary_error:
             cleanup_errors = _close_descriptors(descriptors)
@@ -1436,8 +1541,15 @@ class _GuardOwnership:
     phase: int
     scope_device: int
     scope_inode: int
-    reservation_nonce: str
+    reservation_nonce: str | None
     artifact_release: _ProbeConnectGuardArtifactRelease
+    receipt_version: int
+
+
+def _require_reservation_nonce(ownership: _GuardOwnership) -> str:
+    if ownership.receipt_version != 3 or ownership.reservation_nonce is None:
+        raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+    return ownership.reservation_nonce
 
 
 @dataclass(frozen=True, slots=True)
@@ -1466,6 +1578,11 @@ class _CommandBudget:
         if remaining <= 0:
             raise ProbeConnectGuardError("probe_guard_timeout")
         return remaining
+
+
+@dataclass(slots=True)
+class _ProcessOwner:
+    process: subprocess.Popen[bytes] | None = None
 
 
 class ProbeConnectGuardManager:
@@ -1561,7 +1678,8 @@ class ProbeConnectGuardManager:
             except BaseException as primary_error:
                 self._cleanup_failed_install(
                     record,
-                    timeout_seconds=timeout_seconds,
+                    deadline=deadline,
+                    cleanup_timeout_seconds=timeout_seconds,
                     primary_error=primary_error,
                 )
         finally:
@@ -1696,9 +1814,32 @@ class ProbeConnectGuardManager:
         self,
         record: _GuardRecord,
         *,
-        timeout_seconds: float,
+        deadline: float,
+        cleanup_timeout_seconds: float,
         primary_error: BaseException,
     ) -> NoReturn:
+        if isinstance(primary_error, ProbeConnectGuardInstallReconcileRequired):
+            with self._lock:
+                if self._active.get(record.scope.unit_name) is record:
+                    del self._active[record.scope.unit_name]
+                self._reconcile_ready = False
+            if primary_error.interruption is not None:
+                raise primary_error.interruption from None
+            try:
+                remaining = self.reconcile_startup(
+                    timeout_seconds=self._remaining(deadline)
+                )
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                raise ProbeConnectGuardError(
+                    "probe_guard_reconcile_required"
+                ) from None
+            if remaining:
+                raise ProbeConnectGuardError(
+                    "probe_guard_reconcile_required"
+                ) from None
+            raise ProbeConnectGuardError("probe_guard_already_active") from None
         if isinstance(primary_error, ProbeConnectGuardInstallRejectedInterruption):
             with self._lock:
                 if self._active.get(record.scope.unit_name) is record:
@@ -1713,7 +1854,10 @@ class ProbeConnectGuardManager:
             if self._active.get(record.scope.unit_name) is record:
                 record.state = "cleaning"
         try:
-            self._backend.remove(record.scope, timeout_seconds=timeout_seconds)
+            self._backend.remove(
+                record.scope,
+                timeout_seconds=cleanup_timeout_seconds,
+            )
         except BaseException as cleanup_error:
             with self._lock:
                 if self._active.get(record.scope.unit_name) is record:
@@ -1857,6 +2001,39 @@ def _receipt_bytes(
     )
 
 
+def _receipt_bytes_v2(
+    scope: ProbeConnectGuardScope,
+    *,
+    object_sha256: str,
+    artifact_release_id: str,
+    phase: int,
+    scope_device: int,
+    scope_inode: int,
+) -> bytes:
+    """Serialize the cleanup-only receipt emitted before nonce reservations."""
+
+    return (
+        json.dumps(
+            {
+                "address": str(scope.target.address),
+                "artifact_release_id": artifact_release_id,
+                "cgroup_path": str(scope.cgroup_path),
+                "object_sha256": object_sha256,
+                "phase": phase,
+                "port": scope.target.port,
+                "request_id": str(scope.request_id),
+                "scope_device": f"{scope_device:020d}",
+                "scope_inode": f"{scope_inode:020d}",
+                "unit_name": scope.unit_name,
+                "version": 2,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
 def _linux_architecture(machine: str) -> str:
     aliases = {
         "amd64": "amd64",
@@ -1976,6 +2153,22 @@ def _parse_artifact_catalog(payload: bytes) -> _ProbeConnectGuardArtifactCatalog
             current_release_id=decoded["current_release_id"],
             releases=tuple(releases),
         )
+        cleanup_release_ids = {
+            release.release_id
+            for release in catalog.releases
+            if release.cleanup_compatible
+        }
+        if any(
+            {
+                release.architecture
+                for release in catalog.releases
+                if release.release_id == release_id
+                and release.cleanup_compatible
+            }
+            != {"amd64", "arm64"}
+            for release_id in cleanup_release_ids
+        ):
+            raise ValueError
         current_architectures = {
             release.architecture
             for release in catalog.releases
@@ -2339,11 +2532,12 @@ def _run_command(
     timeout_seconds: float,
     pass_fds: tuple[int, ...] = (),
 ) -> str:
-    process: subprocess.Popen[bytes] | None = None
+    owner = _ProcessOwner()
     selector: selectors.BaseSelector | None = None
     try:
         try:
-            process = subprocess.Popen(
+            _spawn_owned_process(
+                owner,
                 arguments,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -2356,6 +2550,9 @@ def _run_command(
             raise ProbeConnectGuardError(
                 "probe_guard_kernel_operation_failed"
             ) from None
+        process = owner.process
+        if process is None:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
         stdout = bytearray()
         stderr = bytearray()
         selector = selectors.DefaultSelector()
@@ -2387,6 +2584,7 @@ def _run_command(
         returncode = process.wait(timeout=remaining)
     except BaseException as primary_error:
         cleanup_errors: list[BaseException] = []
+        process = owner.process
         if process is not None:
             process_cleanup_error = _terminate_and_reap(process)
             if process_cleanup_error is not None:
@@ -2394,8 +2592,8 @@ def _run_command(
         cleanup_errors.extend(
             _close_command_resources(
                 selector,
-                process.stdout if process is not None else None,
-                process.stderr if process is not None else None,
+                getattr(process, "stdout", None) if process is not None else None,
+                getattr(process, "stderr", None) if process is not None else None,
             )
         )
         if cleanup_errors and (
@@ -2413,6 +2611,7 @@ def _run_command(
         if not isinstance(primary_error, Exception):
             raise
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+    process = owner.process
     assert process is not None
     cleanup_errors = _close_command_resources(
         selector,
@@ -2432,6 +2631,26 @@ def _run_command(
         return stdout.decode("utf-8")
     except UnicodeDecodeError:
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+
+
+def _spawn_owned_process(
+    owner: _ProcessOwner,
+    arguments: tuple[str, ...],
+    **keywords: object,
+) -> None:
+    """Publish Popen ownership before its initializer can create a child."""
+
+    process_type = subprocess.Popen
+    process = cast(
+        subprocess.Popen[bytes],
+        process_type.__new__(process_type),
+    )
+    owner.process = process
+    process_type.__init__(  # type: ignore[call-overload]
+        process,
+        arguments,
+        **keywords,
+    )
 
 
 def _terminate_and_reap(process: subprocess.Popen[bytes]) -> BaseException | None:
