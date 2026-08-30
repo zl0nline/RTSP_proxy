@@ -466,12 +466,12 @@ def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
     assert "go test -race ./internal/auth ./internal/core ./internal/servers/rtsp" in builder
 
 
-def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None:
+def test_probe_ffprobe_source_build_has_immutable_build_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     probe = catalog["probe_ffprobe"]
     patch = Path(probe["patch"])
 
-    assert probe["status"] == "digest-pinned-native-candidate"
+    assert probe["status"] == "source-only"
     assert probe["source_repository"] == "https://github.com/FFmpeg/FFmpeg"
     assert probe["source_commit"] == "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b"
     assert probe["source_date_epoch"] == 1_785_458_830
@@ -487,18 +487,9 @@ def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None
             "make": "4.3-4.1build2",
         },
     }
-    assert probe["architectures"] == {
-        "amd64": {
-            "binary_sha256": (
-                "88352366809808ab26eadf2e3511ad762af548ca23a879501052b58361c15ea6"
-            )
-        },
-        "arm64": {
-            "binary_sha256": (
-                "ae21669da8f09d9401c35e7a3b9943846b7f56576c645c984c44a8b439a67589"
-            )
-        },
-    }
+    assert probe["cflags"] == ["-O2", "-fno-ident"]
+    assert probe["source_prefix_map"] == "/usr/src/ffmpeg"
+    assert probe["architectures"] == {}
 
     result = subprocess.run(
         ["sh", "-n", "tools/build_probe_ffprobe.sh"],
@@ -511,7 +502,7 @@ def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None
     builder = Path("tools/build_probe_ffprobe.sh").read_text(encoding="utf-8")
     assert "git -C \"$source_root\" apply --check" in builder
     assert "dpkg-query" in builder
-    assert "expected_binary_sha256" in builder
+    assert "-ffile-prefix-map=$source_root=$source_prefix_map" in builder
     flags = probe["configure_flags"]
     assert "--disable-autodetect" in flags
     assert "--disable-ffmpeg" in flags

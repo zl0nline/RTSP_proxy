@@ -36,10 +36,23 @@ patch_sha256=$(jq --raw-output '.probe_ffprobe.patch_sha256' "$catalog")
 compiler=$(jq --raw-output '.probe_ffprobe.compiler' "$catalog")
 compiler_major=$(jq --raw-output '.probe_ffprobe.compiler_major' "$catalog")
 expected_version=$(jq --raw-output '.probe_ffprobe.version' "$catalog")
-expected_binary_sha256=$(
-    jq --exit-status --raw-output --arg arch "$architecture" \
-        '.probe_ffprobe.architectures[$arch].binary_sha256' "$catalog"
+candidate_status=$(jq --exit-status --raw-output '.probe_ffprobe.status' "$catalog")
+source_prefix_map=$(
+    jq --exit-status --raw-output '.probe_ffprobe.source_prefix_map' "$catalog"
 )
+case "$candidate_status" in
+    source-only) expected_binary_sha256= ;;
+    digest-pinned-native-candidate)
+        expected_binary_sha256=$(
+            jq --exit-status --raw-output --arg arch "$architecture" \
+                '.probe_ffprobe.architectures[$arch].binary_sha256' "$catalog"
+        )
+        ;;
+    *)
+        echo "unsupported probe ffprobe candidate status: $candidate_status" >&2
+        exit 1
+        ;;
+esac
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -105,6 +118,8 @@ set --
 while IFS= read -r flag; do
     set -- "$@" "$flag"
 done < "$flags_file"
+cflags=$(jq --exit-status --raw-output '.probe_ffprobe.cflags | join(" ")' "$catalog")
+set -- "$@" "--extra-cflags=$cflags -ffile-prefix-map=$source_root=$source_prefix_map"
 
 mkdir "$object_root"
 (
@@ -126,8 +141,9 @@ if [ "$actual_version" != "$expected_version" ]; then
 fi
 install -m 0755 "$object_root/ffprobe" "$output"
 actual_binary_sha256=$(sha256_of "$output")
-if [ "$actual_binary_sha256" != "$expected_binary_sha256" ]; then
-    echo "probe ffprobe binary SHA-256 mismatch" >&2
+if [ -n "$expected_binary_sha256" ] && \
+    [ "$actual_binary_sha256" != "$expected_binary_sha256" ]; then
+    echo "probe ffprobe binary SHA-256 mismatch: expected $expected_binary_sha256, got $actual_binary_sha256" >&2
     exit 1
 fi
 printf '%s  %s\n' "$actual_binary_sha256" "$output"

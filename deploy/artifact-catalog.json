@@ -25,7 +25,7 @@
     }
   },
   "probe_ffprobe": {
-    "status": "digest-pinned-native-candidate",
+    "status": "source-only",
     "version": "9b6c896-rtsp-proxy.1",
     "source_repository": "https://github.com/FFmpeg/FFmpeg",
     "source_commit": "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b",
@@ -44,6 +44,11 @@
     },
     "patch": "patches/ffmpeg-n8.1.2-34-g9b6c8969e0/0001-refuse-rtsp-redirects.patch",
     "patch_sha256": "66b3baf962f76e67ac90d863d55fbc404d2cd805a534463614aa79322b554dcf",
+    "cflags": [
+      "-O2",
+      "-fno-ident"
+    ],
+    "source_prefix_map": "/usr/src/ffmpeg",
     "configure_flags": [
       "--prefix=/usr/local/libexec/rtsp-proxy-probe",
       "--extra-version=rtsp-proxy.1",
@@ -60,18 +65,10 @@
       "--enable-demuxer=concat,rtsp,sdp,rtp",
       "--enable-parser=h264,hevc,opus",
       "--enable-decoder=h264,hevc,opus",
-      "--extra-cflags=-O2 -fno-ident",
       "--extra-ldflags=-Wl,--build-id=none"
     ],
-    "provenance": "controlled native source-build candidate with exact Ubuntu snapshot, toolchain package versions and architecture digests; release admission and executor integration pending",
-    "architectures": {
-      "amd64": {
-        "binary_sha256": "88352366809808ab26eadf2e3511ad762af548ca23a879501052b58361c15ea6"
-      },
-      "arm64": {
-        "binary_sha256": "ae21669da8f09d9401c35e7a3b9943846b7f56576c645c984c44a8b439a67589"
-      }
-    }
+    "provenance": "controlled source-build candidate with exact Ubuntu snapshot, toolchain package versions and source-path remapping; deterministic native rebuild and architecture digests pending",
+    "architectures": {}
   },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260731",
