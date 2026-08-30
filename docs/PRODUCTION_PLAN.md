@@ -1287,7 +1287,12 @@ impact is measured.
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
   independent review and native amd64/arm64
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
-  green; descriptor transport and executor still disabled);
+  green; broker service and executor still disabled);
+- [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
+  one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
+  authoritative request-expiry recheck, tuple binding, sender consumption and
+  receiver ownership-safe cleanup (direct-Linux amd64 green; independent review
+  and native amd64/arm64 CI pending; broker service and executor still disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;

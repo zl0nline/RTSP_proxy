@@ -89,6 +89,13 @@ def create_sealed_probe_input(payload: bytes) -> int:
 def validate_sealed_probe_input(descriptor: int) -> int:
     """Validate and rewind an immutable input without returning its secret bytes."""
 
+    size, _contract = inspect_sealed_probe_input(descriptor)
+    return size
+
+
+def inspect_sealed_probe_input(descriptor: int) -> tuple[int, ProbeInputContract]:
+    """Validate once, rewind and return only secret-free parsed metadata."""
+
     if isinstance(descriptor, bool) or not isinstance(descriptor, int) or descriptor < 0:
         raise ValueError("probe_input_descriptor_invalid")
     try:
@@ -111,12 +118,12 @@ def validate_sealed_probe_input(descriptor: int) -> int:
         raise ValueError("probe_input_descriptor_invalid") from error
     if len(payload) != metadata.st_size:
         raise ValueError("probe_input_descriptor_invalid")
-    _validate_probe_input_payload(payload)
+    contract = parse_probe_input_payload(payload)
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError as error:
         raise ValueError("probe_input_descriptor_invalid") from error
-    return metadata.st_size
+    return metadata.st_size, contract
 
 
 @dataclass(frozen=True, slots=True)

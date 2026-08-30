@@ -38,10 +38,10 @@ at commit `3f7f400`.
 
 ## Deliberately excluded
 
-This primitive does not yet transfer the descriptor to another identity and
-does not run ffprobe. The authenticated broker socket, `SO_PEERCRED`, exactly
-one `SCM_RIGHTS` descriptor, close-on-receive ownership, system-manager unit,
-BPF attach/readback/run gate, no-redirect ffprobe, bounded output and complete
-cancellation/residue matrix remain required. Consequently ADR 0004 stays
-Proposed, the production executor stays disabled and Phase G remains
-IN PROGRESS / Production NO-GO.
+This primitive does not run ffprobe. A separately documented transport
+primitive now covers authenticated `SO_PEERCRED` plus exactly one `SCM_RIGHTS`
+descriptor, but it is not a deployed root service. The broker service,
+system-manager unit, BPF attach/readback/run gate, no-redirect ffprobe, bounded
+output and complete cancellation/residue matrix remain required. Consequently
+ADR 0004 stays Proposed, the production executor stays disabled and Phase G
+remains IN PROGRESS / Production NO-GO.
