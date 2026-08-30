@@ -9,6 +9,7 @@ import re
 import secrets
 import selectors
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from threading import Lock
-from typing import IO, NoReturn, Protocol, cast
+from typing import NoReturn, Protocol, cast
 from uuid import UUID
 
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
@@ -32,6 +33,7 @@ _COMMAND_OUTPUT_MAX_BYTES = 65_536
 _COMMAND_CLEANUP_SECONDS = 1.0
 _SPAWN_WRAPPER = """
 import os
+import signal
 import sys
 
 pid_descriptor = int(sys.argv[1])
@@ -48,9 +50,11 @@ os.closerange(lower, upper)
 os.write(pid_descriptor, f"{os.getpid()}\\n".encode("ascii"))
 if os.read(gate_descriptor, 1) != b"R":
     raise SystemExit(125)
+restored_signal_mask = {int(item) for item in sys.argv[4].split(",") if item}
+signal.pthread_sigmask(signal.SIG_SETMASK, restored_signal_mask)
 os.close(pid_descriptor)
 os.close(gate_descriptor)
-os.execve(sys.argv[4], sys.argv[4:], os.environ)
+os.execve(sys.argv[6], sys.argv[6:], os.environ)
 """
 
 
@@ -1608,8 +1612,8 @@ class _CommandBudget:
 class _SpawnedProcess:
     arguments: tuple[str, ...]
     pid: int | None = None
-    stdout: IO[bytes] | None = None
-    stderr: IO[bytes] | None = None
+    stdout: _OwnedPipeReader | None = None
+    stderr: _OwnedPipeReader | None = None
     returncode: int | None = None
     wait_lock: Lock = field(default_factory=Lock, repr=False)
 
@@ -1657,30 +1661,32 @@ class _ProcessOwner:
 
 
 class _OwnedSpawnPipe:
-    """Pipe descriptors whose C output slots are owned before allocation."""
+    """Object-owned local channel safe across allocation and close interruption."""
 
     def __init__(self) -> None:
-        self._descriptors = (ctypes.c_int * 2)(-1, -1)
+        self._read_socket: socket.socket | None = None
+        self._write_socket: socket.socket | None = None
+        self._read_transferred = False
 
     def acquire(self) -> None:
-        _pipe_into(self._descriptors)
-        for descriptor in self._descriptors:
-            flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
-            fcntl.fcntl(descriptor, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        if self._read_socket is not None or self._write_socket is not None:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        self._read_socket, self._write_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM,
+        )
 
     @property
     def read_descriptor(self) -> int:
-        descriptor = int(self._descriptors[0])
-        if descriptor < 0:
+        if self._read_socket is None:
             raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
-        return descriptor
+        return self._read_socket.fileno()
 
     @property
     def write_descriptor(self) -> int:
-        descriptor = int(self._descriptors[1])
-        if descriptor < 0:
+        if self._write_socket is None:
             raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
-        return descriptor
+        return self._write_socket.fileno()
 
     def close_read(self) -> None:
         self._close(0)
@@ -1688,15 +1694,17 @@ class _OwnedSpawnPipe:
     def close_write(self) -> None:
         self._close(1)
 
-    def open_read(self) -> IO[bytes]:
-        descriptor = self.read_descriptor
-        stream = os.fdopen(descriptor, "rb", buffering=0)
-        self._descriptors[0] = -1
-        return stream
+    def transfer_read(self) -> None:
+        self._read_transferred = True
+
+    def close_transferred_read(self) -> None:
+        self._read_transferred = False
+        self._close(0)
 
     def close(self) -> list[BaseException]:
         errors: list[BaseException] = []
-        for index in (1, 0):
+        indexes = (1,) if self._read_transferred else (1, 0)
+        for index in indexes:
             try:
                 self._close(index)
             except BaseException as error:
@@ -1704,11 +1712,25 @@ class _OwnedSpawnPipe:
         return errors
 
     def _close(self, index: int) -> None:
-        descriptor = int(self._descriptors[index])
-        if descriptor < 0:
+        endpoint = self._read_socket if index == 0 else self._write_socket
+        if endpoint is None:
             return
-        os.close(descriptor)
-        self._descriptors[index] = -1
+        endpoint.close()
+        if index == 0:
+            self._read_socket = None
+        else:
+            self._write_socket = None
+
+
+class _OwnedPipeReader:
+    def __init__(self, pipe: _OwnedSpawnPipe) -> None:
+        self._pipe = pipe
+
+    def fileno(self) -> int:
+        return self._pipe.read_descriptor
+
+    def close(self) -> None:
+        self._pipe.close_transferred_read()
 
 
 class ProbeConnectGuardManager:
@@ -2660,6 +2682,14 @@ def _run_command(
 ) -> str:
     owner = _ProcessOwner()
     selector: selectors.BaseSelector | None = None
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+    deadline = time.monotonic() + timeout_seconds
     try:
         try:
             _spawn_owned_process(
@@ -2671,6 +2701,7 @@ def _run_command(
                 text=False,
                 env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin"},
                 pass_fds=pass_fds,
+                deadline=deadline,
             )
         except OSError:
             raise ProbeConnectGuardError(
@@ -2682,7 +2713,6 @@ def _run_command(
         stdout = bytearray()
         stderr = bytearray()
         selector = selectors.DefaultSelector()
-        deadline = time.monotonic() + timeout_seconds
         if process.stdout is None or process.stderr is None:
             raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
         for stream, output in ((process.stdout, stdout), (process.stderr, stderr)):
@@ -2769,6 +2799,7 @@ def _spawn_owned_process(
     text: bool,
     env: dict[str, str],
     pass_fds: tuple[int, ...],
+    deadline: float,
 ) -> None:
     """Spawn with signals blocked until the kernel PID is ledger-owned."""
 
@@ -2789,6 +2820,9 @@ def _spawn_owned_process(
     try:
         previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         child_signal_mask = tuple(int(item) for item in previous_mask)
+        guarded_child_signal_mask = tuple(
+            sorted({*child_signal_mask, *(int(item) for item in blocked_signals)})
+        )
         for pipe in pipes:
             pipe.acquire()
         process = _SpawnedProcess(arguments=arguments)
@@ -2818,8 +2852,12 @@ def _spawn_owned_process(
         )
         pid_descriptor = descriptor_mapping[pid_pipe.write_descriptor]
         gate_descriptor = descriptor_mapping[gate_pipe.read_descriptor]
+        spawn_nonce = secrets.token_hex(16)
+        wrapper_executable = (
+            "/proc/self/exe" if Path("/proc/self/exe").exists() else sys.executable
+        )
         wrapper_arguments = (
-            sys.executable,
+            wrapper_executable,
             "-I",
             "-S",
             "-c",
@@ -2827,6 +2865,8 @@ def _spawn_owned_process(
             str(pid_descriptor),
             str(gate_descriptor),
             ",".join(str(item) for item in sorted(descriptor_mapping.values())),
+            ",".join(str(item) for item in sorted(child_signal_mask)),
+            spawn_nonce,
             *bound_arguments,
         )
         file_actions = [
@@ -2844,28 +2884,41 @@ def _spawn_owned_process(
                 wrapper_arguments,
                 env,
                 file_actions=file_actions,
-                setsigmask=child_signal_mask,
+                setsigmask=guarded_child_signal_mask,
             )
             process.pid = spawned_pid
         except BaseException:
             pid_pipe.close_write()
             gate_pipe.close_read()
-            recovered_pid = _read_reported_spawn_pid(pid_pipe, required=False)
+            recovery_deadline = time.monotonic() + _COMMAND_CLEANUP_SECONDS
+            recovered_pid = _read_reported_spawn_pid(
+                pid_pipe,
+                required=False,
+                deadline=recovery_deadline,
+            )
+            if recovered_pid is None:
+                recovered_pid = _recover_gated_spawn_pid(spawn_nonce)
             if recovered_pid is not None:
                 process.pid = recovered_pid
             gate_pipe.close_write()
             raise
         pid_pipe.close_write()
         gate_pipe.close_read()
-        reported_pid = _read_reported_spawn_pid(pid_pipe, required=True)
+        reported_pid = _read_reported_spawn_pid(
+            pid_pipe,
+            required=True,
+            deadline=deadline,
+        )
         if reported_pid != process.pid:
             raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
         os.write(gate_pipe.write_descriptor, b"R")
         gate_pipe.close_write()
         stdout_pipe.close_write()
         stderr_pipe.close_write()
-        process.stdout = stdout_pipe.open_read()
-        process.stderr = stderr_pipe.open_read()
+        process.stdout = _OwnedPipeReader(stdout_pipe)
+        stdout_pipe.transfer_read()
+        process.stderr = _OwnedPipeReader(stderr_pipe)
+        stderr_pipe.transfer_read()
     except BaseException as error:
         primary_error = error
         raise
@@ -2899,32 +2952,15 @@ def _spawn_owned_process(
             raise ProbeConnectGuardError("probe_guard_command_cleanup_failed")
 
 
-def _pipe_into(descriptors: ctypes.Array[ctypes.c_int]) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    pipe2 = getattr(libc, "pipe2", None)
-    if pipe2 is None:
-        pipe = libc.pipe
-        pipe.argtypes = (ctypes.POINTER(ctypes.c_int),)
-        pipe.restype = ctypes.c_int
-        result = pipe(descriptors)
-    else:
-        pipe2.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_int)
-        pipe2.restype = ctypes.c_int
-        result = pipe2(descriptors, os.O_CLOEXEC)
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
-
-
 def _read_reported_spawn_pid(
     pipe: _OwnedSpawnPipe,
     *,
     required: bool,
+    deadline: float,
 ) -> int | None:
     descriptor = pipe.read_descriptor
     selector = selectors.DefaultSelector()
     payload = bytearray()
-    deadline = time.monotonic() + _COMMAND_CLEANUP_SECONDS
     try:
         selector.register(descriptor, selectors.EVENT_READ)
         while b"\n" not in payload:
@@ -2955,6 +2991,40 @@ def _read_reported_spawn_pid(
         return int(decoded)
     except (UnicodeDecodeError, ValueError):
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+
+
+def _recover_gated_spawn_pid(spawn_nonce: str) -> int | None:
+    children_path = Path("/proc/thread-self/children")
+    if not children_path.is_file():
+        return None
+    try:
+        children_payload = children_path.read_bytes()
+        if len(children_payload) > 8_192:
+            raise ValueError
+        child_pids = tuple(
+            int(item) for item in children_payload.decode("ascii").split()
+        )
+    except (OSError, UnicodeDecodeError, ValueError):
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+    expected_nonce = spawn_nonce.encode("ascii")
+    matches: list[int] = []
+    for child_pid in child_pids:
+        try:
+            with Path(f"/proc/{child_pid}/cmdline").open("rb") as stream:
+                command_line = stream.read(65_537)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ProbeConnectGuardError(
+                "probe_guard_kernel_operation_failed"
+            ) from None
+        if len(command_line) > 65_536:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        if expected_nonce in command_line.split(b"\0"):
+            matches.append(child_pid)
+    if len(matches) > 1:
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+    return matches[0] if matches else None
 
 
 def _replace_descriptor_argument(

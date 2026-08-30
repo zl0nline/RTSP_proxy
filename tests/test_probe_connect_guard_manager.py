@@ -8,6 +8,7 @@ import selectors
 import shutil
 import signal
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
@@ -2690,6 +2691,7 @@ def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_spawn = os.posix_spawn
+    original_pid_report = probe_connect_guard._read_reported_spawn_pid
     spawned: list[int] = []
 
     def interrupt_after_spawn(
@@ -2702,7 +2704,17 @@ def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
         spawned.append(pid)
         raise KeyboardInterrupt("spawn return interrupted")
 
+    def force_proc_recovery(*args: Any, **kwargs: Any) -> int | None:
+        recovered = original_pid_report(*args, **kwargs)
+        assert recovered is not None
+        return None
+
     monkeypatch.setattr(os, "posix_spawn", interrupt_after_spawn)
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_read_reported_spawn_pid",
+        force_proc_recovery,
+    )
     try:
         with pytest.raises(BaseException) as raised:
             probe_connect_guard._run_command(
@@ -2729,26 +2741,73 @@ def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
 
 
 @pytest.mark.skipif(
+    not Path("/proc/self/exe").exists(),
+    reason="verified current executable is a Linux production boundary",
+)
+def test_bpftool_command_executes_wrapper_from_current_inode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "rtsp_proxy.probe_connect_guard.sys.executable",
+        "/missing/python",
+    )
+
+    assert (
+        probe_connect_guard._run_command(
+            ("/bin/true",),
+            timeout_seconds=1.0,
+        )
+        == ""
+    )
+
+
+def test_bpftool_command_includes_spawn_handshake_in_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_SPAWN_WRAPPER",
+        "import time; time.sleep(0.2)\n" + probe_connect_guard._SPAWN_WRAPPER,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=0.05,
+        )
+
+    assert time.monotonic() - started < 0.75
+
+
+@pytest.mark.skipif(
     not Path("/proc/self/fd").is_dir(),
     reason="descriptor ownership is a Linux production boundary",
 )
 def test_bpftool_command_closes_descriptors_when_pipe_acquisition_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_pipe_into = probe_connect_guard._pipe_into
+    original_acquire = probe_connect_guard._OwnedSpawnPipe.acquire
     calls = 0
     allocated: list[int] = []
 
-    def fail_second_pipe(descriptors: Any) -> None:
+    def fail_second_pipe(pipe: Any) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("injected pipe failure")
-        original_pipe_into(descriptors)
-        allocated.extend(int(descriptor) for descriptor in descriptors)
+        original_acquire(pipe)
+        allocated.extend((pipe.read_descriptor, pipe.write_descriptor))
 
     before = set(Path("/proc/self/fd").iterdir())
-    monkeypatch.setattr(probe_connect_guard, "_pipe_into", fail_second_pipe)
+    monkeypatch.setattr(
+        probe_connect_guard._OwnedSpawnPipe,
+        "acquire",
+        fail_second_pipe,
+    )
 
     with pytest.raises(
         ProbeConnectGuardError,
@@ -2772,22 +2831,22 @@ def test_bpftool_command_closes_descriptors_when_pipe_acquisition_fails(
 def test_bpftool_command_closes_pipe_when_allocation_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_pipe_into = probe_connect_guard._pipe_into
+    original_acquire = probe_connect_guard._OwnedSpawnPipe.acquire
     calls = 0
     allocated: list[int] = []
 
-    def interrupt_after_allocation(descriptors: Any) -> None:
+    def interrupt_after_allocation(pipe: Any) -> None:
         nonlocal calls
         calls += 1
-        original_pipe_into(descriptors)
-        allocated.extend(int(descriptor) for descriptor in descriptors)
+        original_acquire(pipe)
+        allocated.extend((pipe.read_descriptor, pipe.write_descriptor))
         if calls == 1:
             raise KeyboardInterrupt("pipe allocation interrupted")
 
     before = set(Path("/proc/self/fd").iterdir())
     monkeypatch.setattr(
-        probe_connect_guard,
-        "_pipe_into",
+        probe_connect_guard._OwnedSpawnPipe,
+        "acquire",
         interrupt_after_allocation,
     )
 
@@ -2801,6 +2860,24 @@ def test_bpftool_command_closes_pipe_when_allocation_is_interrupted(
     for descriptor in allocated:
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+def test_spawn_pipe_second_close_cannot_close_reused_descriptor(
+) -> None:
+    pipe = probe_connect_guard._OwnedSpawnPipe()
+    pipe.acquire()
+    descriptor = pipe.read_descriptor
+    replacement = os.open(os.devnull, os.O_RDONLY)
+    try:
+        pipe.close_read()
+        os.dup2(replacement, descriptor)
+
+        assert pipe.close() == []
+        os.fstat(descriptor)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+        os.close(replacement)
 
 
 @pytest.mark.skipif(
