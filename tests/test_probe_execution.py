@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from pathlib import Path
+from threading import Event, Thread
 from uuid import UUID, uuid4
 
 import pytest
@@ -101,6 +102,10 @@ class _Systemd:
         collect_on_cancel: bool = True,
         output: bytes = b'{"streams":[]}',
         publish_on_start: bool = True,
+        read_started: Event | None = None,
+        read_release: Event | None = None,
+        cancel_started: Event | None = None,
+        cancel_release: Event | None = None,
     ) -> None:
         self.events = events
         self.start_error = start_error
@@ -111,6 +116,10 @@ class _Systemd:
         self.collect_on_cancel = collect_on_cancel
         self.output = output
         self.publish_on_start = publish_on_start
+        self.read_started = read_started
+        self.read_release = read_release
+        self.cancel_started = cancel_started
+        self.cancel_release = cancel_release
         self.lease: ProbeTransientLease | None = None
 
     def start_owned(
@@ -151,13 +160,17 @@ class _Systemd:
         assert output_fd == 102
         assert timeout_seconds > 0
         self.events.append("systemd.read_output")
+        if self.read_started is not None:
+            self.read_started.set()
+        if self.read_release is not None:
+            assert self.read_release.wait(timeout=5.0)
         if self.collect_before_read_error:
             collected(lease)
         if self.read_error is not None:
             raise self.read_error
         return self.output
 
-    def cancel(
+    def ensure_collected(
         self,
         lease: ProbeTransientLease,
         *,
@@ -167,6 +180,10 @@ class _Systemd:
         assert lease is self.lease
         assert timeout_seconds > 0
         self.events.append("systemd.cancel")
+        if self.cancel_started is not None:
+            self.cancel_started.set()
+        if self.cancel_release is not None:
+            assert self.cancel_release.wait(timeout=5.0)
         if self.collect_on_cancel:
             collected(lease)
         if self.cancel_error is not None:
@@ -226,7 +243,7 @@ class _Guard:
         if self.install_error is not None:
             raise self.install_error
 
-    def release(
+    def ensure_released(
         self,
         lease: ProbeConnectGuardLease,
         *,
@@ -259,6 +276,34 @@ class _Decoder:
         )
 
 
+class _Recovery:
+    def __init__(
+        self,
+        *,
+        unit_unresolved: int = 0,
+        guard_unresolved: int = 0,
+        error: Exception | None = None,
+    ) -> None:
+        self.unit_unresolved = unit_unresolved
+        self.guard_unresolved = guard_unresolved
+        self.error = error
+        self.events: list[str] = []
+
+    def reconcile_units(self, *, timeout_seconds: float) -> int:
+        assert timeout_seconds > 0
+        self.events.append("recovery.units")
+        if self.error is not None:
+            raise self.error
+        return self.unit_unresolved
+
+    def reconcile_guards(self, *, timeout_seconds: float) -> int:
+        assert timeout_seconds > 0
+        self.events.append("recovery.guards")
+        if self.error is not None:
+            raise self.error
+        return self.guard_unresolved
+
+
 def _received_request() -> ReceivedProbeInput:
     return _received_for_request(
         ProbeBrokerRequest(
@@ -284,18 +329,24 @@ def _broker(
     guard: _Guard | None = None,
     channels: _ChannelFactory | None = None,
     decoder: _Decoder | None = None,
+    recovery: _Recovery | None = None,
+    reconcile: bool = True,
     monotonic: Callable[[], float] = lambda: 100.0,
     wall_clock_ms: Callable[[], int] = lambda: 1_799_999_999_000,
 ) -> ProbeExecutionBroker:
-    return ProbeExecutionBroker(
+    broker = ProbeExecutionBroker(
         systemd=systemd or _Systemd(events),
         guard=guard or _Guard(events),
         cgroups=_Cgroups(events),
         channels=channels or _ChannelFactory(events),
         decoder=decoder or _Decoder(),
+        recovery=recovery or _Recovery(),
         monotonic=monotonic,
         wall_clock_ms=wall_clock_ms,
     )
+    if reconcile:
+        assert broker.reconcile_startup(timeout_seconds=5.0) == 0
+    return broker
 
 
 def test_probe_execution_orders_guard_before_release_and_collects_everything() -> None:
@@ -451,6 +502,7 @@ def test_probe_execution_never_releases_guard_until_unit_collection_is_proven() 
     assert "systemd.cancel" in events
     assert "guard.release" not in events
     assert "channels.close" not in events
+    assert "channels.release_gate" not in events
 
     now[0] = 100.0
     systemd.cancel_error = None
@@ -645,3 +697,149 @@ def test_probe_execution_rejects_invalid_monotonic_clock(
 def test_probe_execution_rejects_non_received_value() -> None:
     with pytest.raises(ProbeExecutionError, match="probe_execution_request_invalid"):
         _broker([]).execute(object(), timeout_seconds=5.0)  # type: ignore[arg-type]
+
+
+def test_cleanup_retry_ignores_an_execution_that_is_still_reading() -> None:
+    events: list[str] = []
+    read_started = Event()
+    read_release = Event()
+    systemd = _Systemd(
+        events,
+        read_started=read_started,
+        read_release=read_release,
+    )
+    broker = _broker(events, systemd=systemd)
+    outcome: list[ProbeExecutionResult] = []
+
+    execution = Thread(
+        target=lambda: outcome.append(
+            broker.execute(_received_request(), timeout_seconds=5.0)
+        )
+    )
+    execution.start()
+    assert read_started.wait(timeout=5.0)
+
+    assert broker.retry_pending_cleanup(timeout_seconds=1.0) == 0
+    assert "systemd.cancel" not in events
+
+    read_release.set()
+    execution.join(timeout=5.0)
+    assert not execution.is_alive()
+    assert len(outcome) == 1
+
+
+def test_probe_execution_requires_successful_unit_before_guard_startup_recovery() -> None:
+    events: list[str] = []
+    broker = _broker(events, reconcile=False)
+    received = _received_request()
+
+    with pytest.raises(ProbeExecutionError, match="probe_execution_recovery_required"):
+        broker.execute(received, timeout_seconds=5.0)
+
+    assert events == []
+    received.close()
+
+
+def test_probe_execution_stays_disabled_while_startup_recovery_is_unresolved() -> None:
+    recovery = _Recovery(unit_unresolved=1)
+    broker = _broker([], recovery=recovery, reconcile=False)
+
+    assert broker.reconcile_startup(timeout_seconds=5.0) == 1
+    assert recovery.events == ["recovery.units"]
+    received = _received_request()
+    with pytest.raises(ProbeExecutionError, match="probe_execution_recovery_required"):
+        broker.execute(received, timeout_seconds=5.0)
+    received.close()
+
+    recovery.unit_unresolved = 0
+    assert broker.reconcile_startup(timeout_seconds=5.0) == 0
+    assert recovery.events[-2:] == ["recovery.units", "recovery.guards"]
+    assert isinstance(
+        broker.execute(_received_request(), timeout_seconds=5.0),
+        ProbeExecutionResult,
+    )
+
+
+def test_probe_execution_sanitizes_startup_recovery_failure() -> None:
+    broker = _broker(
+        [],
+        recovery=_Recovery(error=RuntimeError("rtsp://user:secret@example.invalid")),
+        reconcile=False,
+    )
+
+    with pytest.raises(ProbeExecutionError, match="probe_execution_recovery_failed") as raised:
+        broker.reconcile_startup(timeout_seconds=5.0)
+
+    assert "secret" not in str(raised.value)
+
+
+def test_probe_execution_does_not_enable_until_owned_guards_are_reconciled() -> None:
+    recovery = _Recovery(guard_unresolved=1)
+    broker = _broker([], recovery=recovery, reconcile=False)
+
+    assert broker.reconcile_startup(timeout_seconds=5.0) == 1
+    assert recovery.events == ["recovery.units", "recovery.guards"]
+    received = _received_request()
+    with pytest.raises(ProbeExecutionError, match="probe_execution_recovery_required"):
+        broker.execute(received, timeout_seconds=5.0)
+    received.close()
+
+
+def test_startup_recovery_refuses_to_race_an_active_execution() -> None:
+    events: list[str] = []
+    read_started = Event()
+    read_release = Event()
+    broker = _broker(
+        events,
+        systemd=_Systemd(
+            events,
+            read_started=read_started,
+            read_release=read_release,
+        ),
+    )
+    execution = Thread(
+        target=lambda: broker.execute(_received_request(), timeout_seconds=5.0)
+    )
+    execution.start()
+    assert read_started.wait(timeout=5.0)
+
+    with pytest.raises(ProbeExecutionError, match="probe_execution_recovery_busy"):
+        broker.reconcile_startup(timeout_seconds=1.0)
+
+    read_release.set()
+    execution.join(timeout=5.0)
+    assert not execution.is_alive()
+
+
+def test_only_one_cleanup_sweep_can_claim_a_pending_execution() -> None:
+    events: list[str] = []
+    systemd = _Systemd(
+        events,
+        collect_before_read_error=False,
+        collect_on_cancel=False,
+    )
+    broker = _broker(events, systemd=systemd)
+    with pytest.raises(ProbeExecutionError, match="probe_execution_cleanup_pending"):
+        broker.execute(_received_request(), timeout_seconds=5.0)
+
+    cancel_started = Event()
+    cancel_release = Event()
+    systemd.cancel_started = cancel_started
+    systemd.cancel_release = cancel_release
+    systemd.collect_on_cancel = True
+    outcomes: list[int] = []
+    sweep = Thread(
+        target=lambda: outcomes.append(
+            broker.retry_pending_cleanup(timeout_seconds=5.0)
+        )
+    )
+    sweep.start()
+    assert cancel_started.wait(timeout=5.0)
+
+    assert broker.retry_pending_cleanup(timeout_seconds=1.0) == 1
+    assert events.count("systemd.cancel") == 2
+
+    cancel_release.set()
+    sweep.join(timeout=5.0)
+    assert not sweep.is_alive()
+    assert outcomes == [0]

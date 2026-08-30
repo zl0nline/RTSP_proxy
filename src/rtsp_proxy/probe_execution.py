@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
@@ -18,6 +18,7 @@ from rtsp_proxy.probes import ProbeExecutionResult
 _MAX_EXECUTION_SECONDS = 60.0
 _MAX_OUTPUT_BYTES = 65_536
 _CLEANUP_RESERVE_SECONDS = 5.0
+_MAX_EXECUTION_RECORDS = 128
 
 
 class ProbeExecutionError(RuntimeError):
@@ -85,14 +86,14 @@ class _SystemdController(Protocol):
     ) -> bytes:
         """Call collected only after the exact unit is definitively gone."""
 
-    def cancel(
+    def ensure_collected(
         self,
         lease: ProbeTransientLease,
         *,
         timeout_seconds: float,
         collected: Callable[[ProbeTransientLease], None],
     ) -> None:
-        """Boundedly collect the exact unit and then call collected."""
+        """Idempotently collect the exact unit and then call collected."""
 
 
 class _CgroupResolver(Protocol):
@@ -112,14 +113,22 @@ class _GuardController(Protocol):
     ) -> None:
         """Publish the lease before a committed guard can escape this call."""
 
-    def release(
+    def ensure_released(
         self,
         lease: ProbeConnectGuardLease,
         *,
         timeout_seconds: float,
         released: Callable[[ProbeConnectGuardLease], None],
     ) -> None:
-        """Remove the exact guard and then call released."""
+        """Idempotently remove the exact guard and then call released."""
+
+
+class _StartupRecovery(Protocol):
+    def reconcile_units(self, *, timeout_seconds: float) -> int:
+        """Stop and collect every receipt-owned transient unit first."""
+
+    def reconcile_guards(self, *, timeout_seconds: float) -> int:
+        """Remove receipt-owned guards only after every unit is gone."""
 
 
 class _ResultDecoder(Protocol):
@@ -134,6 +143,8 @@ class _ExecutionOwnership:
     systemd: _OwnerSlot[ProbeTransientLease] = field(default_factory=_OwnerSlot)
     guard: _OwnerSlot[ProbeConnectGuardLease] = field(default_factory=_OwnerSlot)
     received_closed: bool = False
+    state: Literal["executing", "cleaning", "cleanup_pending"] = "executing"
+    operation_lock: Lock = field(default_factory=Lock, repr=False)
 
     @property
     def collected(self) -> bool:
@@ -156,6 +167,7 @@ class ProbeExecutionBroker:
         cgroups: _CgroupResolver,
         channels: _ExecutionChannelFactory,
         decoder: _ResultDecoder,
+        recovery: _StartupRecovery,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock_ms: Callable[[], int] = lambda: int(time.time() * 1_000),
     ) -> None:
@@ -164,10 +176,51 @@ class ProbeExecutionBroker:
         self._cgroups = cgroups
         self._channels = channels
         self._decoder = decoder
+        self._recovery = recovery
         self._monotonic = monotonic
         self._wall_clock_ms = wall_clock_ms
         self._active: dict[UUID, _ExecutionOwnership] = {}
         self._active_lock = Lock()
+        self._recovery_lock = Lock()
+        self._retry_lock = Lock()
+        self._recovery_ready = False
+
+    def reconcile_startup(self, *, timeout_seconds: float) -> int:
+        timeout = self._validate_timeout(timeout_seconds)
+        with self._recovery_lock:
+            with self._active_lock:
+                if self._active:
+                    raise ProbeExecutionError("probe_execution_recovery_busy")
+                self._recovery_ready = False
+            deadline = self._monotonic_deadline(timeout)
+            try:
+                unresolved_units = self._recovery.reconcile_units(
+                    timeout_seconds=self._remaining(deadline)
+                )
+            except Exception:
+                raise ProbeExecutionError("probe_execution_recovery_failed") from None
+            self._validate_recovery_count(unresolved_units)
+            if unresolved_units:
+                return unresolved_units
+            try:
+                unresolved_guards = self._recovery.reconcile_guards(
+                    timeout_seconds=self._remaining(deadline)
+                )
+            except Exception:
+                raise ProbeExecutionError("probe_execution_recovery_failed") from None
+            self._validate_recovery_count(unresolved_guards)
+            with self._active_lock:
+                self._recovery_ready = unresolved_guards == 0
+            return unresolved_guards
+
+    @staticmethod
+    def _validate_recovery_count(unresolved: int) -> None:
+        if (
+            isinstance(unresolved, bool)
+            or not isinstance(unresolved, int)
+            or unresolved < 0
+        ):
+            raise ProbeExecutionError("probe_execution_recovery_failed")
 
     def execute(
         self,
@@ -181,12 +234,40 @@ class ProbeExecutionBroker:
         request = received.request
         deadline = self._execution_deadline(request, timeout_seconds=timeout)
         ownership = _ExecutionOwnership(received=received)
+        ownership.operation_lock.acquire()
+        try:
+            return self._execute_claimed(
+                request,
+                ownership,
+                deadline=deadline,
+            )
+        finally:
+            with self._active_lock:
+                if (
+                    self._active.get(request.request_id) is ownership
+                    and not ownership.collected
+                ):
+                    ownership.state = "cleanup_pending"
+            ownership.operation_lock.release()
+
+    def _execute_claimed(
+        self,
+        request: ProbeBrokerRequest,
+        ownership: _ExecutionOwnership,
+        *,
+        deadline: float,
+    ) -> ProbeExecutionResult:
+        received = ownership.received
         primary_error: BaseException | None = None
         result: ProbeExecutionResult | None = None
         try:
             with self._active_lock:
+                if not self._recovery_ready:
+                    raise ProbeExecutionError("probe_execution_recovery_required")
                 if request.request_id in self._active:
                     raise ProbeExecutionError("probe_execution_already_active")
+                if len(self._active) >= _MAX_EXECUTION_RECORDS:
+                    raise ProbeExecutionError("probe_execution_capacity_exhausted")
                 self._active[request.request_id] = ownership
             self._channels.create_owned(
                 received,
@@ -214,6 +295,7 @@ class ProbeExecutionBroker:
                 publish=ownership.guard.publish,
             )
             self._require_request_live(request)
+            _ = self._remaining(deadline)
             execution_channels.release_gate()
             systemd_lease = self._require_systemd_lease(ownership)
             raw_result = self._systemd.read_output(
@@ -231,6 +313,9 @@ class ProbeExecutionBroker:
         if not owns_record:
             self._raise_failures(primary_error, [])
             raise ProbeExecutionError("probe_execution_failed")
+        with self._active_lock:
+            if self._active.get(request.request_id) is ownership:
+                ownership.state = "cleaning"
         cleanup_deadline = self._cleanup_deadline()
         cleanup_errors = self._cleanup_ownership(ownership, deadline=cleanup_deadline)
         if ownership.collected:
@@ -245,26 +330,54 @@ class ProbeExecutionBroker:
 
     def retry_pending_cleanup(self, *, timeout_seconds: float) -> int:
         timeout = self._validate_timeout(timeout_seconds)
-        deadline = self._monotonic_deadline(timeout)
-        with self._active_lock:
-            pending = tuple(self._active.items())
-        interruptions: list[BaseException] = []
-        for request_id, ownership in pending:
-            if self._remaining_or_none(deadline) is None:
-                break
-            errors = self._cleanup_ownership(ownership, deadline=deadline)
-            interruptions.extend(
-                error for error in errors if not isinstance(error, Exception)
-            )
-            if ownership.collected:
-                self._remove_ownership(request_id, ownership)
-        if interruptions:
-            raise BaseExceptionGroup(
-                "probe execution cleanup retry was interrupted",
-                [_sanitize_interruption(error) for error in interruptions],
-            ) from None
-        with self._active_lock:
-            return len(self._active)
+        if not self._retry_lock.acquire(blocking=False):
+            return self._unresolved_cleanup_count()
+        try:
+            deadline = self._monotonic_deadline(timeout)
+            with self._active_lock:
+                pending = tuple(
+                    (request_id, ownership)
+                    for request_id, ownership in self._active.items()
+                    if ownership.state == "cleanup_pending"
+                )
+            interruptions: list[BaseException] = []
+            for request_id, ownership in pending:
+                if self._remaining_or_none(deadline) is None:
+                    break
+                if not ownership.operation_lock.acquire(blocking=False):
+                    continue
+                claimed = False
+                try:
+                    with self._active_lock:
+                        if (
+                            self._active.get(request_id) is not ownership
+                            or ownership.state != "cleanup_pending"
+                        ):
+                            continue
+                        ownership.state = "cleaning"
+                        claimed = True
+                    errors = self._cleanup_ownership(ownership, deadline=deadline)
+                    interruptions.extend(
+                        error for error in errors if not isinstance(error, Exception)
+                    )
+                except BaseException as error:
+                    interruptions.append(error)
+                finally:
+                    if claimed and ownership.collected:
+                        self._remove_ownership(request_id, ownership)
+                    elif claimed:
+                        with self._active_lock:
+                            if self._active.get(request_id) is ownership:
+                                ownership.state = "cleanup_pending"
+                    ownership.operation_lock.release()
+            if interruptions:
+                raise BaseExceptionGroup(
+                    "probe execution cleanup retry was interrupted",
+                    [_sanitize_interruption(error) for error in interruptions],
+                ) from None
+            return self._unresolved_cleanup_count()
+        finally:
+            self._retry_lock.release()
 
     def _cleanup_ownership(
         self,
@@ -278,7 +391,7 @@ class ProbeExecutionBroker:
             remaining = self._remaining_or_none(deadline)
             if remaining is not None:
                 try:
-                    self._systemd.cancel(
+                    self._systemd.ensure_collected(
                         systemd_lease,
                         timeout_seconds=remaining,
                         collected=ownership.systemd.release,
@@ -294,7 +407,7 @@ class ProbeExecutionBroker:
             remaining = self._remaining_or_none(deadline)
             if remaining is not None:
                 try:
-                    self._guard.release(
+                    self._guard.ensure_released(
                         guard_lease,
                         timeout_seconds=remaining,
                         released=ownership.guard.release,
@@ -425,6 +538,13 @@ class ProbeExecutionBroker:
         with self._active_lock:
             if self._active.get(request_id) is ownership:
                 self._active.pop(request_id)
+
+    def _unresolved_cleanup_count(self) -> int:
+        with self._active_lock:
+            return sum(
+                ownership.state != "executing"
+                for ownership in self._active.values()
+            )
 
     @staticmethod
     def _raise_failures(
