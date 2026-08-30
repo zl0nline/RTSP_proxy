@@ -25,11 +25,14 @@ class ProbeExecutionError(RuntimeError):
     """One admitted probe could not complete through the isolated executor."""
 
 
-class _ExecutionChannels(Protocol):
+class ProbeExecutionChannels(Protocol):
     """Idempotently closable parent/child descriptor ownership bundle."""
 
-    descriptors: ProbeTransientDescriptors
-    output_fd: int
+    @property
+    def descriptors(self) -> ProbeTransientDescriptors: ...
+
+    @property
+    def output_fd(self) -> int: ...
 
     def close_child_ends(self) -> None: ...
 
@@ -55,12 +58,12 @@ class _OwnerSlot[Owned]:
         self.value = None
 
 
-class _ExecutionChannelFactory(Protocol):
+class ProbeExecutionChannelFactory(Protocol):
     def create_owned(
         self,
         received: ReceivedProbeInput,
         *,
-        publish: Callable[[_ExecutionChannels], None],
+        publish: Callable[[ProbeExecutionChannels], None],
     ) -> None:
         """Duplicate the sealed input and publish every new descriptor owner."""
 
@@ -139,7 +142,7 @@ class _ResultDecoder(Protocol):
 @dataclass(slots=True)
 class _ExecutionOwnership:
     received: ReceivedProbeInput
-    channels: _OwnerSlot[_ExecutionChannels] = field(default_factory=_OwnerSlot)
+    channels: _OwnerSlot[ProbeExecutionChannels] = field(default_factory=_OwnerSlot)
     systemd: _OwnerSlot[ProbeTransientLease] = field(default_factory=_OwnerSlot)
     guard: _OwnerSlot[ProbeConnectGuardLease] = field(default_factory=_OwnerSlot)
     received_closed: bool = False
@@ -165,7 +168,7 @@ class ProbeExecutionBroker:
         systemd: _SystemdController,
         guard: _GuardController,
         cgroups: _CgroupResolver,
-        channels: _ExecutionChannelFactory,
+        channels: ProbeExecutionChannelFactory,
         decoder: _ResultDecoder,
         recovery: _StartupRecovery,
         monotonic: Callable[[], float] = time.monotonic,
@@ -508,7 +511,7 @@ class ProbeExecutionBroker:
         return result
 
     @staticmethod
-    def _require_channels(ownership: _ExecutionOwnership) -> _ExecutionChannels:
+    def _require_channels(ownership: _ExecutionOwnership) -> ProbeExecutionChannels:
         channels = ownership.channels.value
         if channels is None:
             raise ProbeExecutionError("probe_execution_ownership_invalid")

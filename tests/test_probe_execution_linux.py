@@ -5,6 +5,7 @@ import sys
 from contextlib import suppress
 from ipaddress import ip_address
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
@@ -12,7 +13,6 @@ import pytest
 from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
 from rtsp_proxy.probe_execution_linux import (
     LinuxProbeExecutionChannelFactory,
-    LinuxProbeExecutionChannels,
     LinuxSystemdCgroupResolver,
     ProbeExecutionLinuxError,
 )
@@ -21,6 +21,12 @@ from rtsp_proxy.probe_executor import (
     create_sealed_probe_input,
     validate_sealed_probe_input,
 )
+
+if TYPE_CHECKING:
+    from rtsp_proxy.probe_execution import (
+        ProbeExecutionChannelFactory,
+        ProbeExecutionChannels,
+    )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux descriptor contract")
@@ -44,10 +50,11 @@ def test_linux_execution_channels_transfer_gate_input_and_output_without_leaks()
         ),
         _descriptor=create_sealed_probe_input(payload),
     )
-    published: list[LinuxProbeExecutionChannels] = []
+    factory: ProbeExecutionChannelFactory = LinuxProbeExecutionChannelFactory()
+    published: list[ProbeExecutionChannels] = []
 
     try:
-        LinuxProbeExecutionChannelFactory().create_owned(
+        factory.create_owned(
             received,
             publish=published.append,
         )
@@ -121,7 +128,7 @@ def test_linux_channel_factory_publishes_owner_before_reading_input() -> None:
         ),
         _descriptor=-1,
     )
-    published: list[LinuxProbeExecutionChannels] = []
+    published: list[ProbeExecutionChannels] = []
 
     with pytest.raises(ProbeExecutionLinuxError, match="probe_execution_input_invalid"):
         LinuxProbeExecutionChannelFactory().create_owned(
@@ -155,7 +162,7 @@ def test_linux_execution_channel_close_cannot_close_a_reused_descriptor(
             b"option rw_timeout 5000000\n"
         ),
     )
-    published: list[LinuxProbeExecutionChannels] = []
+    published: list[ProbeExecutionChannels] = []
     LinuxProbeExecutionChannelFactory().create_owned(received, publish=published.append)
     channels = published[0]
     victim = channels.output_fd
@@ -188,6 +195,59 @@ def test_linux_execution_channel_close_cannot_close_a_reused_descriptor(
     assert set(os.listdir("/proc/self/fd")) == before
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux descriptor contract")
+def test_linux_execution_channel_retries_a_close_interrupted_before_syscall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = set(os.listdir("/proc/self/fd"))
+    received = ReceivedProbeInput(
+        request=ProbeBrokerRequest(
+            request_id=uuid4(),
+            endpoint_generation=uuid4(),
+            target=ProbeConnectGuardTarget(
+                address=ip_address("192.0.2.10"),
+                port=8554,
+            ),
+            deadline_unix_ms=4_000_000_000_000,
+        ),
+        _descriptor=create_sealed_probe_input(
+            b"ffconcat version 1.0\n"
+            b"file 'rtsp://192.0.2.10:8554/live'\n"
+            b"option rtsp_transport tcp\n"
+            b"option rw_timeout 5000000\n"
+        ),
+    )
+    published: list[ProbeExecutionChannels] = []
+    LinuxProbeExecutionChannelFactory().create_owned(received, publish=published.append)
+    channels = published[0]
+    victim = channels.output_fd
+    native_close = os.close
+    interrupted = False
+
+    def interrupt_before_close(descriptor: int) -> None:
+        nonlocal interrupted
+        if descriptor == victim and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("close interrupted")
+        native_close(descriptor)
+
+    monkeypatch.setattr(os, "close", interrupt_before_close)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="close interrupted"):
+            channels.close()
+        os.fstat(victim)
+        channels.close()
+        with pytest.raises(OSError):
+            os.fstat(victim)
+    finally:
+        monkeypatch.undo()
+        received.close()
+        with suppress(OSError):
+            native_close(victim)
+
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
 def test_linux_cgroup_resolver_returns_only_the_exact_transient_unit(
     tmp_path: Path,
 ) -> None:
@@ -206,3 +266,42 @@ def test_linux_cgroup_resolver_returns_only_the_exact_transient_unit(
     foreign.mkdir()
     with pytest.raises(RuntimeError, match="probe_execution_cgroup_invalid"):
         resolver.resolve(unit_name="foreign.service", timeout_seconds=1.0)
+
+
+@pytest.mark.parametrize(
+    "invalid_sample",
+    [float("nan"), float("inf"), float("-inf"), RuntimeError()],
+)
+def test_linux_cgroup_resolver_rejects_an_invalid_clock_without_sleeping(
+    tmp_path: Path,
+    invalid_sample: object,
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    (cgroup_root / "rtsp-probe.slice").mkdir(parents=True)
+    (cgroup_root / "cgroup.controllers").write_text("cpu memory pids\n", encoding="ascii")
+    samples = iter((0.0, invalid_sample))
+
+    def monotonic() -> float:
+        sample = next(samples)
+        if isinstance(sample, BaseException):
+            raise sample
+        assert isinstance(sample, float)
+        return sample
+
+    def unexpected_sleep(_seconds: float) -> None:
+        raise AssertionError("invalid clocks must fail before sleeping")
+
+    resolver = LinuxSystemdCgroupResolver(
+        cgroup_root=cgroup_root,
+        monotonic=monotonic,
+        sleep=unexpected_sleep,
+    )
+
+    with pytest.raises(
+        ProbeExecutionLinuxError,
+        match="probe_execution_cgroup_unavailable",
+    ):
+        resolver.resolve(
+            unit_name=f"rtsp-probe-{uuid4().hex}.service",
+            timeout_seconds=1.0,
+        )

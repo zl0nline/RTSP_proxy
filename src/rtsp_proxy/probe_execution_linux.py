@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import errno
+import fcntl
 import os
 import re
 import stat
@@ -9,10 +11,14 @@ import time
 from collections.abc import Callable
 from math import isfinite
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rtsp_proxy.probe_broker import ReceivedProbeInput
 from rtsp_proxy.probe_executor import validate_sealed_probe_input
 from rtsp_proxy.probe_systemd import ProbeTransientDescriptors
+
+if TYPE_CHECKING:
+    from rtsp_proxy.probe_execution import ProbeExecutionChannels
 
 
 class ProbeExecutionLinuxError(RuntimeError):
@@ -24,6 +30,10 @@ class _OwnedPipe:
 
     def __init__(self) -> None:
         self._descriptors = (ctypes.c_int * 2)(-1, -1)
+        self._closing_identities: list[tuple[int, int, int, int] | None] = [
+            None,
+            None,
+        ]
 
     def acquire(self) -> None:
         if self._descriptors[0] >= 0 or self._descriptors[1] >= 0:
@@ -71,11 +81,36 @@ class _OwnedPipe:
         descriptor = int(self._descriptors[index])
         if descriptor < 0:
             return
-        self._descriptors[index] = -1
+        expected = self._closing_identities[index]
         try:
+            if expected is None:
+                expected = _descriptor_identity(descriptor)
+                self._closing_identities[index] = expected
+            elif _descriptor_state(descriptor, expected) != "same":
+                self._clear(index)
+                return
             os.close(descriptor)
-        except OSError:
-            raise ProbeExecutionLinuxError("probe_execution_channel_close_failed") from None
+            self._clear(index)
+        except BaseException as error:
+            inspection_error: BaseException | None = None
+            try:
+                if expected is not None and _descriptor_state(descriptor, expected) != "same":
+                    self._clear(index)
+            except BaseException as observed_error:
+                inspection_error = observed_error
+            if inspection_error is not None:
+                raise BaseExceptionGroup(
+                    "probe execution descriptor close and inspection failed",
+                    [
+                        _sanitize_cleanup_error(error),
+                        _sanitize_cleanup_error(inspection_error),
+                    ],
+                ) from None
+            raise _sanitize_cleanup_error(error) from None
+
+    def _clear(self, index: int) -> None:
+        self._descriptors[index] = -1
+        self._closing_identities[index] = None
 
 
 class LinuxProbeExecutionChannels:
@@ -170,7 +205,7 @@ class LinuxProbeExecutionChannelFactory:
         self,
         received: ReceivedProbeInput,
         *,
-        publish: Callable[[LinuxProbeExecutionChannels], None],
+        publish: Callable[[ProbeExecutionChannels], None],
     ) -> None:
         if not isinstance(received, ReceivedProbeInput) or not callable(publish):
             raise ProbeExecutionLinuxError("probe_execution_channels_invalid")
@@ -220,16 +255,36 @@ class LinuxSystemdCgroupResolver:
             and _directory_without_symlink(slice_path)
         ):
             raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
-        deadline = self._monotonic() + float(timeout_seconds)
+        deadline = self._clock_sample() + float(timeout_seconds)
         while True:
             if _directory_without_symlink(expected) and _regular_file_without_symlink(
                 expected / "cgroup.procs"
             ):
                 return expected
-            remaining = deadline - self._monotonic()
+            remaining = deadline - self._clock_sample()
+            if not isfinite(remaining):
+                raise ProbeExecutionLinuxError("probe_execution_cgroup_unavailable")
             if remaining <= 0:
                 raise ProbeExecutionLinuxError("probe_execution_cgroup_unavailable")
-            self._sleep(min(0.01, remaining))
+            try:
+                self._sleep(min(0.01, remaining))
+            except Exception:
+                raise ProbeExecutionLinuxError(
+                    "probe_execution_cgroup_unavailable"
+                ) from None
+
+    def _clock_sample(self) -> float:
+        try:
+            sample = self._monotonic()
+        except Exception:
+            raise ProbeExecutionLinuxError("probe_execution_cgroup_unavailable") from None
+        if (
+            isinstance(sample, bool)
+            or not isinstance(sample, (int, float))
+            or not isfinite(sample)
+        ):
+            raise ProbeExecutionLinuxError("probe_execution_cgroup_unavailable")
+        return float(sample)
 
 
 def _close_operations(*operations: Callable[[], None]) -> list[BaseException]:
@@ -278,3 +333,22 @@ def _regular_file_without_symlink(path: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
+
+
+def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
+    metadata = os.fstat(descriptor)
+    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode, flags & os.O_ACCMODE
+
+
+def _descriptor_state(
+    descriptor: int,
+    expected: tuple[int, int, int, int],
+) -> str:
+    try:
+        observed = _descriptor_identity(descriptor)
+    except OSError as error:
+        if error.errno == errno.EBADF:
+            return "gone"
+        raise
+    return "same" if observed == expected else "different"
