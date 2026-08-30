@@ -843,3 +843,56 @@ def test_only_one_cleanup_sweep_can_claim_a_pending_execution() -> None:
     sweep.join(timeout=5.0)
     assert not sweep.is_alive()
     assert outcomes == [0]
+
+
+def test_execute_finalization_interruption_leaves_collected_record_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _broker([])
+    finalize = broker._finalize_ownership
+    interrupted = False
+
+    def interrupt_once(request_id: UUID, ownership: object) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("between collection and ledger removal")
+        finalize(request_id, ownership)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(broker, "_finalize_ownership", interrupt_once)
+    with pytest.raises(KeyboardInterrupt, match="ledger removal"):
+        broker.execute(_received_request(), timeout_seconds=5.0)
+
+    monkeypatch.setattr(broker, "_finalize_ownership", finalize)
+    assert broker.retry_pending_cleanup(timeout_seconds=5.0) == 0
+
+
+def test_sweep_finalization_interruption_releases_claim_for_next_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    systemd = _Systemd(
+        events,
+        collect_before_read_error=False,
+        collect_on_cancel=False,
+    )
+    broker = _broker(events, systemd=systemd)
+    with pytest.raises(ProbeExecutionError, match="probe_execution_cleanup_pending"):
+        broker.execute(_received_request(), timeout_seconds=5.0)
+    systemd.collect_on_cancel = True
+    finalize = broker._finalize_ownership
+    interrupted = False
+
+    def interrupt_once(request_id: UUID, ownership: object) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("during sweep finalization")
+        finalize(request_id, ownership)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(broker, "_finalize_ownership", interrupt_once)
+    with pytest.raises(KeyboardInterrupt, match="sweep finalization"):
+        broker.retry_pending_cleanup(timeout_seconds=5.0)
+
+    monkeypatch.setattr(broker, "_finalize_ownership", finalize)
+    assert broker.retry_pending_cleanup(timeout_seconds=5.0) == 0

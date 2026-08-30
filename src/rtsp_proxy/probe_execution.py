@@ -242,13 +242,10 @@ class ProbeExecutionBroker:
                 deadline=deadline,
             )
         finally:
-            with self._active_lock:
-                if (
-                    self._active.get(request.request_id) is ownership
-                    and not ownership.collected
-                ):
-                    ownership.state = "cleanup_pending"
-            ownership.operation_lock.release()
+            try:
+                self._finalize_ownership(request.request_id, ownership)
+            finally:
+                ownership.operation_lock.release()
 
     def _execute_claimed(
         self,
@@ -318,8 +315,6 @@ class ProbeExecutionBroker:
                 ownership.state = "cleaning"
         cleanup_deadline = self._cleanup_deadline()
         cleanup_errors = self._cleanup_ownership(ownership, deadline=cleanup_deadline)
-        if ownership.collected:
-            self._remove_ownership(request.request_id, ownership)
 
         self._raise_failures(primary_error, cleanup_errors)
         if not ownership.collected:
@@ -338,7 +333,7 @@ class ProbeExecutionBroker:
                 pending = tuple(
                     (request_id, ownership)
                     for request_id, ownership in self._active.items()
-                    if ownership.state == "cleanup_pending"
+                    if ownership.state != "executing"
                 )
             interruptions: list[BaseException] = []
             for request_id, ownership in pending:
@@ -351,7 +346,7 @@ class ProbeExecutionBroker:
                     with self._active_lock:
                         if (
                             self._active.get(request_id) is not ownership
-                            or ownership.state != "cleanup_pending"
+                            or ownership.state == "executing"
                         ):
                             continue
                         ownership.state = "cleaning"
@@ -363,13 +358,11 @@ class ProbeExecutionBroker:
                 except BaseException as error:
                     interruptions.append(error)
                 finally:
-                    if claimed and ownership.collected:
-                        self._remove_ownership(request_id, ownership)
-                    elif claimed:
-                        with self._active_lock:
-                            if self._active.get(request_id) is ownership:
-                                ownership.state = "cleanup_pending"
-                    ownership.operation_lock.release()
+                    try:
+                        if claimed:
+                            self._finalize_ownership(request_id, ownership)
+                    finally:
+                        ownership.operation_lock.release()
             if interruptions:
                 raise BaseExceptionGroup(
                     "probe execution cleanup retry was interrupted",
@@ -530,14 +523,17 @@ class ProbeExecutionBroker:
             raise ProbeExecutionError("probe_execution_ownership_invalid")
         return lease
 
-    def _remove_ownership(
+    def _finalize_ownership(
         self,
         request_id: UUID,
         ownership: _ExecutionOwnership,
     ) -> None:
         with self._active_lock:
             if self._active.get(request_id) is ownership:
-                self._active.pop(request_id)
+                if ownership.collected:
+                    self._active.pop(request_id)
+                else:
+                    ownership.state = "cleanup_pending"
 
     def _unresolved_cleanup_count(self) -> int:
         with self._active_lock:
