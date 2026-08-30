@@ -8,11 +8,12 @@ import re
 import signal
 import socket
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import IPv4Network, IPv6Network, ip_network
 from pathlib import Path
+from types import FrameType
 
 from rtsp_proxy.probe_broker_service import ProbeBrokerService
 from rtsp_proxy.probe_connect_guard import (
@@ -41,6 +42,7 @@ _GUARD_OBJECT_RELATIVE = Path(
 )
 _PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
 _OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
+_SignalHandler = int | Callable[[int, FrameType | None], object]
 
 
 class ProbeBrokerRuntimeError(RuntimeError):
@@ -222,7 +224,7 @@ def run_probe_broker() -> None:
     """Run the installed root broker on its single socket-activation descriptor."""
 
     listener: socket.socket | None = None
-    previous_handlers: dict[signal.Signals, signal.Handlers] = {}
+    previous_handlers: dict[signal.Signals, _SignalHandler] = {}
     try:
         if sys.platform != "linux" or platform.system() != "Linux" or os.geteuid() != 0:
             raise ProbeBrokerRuntimeError("probe_broker_linux_root_required")
@@ -235,7 +237,10 @@ def run_probe_broker() -> None:
             expected_gid=expected_gid,
         )
         for watched_signal in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[watched_signal] = signal.getsignal(watched_signal)
+            previous_handler = signal.getsignal(watched_signal)
+            if previous_handler is None:
+                raise ProbeBrokerRuntimeError("probe_broker_signal_handler_invalid")
+            previous_handlers[watched_signal] = previous_handler
             signal.signal(watched_signal, _stop_probe_broker)
         service.serve_forever(listener)
     except ProbeBrokerRuntimeError as error:

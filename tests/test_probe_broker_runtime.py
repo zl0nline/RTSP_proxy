@@ -419,6 +419,24 @@ def test_probe_broker_entrypoint_sanitizes_startup_failure_and_closes_listener(
     assert listener.closed is True
 
 
+def test_probe_broker_entrypoint_rejects_unrestorable_signal_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = _RuntimeListener()
+    service = _RuntimeService()
+    _install_root_runtime_fakes(
+        monkeypatch,
+        service=service,
+        listener=listener,
+    )
+    monkeypatch.setattr(signal, "getsignal", lambda _watched: None)
+
+    with pytest.raises(SystemExit, match=r"^probe_broker_signal_handler_invalid$"):
+        run_probe_broker()
+
+    assert listener.closed is True
+
+
 def test_probe_broker_entrypoint_requires_linux_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
