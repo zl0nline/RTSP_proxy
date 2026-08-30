@@ -32,6 +32,7 @@ rtsp-proxy-load = "rtsp_proxy.load_cli:main"
 rtsp-proxy-migrate = "rtsp_proxy.migrate:run_migrations"
 rtsp-proxy-node-helper = "rtsp_proxy.node_runtime:run_node_runtime_helper"
 rtsp-proxy-nft-reconcile = "rtsp_proxy.nft_reconcile:main"
+rtsp-proxy-probe-launcher = "rtsp_proxy.probe_launcher:main"
 rtsp-proxy-phase-d-transition = "rtsp_proxy.phase_d_transition:main"
 rtsp-proxy-break-glass = "rtsp_proxy.break_glass_cli:main"
 
