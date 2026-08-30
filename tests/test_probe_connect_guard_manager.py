@@ -891,6 +891,19 @@ def test_reconcile_collects_owned_reservation_after_scope_collision_crash(
     assert not receipt.exists()
 
 
+def test_bpffs_reservation_name_is_visible_and_request_bound(tmp_path: Path) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    nonce = "a" * 32
+
+    reservation = backend._reservation_scope_path(scope, nonce)
+
+    assert reservation.parent == tmp_path / "pins"
+    assert reservation.name == (
+        f"rtsp_probe_reservation_{scope.request_id.hex}_{nonce}"
+    )
+
+
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_collision_receipt_cleanup_failure_never_owns_the_foreign_scope(
     tmp_path: Path,
@@ -1158,7 +1171,7 @@ def test_bpftool_backend_preserves_receipt_promotion_and_cleanup_failures(
         raise RuntimeError("promotion failed")
 
     def fail_scope_cleanup(path: Path) -> None:
-        if path.name.endswith(".reserved"):
+        if path.name.startswith("rtsp_probe_reservation_"):
             raise KeyboardInterrupt("scope cleanup interrupted")
         original_rmdir(path)
 
@@ -1170,7 +1183,10 @@ def test_bpftool_backend_preserves_receipt_promotion_and_cleanup_failures(
 
     assert any(isinstance(error, RuntimeError) for error in raised.value.exceptions)
     assert any(isinstance(error, KeyboardInterrupt) for error in raised.value.exceptions)
-    assert any(path.name.endswith(".reserved") for path in (tmp_path / "pins").iterdir())
+    assert any(
+        path.name.startswith("rtsp_probe_reservation_")
+        for path in (tmp_path / "pins").iterdir()
+    )
 
 
 def test_bpftool_backend_refuses_an_existing_receipt_reservation(

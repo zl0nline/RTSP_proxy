@@ -1011,7 +1011,7 @@ class BpftoolProbeConnectGuardBackend:
         reservation_nonce: str,
     ) -> Path:
         return self._pin_root / (
-            f".{scope.request_id.hex}.{reservation_nonce}.reserved"
+            f"rtsp_probe_reservation_{scope.request_id.hex}_{reservation_nonce}"
         )
 
     def _promotion_receipt_path(
