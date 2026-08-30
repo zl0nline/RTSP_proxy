@@ -359,6 +359,48 @@ def test_linux_cgroup_resolver_rejects_transient_cgroup_symlinks(
         resolver.resolve(unit_name=unit_name, timeout_seconds=1.0)
 
 
+@pytest.mark.parametrize("failed_component", ["slice", "unit", "cgroup.procs"])
+def test_linux_cgroup_resolver_fails_closed_on_transient_cgroup_io_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_component: str,
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    slice_path = cgroup_root / "rtsp-probe.slice"
+    unit_name = f"rtsp-probe-{uuid4().hex}.service"
+    expected = slice_path / unit_name
+    expected.mkdir(parents=True)
+    (cgroup_root / "cgroup.controllers").write_text(
+        "cpu memory pids\n",
+        encoding="ascii",
+    )
+    procs_path = expected / "cgroup.procs"
+    procs_path.write_text("123\n", encoding="ascii")
+    failed_path = {
+        "slice": slice_path,
+        "unit": expected,
+        "cgroup.procs": procs_path,
+    }[failed_component]
+    original_lstat = Path.lstat
+
+    def failing_lstat(path: Path) -> os.stat_result:
+        if path == failed_path:
+            raise OSError("simulated cgroup inventory failure")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", failing_lstat)
+    resolver = LinuxSystemdCgroupResolver(
+        cgroup_root=cgroup_root,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(
+        ProbeExecutionLinuxError,
+        match="probe_execution_cgroup_unavailable",
+    ):
+        resolver.resolve(unit_name=unit_name, timeout_seconds=1.0)
+
+
 @pytest.mark.parametrize(
     "invalid_sample",
     [float("nan"), float("inf"), float("-inf"), RuntimeError()],
