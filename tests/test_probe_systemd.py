@@ -112,13 +112,12 @@ def test_transient_unit_is_an_exact_typed_start_transient_unit_request() -> None
         "CollectMode": ("s", "inactive-or-failed"),
         "ExecStart": ("a(sasb)", ((_LAUNCHER, (_LAUNCHER,), False),)),
         "StandardInputFileDescriptor": ("h", 7),
-        "ExtraFileDescriptors": ("a(hs)", ((8, "probe-input"),)),
+        "StandardErrorFileDescriptor": ("h", 8),
         "StandardOutputFileDescriptor": ("h", 9),
-        "StandardError": ("s", "null"),
         "DynamicUser": ("b", True),
         "NoNewPrivileges": ("b", True),
         "ProtectProc": ("s", "invisible"),
-        "PrivateTmpEx": ("s", "disconnected"),
+        "PrivateTmp": ("b", True),
         "PrivateDevices": ("b", True),
         "ProtectSystem": ("s", "strict"),
         "ProtectHome": ("s", "yes"),
@@ -270,11 +269,11 @@ def test_systemd_manager_sends_the_exact_start_transient_unit_message() -> None:
     wire_properties = {name: (signature, value) for name, signature, value in call.body[2]}
     unit_properties = _properties(build_probe_transient_unit(_request(), descriptors=descriptors))
     assert wire_properties["StandardInputFileDescriptor"] == ("h", 0)
-    assert wire_properties["ExtraFileDescriptors"] == ("a(hs)", ((1, "probe-input"),))
+    assert wire_properties["StandardErrorFileDescriptor"] == ("h", 1)
     assert wire_properties["StandardOutputFileDescriptor"] == ("h", 2)
     descriptor_properties = {
         "StandardInputFileDescriptor",
-        "ExtraFileDescriptors",
+        "StandardErrorFileDescriptor",
         "StandardOutputFileDescriptor",
     }
     wire_non_descriptor = {

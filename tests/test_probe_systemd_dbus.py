@@ -185,8 +185,8 @@ def test_dbus_transport_sends_the_exact_message_and_unix_descriptors(
     assert all(isinstance(value, Variant) for value in properties.values())
     assert properties["StandardInputFileDescriptor"].signature == "h"
     assert properties["StandardInputFileDescriptor"].value == 0
-    assert properties["ExtraFileDescriptors"].signature == "a(hs)"
-    assert properties["ExtraFileDescriptors"].value == [[1, "probe-input"]]
+    assert properties["StandardErrorFileDescriptor"].signature == "h"
+    assert properties["StandardErrorFileDescriptor"].value == 1
     assert properties["StandardOutputFileDescriptor"].signature == "h"
     assert properties["StandardOutputFileDescriptor"].value == 2
     assert properties["IPAddressAllow"].value == [[2, b"\xc0\x00\x02\x0a", 32]]

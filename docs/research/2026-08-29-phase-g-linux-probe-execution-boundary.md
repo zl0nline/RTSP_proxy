@@ -340,7 +340,7 @@ The components and checks are:
    and never accepts caller-provided systemd properties.
 4. The transient service has, at minimum, `Type=exec`, `DynamicUser=yes`,
    `ProtectProc=invisible`, an empty capability/ambient-capability set,
-   `NoNewPrivileges=yes`, `PrivateTmp=disconnected`, `PrivateDevices=yes`,
+   `NoNewPrivileges=yes`, `PrivateTmp=yes`, `PrivateDevices=yes`,
    `ProtectSystem=strict`, `ProtectHome=yes`, kernel/control-group protections,
    `RestrictSUIDSGID=yes`, `LockPersonality=yes`, `RestrictRealtime=yes`, a
    narrow `RestrictAddressFamilies=`, `SocketBindDeny=any`, and no writable
@@ -359,7 +359,13 @@ The components and checks are:
    recommended lifecycle mode
    ([runtime limit](https://github.com/systemd/systemd/blob/v259/man/systemd.service.xml#L745-L764),
    [kill semantics](https://github.com/systemd/systemd/blob/v259/man/systemd.kill.xml#L63-L103)).
-7. ffprobe stderr is `/dev/null` or a non-logging bounded sink. stdout is capped
+7. On the Ubuntu 24.04/systemd 255 compatibility path the sealed input is
+   installed as the service's standard-error descriptor, the gate remains
+   standard input, and bounded result output remains standard output. The
+   launcher treats fd 2 strictly as read-only input and never writes diagnostics
+   to it. This avoids the newer `ExtraFileDescriptors=`/`PrivateTmpEx=` transient
+   properties while preserving anonymous sealed input and quiet execution.
+   ffprobe stderr is `/dev/null` or a non-logging bounded sink. stdout is capped
    before JSON parsing; exceeding the cap stops the whole unit. The parser
    allowlists codec/profile fields and returns no URL, IP, credential, raw
    metadata or raw ffprobe error.

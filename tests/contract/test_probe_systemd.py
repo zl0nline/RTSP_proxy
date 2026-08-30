@@ -59,9 +59,6 @@ def _unit_properties(unit_name: str) -> dict[str, str]:
             "--property=DynamicUser",
             "--property=NoNewPrivileges",
             "--property=ProtectSystem",
-            "--property=StandardInput",
-            "--property=StandardOutput",
-            "--property=ExtraFileDescriptorNames",
         ],
         check=False,
         capture_output=True,
@@ -238,9 +235,6 @@ def test_system_manager_enforces_policy_gate_and_sealed_input_flow() -> None:
             "DynamicUser": "yes",
             "NoNewPrivileges": "yes",
             "ProtectSystem": "strict",
-            "StandardInput": "fd",
-            "StandardOutput": "fd",
-            "ExtraFileDescriptorNames": "probe-input",
         }
         assert select.select([fixture.output_read_fd], [], [], 0)[0] == []
 

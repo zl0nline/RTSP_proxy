@@ -15,15 +15,11 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 
 
 def main() -> int:
-    if (
-        os.environ.get("LISTEN_PID") != str(os.getpid())
-        or os.environ.get("LISTEN_FDS") != "1"
-        or os.environ.get("LISTEN_FDNAMES") != "probe-input"
-    ):
+    if any(name in os.environ for name in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES")):
         return 20
     if os.read(0, 1) != b"R":
         return 21
-    payload = os.read(3, 16_385)
+    payload = os.read(2, 16_385)
     if not payload or len(payload) > 16_384:
         return 22
     if b"/probe-systemd-overflow" in payload:

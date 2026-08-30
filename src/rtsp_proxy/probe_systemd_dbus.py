@@ -259,9 +259,6 @@ def _dbus_value(
     if signature == "(bas)":
         allow_list, values = cast(tuple[bool, tuple[str, ...]], value)
         return [allow_list, list(values)]
-    if signature == "a(hs)":
-        descriptors = cast(tuple[tuple[int, str], ...], value)
-        return [[descriptor, name] for descriptor, name in descriptors]
     if signature == "a(iayu)":
         prefixes = cast(tuple[tuple[int, bytes, int], ...], value)
         return [[family, address, prefix_length] for family, address, prefix_length in prefixes]

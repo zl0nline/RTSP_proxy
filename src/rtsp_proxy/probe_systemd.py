@@ -10,7 +10,7 @@ from ipaddress import IPv4Address
 from math import isfinite
 from threading import Lock
 from time import monotonic
-from typing import Literal, NoReturn, Protocol, cast
+from typing import Literal, NoReturn, Protocol
 from uuid import UUID
 
 from rtsp_proxy.probe_broker import ProbeBrokerRequest
@@ -29,7 +29,6 @@ _PROBE_CLEANUP_RETRY_MAX_UNITS = 8
 
 type _ExecStartValue = tuple[tuple[str, tuple[str, ...], bool], ...]
 type _AddressFamilyFilterValue = tuple[bool, tuple[str, ...]]
-type _ExtraFileDescriptorsValue = tuple[tuple[int, str], ...]
 type _IpAddressFilterValue = tuple[tuple[int, bytes, int], ...]
 type _SocketBindFilterValue = tuple[tuple[int, int, int, int], ...]
 type ProbeSystemdValue = (
@@ -38,7 +37,6 @@ type ProbeSystemdValue = (
     | int
     | _ExecStartValue
     | _AddressFamilyFilterValue
-    | _ExtraFileDescriptorsValue
     | _IpAddressFilterValue
     | _SocketBindFilterValue
 )
@@ -49,7 +47,6 @@ type ProbeSystemdSignature = Literal[
     "u",
     "h",
     "a(sasb)",
-    "a(hs)",
     "(bas)",
     "a(iayu)",
     "a(iiqq)",
@@ -701,22 +698,6 @@ def _build_systemd_call(unit: ProbeTransientUnit) -> ProbeSystemdCall:
             descriptor = value
             value = len(unix_fds)
             unix_fds.append(descriptor)
-        elif property_.signature == "a(hs)":
-            if not isinstance(value, tuple):
-                raise ProbeSystemdError("probe_transient_policy_invalid")
-            extra_descriptors = cast(_ExtraFileDescriptorsValue, value)
-            indexed_descriptors: list[tuple[int, str]] = []
-            for descriptor, descriptor_name in extra_descriptors:
-                if (
-                    isinstance(descriptor, bool)
-                    or not isinstance(descriptor, int)
-                    or descriptor < 0
-                    or not descriptor_name
-                ):
-                    raise ProbeSystemdError("probe_transient_policy_invalid")
-                indexed_descriptors.append((len(unix_fds), descriptor_name))
-                unix_fds.append(descriptor)
-            value = tuple(indexed_descriptors)
         properties.append((property_.name, property_.signature, value))
     if len(unix_fds) != 3 or len(set(unix_fds)) != len(unix_fds):
         raise ProbeSystemdError("probe_transient_policy_invalid")
@@ -738,17 +719,14 @@ def _fixed_properties(descriptors: ProbeTransientDescriptors) -> tuple[ProbeSyst
         _property("CollectMode", "s", "inactive-or-failed"),
         _property("ExecStart", "a(sasb)", ((_PROBE_LAUNCHER, (_PROBE_LAUNCHER,), False),)),
         _property("StandardInputFileDescriptor", "h", descriptors.run_gate_fd),
-        _property(
-            "ExtraFileDescriptors",
-            "a(hs)",
-            ((descriptors.sealed_input_fd, "probe-input"),),
-        ),
+        # systemd 255 has no ExtraFileDescriptors= transient property. The
+        # quiet launcher treats fd 2 exclusively as immutable input.
+        _property("StandardErrorFileDescriptor", "h", descriptors.sealed_input_fd),
         _property("StandardOutputFileDescriptor", "h", descriptors.output_write_fd),
-        _property("StandardError", "s", "null"),
         _property("DynamicUser", "b", True),
         _property("NoNewPrivileges", "b", True),
         _property("ProtectProc", "s", "invisible"),
-        _property("PrivateTmpEx", "s", "disconnected"),
+        _property("PrivateTmp", "b", True),
         _property("PrivateDevices", "b", True),
         _property("ProtectSystem", "s", "strict"),
         _property("ProtectHome", "s", "yes"),
