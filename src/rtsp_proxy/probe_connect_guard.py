@@ -11,6 +11,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 import weakref
 from collections.abc import Callable
@@ -29,6 +30,28 @@ from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
 
 _COMMAND_OUTPUT_MAX_BYTES = 65_536
 _COMMAND_CLEANUP_SECONDS = 1.0
+_SPAWN_WRAPPER = """
+import os
+import sys
+
+pid_descriptor = int(sys.argv[1])
+gate_descriptor = int(sys.argv[2])
+kept_descriptors = {0, 1, 2, pid_descriptor, gate_descriptor}
+kept_descriptors.update(int(item) for item in sys.argv[3].split(",") if item)
+descriptor_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+upper = max((int(item) for item in os.listdir(descriptor_directory)), default=2) + 1
+lower = 3
+for descriptor in sorted(kept_descriptors - {0, 1, 2}):
+    os.closerange(lower, descriptor)
+    lower = descriptor + 1
+os.closerange(lower, upper)
+os.write(pid_descriptor, f"{os.getpid()}\\n".encode("ascii"))
+if os.read(gate_descriptor, 1) != b"R":
+    raise SystemExit(125)
+os.close(pid_descriptor)
+os.close(gate_descriptor)
+os.execve(sys.argv[4], sys.argv[4:], os.environ)
+"""
 
 
 class ProbeConnectGuardError(RuntimeError):
@@ -1633,6 +1656,61 @@ class _ProcessOwner:
     process: _SpawnedProcess | None = None
 
 
+class _OwnedSpawnPipe:
+    """Pipe descriptors whose C output slots are owned before allocation."""
+
+    def __init__(self) -> None:
+        self._descriptors = (ctypes.c_int * 2)(-1, -1)
+
+    def acquire(self) -> None:
+        _pipe_into(self._descriptors)
+        for descriptor in self._descriptors:
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+            fcntl.fcntl(descriptor, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+
+    @property
+    def read_descriptor(self) -> int:
+        descriptor = int(self._descriptors[0])
+        if descriptor < 0:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        return descriptor
+
+    @property
+    def write_descriptor(self) -> int:
+        descriptor = int(self._descriptors[1])
+        if descriptor < 0:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        return descriptor
+
+    def close_read(self) -> None:
+        self._close(0)
+
+    def close_write(self) -> None:
+        self._close(1)
+
+    def open_read(self) -> IO[bytes]:
+        descriptor = self.read_descriptor
+        stream = os.fdopen(descriptor, "rb", buffering=0)
+        self._descriptors[0] = -1
+        return stream
+
+    def close(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        for index in (1, 0):
+            try:
+                self._close(index)
+            except BaseException as error:
+                errors.append(_sanitize_cleanup_error(error))
+        return errors
+
+    def _close(self, index: int) -> None:
+        descriptor = int(self._descriptors[index])
+        if descriptor < 0:
+            return
+        os.close(descriptor)
+        self._descriptors[index] = -1
+
+
 class ProbeConnectGuardManager:
     """Own install/read-back/release for exact per-probe cgroup guards."""
 
@@ -2702,37 +2780,33 @@ def _spawn_owned_process(
         or not arguments
     ):
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
-    parent_descriptors: list[int] = []
     previous_mask: set[int | signal.Signals] | None = None
     process: _SpawnedProcess | None = None
-    try:
-        stdout_read, stdout_write = os.pipe()
-        parent_descriptors.extend((stdout_read, stdout_write))
-        stderr_read, stderr_write = os.pipe()
-        parent_descriptors.extend((stderr_read, stderr_write))
-        devnull = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
-        parent_descriptors.append(devnull)
-    except BaseException:
-        for descriptor in reversed(parent_descriptors):
-            with suppress(OSError):
-                os.close(descriptor)
-        raise
+    pipes = tuple(_OwnedSpawnPipe() for _index in range(4))
+    stdout_pipe, stderr_pipe, pid_pipe, gate_pipe = pipes
     blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+    primary_error: BaseException | None = None
     try:
         previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         child_signal_mask = tuple(int(item) for item in previous_mask)
+        for pipe in pipes:
+            pipe.acquire()
         process = _SpawnedProcess(arguments=arguments)
         owner.process = process
+        child_descriptors = (*pass_fds, pid_pipe.write_descriptor, gate_pipe.read_descriptor)
         occupied_descriptors = {
             0,
             1,
             2,
-            *pass_fds,
-            *parent_descriptors,
+            *child_descriptors,
+            *(descriptor for pipe in pipes for descriptor in (
+                pipe.read_descriptor,
+                pipe.write_descriptor,
+            )),
         }
         descriptor_mapping: dict[int, int] = {}
         next_descriptor = 64
-        for descriptor in pass_fds:
+        for descriptor in child_descriptors:
             while next_descriptor in occupied_descriptors:
                 next_descriptor += 1
             descriptor_mapping[descriptor] = next_descriptor
@@ -2742,59 +2816,145 @@ def _spawn_owned_process(
             _replace_descriptor_argument(argument, descriptor_mapping)
             for argument in arguments
         )
+        pid_descriptor = descriptor_mapping[pid_pipe.write_descriptor]
+        gate_descriptor = descriptor_mapping[gate_pipe.read_descriptor]
+        wrapper_arguments = (
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _SPAWN_WRAPPER,
+            str(pid_descriptor),
+            str(gate_descriptor),
+            ",".join(str(item) for item in sorted(descriptor_mapping.values())),
+            *bound_arguments,
+        )
         file_actions = [
-            (os.POSIX_SPAWN_DUP2, devnull, 0),
-            (os.POSIX_SPAWN_DUP2, stdout_write, 1),
-            (os.POSIX_SPAWN_DUP2, stderr_write, 2),
+            (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0o600),
+            (os.POSIX_SPAWN_DUP2, stdout_pipe.write_descriptor, 1),
+            (os.POSIX_SPAWN_DUP2, stderr_pipe.write_descriptor, 2),
             *(
                 (os.POSIX_SPAWN_DUP2, source, destination)
                 for source, destination in descriptor_mapping.items()
             ),
-            *(
-                (os.POSIX_SPAWN_CLOSE, descriptor)
-                for descriptor in _inheritable_descriptors()
-                if descriptor not in {0, 1, 2, *descriptor_mapping.values()}
-            ),
         ]
-        process.pid = os.posix_spawn(
-            bound_arguments[0],
-            bound_arguments,
-            env,
-            file_actions=file_actions,
-            setsigmask=child_signal_mask,
-        )
-        for descriptor in (stdout_write, stderr_write, devnull):
-            os.close(descriptor)
-            parent_descriptors.remove(descriptor)
-        process.stdout = os.fdopen(stdout_read, "rb", buffering=0)
-        parent_descriptors.remove(stdout_read)
-        process.stderr = os.fdopen(stderr_read, "rb", buffering=0)
-        parent_descriptors.remove(stderr_read)
-    finally:
-        for descriptor in reversed(parent_descriptors):
-            with suppress(OSError):
-                os.close(descriptor)
-        if previous_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
-
-def _inheritable_descriptors() -> tuple[int, ...]:
-    descriptor_directory = Path("/proc/self/fd")
-    if not descriptor_directory.is_dir():
-        descriptor_directory = Path("/dev/fd")
-    try:
-        entries = tuple(descriptor_directory.iterdir())
-    except OSError:
-        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
-    descriptors: list[int] = []
-    for entry in entries:
         try:
-            descriptor = int(entry.name)
-            if descriptor >= 3 and os.get_inheritable(descriptor):
-                descriptors.append(descriptor)
-        except (OSError, ValueError):
-            continue
-    return tuple(sorted(set(descriptors)))
+            spawned_pid = os.posix_spawn(
+                wrapper_arguments[0],
+                wrapper_arguments,
+                env,
+                file_actions=file_actions,
+                setsigmask=child_signal_mask,
+            )
+            process.pid = spawned_pid
+        except BaseException:
+            pid_pipe.close_write()
+            gate_pipe.close_read()
+            recovered_pid = _read_reported_spawn_pid(pid_pipe, required=False)
+            if recovered_pid is not None:
+                process.pid = recovered_pid
+            gate_pipe.close_write()
+            raise
+        pid_pipe.close_write()
+        gate_pipe.close_read()
+        reported_pid = _read_reported_spawn_pid(pid_pipe, required=True)
+        if reported_pid != process.pid:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        os.write(gate_pipe.write_descriptor, b"R")
+        gate_pipe.close_write()
+        stdout_pipe.close_write()
+        stderr_pipe.close_write()
+        process.stdout = stdout_pipe.open_read()
+        process.stderr = stderr_pipe.open_read()
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_errors = [error for pipe in reversed(pipes) for error in pipe.close()]
+        if previous_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            except BaseException as error:
+                cleanup_errors.append(_sanitize_cleanup_error(error))
+        if cleanup_errors:
+            if primary_error is not None and (
+                not isinstance(primary_error, Exception)
+                or any(not isinstance(error, Exception) for error in cleanup_errors)
+            ):
+                raise BaseExceptionGroup(
+                    "probe guard spawn cleanup was interrupted",
+                    [primary_error, *cleanup_errors],
+                ) from None
+            if (
+                primary_error is None
+                and len(cleanup_errors) == 1
+                and not isinstance(cleanup_errors[0], Exception)
+            ):
+                raise cleanup_errors[0]
+            if any(not isinstance(error, Exception) for error in cleanup_errors):
+                raise BaseExceptionGroup(
+                    "probe guard spawn cleanup was interrupted",
+                    cleanup_errors,
+                ) from None
+            raise ProbeConnectGuardError("probe_guard_command_cleanup_failed")
+
+
+def _pipe_into(descriptors: ctypes.Array[ctypes.c_int]) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    pipe2 = getattr(libc, "pipe2", None)
+    if pipe2 is None:
+        pipe = libc.pipe
+        pipe.argtypes = (ctypes.POINTER(ctypes.c_int),)
+        pipe.restype = ctypes.c_int
+        result = pipe(descriptors)
+    else:
+        pipe2.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_int)
+        pipe2.restype = ctypes.c_int
+        result = pipe2(descriptors, os.O_CLOEXEC)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _read_reported_spawn_pid(
+    pipe: _OwnedSpawnPipe,
+    *,
+    required: bool,
+) -> int | None:
+    descriptor = pipe.read_descriptor
+    selector = selectors.DefaultSelector()
+    payload = bytearray()
+    deadline = time.monotonic() + _COMMAND_CLEANUP_SECONDS
+    try:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while b"\n" not in payload:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                if required:
+                    raise ProbeConnectGuardError(
+                        "probe_guard_kernel_operation_failed"
+                    )
+                return None
+            chunk = os.read(descriptor, 32 - len(payload))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) >= 32 and b"\n" not in payload:
+                break
+    finally:
+        selector.close()
+        pipe.close_read()
+    if not payload:
+        if required:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        return None
+    try:
+        decoded = payload.decode("ascii")
+        if not re.fullmatch(r"[1-9][0-9]{0,9}\n", decoded):
+            raise ValueError
+        return int(decoded)
+    except (UnicodeDecodeError, ValueError):
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
 
 
 def _replace_descriptor_argument(

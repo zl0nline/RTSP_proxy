@@ -2684,23 +2684,71 @@ def test_bpftool_command_owns_pid_before_unblocking_process_interruption(
 
 @pytest.mark.skipif(
     not Path("/proc/self/fd").is_dir(),
+    reason="spawn ownership is a Linux production boundary",
+)
+def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = os.posix_spawn
+    spawned: list[int] = []
+
+    def interrupt_after_spawn(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        pid = original_spawn(path, arguments, environment, **keywords)
+        spawned.append(pid)
+        raise KeyboardInterrupt("spawn return interrupted")
+
+    monkeypatch.setattr(os, "posix_spawn", interrupt_after_spawn)
+    try:
+        with pytest.raises(BaseException) as raised:
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "import time; time.sleep(30)"),
+                timeout_seconds=1.0,
+            )
+
+        assert isinstance(raised.value, KeyboardInterrupt) or (
+            isinstance(raised.value, BaseExceptionGroup)
+            and any(
+                isinstance(error, KeyboardInterrupt)
+                for error in raised.value.exceptions
+            )
+        )
+        assert len(spawned) == 1
+        with pytest.raises(ChildProcessError):
+            os.waitpid(spawned[0], os.WNOHANG)
+    finally:
+        for pid in spawned:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
     reason="descriptor ownership is a Linux production boundary",
 )
 def test_bpftool_command_closes_descriptors_when_pipe_acquisition_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_pipe = os.pipe
+    original_pipe_into = probe_connect_guard._pipe_into
     calls = 0
+    allocated: list[int] = []
 
-    def fail_second_pipe() -> tuple[int, int]:
+    def fail_second_pipe(descriptors: Any) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("injected pipe failure")
-        return original_pipe()
+        original_pipe_into(descriptors)
+        allocated.extend(int(descriptor) for descriptor in descriptors)
 
     before = set(Path("/proc/self/fd").iterdir())
-    monkeypatch.setattr(os, "pipe", fail_second_pipe)
+    monkeypatch.setattr(probe_connect_guard, "_pipe_into", fail_second_pipe)
 
     with pytest.raises(
         ProbeConnectGuardError,
@@ -2711,7 +2759,48 @@ def test_bpftool_command_closes_descriptors_when_pipe_acquisition_fails(
             timeout_seconds=1.0,
         )
 
-    assert set(Path("/proc/self/fd").iterdir()) == before
+    assert not set(Path("/proc/self/fd").iterdir()).difference(before)
+    for descriptor in allocated:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor ownership is a Linux production boundary",
+)
+def test_bpftool_command_closes_pipe_when_allocation_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_pipe_into = probe_connect_guard._pipe_into
+    calls = 0
+    allocated: list[int] = []
+
+    def interrupt_after_allocation(descriptors: Any) -> None:
+        nonlocal calls
+        calls += 1
+        original_pipe_into(descriptors)
+        allocated.extend(int(descriptor) for descriptor in descriptors)
+        if calls == 1:
+            raise KeyboardInterrupt("pipe allocation interrupted")
+
+    before = set(Path("/proc/self/fd").iterdir())
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_pipe_into",
+        interrupt_after_allocation,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="pipe allocation interrupted"):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=1.0,
+        )
+
+    assert not set(Path("/proc/self/fd").iterdir()).difference(before)
+    for descriptor in allocated:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 @pytest.mark.skipif(
@@ -2722,6 +2811,48 @@ def test_bpftool_command_closes_unrelated_inheritable_descriptors() -> None:
     unrelated_read, unrelated_write = os.pipe()
     try:
         os.set_inheritable(unrelated_read, True)
+        observed = probe_connect_guard._run_command(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; fd=int(sys.argv[1]); "
+                    "\ntry: os.fstat(fd)"
+                    "\nexcept OSError: print('closed')"
+                    "\nelse: print('visible')"
+                ),
+                str(unrelated_read),
+            ),
+            timeout_seconds=1.0,
+        )
+    finally:
+        os.close(unrelated_read)
+        os.close(unrelated_write)
+
+    assert observed == "closed\n"
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor inheritance is a Linux production boundary",
+)
+def test_bpftool_command_closes_descriptor_made_inheritable_during_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unrelated_read, unrelated_write = os.pipe()
+    original_spawn = os.posix_spawn
+
+    def expose_descriptor_during_spawn(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        os.set_inheritable(unrelated_read, True)
+        return original_spawn(path, arguments, environment, **keywords)
+
+    monkeypatch.setattr(os, "posix_spawn", expose_descriptor_during_spawn)
+    try:
         observed = probe_connect_guard._run_command(
             (
                 sys.executable,
