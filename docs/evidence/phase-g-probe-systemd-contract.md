@@ -24,7 +24,7 @@ ffprobe.
   capabilities, `NoNewPrivileges`, strict filesystem/kernel/cgroup protection,
   a narrow address-family set, no socket bind and address-level network deny.
   Exact destination enforcement remains the separate cgroup connect guard.
-- stdin is a broker-held release gate, fd 2 is read-only sealed input and stdout
+- stdin is a broker-held release gate, fd 2 is immutable sealed input and stdout
   is a bounded result pipe. The quiet launcher never writes diagnostics to fd 2.
   This fixed ABI uses transient properties available in systemd 255 while also
   passing on systemd 259.
@@ -55,9 +55,9 @@ jobs in total.
 ## Deliberately excluded
 
 There is still no installed root-owned broker socket/service and no production
-probe executor. The broker must authenticate the AF_UNIX peer, revalidate the
-site/CIDR policy, attach and read back both cgroup BPF hooks before releasing
-the gate, hand the sealed input to a controlled no-redirect ffprobe build,
-parse only an allowlisted bounded result and prove end-to-end cancellation,
-restart and residue cleanup. ADR 0004 therefore remains Proposed, Phase G stays
-IN PROGRESS and Production remains NO-GO.
+probe executor. The controlled no-redirect artifact, fixed quiet launcher and
+strict codec-only decoder now exist separately. The broker must authenticate
+the AF_UNIX peer, revalidate the site/CIDR policy, attach and read back both
+cgroup BPF hooks before releasing the gate, and prove their integrated
+end-to-end cancellation, restart and residue cleanup. ADR 0004 therefore
+remains Proposed, Phase G stays IN PROGRESS and Production remains NO-GO.

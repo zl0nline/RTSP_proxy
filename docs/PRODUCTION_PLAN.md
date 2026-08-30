@@ -1289,9 +1289,14 @@ impact is measured.
   independent review and native amd64/arm64
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
   green; broker service and executor still disabled);
-- [ ] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe
-  candidate after immutable amd64/arm64 digests, behavioral redirect refusal,
-  release admission and privileged executor evidence are green;
+- [x] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe as a
+  distinct reproducible amd64/arm64 release artifact with immutable digests,
+  ordinary RTSP/TCP plus redirect-refusal behavior and clean-wheel release
+  admission (all nine jobs green in
+  [CI run 33323810984](https://github.com/zl0nline/RTSP_proxy/actions/runs/33323810984));
+- [ ] complete independent review and privileged amd64/arm64 evidence for the
+  fixed quiet launcher, strict codec-only decoder and full
+  systemd+BPF+ffprobe cancellation/residue transaction;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
@@ -1306,7 +1311,7 @@ impact is measured.
   (direct Linux systemd 259 and independently reviewed; privileged systemd 255
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
-  root broker, BPF transaction and real ffprobe execution still disabled);
+  root broker and integrated BPF+ffprobe transaction still disabled);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] implement the broker/executor, periodic risk-based producer and durable
   health-state orchestration;
