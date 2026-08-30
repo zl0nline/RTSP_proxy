@@ -765,7 +765,18 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
     os.environ.get("RTSP_PROXY_RUN_PROBE_BPF_CONTRACT") != "1",
     reason="privileged probe BPF contract is opt-in",
 )
+@pytest.mark.parametrize(
+    ("target_family", "target_host", "alternate_family", "alternate_host"),
+    [
+        (socket.AF_INET, "127.0.0.1", socket.AF_INET6, "::1"),
+        (socket.AF_INET6, "::1", socket.AF_INET, "127.0.0.1"),
+    ],
+)
 def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collection(
+    target_family: socket.AddressFamily,
+    target_host: str,
+    alternate_family: socket.AddressFamily,
+    alternate_host: str,
 ) -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.fail("probe BPF contract requires a root Linux test process")
@@ -783,7 +794,7 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     request_id = uuid.uuid4()
     unit_name = f"rtsp-probe-{request_id.hex}.service"
     allowed_port, denied_port = _free_adjacent_ports()
-    target = ProbeConnectGuardTarget(ip_address("127.0.0.1"), allowed_port)
+    target = ProbeConnectGuardTarget(ip_address(target_host), allowed_port)
     payload = serialize_probe_input(
         address=target.address,
         port=target.port,
@@ -800,8 +811,9 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     with _managed_resources() as resources:
         stopping = threading.Event()
         listeners = [
-            _listener(socket.AF_INET, "127.0.0.1", allowed_port),
-            _listener(socket.AF_INET, "127.0.0.1", denied_port),
+            _listener(target_family, target_host, allowed_port),
+            _listener(target_family, target_host, denied_port),
+            _listener(alternate_family, alternate_host, allowed_port),
         ]
         threads: list[threading.Thread] = []
         for listener in listeners:
@@ -921,7 +933,11 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
             )
         )
         transient_lease = None
-        assert observed == {"allowed": True, "denied": False}
+        assert observed == {
+            "allowed": True,
+            "wrong_family": False,
+            "wrong_port": False,
+        }
         _wait_for_transient_collection(unit_name)
         assert not cgroup.exists()
         release_guard()

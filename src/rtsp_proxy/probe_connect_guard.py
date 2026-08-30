@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import json
 import os
 import platform
 import re
+import secrets
 import selectors
 import stat
 import subprocess
 import time
+import weakref
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from hashlib import sha256
 from importlib.resources import files
@@ -197,6 +202,7 @@ class BpftoolProbeConnectGuardBackend:
     _IPV6_ATTACH = "cgroup_inet6_connect"
     _RECONCILE_MAX_SCOPES = 8
     _OWNERSHIP_MAX_SCOPES = 256
+    _COORDINATOR_NAME = ".probe-connect-guard.lock"
 
     def __init__(
         self,
@@ -243,14 +249,51 @@ class BpftoolProbeConnectGuardBackend:
             executable=False,
             expected_sha256=artifact_identity.object_sha256,
         )
-        self._pin_root = _trusted_directory(pin_root, owner_uid=trusted_owner_uid)
-        self._ownership_root = _trusted_directory(
-            ownership_root,
-            owner_uid=trusted_owner_uid,
-        )
+        root_descriptors: list[int] = []
+        use_bound_roots = run is None and trusted_owner_uid == 0
+        try:
+            pin_root_descriptor = _open_trusted_directory(
+                pin_root,
+                owner_uid=trusted_owner_uid,
+            )
+            root_descriptors.append(pin_root_descriptor)
+            ownership_root_descriptor = _open_trusted_directory(
+                ownership_root,
+                owner_uid=trusted_owner_uid,
+            )
+            root_descriptors.append(ownership_root_descriptor)
+            self._pin_root = Path(
+                _directory_descriptor_path(
+                    pin_root_descriptor,
+                    fallback=pin_root,
+                )
+                if use_bound_roots
+                else pin_root
+            )
+            self._ownership_root = Path(
+                _directory_descriptor_path(
+                    ownership_root_descriptor,
+                    fallback=ownership_root,
+                )
+                if use_bound_roots
+                else ownership_root
+            )
+        except BaseException:
+            _close_descriptors(root_descriptors)
+            raise
         self._owner_uid = trusted_owner_uid
         self._run = run
         self._monotonic = monotonic
+        self._scope_lock_guard = Lock()
+        self._scope_locks: dict[UUID, int] = {}
+        self._root_finalizer = weakref.finalize(
+            self,
+            _close_backend_descriptors,
+            tuple(root_descriptors),
+            self._scope_locks,
+        )
+        self._coordinator_path = self._ownership_root / self._COORDINATOR_NAME
+        self._ensure_coordinator_file()
 
     def install(
         self,
@@ -266,86 +309,125 @@ class BpftoolProbeConnectGuardBackend:
             ) from None
         paths = self._paths(scope)
         budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
-        if paths.scope.exists() or paths.receipt.exists():
-            raise ProbeConnectGuardInstallRejected(
-                "probe_guard_already_active"
+        coordinator = self._acquire_coordinator(shared=True, budget=budget)
+        retain_coordinator = False
+        try:
+            if paths.scope.exists() or paths.receipt.exists():
+                raise ProbeConnectGuardInstallRejected(
+                    "probe_guard_already_active"
+                )
+            reservation_nonce = self._create_receipt(scope, paths.receipt)
+            retain_coordinator = True
+            reservation_scope = self._reservation_scope_path(
+                scope,
+                reservation_nonce,
             )
-        self._create_receipt(scope, paths.receipt)
-        try:
-            os.mkdir(paths.scope, mode=0o700)
-        except FileExistsError:
             try:
-                self._remove_reserved_receipt(paths.receipt)
-            except BaseException as error:
-                if not isinstance(error, Exception):
-                    raise ProbeConnectGuardInstallRejectedInterruption(error) from None
-            raise ProbeConnectGuardInstallRejected(
-                "probe_guard_already_active"
-            ) from None
-        try:
-            self._promote_receipt(scope, paths.receipt, paths.scope)
-        except BaseException as primary_error:
-            cleanup_errors: list[BaseException] = []
-            try:
-                paths.scope.rmdir()
-                self._remove_reserved_receipt(paths.receipt)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(_sanitize_cleanup_error(cleanup_error))
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "probe guard ownership promotion and cleanup failed",
-                    [primary_error, *cleanup_errors],
+                os.mkdir(reservation_scope, mode=0o700)
+                self._promote_receipt(
+                    scope,
+                    paths.receipt,
+                    reservation_scope,
+                )
+                _rename_directory_no_replace(reservation_scope, paths.scope)
+                _fsync_directory(self._pin_root)
+                self._finalize_receipt(scope, paths.receipt, paths.scope)
+            except BaseException as primary_error:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    self._cleanup_preload_reservation(
+                        scope,
+                        paths.receipt,
+                        reservation_scope,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(_sanitize_cleanup_error(cleanup_error))
+                if cleanup_errors:
+                    if isinstance(primary_error, FileExistsError):
+                        interruption = next(
+                            (
+                                error
+                                for error in cleanup_errors
+                                if not isinstance(error, Exception)
+                            ),
+                            None,
+                        )
+                        if interruption is not None:
+                            raise ProbeConnectGuardInstallRejectedInterruption(
+                                interruption
+                            ) from None
+                        raise ProbeConnectGuardInstallRejected(
+                            "probe_guard_already_active"
+                        ) from None
+                    raise BaseExceptionGroup(
+                        "probe guard ownership promotion and cleanup failed",
+                        [primary_error, *cleanup_errors],
+                    ) from None
+                retain_coordinator = False
+                if isinstance(primary_error, FileExistsError):
+                    raise ProbeConnectGuardInstallRejected(
+                        "probe_guard_already_active"
+                    ) from None
+                if not isinstance(primary_error, Exception):
+                    raise ProbeConnectGuardInstallRejectedInterruption(
+                        primary_error
+                    ) from None
+                raise ProbeConnectGuardInstallRejected(
+                    "probe_guard_install_failed"
                 ) from None
-            if not isinstance(primary_error, Exception):
-                raise ProbeConnectGuardInstallRejectedInterruption(
-                    primary_error
-                ) from None
-            raise ProbeConnectGuardInstallRejected(
-                "probe_guard_install_failed"
-            ) from None
-        for path in (paths.programs, paths.maps):
-            os.mkdir(path, mode=0o700)
-        self._command(
-            "prog",
-            "loadall",
-            str(self._object),
-            str(paths.programs),
-            "pinmaps",
-            str(paths.maps),
-            budget=budget,
-        )
-        self._command(
-            "cgroup",
-            "attach",
-            str(scope.cgroup_path),
-            self._IPV4_ATTACH,
-            "pinned",
-            str(paths.ipv4),
-            budget=budget,
-        )
-        self._command(
-            "cgroup",
-            "attach",
-            str(scope.cgroup_path),
-            self._IPV6_ATTACH,
-            "pinned",
-            str(paths.ipv6),
-            budget=budget,
-        )
-        key = (0).to_bytes(4, "little")
-        self._command(
-            "map",
-            "update",
-            "pinned",
-            str(paths.target_map),
-            "key",
-            "hex",
-            *_hex_bytes(key),
-            "value",
-            "hex",
-            *_hex_bytes(scope.target.map_value()),
-            budget=budget,
-        )
+            self._remember_scope_coordinator(scope, coordinator)
+            coordinator = -1
+            for path in (paths.programs, paths.maps):
+                os.mkdir(path, mode=0o700)
+            self._command(
+                "prog",
+                "loadall",
+                str(self._object),
+                str(paths.programs),
+                "pinmaps",
+                str(paths.maps),
+                budget=budget,
+            )
+            self._command(
+                "cgroup",
+                "attach",
+                str(scope.cgroup_path),
+                self._IPV4_ATTACH,
+                "pinned",
+                str(paths.ipv4),
+                budget=budget,
+            )
+            self._command(
+                "cgroup",
+                "attach",
+                str(scope.cgroup_path),
+                self._IPV6_ATTACH,
+                "pinned",
+                str(paths.ipv6),
+                budget=budget,
+            )
+            key = (0).to_bytes(4, "little")
+            self._command(
+                "map",
+                "update",
+                "pinned",
+                str(paths.target_map),
+                "key",
+                "hex",
+                *_hex_bytes(key),
+                "value",
+                "hex",
+                *_hex_bytes(scope.target.map_value()),
+                budget=budget,
+            )
+        except ProbeConnectGuardInstallRejected:
+            retain_coordinator = False
+            raise
+        finally:
+            if coordinator >= 0:
+                os.close(coordinator)
+            if not retain_coordinator:
+                self._forget_scope_coordinator(scope)
 
     def verify(
         self,
@@ -421,15 +503,32 @@ class BpftoolProbeConnectGuardBackend:
         *,
         timeout_seconds: float,
     ) -> None:
+        budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
+        coordinator = self._scope_coordinator(scope)
+        if coordinator is None:
+            coordinator = self._acquire_coordinator(shared=True, budget=budget)
+            self._remember_scope_coordinator(scope, coordinator)
+        try:
+            self._remove_owned(scope, budget=budget)
+        except BaseException:
+            raise
+        else:
+            self._forget_scope_coordinator(scope)
+
+    def _remove_owned(
+        self,
+        scope: ProbeConnectGuardScope,
+        *,
+        budget: _CommandBudget,
+    ) -> None:
         self._require_artifact_identity()
         paths = self._paths(scope)
-        budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
         if not _path_lexists(paths.receipt):
             if not _path_lexists(paths.scope):
                 return
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         ownership = self._ownership_from_receipt(paths.receipt)
-        if ownership.scope != scope or ownership.phase != 1:
+        if ownership.scope != scope or ownership.phase != 2:
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         if not _path_lexists(paths.scope):
             self._remove_receipt(paths.receipt)
@@ -497,21 +596,27 @@ class BpftoolProbeConnectGuardBackend:
         """Collect a bounded batch of receipt-proven scopes after broker restart."""
 
         budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
-        receipts = self._receipt_inventory()
-        for receipt in receipts[: self._RECONCILE_MAX_SCOPES]:
-            ownership = self._ownership_from_receipt(receipt)
-            try:
-                if ownership.phase == 0:
-                    self._remove_reserved_receipt(receipt)
-                else:
-                    self.remove(
-                        ownership.scope,
-                        timeout_seconds=budget.remaining(),
-                    )
-            except ProbeConnectGuardError:
-                if budget.deadline - self._monotonic() <= 0:
-                    break
-        return len(self._receipt_inventory())
+        coordinator = self._acquire_coordinator(shared=False, budget=budget)
+        try:
+            self._cleanup_promotion_temps()
+            receipts = self._receipt_inventory()
+            for receipt in receipts[: self._RECONCILE_MAX_SCOPES]:
+                ownership = self._ownership_from_receipt(receipt)
+                try:
+                    if ownership.phase == 0:
+                        self._cleanup_reserved_scope(ownership, receipt)
+                    else:
+                        self._cleanup_staged_owned_scope(
+                            ownership,
+                            receipt,
+                            budget=budget,
+                        )
+                except ProbeConnectGuardError:
+                    if budget.deadline - self._monotonic() <= 0:
+                        break
+            return len(self._receipt_inventory())
+        finally:
+            os.close(coordinator)
 
     def _paths(self, scope: ProbeConnectGuardScope) -> _GuardPaths:
         scope_root = self._pin_root / scope.request_id.hex
@@ -527,7 +632,8 @@ class BpftoolProbeConnectGuardBackend:
             receipt=self._ownership_root / f"{scope.request_id.hex}.json",
         )
 
-    def _create_receipt(self, scope: ProbeConnectGuardScope, path: Path) -> None:
+    def _create_receipt(self, scope: ProbeConnectGuardScope, path: Path) -> str:
+        reservation_nonce = secrets.token_hex(16)
         payload = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
@@ -535,29 +641,30 @@ class BpftoolProbeConnectGuardBackend:
             phase=0,
             scope_device=0,
             scope_inode=0,
+            reservation_nonce=reservation_nonce,
         )
+        temporary = self._reservation_receipt_path(
+            scope,
+            reservation_nonce,
+        )
+        linked = False
         try:
-            with open(
-                path,
-                "xb",
-                buffering=0,
-                opener=_receipt_opener,
-            ) as output:
-                written = 0
-                while written < len(payload):
-                    count = output.write(payload[written:])
-                    if count is None or count <= 0:
-                        raise OSError("receipt write made no progress")
-                    written += count
-                os.fsync(output.fileno())
+            _write_exclusive_file(temporary, payload, mode=0o600)
+            os.link(temporary, path, follow_symlinks=False)
+            linked = True
+            temporary.unlink()
+            _fsync_directory(self._ownership_root)
         except FileExistsError:
+            temporary.unlink(missing_ok=True)
             raise ProbeConnectGuardInstallRejected(
                 "probe_guard_already_active"
             ) from None
         except BaseException as primary_error:
             cleanup_errors: list[BaseException] = []
             try:
-                path.unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
+                if linked:
+                    path.unlink(missing_ok=True)
                 _fsync_directory(self._ownership_root)
             except BaseException as error:
                 cleanup_errors.append(_sanitize_cleanup_error(error))
@@ -573,7 +680,7 @@ class BpftoolProbeConnectGuardBackend:
             raise ProbeConnectGuardInstallRejected(
                 "probe_guard_install_failed"
             ) from None
-        _fsync_directory(self._ownership_root)
+        return reservation_nonce
 
     def _promote_receipt(
         self,
@@ -590,14 +697,9 @@ class BpftoolProbeConnectGuardBackend:
             owner_uid=self._owner_uid,
         ):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
-        expected = _receipt_bytes(
-            scope,
-            object_sha256=self._identity.object_sha256,
-            artifact_release_id=self._artifact_release.release_id,
-            phase=0,
-            scope_device=0,
-            scope_inode=0,
-        )
+        ownership = self._ownership_from_receipt(path)
+        if ownership.scope != scope or ownership.phase != 0:
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         replacement = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
@@ -605,32 +707,60 @@ class BpftoolProbeConnectGuardBackend:
             phase=1,
             scope_device=scope_metadata.st_dev,
             scope_inode=scope_metadata.st_ino,
+            reservation_nonce=ownership.reservation_nonce,
         )
-        if len(replacement) != len(expected):
-            raise ProbeConnectGuardError("probe_guard_ownership_invalid")
-        flags = os.O_RDWR | os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = -1
+        temporary = self._promotion_receipt_path(
+            scope,
+            ownership.reservation_nonce,
+        )
         try:
-            descriptor = os.open(path, flags)
-            metadata = os.fstat(descriptor)
-            if not _receipt_metadata_valid(metadata, owner_uid=self._owner_uid):
-                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
-            if os.pread(descriptor, len(expected) + 1, 0) != expected:
-                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
-            written = 0
-            while written < len(replacement):
-                count = os.pwrite(descriptor, replacement[written:], written)
-                if count <= 0:
-                    raise OSError("receipt promotion made no progress")
-                written += count
-            os.fsync(descriptor)
+            _write_exclusive_file(temporary, replacement, mode=0o600)
+            os.replace(temporary, path)
+            _fsync_directory(self._ownership_root)
+        except (OSError, ProbeConnectGuardError):
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
+
+    def _finalize_receipt(
+        self,
+        scope: ProbeConnectGuardScope,
+        path: Path,
+        scope_path: Path,
+    ) -> None:
+        ownership = self._ownership_from_receipt(path)
+        try:
+            scope_metadata = scope_path.lstat()
         except OSError:
             raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+        if (
+            ownership.scope != scope
+            or ownership.phase != 1
+            or not _owned_directory_metadata_valid(
+                scope_metadata,
+                owner_uid=self._owner_uid,
+            )
+            or scope_metadata.st_dev != ownership.scope_device
+            or scope_metadata.st_ino != ownership.scope_inode
+        ):
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        replacement = _receipt_bytes(
+            scope,
+            object_sha256=self._identity.object_sha256,
+            artifact_release_id=self._artifact_release.release_id,
+            phase=2,
+            scope_device=ownership.scope_device,
+            scope_inode=ownership.scope_inode,
+            reservation_nonce=ownership.reservation_nonce,
+        )
+        temporary = self._promotion_receipt_path(
+            scope,
+            ownership.reservation_nonce,
+        )
+        try:
+            _write_exclusive_file(temporary, replacement, mode=0o600)
+            os.replace(temporary, path)
+            _fsync_directory(self._ownership_root)
+        except (OSError, ProbeConnectGuardError):
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
 
     def _require_receipt(
         self,
@@ -642,7 +772,7 @@ class BpftoolProbeConnectGuardBackend:
         ownership = self._ownership_from_receipt(path)
         if (
             ownership.scope != scope
-            or ownership.phase != 1
+            or ownership.phase != 2
             or (
                 require_current
                 and ownership.artifact_release.release_id
@@ -707,15 +837,18 @@ class BpftoolProbeConnectGuardBackend:
             phase = decoded["phase"]
             scope_device_raw = decoded["scope_device"]
             scope_inode_raw = decoded["scope_inode"]
+            reservation_nonce = decoded["reservation_nonce"]
             artifact_release_id = decoded["artifact_release_id"]
             if (
                 isinstance(phase, bool)
                 or not isinstance(phase, int)
-                or phase not in {0, 1}
+                or phase not in {0, 1, 2}
                 or not isinstance(scope_device_raw, str)
                 or not re.fullmatch(r"[0-9]{20}", scope_device_raw)
                 or not isinstance(scope_inode_raw, str)
                 or not re.fullmatch(r"[0-9]{20}", scope_inode_raw)
+                or not isinstance(reservation_nonce, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", reservation_nonce)
                 or not isinstance(artifact_release_id, str)
                 or not re.fullmatch(
                     r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}",
@@ -741,12 +874,13 @@ class BpftoolProbeConnectGuardBackend:
                 "phase",
                 "port",
                 "request_id",
+                "reservation_nonce",
                 "scope_device",
                 "scope_inode",
                 "unit_name",
                 "version",
             }
-            or decoded["version"] != 2
+            or decoded["version"] != 3
             or decoded["object_sha256"] != artifact_release.object_sha256
             or _receipt_bytes(
                 scope,
@@ -755,10 +889,11 @@ class BpftoolProbeConnectGuardBackend:
                 phase=phase,
                 scope_device=scope_device,
                 scope_inode=scope_inode,
+                reservation_nonce=reservation_nonce,
             )
             != payload
             or (phase == 0 and (scope_device != 0 or scope_inode != 0))
-            or (phase == 1 and scope_inode == 0)
+            or (phase in {1, 2} and scope_inode == 0)
             or scope.request_id.version != 4
             or scope.unit_name != f"rtsp-probe-{scope.request_id.hex}.service"
             or not scope.cgroup_path.is_absolute()
@@ -770,6 +905,7 @@ class BpftoolProbeConnectGuardBackend:
             phase=phase,
             scope_device=scope_device,
             scope_inode=scope_inode,
+            reservation_nonce=reservation_nonce,
             artifact_release=artifact_release,
         )
 
@@ -777,6 +913,8 @@ class BpftoolProbeConnectGuardBackend:
         try:
             entries: list[Path] = []
             for entry in self._ownership_root.iterdir():
+                if entry.name == self._COORDINATOR_NAME:
+                    continue
                 entries.append(entry)
                 if len(entries) > self._OWNERSHIP_MAX_SCOPES:
                     raise ProbeConnectGuardError("probe_guard_ownership_capacity")
@@ -798,6 +936,283 @@ class BpftoolProbeConnectGuardBackend:
         if self._ownership_from_receipt(path).phase != 0:
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         self._remove_receipt(path)
+
+    def _reservation_scope_path(
+        self,
+        scope: ProbeConnectGuardScope,
+        reservation_nonce: str,
+    ) -> Path:
+        return self._pin_root / (
+            f".{scope.request_id.hex}.{reservation_nonce}.reserved"
+        )
+
+    def _promotion_receipt_path(
+        self,
+        scope: ProbeConnectGuardScope,
+        reservation_nonce: str,
+    ) -> Path:
+        return self._ownership_root / (
+            f".{scope.request_id.hex}.{reservation_nonce}.next"
+        )
+
+    def _reservation_receipt_path(
+        self,
+        scope: ProbeConnectGuardScope,
+        reservation_nonce: str,
+    ) -> Path:
+        return self._ownership_root / (
+            f".{scope.request_id.hex}.{reservation_nonce}.reserve"
+        )
+
+    def _cleanup_preload_reservation(
+        self,
+        scope: ProbeConnectGuardScope,
+        receipt: Path,
+        reservation_scope: Path,
+    ) -> None:
+        ownership = self._ownership_from_receipt(receipt)
+        if ownership.scope != scope:
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        final_scope = self._paths(scope).scope
+        candidates = [reservation_scope]
+        if ownership.phase in {1, 2}:
+            candidates.append(final_scope)
+        for candidate in candidates:
+            if not _path_lexists(candidate):
+                continue
+            metadata = candidate.lstat()
+            if (
+                candidate == final_scope
+                and ownership.phase in {1, 2}
+                and (
+                    metadata.st_dev != ownership.scope_device
+                    or metadata.st_ino != ownership.scope_inode
+                )
+            ):
+                continue
+            if (
+                not _owned_directory_metadata_valid(
+                    metadata,
+                    owner_uid=self._owner_uid,
+                )
+                or list(candidate.iterdir())
+                or (
+                    ownership.phase in {1, 2}
+                    and (
+                        metadata.st_dev != ownership.scope_device
+                        or metadata.st_ino != ownership.scope_inode
+                    )
+                )
+            ):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            candidate.rmdir()
+        temporary = self._promotion_receipt_path(
+            scope,
+            ownership.reservation_nonce,
+        )
+        temporary.unlink(missing_ok=True)
+        self._remove_receipt(receipt)
+        _fsync_directory(self._pin_root)
+
+    def _cleanup_reserved_scope(
+        self,
+        ownership: _GuardOwnership,
+        receipt: Path,
+    ) -> None:
+        reservation_scope = self._reservation_scope_path(
+            ownership.scope,
+            ownership.reservation_nonce,
+        )
+        if _path_lexists(reservation_scope):
+            metadata = reservation_scope.lstat()
+            if (
+                not _owned_directory_metadata_valid(
+                    metadata,
+                    owner_uid=self._owner_uid,
+                )
+                or list(reservation_scope.iterdir())
+            ):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            reservation_scope.rmdir()
+            _fsync_directory(self._pin_root)
+        temporary = self._promotion_receipt_path(
+            ownership.scope,
+            ownership.reservation_nonce,
+        )
+        temporary.unlink(missing_ok=True)
+        self._remove_reserved_receipt(receipt)
+
+    def _cleanup_staged_owned_scope(
+        self,
+        ownership: _GuardOwnership,
+        receipt: Path,
+        *,
+        budget: _CommandBudget,
+    ) -> None:
+        paths = self._paths(ownership.scope)
+        reservation_scope = self._reservation_scope_path(
+            ownership.scope,
+            ownership.reservation_nonce,
+        )
+        if _path_lexists(paths.scope):
+            if _path_lexists(reservation_scope):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            metadata = paths.scope.lstat()
+            inode_matches = (
+                metadata.st_dev == ownership.scope_device
+                and metadata.st_ino == ownership.scope_inode
+            )
+            if ownership.phase == 1:
+                if inode_matches:
+                    if (
+                        not _owned_directory_metadata_valid(
+                            metadata,
+                            owner_uid=self._owner_uid,
+                        )
+                        or list(paths.scope.iterdir())
+                    ):
+                        raise ProbeConnectGuardError(
+                            "probe_guard_ownership_invalid"
+                        )
+                    paths.scope.rmdir()
+                    _fsync_directory(self._pin_root)
+                self._remove_receipt(receipt)
+                return
+            self._remove_owned(
+                ownership.scope,
+                budget=budget,
+            )
+            return
+        if _path_lexists(reservation_scope):
+            metadata = reservation_scope.lstat()
+            if (
+                not _owned_directory_metadata_valid(
+                    metadata,
+                    owner_uid=self._owner_uid,
+                )
+                or metadata.st_dev != ownership.scope_device
+                or metadata.st_ino != ownership.scope_inode
+                or list(reservation_scope.iterdir())
+            ):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            reservation_scope.rmdir()
+            _fsync_directory(self._pin_root)
+        self._remove_receipt(receipt)
+
+    def _cleanup_promotion_temps(self) -> None:
+        try:
+            entries = list(self._ownership_root.iterdir())
+        except OSError:
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
+        reservation_pattern = re.compile(
+            r"\.([0-9a-f]{32})\.([0-9a-f]{32})\.reserve"
+        )
+        for entry in entries:
+            if reservation_pattern.fullmatch(entry.name) is None:
+                continue
+            metadata = entry.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self._owner_uid
+                or metadata.st_nlink not in {1, 2}
+                or metadata.st_mode & 0o177
+                or metadata.st_size > 2_048
+            ):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            entry.unlink()
+            _fsync_directory(self._ownership_root)
+        entries = list(self._ownership_root.iterdir())
+        pattern = re.compile(r"\.([0-9a-f]{32})\.([0-9a-f]{32})\.next")
+        for entry in entries:
+            match = pattern.fullmatch(entry.name)
+            if match is None:
+                continue
+            receipt = self._ownership_root / f"{match.group(1)}.json"
+            ownership = self._ownership_from_receipt(receipt)
+            metadata = entry.lstat()
+            if (
+                ownership.phase not in {0, 1, 2}
+                or ownership.scope.request_id.hex != match.group(1)
+                or ownership.reservation_nonce != match.group(2)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self._owner_uid
+                or metadata.st_nlink != 1
+                or metadata.st_mode & 0o177
+                or metadata.st_size > 2_048
+            ):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            entry.unlink()
+            _fsync_directory(self._ownership_root)
+
+    def _ensure_coordinator_file(self) -> None:
+        flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = -1
+        try:
+            descriptor = os.open(self._coordinator_path, flags, 0o600)
+            metadata = os.fstat(descriptor)
+            if not _coordinator_metadata_valid(metadata, owner_uid=self._owner_uid):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            _fsync_directory(self._ownership_root)
+        except OSError:
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _acquire_coordinator(
+        self,
+        *,
+        shared: bool,
+        budget: _CommandBudget,
+    ) -> int:
+        flags = os.O_RDWR | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = -1
+        try:
+            descriptor = os.open(self._coordinator_path, flags)
+            if not _coordinator_metadata_valid(
+                os.fstat(descriptor),
+                owner_uid=self._owner_uid,
+            ):
+                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+            operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            while True:
+                try:
+                    fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+                    result = descriptor
+                    descriptor = -1
+                    return result
+                except BlockingIOError:
+                    remaining = budget.remaining()
+                    time.sleep(min(0.01, remaining))
+        except OSError:
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _remember_scope_coordinator(
+        self,
+        scope: ProbeConnectGuardScope,
+        descriptor: int,
+    ) -> None:
+        with self._scope_lock_guard:
+            if scope.request_id in self._scope_locks:
+                raise ProbeConnectGuardError("probe_guard_state_invalid")
+            self._scope_locks[scope.request_id] = descriptor
+
+    def _scope_coordinator(self, scope: ProbeConnectGuardScope) -> int | None:
+        with self._scope_lock_guard:
+            return self._scope_locks.get(scope.request_id)
+
+    def _forget_scope_coordinator(self, scope: ProbeConnectGuardScope) -> None:
+        with self._scope_lock_guard:
+            descriptor = self._scope_locks.pop(scope.request_id, None)
+        if descriptor is not None:
+            os.close(descriptor)
 
     def _command(self, *arguments: str, budget: _CommandBudget) -> str:
         try:
@@ -1021,6 +1436,7 @@ class _GuardOwnership:
     phase: int
     scope_device: int
     scope_inode: int
+    reservation_nonce: str
     artifact_release: _ProbeConnectGuardArtifactRelease
 
 
@@ -1069,7 +1485,7 @@ class ProbeConnectGuardManager:
         self._cleanup_retry_lock = Lock()
         self._cleanup_attempt_sequence = 0
         self._reconcile_in_progress = False
-        self._reconcile_ready = True
+        self._reconcile_ready = False
         self._monotonic = monotonic
 
     def install(
@@ -1096,6 +1512,17 @@ class ProbeConnectGuardManager:
         )
         record = _GuardRecord(scope=scope)
         deadline = self._monotonic() + timeout_seconds
+        with self._lock:
+            reconcile_required = not self._reconcile_ready
+            reconcile_busy = self._reconcile_in_progress
+        if reconcile_busy:
+            raise ProbeConnectGuardError("probe_guard_reconcile_busy")
+        if reconcile_required:
+            remaining = self.reconcile_startup(
+                timeout_seconds=self._remaining(deadline)
+            )
+            if remaining:
+                raise ProbeConnectGuardError("probe_guard_reconcile_required")
         operation_acquired = False
         try:
             record.operation_lock.acquire()
@@ -1405,6 +1832,7 @@ def _receipt_bytes(
     phase: int,
     scope_device: int,
     scope_inode: int,
+    reservation_nonce: str,
 ) -> bytes:
     return (
         json.dumps(
@@ -1416,10 +1844,11 @@ def _receipt_bytes(
                 "phase": phase,
                 "port": scope.target.port,
                 "request_id": str(scope.request_id),
+                "reservation_nonce": reservation_nonce,
                 "scope_device": f"{scope_device:020d}",
                 "scope_inode": f"{scope_inode:020d}",
                 "unit_name": scope.unit_name,
-                "version": 2,
+                "version": 3,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1602,13 +2031,6 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _receipt_opener(path: str, flags: int) -> int:
-    flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return os.open(path, flags, 0o600)
-
-
 def _trusted_path(
     path: Path,
     *,
@@ -1728,27 +2150,132 @@ def _sha256_descriptor(descriptor: int) -> str:
 
 
 def _descriptor_path(descriptor: int, *, fallback: Path) -> str:
+    descriptor_root = Path("/proc/self/fd")
+    if descriptor_root.is_dir():
+        return str(descriptor_root / str(descriptor))
+    if platform.system() != "Linux":
+        return str(fallback)
+    raise ProbeConnectGuardError("probe_guard_tool_invalid")
+
+
+def _directory_descriptor_path(descriptor: int, *, fallback: Path) -> str:
     proc_path = Path("/proc/self/fd")
     if proc_path.is_dir():
         return str(proc_path / str(descriptor))
-    return str(fallback)
+    if platform.system() != "Linux":
+        return str(fallback)
+    raise ProbeConnectGuardError("probe_guard_pin_root_invalid")
 
 
-def _trusted_directory(path: Path, *, owner_uid: int) -> Path:
+def _open_trusted_directory(path: Path, *, owner_uid: int) -> int:
     if not isinstance(path, Path) or not path.is_absolute():
-        raise ProbeConnectGuardError("probe_guard_pin_root_invalid")
-    try:
-        metadata = path.lstat()
-    except OSError:
         raise ProbeConnectGuardError("probe_guard_pin_root_invalid") from None
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != owner_uid
-        or metadata.st_mode & 0o022
-    ):
-        raise ProbeConnectGuardError("probe_guard_pin_root_invalid")
-    return path
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path.anchor, flags)
+        for component in path.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise ProbeConnectGuardError("probe_guard_pin_root_invalid")
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != owner_uid
+            or metadata.st_mode & 0o022
+        ):
+            raise ProbeConnectGuardError("probe_guard_pin_root_invalid")
+        result = descriptor
+        descriptor = -1
+        return result
+    except (OSError, ValueError):
+        raise ProbeConnectGuardError("probe_guard_pin_root_invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _write_exclusive_file(path: Path, payload: bytes, *, mode: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, mode)
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("file write made no progress")
+            written += count
+        os.fsync(descriptor)
+    except OSError:
+        raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError(os.fspath(destination))
+    if platform.system() != "Linux":
+        os.rename(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == 17:
+            raise FileExistsError(os.fspath(destination))
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _coordinator_metadata_valid(
+    metadata: os.stat_result,
+    *,
+    owner_uid: int,
+) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == owner_uid
+        and metadata.st_nlink == 1
+        and metadata.st_mode & 0o177 == 0
+        and metadata.st_size == 0
+    )
+
+
+def _close_backend_descriptors(
+    root_descriptors: tuple[int, ...],
+    scope_descriptors: dict[UUID, int],
+) -> None:
+    descriptors = [*scope_descriptors.values(), *root_descriptors]
+    scope_descriptors.clear()
+    for descriptor in descriptors:
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 def _owned_directory_valid(path: Path, *, owner_uid: int) -> bool:
@@ -1812,20 +2339,23 @@ def _run_command(
     timeout_seconds: float,
     pass_fds: tuple[int, ...] = (),
 ) -> str:
-    try:
-        process = subprocess.Popen(
-            arguments,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin"},
-            pass_fds=pass_fds,
-        )
-    except OSError:
-        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+    process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     try:
+        try:
+            process = subprocess.Popen(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin"},
+                pass_fds=pass_fds,
+            )
+        except OSError:
+            raise ProbeConnectGuardError(
+                "probe_guard_kernel_operation_failed"
+            ) from None
         stdout = bytearray()
         stderr = bytearray()
         selector = selectors.DefaultSelector()
@@ -1857,14 +2387,15 @@ def _run_command(
         returncode = process.wait(timeout=remaining)
     except BaseException as primary_error:
         cleanup_errors: list[BaseException] = []
-        process_cleanup_error = _terminate_and_reap(process)
-        if process_cleanup_error is not None:
-            cleanup_errors.append(process_cleanup_error)
+        if process is not None:
+            process_cleanup_error = _terminate_and_reap(process)
+            if process_cleanup_error is not None:
+                cleanup_errors.append(process_cleanup_error)
         cleanup_errors.extend(
             _close_command_resources(
                 selector,
-                process.stdout,
-                process.stderr,
+                process.stdout if process is not None else None,
+                process.stderr if process is not None else None,
             )
         )
         if cleanup_errors and (
@@ -1882,6 +2413,7 @@ def _run_command(
         if not isinstance(primary_error, Exception):
             raise
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+    assert process is not None
     cleanup_errors = _close_command_resources(
         selector,
         process.stdout,

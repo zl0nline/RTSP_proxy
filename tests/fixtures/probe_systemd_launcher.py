@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import time
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 
 
@@ -40,16 +41,26 @@ def main() -> int:
             target = urlsplit(file_line[6:-1])
             if target.hostname is None or target.port is None:
                 return 23
+            address = ip_address(target.hostname)
+            family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+            alternate_family = (
+                socket.AF_INET6 if family == socket.AF_INET else socket.AF_INET
+            )
+            alternate_host = "::1" if alternate_family == socket.AF_INET6 else "127.0.0.1"
             results: dict[str, bool] = {}
-            for label, port in (
-                ("allowed", target.port),
-                ("denied", target.port + 1),
+            for label, connect_family, host, port in (
+                ("allowed", family, target.hostname, target.port),
+                ("wrong_port", family, target.hostname, target.port + 1),
+                (
+                    "wrong_family",
+                    alternate_family,
+                    alternate_host,
+                    target.port,
+                ),
             ):
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                with socket.socket(connect_family, socket.SOCK_STREAM) as connection:
                     connection.settimeout(1.0)
-                    results[label] = connection.connect_ex(
-                        (target.hostname, port)
-                    ) == 0
+                    results[label] = connection.connect_ex((host, port)) == 0
         except (OSError, StopIteration, UnicodeError, ValueError):
             return 24
         _write_all(
