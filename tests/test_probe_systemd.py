@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import os
+import traceback
+from dataclasses import replace
 from ipaddress import ip_address
-from typing import cast
-from uuid import UUID
+from threading import Event, Thread
+from typing import Never, SupportsIndex, cast
+from uuid import UUID, uuid4
 
 import pytest
 
 from rtsp_proxy.probe_broker import ProbeBrokerRequest
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
 from rtsp_proxy.probe_systemd import (
+    ProbeSystemdCall,
     ProbeSystemdError,
+    ProbeSystemdReply,
+    ProbeSystemdStartRejected,
+    ProbeSystemdTransport,
     ProbeTransientDescriptors,
+    ProbeTransientLease,
     ProbeTransientUnit,
+    SystemdProbeManager,
     build_probe_transient_unit,
 )
 
@@ -19,6 +29,41 @@ _REQUEST_ID = UUID("447a1c4e-4c79-4c50-8e51-42c4dfa5fb19")
 _GENERATION = UUID("d7cbf9ca-5328-4ed2-a5eb-b9e1b0ca9914")
 _NOW_MS = 1_800_000_000_000
 _LAUNCHER = "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-probe-launcher"
+
+
+class _RecordingTransport(ProbeSystemdTransport):
+    def __init__(
+        self,
+        reply: ProbeSystemdReply | BaseException,
+        *,
+        recovery: BaseException | None = None,
+    ) -> None:
+        self._reply = reply
+        self.recovery = recovery
+        self.calls: list[tuple[ProbeSystemdCall, float]] = []
+        self.recoveries: list[tuple[str, float]] = []
+
+    def call(self, request: ProbeSystemdCall, *, timeout_seconds: float) -> ProbeSystemdReply:
+        self.calls.append((request, timeout_seconds))
+        if isinstance(self._reply, BaseException):
+            raise self._reply
+        return self._reply
+
+    def recover(self, unit_name: str, *, timeout_seconds: float) -> None:
+        self.recoveries.append((unit_name, timeout_seconds))
+        if self.recovery is not None:
+            raise self.recovery
+
+
+class _InterruptingJobPath(str):
+    def startswith(
+        self,
+        prefix: str | tuple[str, ...],
+        start: SupportsIndex | None = 0,
+        end: SupportsIndex | None = None,
+    ) -> bool:
+        del prefix, start, end
+        raise KeyboardInterrupt
 
 
 def _request(*, address: str = "192.0.2.10") -> ProbeBrokerRequest:
@@ -39,20 +84,25 @@ def _properties(unit: ProbeTransientUnit) -> dict[str, tuple[str, object]]:
 def test_transient_unit_is_an_exact_typed_start_transient_unit_request() -> None:
     unit = build_probe_transient_unit(
         _request(),
-        descriptors=ProbeTransientDescriptors(input_fd=7, output_fd=8),
+        descriptors=ProbeTransientDescriptors(
+            run_gate_fd=7,
+            sealed_input_fd=8,
+            output_read_fd=6,
+            output_write_fd=9,
+        ),
     )
 
     assert unit.unit_name == "rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service"
     assert unit.start_mode == "fail"
     assert unit.guard_target == _request().target
-    assert unit.maximum_output_bytes == 65_536
     assert _properties(unit) == {
         "Type": ("s", "exec"),
         "Slice": ("s", "rtsp-probe.slice"),
         "CollectMode": ("s", "inactive-or-failed"),
         "ExecStart": ("a(sasb)", ((_LAUNCHER, (_LAUNCHER,), False),)),
         "StandardInputFileDescriptor": ("h", 7),
-        "StandardOutputFileDescriptor": ("h", 8),
+        "ExtraFileDescriptors": ("a(hs)", ((8, "probe-input"),)),
+        "StandardOutputFileDescriptor": ("h", 9),
         "StandardError": ("s", "null"),
         "DynamicUser": ("b", True),
         "NoNewPrivileges": ("b", True),
@@ -101,7 +151,12 @@ def test_transient_unit_is_an_exact_typed_start_transient_unit_request() -> None
 def test_transient_unit_uses_linux_ipv6_abi_and_an_exact_host_prefix() -> None:
     unit = build_probe_transient_unit(
         _request(address="2001:db8::10"),
-        descriptors=ProbeTransientDescriptors(input_fd=7, output_fd=8),
+        descriptors=ProbeTransientDescriptors(
+            run_gate_fd=7,
+            sealed_input_fd=8,
+            output_read_fd=6,
+            output_write_fd=9,
+        ),
     )
 
     assert _properties(unit)["IPAddressAllow"] == (
@@ -112,17 +167,37 @@ def test_transient_unit_uses_linux_ipv6_abi_and_an_exact_host_prefix() -> None:
 
 
 @pytest.mark.parametrize(
-    ("input_fd", "output_fd"),
-    [(-1, 8), (7, -1), (7, 7), (True, 8), (7, False)],
+    ("run_gate_fd", "sealed_input_fd", "output_read_fd", "output_write_fd"),
+    [
+        (-1, 8, 6, 9),
+        (7, -1, 6, 9),
+        (7, 8, -1, 9),
+        (7, 8, 6, -1),
+        (7, 7, 6, 9),
+        (7, 8, 8, 9),
+        (7, 8, 6, 6),
+        (7, 8, 6, 7),
+        (True, 8, 6, 9),
+        (7, False, 6, 9),
+        (7, 8, False, 9),
+        (7, 8, 6, False),
+    ],
 )
 def test_transient_unit_rejects_invalid_broker_owned_descriptors(
-    input_fd: int,
-    output_fd: int,
+    run_gate_fd: int,
+    sealed_input_fd: int,
+    output_read_fd: int,
+    output_write_fd: int,
 ) -> None:
     with pytest.raises(ProbeSystemdError, match="probe_transient_descriptors_invalid"):
         build_probe_transient_unit(
             _request(),
-            descriptors=ProbeTransientDescriptors(input_fd=input_fd, output_fd=output_fd),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=run_gate_fd,
+                sealed_input_fd=sealed_input_fd,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
         )
 
 
@@ -130,5 +205,760 @@ def test_transient_unit_rejects_a_non_request_without_rendering_a_policy() -> No
     with pytest.raises(ProbeSystemdError, match="probe_transient_request_invalid"):
         build_probe_transient_unit(
             cast(ProbeBrokerRequest, object()),
-            descriptors=ProbeTransientDescriptors(input_fd=7, output_fd=8),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=7,
+                sealed_input_fd=8,
+                output_read_fd=6,
+                output_write_fd=9,
+            ),
         )
+
+
+def test_systemd_manager_sends_the_exact_start_transient_unit_message() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=7,
+        sealed_input_fd=8,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    try:
+        result = manager.start(
+            _request(),
+            descriptors=descriptors,
+            timeout_seconds=2.5,
+        )
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+    assert result.job_path == "/org/freedesktop/systemd1/job/42"
+    assert result.request_id == _REQUEST_ID
+    assert result.endpoint_generation == _GENERATION
+    assert result.guard_target == _request().target
+    assert result.deadline_unix_ms == _NOW_MS + 10_000
+    assert len(transport.calls) == 1
+    call, timeout_seconds = transport.calls[0]
+    assert timeout_seconds == 2.5
+    assert call.destination == "org.freedesktop.systemd1"
+    assert call.object_path == "/org/freedesktop/systemd1"
+    assert call.interface == "org.freedesktop.systemd1.Manager"
+    assert call.member == "StartTransientUnit"
+    assert call.signature == "ssa(sv)a(sa(sv))"
+    assert call.body[0:2] == (
+        "rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service",
+        "fail",
+    )
+    assert call.body[3] == ()
+    assert call.unix_fds == (7, 8, descriptors.output_write_fd)
+
+    wire_properties = {name: (signature, value) for name, signature, value in call.body[2]}
+    unit_properties = _properties(build_probe_transient_unit(_request(), descriptors=descriptors))
+    assert wire_properties["StandardInputFileDescriptor"] == ("h", 0)
+    assert wire_properties["ExtraFileDescriptors"] == ("a(hs)", ((1, "probe-input"),))
+    assert wire_properties["StandardOutputFileDescriptor"] == ("h", 2)
+    descriptor_properties = {
+        "StandardInputFileDescriptor",
+        "ExtraFileDescriptors",
+        "StandardOutputFileDescriptor",
+    }
+    wire_non_descriptor = {
+        name: value for name, value in wire_properties.items() if name not in descriptor_properties
+    }
+    unit_non_descriptor = {
+        name: value for name, value in unit_properties.items() if name not in descriptor_properties
+    }
+    assert wire_non_descriptor == unit_non_descriptor
+
+
+def test_systemd_manager_sanitizes_transport_failures() -> None:
+    transport = _RecordingTransport(RuntimeError("secret-bearing remote error"))
+    manager = SystemdProbeManager(transport=transport)
+    output_read_fd, output_write_fd = os.pipe()
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=7,
+        sealed_input_fd=8,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+
+    try:
+        with pytest.raises(ProbeSystemdError, match=r"^probe_transient_start_failed$") as raised:
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=2.5)
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+    assert "secret" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "secret-bearing" not in "".join(traceback.format_exception(raised.value))
+    assert transport.recoveries == [
+        ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+    ]
+
+
+def test_systemd_manager_constructs_policy_internally() -> None:
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+
+    with pytest.raises(ProbeSystemdError, match="probe_transient_request_invalid"):
+        manager.start(
+            cast(ProbeBrokerRequest, object()),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=7,
+                sealed_input_fd=8,
+                output_read_fd=6,
+                output_write_fd=9,
+            ),
+            timeout_seconds=2.5,
+        )
+
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.0, -1.0, 60.1, float("inf"), float("nan")])
+def test_systemd_manager_rejects_an_invalid_timeout(timeout_seconds: float) -> None:
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=7,
+        sealed_input_fd=8,
+        output_read_fd=6,
+        output_write_fd=9,
+    )
+
+    with pytest.raises(ProbeSystemdError, match="probe_transient_timeout_invalid"):
+        manager.start(_request(), descriptors=descriptors, timeout_seconds=timeout_seconds)
+
+    assert transport.calls == []
+
+
+def _start_with_output_pipe() -> tuple[
+    SystemdProbeManager,
+    _RecordingTransport,
+    ProbeTransientLease,
+    int,
+    int,
+]:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    lease = manager.start(
+        _request(),
+        descriptors=ProbeTransientDescriptors(
+            run_gate_fd=100,
+            sealed_input_fd=101,
+            output_read_fd=output_read_fd,
+            output_write_fd=output_write_fd,
+        ),
+        timeout_seconds=2.5,
+    )
+    return manager, transport, lease, output_read_fd, output_write_fd
+
+
+def test_systemd_manager_reads_bounded_output_and_collects_the_unit() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    try:
+        os.write(output_write_fd, b'{"status":"ok"}\n')
+        os.close(output_write_fd)
+        output_write_fd = -1
+
+        assert manager.read_output(
+            lease,
+            output_fd=output_read_fd,
+            timeout_seconds=1.0,
+        ) == b'{"status":"ok"}\n'
+
+        with pytest.raises(ProbeSystemdError, match="probe_transient_lease_invalid"):
+            manager.read_output(
+                lease,
+                output_fd=output_read_fd,
+                timeout_seconds=1.0,
+            )
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        if output_write_fd >= 0:
+            os.close(output_write_fd)
+
+
+def test_systemd_manager_stops_the_unit_on_output_overflow() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+
+    def write_overflow() -> None:
+        try:
+            remaining = memoryview(b"x" * 65_537)
+            while remaining:
+                remaining = remaining[os.write(output_write_fd, remaining) :]
+        finally:
+            os.close(output_write_fd)
+
+    writer = Thread(target=write_overflow)
+    writer.start()
+    try:
+        with pytest.raises(ProbeSystemdError, match="probe_transient_output_overflow"):
+            manager.read_output(
+                lease,
+                output_fd=output_read_fd,
+                timeout_seconds=1.0,
+            )
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        writer.join(timeout=1)
+    assert not writer.is_alive()
+
+
+def test_systemd_manager_stops_the_unit_on_output_timeout() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    try:
+        with pytest.raises(ProbeSystemdError, match="probe_transient_output_timeout"):
+            manager.read_output(
+                lease,
+                output_fd=output_read_fd,
+                timeout_seconds=0.01,
+            )
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_rejects_a_non_reader_output_descriptor_and_stops() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    try:
+        with pytest.raises(ProbeSystemdError, match="probe_transient_output_mismatch"):
+            manager.read_output(
+                lease,
+                output_fd=output_write_fd,
+                timeout_seconds=1.0,
+            )
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_cancels_only_an_active_exact_unit() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    try:
+        with pytest.raises(ProbeSystemdError, match="probe_transient_lease_invalid"):
+            manager.cancel(replace(lease))
+        manager.cancel(lease)
+        with pytest.raises(ProbeSystemdError, match="probe_transient_lease_invalid"):
+            manager.cancel(lease)
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_rejects_output_from_an_unrelated_pipe() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    forged_read_fd, forged_write_fd = os.pipe()
+    try:
+        os.write(forged_write_fd, b'{"forged":true}\n')
+        os.close(forged_write_fd)
+        forged_write_fd = -1
+
+        with pytest.raises(ProbeSystemdError, match="probe_transient_output_mismatch"):
+            manager.read_output(
+                lease,
+                output_fd=forged_read_fd,
+                timeout_seconds=1.0,
+            )
+
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+        os.close(forged_read_fd)
+        if forged_write_fd >= 0:
+            os.close(forged_write_fd)
+
+
+def test_systemd_manager_retains_failed_cleanup_and_allows_a_bounded_retry() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"),
+        recovery=TimeoutError("injected cleanup timeout"),
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    try:
+        lease = manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
+            manager.cancel(lease)
+        with pytest.raises(ProbeSystemdError, match="probe_transient_already_active"):
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+
+        transport.recovery = None
+        assert manager.retry_pending_cleanup() == 0
+        replacement = manager.start(
+            _request(),
+            descriptors=descriptors,
+            timeout_seconds=1.0,
+        )
+        manager.cancel(replacement)
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_retains_ambiguous_start_when_initial_cleanup_fails() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        TimeoutError("injected ambiguous start"),
+        recovery=TimeoutError("injected cleanup timeout"),
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    try:
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+        with pytest.raises(ProbeSystemdError, match="probe_transient_already_active"):
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+
+        transport.recovery = None
+        assert manager.retry_pending_cleanup() == 0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_does_not_cleanup_a_definitive_unit_exists_rejection() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdStartRejected("probe_transient_start_rejected")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    try:
+        with pytest.raises(
+            ProbeSystemdStartRejected,
+            match="probe_transient_start_rejected",
+        ):
+            manager.start(
+                _request(),
+                descriptors=ProbeTransientDescriptors(
+                    run_gate_fd=100,
+                    sealed_input_fd=101,
+                    output_read_fd=output_read_fd,
+                    output_write_fd=output_write_fd,
+                ),
+                timeout_seconds=1.0,
+            )
+        assert transport.recoveries == []
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_preserves_grouped_process_interruption_without_secrets() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        BaseExceptionGroup(
+            "system bus operation and disconnect failed",
+            [KeyboardInterrupt(), RuntimeError("secret-bearing disconnect failure")],
+        )
+    )
+    manager = SystemdProbeManager(transport=transport)
+    try:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            manager.start(
+                _request(),
+                descriptors=ProbeTransientDescriptors(
+                    run_gate_fd=100,
+                    sealed_input_fd=101,
+                    output_read_fd=output_read_fd,
+                    output_write_fd=output_write_fd,
+                ),
+                timeout_seconds=1.0,
+            )
+
+        assert any(isinstance(item, KeyboardInterrupt) for item in raised.value.exceptions)
+        assert "secret-bearing" not in "".join(traceback.format_exception(raised.value))
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_recovers_when_interrupted_after_start_reply() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path=_InterruptingJobPath("not-observed"))
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+        transport._reply = ProbeSystemdReply(
+            job_path="/org/freedesktop/systemd1/job/43"
+        )
+        replacement = manager.start(
+            _request(),
+            descriptors=descriptors,
+            timeout_seconds=1.0,
+        )
+        manager.cancel(replacement)
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_retains_reservation_interrupted_before_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+
+    def interrupt_reserved_start(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_start_reserved", interrupt_reserved_start)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+        monkeypatch.undo()
+        assert manager.retry_pending_cleanup() == 0
+        assert transport.recoveries == []
+        replacement = manager.start(
+            _request(),
+            descriptors=descriptors,
+            timeout_seconds=1.0,
+        )
+        manager.cancel(replacement)
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_retains_accepted_unit_interrupted_before_lease_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    original_start = manager._start_reserved
+
+    def interrupt_after_acceptance(*args: object, **kwargs: object) -> Never:
+        original_start(*args, **kwargs)  # type: ignore[arg-type]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_start_reserved", interrupt_after_acceptance)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+        monkeypatch.setattr(manager, "_start_reserved", original_start)
+        assert manager.retry_pending_cleanup() == 0
+        assert len(transport.recoveries) == 1
+        assert transport.recoveries[0][0] == (
+            "rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service"
+        )
+        assert 0 < transport.recoveries[0][1] <= 7.0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_retains_cleanup_interrupted_by_process_signal() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"),
+        recovery=KeyboardInterrupt(),
+    )
+    manager = SystemdProbeManager(transport=transport)
+    try:
+        lease = manager.start(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+        )
+
+        with pytest.raises(BaseExceptionGroup) as interrupted:
+            manager.cancel(lease)
+        assert any(
+            isinstance(error, KeyboardInterrupt)
+            for error in interrupted.value.exceptions
+        )
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_in_progress"):
+            manager.cancel(lease)
+
+        transport.recovery = None
+        assert manager.retry_pending_cleanup() == 0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_retains_cleanup_when_recovery_entry_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    original_attempt = manager._attempt_recovery
+
+    def interrupt_recovery(
+        unit_name: str,
+        *,
+        timeout_seconds: float = 7.0,
+    ) -> Never:
+        del unit_name, timeout_seconds
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_attempt_recovery", interrupt_recovery)
+    try:
+        with pytest.raises(BaseExceptionGroup) as interrupted:
+            manager.cancel(lease)
+        assert any(
+            isinstance(error, KeyboardInterrupt)
+            for error in interrupted.value.exceptions
+        )
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_in_progress"):
+            manager.cancel(lease)
+
+        monkeypatch.setattr(manager, "_attempt_recovery", original_attempt)
+        assert manager.retry_pending_cleanup() == 0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_retains_cleanup_interrupted_during_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    original_finish = manager._finish_recovery
+
+    def interrupt_finalization(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_finish_recovery", interrupt_finalization)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            manager.cancel(lease)
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_in_progress"):
+            manager.cancel(lease)
+
+        monkeypatch.setattr(manager, "_finish_recovery", original_finish)
+        assert manager.retry_pending_cleanup() == 0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_caps_each_pending_cleanup_sweep() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"),
+        recovery=TimeoutError("injected cleanup timeout"),
+    )
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    try:
+        unit_names: list[str] = []
+        for _ in range(10):
+            lease = manager.start(
+                replace(_request(), request_id=uuid4()),
+                descriptors=descriptors,
+                timeout_seconds=1.0,
+            )
+            unit_names.append(lease.unit_name)
+            with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
+                manager.cancel(lease)
+
+        recovery_count = len(transport.recoveries)
+        assert manager.retry_pending_cleanup() == 10
+        assert len(transport.recoveries) - recovery_count == 8
+
+        stubborn_units = set(unit_names[:8])
+
+        def recover_selectively(unit_name: str, *, timeout_seconds: float) -> None:
+            transport.recoveries.append((unit_name, timeout_seconds))
+            if unit_name in stubborn_units:
+                raise TimeoutError("injected persistent cleanup timeout")
+
+        transport.recover = recover_selectively  # type: ignore[method-assign]
+        assert manager.retry_pending_cleanup() == 8
+        assert set(unit_names[8:]).issubset(
+            unit_name for unit_name, _ in transport.recoveries[recovery_count + 8 :]
+        )
+
+        stubborn_units.clear()
+        assert manager.retry_pending_cleanup() == 0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+class _BlockingStartTransport(_RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__(ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"))
+        self.entered = Event()
+        self.release = Event()
+
+    def call(self, request: ProbeSystemdCall, *, timeout_seconds: float) -> ProbeSystemdReply:
+        self.calls.append((request, timeout_seconds))
+        self.entered.set()
+        if not self.release.wait(timeout=1):
+            raise TimeoutError("injected blocked start")
+        return ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+
+
+class _BlockingCleanupTransport(_RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__(
+            ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"),
+            recovery=TimeoutError("injected initial cleanup timeout"),
+        )
+        self.block_cleanup = False
+        self.cleanup_entered = Event()
+        self.cleanup_release = Event()
+
+    def recover(self, unit_name: str, *, timeout_seconds: float) -> None:
+        self.recoveries.append((unit_name, timeout_seconds))
+        if not self.block_cleanup:
+            raise cast(BaseException, self.recovery)
+        self.cleanup_entered.set()
+        if not self.cleanup_release.wait(timeout=1):
+            raise TimeoutError("injected blocked cleanup")
+
+
+def test_systemd_manager_serializes_same_id_while_start_is_in_progress() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _BlockingStartTransport()
+    manager = SystemdProbeManager(transport=transport)
+    descriptors = ProbeTransientDescriptors(
+        run_gate_fd=100,
+        sealed_input_fd=101,
+        output_read_fd=output_read_fd,
+        output_write_fd=output_write_fd,
+    )
+    leases: list[ProbeTransientLease] = []
+
+    def start() -> None:
+        leases.append(
+            manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+        )
+
+    thread = Thread(target=start)
+    thread.start()
+    try:
+        assert transport.entered.wait(timeout=1)
+        try:
+            with pytest.raises(ProbeSystemdError, match="probe_transient_already_active"):
+                manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+        finally:
+            transport.release.set()
+            thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert len(leases) == 1
+        manager.cancel(leases[0])
+    finally:
+        transport.release.set()
+        thread.join(timeout=1)
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_does_not_wait_behind_an_active_cleanup_sweep() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _BlockingCleanupTransport()
+    manager = SystemdProbeManager(transport=transport)
+    lease = manager.start(
+        _request(),
+        descriptors=ProbeTransientDescriptors(
+            run_gate_fd=100,
+            sealed_input_fd=101,
+            output_read_fd=output_read_fd,
+            output_write_fd=output_write_fd,
+        ),
+        timeout_seconds=1.0,
+    )
+    with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
+        manager.cancel(lease)
+    transport.block_cleanup = True
+    results: list[int] = []
+    thread = Thread(target=lambda: results.append(manager.retry_pending_cleanup()))
+    thread.start()
+    try:
+        assert transport.cleanup_entered.wait(timeout=1)
+        assert manager.retry_pending_cleanup() == 1
+    finally:
+        transport.cleanup_release.set()
+        thread.join(timeout=1)
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+    assert not thread.is_alive()
+    assert results == [0]

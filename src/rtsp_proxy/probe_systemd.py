@@ -1,8 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import fcntl
+import os
+import select
+import stat
+import sys
+from dataclasses import dataclass, field
 from ipaddress import IPv4Address
-from typing import Literal
+from math import isfinite
+from threading import Lock
+from time import monotonic
+from typing import Literal, NoReturn, Protocol, cast
+from uuid import UUID
 
 from rtsp_proxy.probe_broker import ProbeBrokerRequest
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
@@ -13,9 +22,14 @@ _LINUX_AF_UNSPEC = 0
 _LINUX_AF_INET = 2
 _LINUX_AF_INET6 = 10
 _IP_PROTOCOL_ANY = 0
+_PROBE_OUTPUT_MAX_BYTES = 65_536
+_PROBE_RECOVERY_TIMEOUT_SECONDS = 7.0
+_PROBE_CLEANUP_RETRY_TIMEOUT_SECONDS = 7.0
+_PROBE_CLEANUP_RETRY_MAX_UNITS = 8
 
 type _ExecStartValue = tuple[tuple[str, tuple[str, ...], bool], ...]
 type _AddressFamilyFilterValue = tuple[bool, tuple[str, ...]]
+type _ExtraFileDescriptorsValue = tuple[tuple[int, str], ...]
 type _IpAddressFilterValue = tuple[tuple[int, bytes, int], ...]
 type _SocketBindFilterValue = tuple[tuple[int, int, int, int], ...]
 type ProbeSystemdValue = (
@@ -24,6 +38,7 @@ type ProbeSystemdValue = (
     | int
     | _ExecStartValue
     | _AddressFamilyFilterValue
+    | _ExtraFileDescriptorsValue
     | _IpAddressFilterValue
     | _SocketBindFilterValue
 )
@@ -34,14 +49,34 @@ type ProbeSystemdSignature = Literal[
     "u",
     "h",
     "a(sasb)",
+    "a(hs)",
     "(bas)",
     "a(iayu)",
     "a(iiqq)",
+]
+type ProbeSystemdPropertyEntry = tuple[str, ProbeSystemdSignature, ProbeSystemdValue]
+type ProbeSystemdCallBody = tuple[
+    str,
+    Literal["fail"],
+    tuple[ProbeSystemdPropertyEntry, ...],
+    tuple[()],
 ]
 
 
 class ProbeSystemdError(RuntimeError):
     """A transient probe unit could not be represented by the fixed policy."""
+
+
+class ProbeSystemdStartRejected(ProbeSystemdError):
+    """systemd definitively rejected StartTransientUnit before creating it."""
+
+
+class ProbeSystemdStartRejectedInterruption(BaseException):
+    """A definitive rejection was followed by a process-level interruption."""
+
+    def __init__(self, interruption: BaseException) -> None:
+        super().__init__("probe_transient_start_rejected_interrupted")
+        self.interruption = interruption
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +90,12 @@ class ProbeSystemdProperty:
 
 @dataclass(frozen=True, slots=True)
 class ProbeTransientDescriptors:
-    """Broker-owned input/output descriptors passed as D-Bus handles."""
+    """Broker-owned run gate, sealed input and bounded output handles."""
 
-    input_fd: int
-    output_fd: int
+    run_gate_fd: int
+    sealed_input_fd: int
+    output_read_fd: int
+    output_write_fd: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,8 +105,480 @@ class ProbeTransientUnit:
     unit_name: str
     start_mode: Literal["fail"]
     properties: tuple[ProbeSystemdProperty, ...]
-    maximum_output_bytes: int
     guard_target: ProbeConnectGuardTarget
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeSystemdCall:
+    """One direct system-manager method call with indexed Unix descriptors."""
+
+    destination: str
+    object_path: str
+    interface: str
+    member: str
+    signature: str
+    body: ProbeSystemdCallBody
+    unix_fds: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeSystemdReply:
+    """Secret-free result of accepting one transient start job."""
+
+    job_path: str
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ProbeTransientLease:
+    """Opaque ownership capability for one accepted transient probe unit."""
+
+    unit_name: str
+    job_path: str
+    request_id: UUID
+    endpoint_generation: UUID
+    guard_target: ProbeConnectGuardTarget
+    deadline_unix_ms: int
+
+
+@dataclass(slots=True)
+class _UnitRecord:
+    state: Literal["starting", "active", "cleaning", "cleanup_pending"]
+    output_read_fd: int
+    output_pipe_identity: tuple[int, int]
+    lease: ProbeTransientLease | None = None
+    operation_lock: Lock = field(default_factory=Lock, repr=False)
+    cleanup_attempt_order: int = 0
+    start_may_exist: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryOutcome:
+    collected: bool
+    interruption: BaseException | None = None
+
+
+class ProbeSystemdTransport(Protocol):
+    """Adapter seam for one bounded call to the system manager."""
+
+    def call(
+        self,
+        request: ProbeSystemdCall,
+        *,
+        timeout_seconds: float,
+    ) -> ProbeSystemdReply: ...
+
+    def recover(self, unit_name: str, *, timeout_seconds: float) -> None: ...
+
+
+class SystemdProbeManager:
+    """Translate the fixed policy into one bounded StartTransientUnit call."""
+
+    def __init__(self, *, transport: ProbeSystemdTransport) -> None:
+        self._transport = transport
+        self._units: dict[str, _UnitRecord] = {}
+        self._units_lock = Lock()
+        self._cleanup_retry_lock = Lock()
+        self._cleanup_attempt_sequence = 0
+
+    def start(
+        self,
+        request: ProbeBrokerRequest,
+        *,
+        descriptors: ProbeTransientDescriptors,
+        timeout_seconds: float,
+    ) -> ProbeTransientLease:
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 60:
+            raise ProbeSystemdError("probe_transient_timeout_invalid")
+        unit = build_probe_transient_unit(request, descriptors=descriptors)
+        call = _build_systemd_call(unit)
+        output_pipe_identity = _pipe_identity(descriptors.output_read_fd, write_end=False)
+        output_write_identity = _pipe_identity(descriptors.output_write_fd, write_end=True)
+        if sys.platform == "linux" and output_pipe_identity != output_write_identity:
+            raise ProbeSystemdError("probe_transient_output_mismatch")
+        record = _UnitRecord(
+            state="starting",
+            output_read_fd=descriptors.output_read_fd,
+            output_pipe_identity=output_pipe_identity,
+        )
+        record.operation_lock.acquire()
+        lease: ProbeTransientLease | None = None
+        try:
+            with self._units_lock:
+                if unit.unit_name in self._units:
+                    raise ProbeSystemdError("probe_transient_already_active")
+                self._units[unit.unit_name] = record
+            lease = self._start_reserved(
+                request,
+                unit=unit,
+                call=call,
+                record=record,
+                timeout_seconds=timeout_seconds,
+            )
+            return lease
+        finally:
+            self._release_operation(
+                unit.unit_name,
+                record,
+                preserve_active=lease is not None and sys.exc_info()[0] is None,
+            )
+
+    def _start_reserved(
+        self,
+        request: ProbeBrokerRequest,
+        *,
+        unit: ProbeTransientUnit,
+        call: ProbeSystemdCall,
+        record: _UnitRecord,
+        timeout_seconds: float,
+    ) -> ProbeTransientLease:
+        reply: ProbeSystemdReply | None = None
+        failure: str | None = None
+        interruption: BaseException | None = None
+        try:
+            record.start_may_exist = True
+            reply = self._transport.call(call, timeout_seconds=timeout_seconds)
+        except ProbeSystemdStartRejected:
+            self._remove_record(unit.unit_name, record)
+            raise ProbeSystemdStartRejected("probe_transient_start_rejected") from None
+        except ProbeSystemdStartRejectedInterruption as error:
+            self._remove_record(unit.unit_name, record)
+            raise _sanitize_interruption(error.interruption) from None
+        except Exception:
+            failure = "probe_transient_start_failed"
+        except BaseException as error:
+            interruption = _sanitize_interruption(error)
+        if failure is not None or interruption is not None:
+            self._recover_reserved_start(
+                unit.unit_name,
+                record,
+                failure=failure,
+                interruption=interruption,
+            )
+        response_valid = False
+        failure = None
+        interruption = None
+        try:
+            response_valid = (
+                isinstance(reply, ProbeSystemdReply)
+                and reply.job_path.startswith("/org/freedesktop/systemd1/job/")
+                and reply.job_path.removeprefix(
+                    "/org/freedesktop/systemd1/job/"
+                ).isdigit()
+            )
+        except Exception:
+            failure = "probe_transient_response_invalid"
+        except BaseException as error:
+            interruption = _sanitize_interruption(error)
+        if not response_valid and failure is None and interruption is None:
+            failure = "probe_transient_response_invalid"
+        if failure is not None or interruption is not None:
+            self._recover_reserved_start(
+                unit.unit_name,
+                record,
+                failure=failure,
+                interruption=interruption,
+            )
+        assert isinstance(reply, ProbeSystemdReply)
+        lease: ProbeTransientLease | None = None
+        failure = None
+        interruption = None
+        try:
+            lease = ProbeTransientLease(
+                unit_name=unit.unit_name,
+                job_path=reply.job_path,
+                request_id=request.request_id,
+                endpoint_generation=request.endpoint_generation,
+                guard_target=request.target,
+                deadline_unix_ms=request.deadline_unix_ms,
+            )
+            with self._units_lock:
+                if (
+                    self._units.get(unit.unit_name) is not record
+                    or record.state != "starting"
+                ):
+                    raise ProbeSystemdError("probe_transient_state_invalid")
+                record.lease = lease
+                record.state = "active"
+        except Exception:
+            failure = "probe_transient_start_failed"
+        except BaseException as error:
+            interruption = _sanitize_interruption(error)
+        if failure is not None or interruption is not None:
+            self._recover_reserved_start(
+                unit.unit_name,
+                record,
+                failure=failure,
+                interruption=interruption,
+            )
+        assert lease is not None
+        return lease
+
+    def read_output(
+        self,
+        lease: ProbeTransientLease,
+        *,
+        output_fd: int,
+        timeout_seconds: float,
+    ) -> bytes:
+        """Read one bounded result and always collect its exact transient unit."""
+
+        output = self._cleanup_lease(
+            lease,
+            output_fd=output_fd,
+            timeout_seconds=timeout_seconds,
+        )
+        if output is None:
+            raise ProbeSystemdError("probe_transient_output_failed")
+        return output
+
+    def cancel(self, lease: ProbeTransientLease) -> None:
+        """Stop and collect one exact active probe unit."""
+
+        self._cleanup_lease(lease, output_fd=None, timeout_seconds=None)
+
+    def retry_pending_cleanup(self) -> int:
+        """Retry one bounded batch without waiting behind another cleanup sweep."""
+
+        if not self._cleanup_retry_lock.acquire(blocking=False):
+            return self._unresolved_cleanup_count()
+        try:
+            deadline = monotonic() + _PROBE_CLEANUP_RETRY_TIMEOUT_SECONDS
+            with self._units_lock:
+                pending = sorted(
+                    (
+                        (unit_name, record)
+                        for unit_name, record in self._units.items()
+                        if record.state == "cleanup_pending"
+                    ),
+                    key=lambda item: item[1].cleanup_attempt_order,
+                )[:_PROBE_CLEANUP_RETRY_MAX_UNITS]
+            interruptions: list[BaseException] = []
+            for unit_name, record in pending:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                recovery = self._retry_pending_record(
+                    unit_name,
+                    record,
+                    timeout_seconds=min(_PROBE_RECOVERY_TIMEOUT_SECONDS, remaining),
+                )
+                if recovery is not None and recovery.interruption is not None:
+                    interruptions.append(recovery.interruption)
+            if interruptions:
+                raise BaseExceptionGroup(
+                    "probe cleanup retry was interrupted",
+                    interruptions,
+                ) from None
+            return self._unresolved_cleanup_count()
+        finally:
+            self._cleanup_retry_lock.release()
+
+    def _cleanup_lease(
+        self,
+        lease: ProbeTransientLease,
+        *,
+        output_fd: int | None,
+        timeout_seconds: float | None,
+    ) -> bytes | None:
+        if not isinstance(lease, ProbeTransientLease):
+            raise ProbeSystemdError("probe_transient_lease_invalid")
+        with self._units_lock:
+            record = self._units.get(lease.unit_name)
+            if record is None or record.lease is not lease:
+                raise ProbeSystemdError("probe_transient_lease_invalid")
+        acquired = False
+        try:
+            acquired = record.operation_lock.acquire(blocking=False)
+            if not acquired:
+                raise ProbeSystemdError("probe_transient_cleanup_in_progress")
+            with self._units_lock:
+                if self._units.get(lease.unit_name) is not record:
+                    raise ProbeSystemdError("probe_transient_lease_invalid")
+                if record.lease is not lease:
+                    raise ProbeSystemdError("probe_transient_lease_invalid")
+                if record.state != "active":
+                    raise ProbeSystemdError("probe_transient_cleanup_in_progress")
+                record.state = "cleaning"
+            output: bytes | None = None
+            failure: str | None = None
+            interruption: BaseException | None = None
+            if output_fd is not None:
+                try:
+                    if (
+                        output_fd != record.output_read_fd
+                        or _pipe_identity(output_fd, write_end=False)
+                        != record.output_pipe_identity
+                    ):
+                        raise ProbeSystemdError("probe_transient_output_mismatch")
+                    if timeout_seconds is None:
+                        raise ProbeSystemdError("probe_transient_timeout_invalid")
+                    output = _read_bounded_output(
+                        output_fd,
+                        timeout_seconds=timeout_seconds,
+                    )
+                except ProbeSystemdError as error:
+                    failure = str(error)
+                except Exception:
+                    failure = "probe_transient_output_failed"
+                except BaseException as error:
+                    interruption = _sanitize_interruption(error)
+            recovery = self._recover_cleaning_record(lease.unit_name, record)
+            _raise_after_recovery(
+                failure=failure,
+                interruption=interruption,
+                recovery=recovery,
+            )
+            return output
+        finally:
+            if acquired:
+                self._release_operation(lease.unit_name, record)
+
+    def _retry_pending_record(
+        self,
+        unit_name: str,
+        record: _UnitRecord,
+        *,
+        timeout_seconds: float,
+    ) -> _RecoveryOutcome | None:
+        acquired = False
+        try:
+            acquired = record.operation_lock.acquire(blocking=False)
+            if not acquired:
+                return None
+            with self._units_lock:
+                if (
+                    self._units.get(unit_name) is not record
+                    or record.state != "cleanup_pending"
+                ):
+                    return None
+                record.state = "cleaning"
+            return self._recover_cleaning_record(
+                unit_name,
+                record,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            if acquired:
+                self._release_operation(unit_name, record)
+
+    def _attempt_recovery(
+        self,
+        unit_name: str,
+        *,
+        timeout_seconds: float = _PROBE_RECOVERY_TIMEOUT_SECONDS,
+    ) -> _RecoveryOutcome:
+        try:
+            self._transport.recover(
+                unit_name,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            return _RecoveryOutcome(collected=False)
+        except BaseException as error:
+            return _RecoveryOutcome(
+                collected=False,
+                interruption=_sanitize_interruption(error),
+            )
+        return _RecoveryOutcome(collected=True)
+
+    def _recover_reserved_start(
+        self,
+        unit_name: str,
+        record: _UnitRecord,
+        *,
+        failure: str | None,
+        interruption: BaseException | None,
+    ) -> NoReturn:
+        self._mark_cleaning(unit_name, record)
+        recovery = self._recover_cleaning_record(unit_name, record)
+        _raise_after_recovery(
+            failure=failure,
+            interruption=interruption,
+            recovery=recovery,
+        )
+        raise ProbeSystemdError("probe_transient_start_failed")
+
+    def _recover_cleaning_record(
+        self,
+        unit_name: str,
+        record: _UnitRecord,
+        *,
+        timeout_seconds: float = _PROBE_RECOVERY_TIMEOUT_SECONDS,
+    ) -> _RecoveryOutcome:
+        try:
+            recovery = self._attempt_recovery(
+                unit_name,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            recovery = _RecoveryOutcome(collected=False)
+        except BaseException as error:
+            recovery = _RecoveryOutcome(
+                collected=False,
+                interruption=_sanitize_interruption(error),
+            )
+        self._finish_recovery(unit_name, record, recovery)
+        return recovery
+
+    def _mark_cleaning(self, unit_name: str, record: _UnitRecord) -> None:
+        with self._units_lock:
+            if self._units.get(unit_name) is not record or record.state not in {
+                "starting",
+                "active",
+            }:
+                raise ProbeSystemdError("probe_transient_state_invalid")
+            record.state = "cleaning"
+
+    def _unresolved_cleanup_count(self) -> int:
+        with self._units_lock:
+            return sum(
+                record.state in {"cleaning", "cleanup_pending"}
+                for record in self._units.values()
+            )
+
+    def _finish_recovery(
+        self,
+        unit_name: str,
+        record: _UnitRecord,
+        recovery: _RecoveryOutcome,
+    ) -> None:
+        with self._units_lock:
+            if self._units.get(unit_name) is not record or record.state != "cleaning":
+                raise ProbeSystemdError("probe_transient_state_invalid")
+            if recovery.collected:
+                del self._units[unit_name]
+            else:
+                self._mark_cleanup_pending_locked(record)
+
+    def _release_operation(
+        self,
+        unit_name: str,
+        record: _UnitRecord,
+        *,
+        preserve_active: bool = False,
+    ) -> None:
+        try:
+            with self._units_lock:
+                if self._units.get(unit_name) is record:
+                    if record.state == "starting" and not record.start_may_exist:
+                        del self._units[unit_name]
+                    elif record.state in {"starting", "cleaning"} or (
+                        record.state == "active" and not preserve_active
+                    ):
+                        self._mark_cleanup_pending_locked(record)
+        finally:
+            record.operation_lock.release()
+
+    def _mark_cleanup_pending_locked(self, record: _UnitRecord) -> None:
+        self._cleanup_attempt_sequence += 1
+        record.cleanup_attempt_order = self._cleanup_attempt_sequence
+        record.state = "cleanup_pending"
+
+    def _remove_record(self, unit_name: str, record: _UnitRecord) -> None:
+        with self._units_lock:
+            if self._units.get(unit_name) is not record:
+                raise ProbeSystemdError("probe_transient_state_invalid")
+            del self._units[unit_name]
 
 
 def _property(
@@ -80,14 +589,161 @@ def _property(
     return ProbeSystemdProperty(name=name, signature=signature, value=value)
 
 
+def _probe_unit_name(request: ProbeBrokerRequest) -> str:
+    if not isinstance(request, ProbeBrokerRequest):
+        raise ProbeSystemdError("probe_transient_request_invalid")
+    return f"rtsp-probe-{request.request_id.hex}.service"
+
+
+def _pipe_identity(descriptor: int, *, write_end: bool) -> tuple[int, int]:
+    if isinstance(descriptor, bool) or not isinstance(descriptor, int) or descriptor < 0:
+        raise ProbeSystemdError("probe_transient_output_invalid")
+    try:
+        metadata = os.fstat(descriptor)
+        descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        inheritable = os.get_inheritable(descriptor)
+    except (OSError, ValueError):
+        raise ProbeSystemdError("probe_transient_output_invalid") from None
+    expected_access = os.O_WRONLY if write_end else os.O_RDONLY
+    if (
+        not stat.S_ISFIFO(metadata.st_mode)
+        or descriptor_flags & os.O_ACCMODE != expected_access
+        or inheritable
+    ):
+        raise ProbeSystemdError("probe_transient_output_invalid")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _sanitize_interruption(error: BaseException) -> BaseException:
+    if isinstance(error, BaseExceptionGroup):
+        return error.derive(tuple(_sanitize_interruption(item) for item in error.exceptions))
+    if isinstance(error, Exception):
+        return ProbeSystemdError("probe_transient_operation_failed")
+    return error
+
+
+def _raise_after_recovery(
+    *,
+    failure: str | None,
+    interruption: BaseException | None,
+    recovery: _RecoveryOutcome,
+) -> None:
+    if recovery.interruption is not None:
+        errors: list[BaseException] = []
+        if interruption is not None:
+            errors.append(interruption)
+        elif failure is not None:
+            errors.append(ProbeSystemdError(failure))
+        errors.append(recovery.interruption)
+        raise BaseExceptionGroup(
+            "probe operation and recovery were interrupted",
+            errors,
+        ) from None
+    if not recovery.collected:
+        cleanup_error = ProbeSystemdError("probe_transient_cleanup_pending")
+        if interruption is not None:
+            raise BaseExceptionGroup(
+                "probe operation was interrupted and cleanup remains pending",
+                [interruption, cleanup_error],
+            ) from None
+        raise cleanup_error from None
+    if interruption is not None:
+        raise interruption from None
+    if failure is not None:
+        raise ProbeSystemdError(failure) from None
+
+
+def _read_bounded_output(descriptor: int, *, timeout_seconds: float) -> bytes:
+    if (
+        isinstance(descriptor, bool)
+        or not isinstance(descriptor, int)
+        or descriptor < 0
+        or not isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+        or timeout_seconds > 60
+    ):
+        raise ProbeSystemdError("probe_transient_output_invalid")
+    _pipe_identity(descriptor, write_end=False)
+    deadline = monotonic() + timeout_seconds
+    output = bytearray()
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ProbeSystemdError("probe_transient_output_timeout")
+        try:
+            ready, _, _ = select.select([descriptor], [], [], remaining)
+            if not ready:
+                raise ProbeSystemdError("probe_transient_output_timeout")
+            chunk = os.read(descriptor, min(16_384, _PROBE_OUTPUT_MAX_BYTES + 1 - len(output)))
+        except ProbeSystemdError:
+            raise
+        except OSError:
+            raise ProbeSystemdError("probe_transient_output_invalid") from None
+        if not chunk:
+            if not output:
+                raise ProbeSystemdError("probe_transient_output_invalid")
+            return bytes(output)
+        output.extend(chunk)
+        if len(output) > _PROBE_OUTPUT_MAX_BYTES:
+            raise ProbeSystemdError("probe_transient_output_overflow")
+
+
+def _build_systemd_call(unit: ProbeTransientUnit) -> ProbeSystemdCall:
+    if not isinstance(unit, ProbeTransientUnit):
+        raise ProbeSystemdError("probe_transient_policy_invalid")
+    unix_fds: list[int] = []
+    properties: list[ProbeSystemdPropertyEntry] = []
+    for property_ in unit.properties:
+        value = property_.value
+        if property_.signature == "h":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ProbeSystemdError("probe_transient_policy_invalid")
+            descriptor = value
+            value = len(unix_fds)
+            unix_fds.append(descriptor)
+        elif property_.signature == "a(hs)":
+            if not isinstance(value, tuple):
+                raise ProbeSystemdError("probe_transient_policy_invalid")
+            extra_descriptors = cast(_ExtraFileDescriptorsValue, value)
+            indexed_descriptors: list[tuple[int, str]] = []
+            for descriptor, descriptor_name in extra_descriptors:
+                if (
+                    isinstance(descriptor, bool)
+                    or not isinstance(descriptor, int)
+                    or descriptor < 0
+                    or not descriptor_name
+                ):
+                    raise ProbeSystemdError("probe_transient_policy_invalid")
+                indexed_descriptors.append((len(unix_fds), descriptor_name))
+                unix_fds.append(descriptor)
+            value = tuple(indexed_descriptors)
+        properties.append((property_.name, property_.signature, value))
+    if len(unix_fds) != 3 or len(set(unix_fds)) != len(unix_fds):
+        raise ProbeSystemdError("probe_transient_policy_invalid")
+    return ProbeSystemdCall(
+        destination="org.freedesktop.systemd1",
+        object_path="/org/freedesktop/systemd1",
+        interface="org.freedesktop.systemd1.Manager",
+        member="StartTransientUnit",
+        signature="ssa(sv)a(sa(sv))",
+        body=(unit.unit_name, unit.start_mode, tuple(properties), ()),
+        unix_fds=tuple(unix_fds),
+    )
+
+
 def _fixed_properties(descriptors: ProbeTransientDescriptors) -> tuple[ProbeSystemdProperty, ...]:
     return (
         _property("Type", "s", "exec"),
         _property("Slice", "s", _PROBE_SLICE),
         _property("CollectMode", "s", "inactive-or-failed"),
         _property("ExecStart", "a(sasb)", ((_PROBE_LAUNCHER, (_PROBE_LAUNCHER,), False),)),
-        _property("StandardInputFileDescriptor", "h", descriptors.input_fd),
-        _property("StandardOutputFileDescriptor", "h", descriptors.output_fd),
+        _property("StandardInputFileDescriptor", "h", descriptors.run_gate_fd),
+        _property(
+            "ExtraFileDescriptors",
+            "a(hs)",
+            ((descriptors.sealed_input_fd, "probe-input"),),
+        ),
+        _property("StandardOutputFileDescriptor", "h", descriptors.output_write_fd),
         _property("StandardError", "s", "null"),
         _property("DynamicUser", "b", True),
         _property("NoNewPrivileges", "b", True),
@@ -146,13 +802,18 @@ def build_probe_transient_unit(
 
     if not isinstance(request, ProbeBrokerRequest):
         raise ProbeSystemdError("probe_transient_request_invalid")
-    descriptor_values = (descriptors.input_fd, descriptors.output_fd)
+    descriptor_values = (
+        descriptors.run_gate_fd,
+        descriptors.sealed_input_fd,
+        descriptors.output_read_fd,
+        descriptors.output_write_fd,
+    )
     if (
         any(
             not isinstance(value, int) or isinstance(value, bool) or value < 0
             for value in descriptor_values
         )
-        or descriptors.input_fd == descriptors.output_fd
+        or len(set(descriptor_values)) != len(descriptor_values)
     ):
         raise ProbeSystemdError("probe_transient_descriptors_invalid")
 
@@ -167,9 +828,8 @@ def build_probe_transient_unit(
         ),
     )
     return ProbeTransientUnit(
-        unit_name=f"rtsp-probe-{request.request_id.hex}.service",
+        unit_name=_probe_unit_name(request),
         start_mode="fail",
         properties=properties,
-        maximum_output_bytes=65_536,
         guard_target=request.target,
     )

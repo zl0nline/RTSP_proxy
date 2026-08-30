@@ -100,6 +100,8 @@ jobs:
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-role
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-node-helper
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-nft-reconcile
+          sudo install -m 0755 tests/fixtures/probe_systemd_launcher.py \
+            /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-launcher
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/bin/mediamtx
           sudo ln -s releases/ci /opt/rtsp-proxy/current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
@@ -138,6 +140,14 @@ jobs:
           sudo nft --json list table inet rtsp_proxy | \
             jq --exit-status '.nftables[] | select(.table.comment == "rtsp-proxy-owned:v1")'
           sudo nft delete table inet rtsp_proxy
+
+      - name: Verify direct transient probe policy
+        run: |
+          sudo env \
+            PYTHONPATH="$PWD/src" \
+            RTSP_PROXY_RUN_PROBE_SYSTEMD_CONTRACT=1 \
+            "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
+            tests/contract/test_probe_systemd.py
 
       - name: Verify exact cgroup probe connect guard
         run: |
