@@ -216,6 +216,53 @@ jobs:
           path: .artifacts/probe/rtsp_probe_connect_guard.bpf.o
           if-no-files-found: error
 
+  probe-ffprobe-contract:
+    name: probe-ffprobe-contract (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Build controlled no-redirect ffprobe (${{ matrix.arch }})
+        run: |
+          test "$(gcc -dumpfullversion | awk -F. '{print $1}')" = \
+            "$(jq --raw-output '.probe_ffprobe.compiler_major' deploy/artifact-catalog.json)"
+          mkdir -p .artifacts/probe-ffprobe
+          tools/build_probe_ffprobe.sh \
+            "${{ matrix.arch }}" \
+            .artifacts/probe-ffprobe/ffprobe
+
+      - name: Verify controlled RTSP redirect refusal
+        env:
+          PROBE_FFPROBE_BINARY: .artifacts/probe-ffprobe/ffprobe
+        run: uv run pytest -q tests/contract/test_probe_ffprobe.py
+
+      - name: Upload controlled probe ffprobe candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: probe-ffprobe-${{ matrix.arch }}
+          path: .artifacts/probe-ffprobe/ffprobe
+          if-no-files-found: error
+
   browser-e2e:
     # This is an external Chromium-client gate. agent-browser does not publish
     # a Linux arm64 Chromium bundle; the server-side templates, OIDC/session,

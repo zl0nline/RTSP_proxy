@@ -31,6 +31,7 @@ _FFCONCAT = (
     b"ffconcat version 1.0\n"
     b"file 'rtsp://camera:secret@192.0.2.10:8554/live'\n"
     b"option rtsp_transport tcp\n"
+    b"option rtsp_flags no_redirect\n"
     b"option rw_timeout 5000000\n"
 )
 

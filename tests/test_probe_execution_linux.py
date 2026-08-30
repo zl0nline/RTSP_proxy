@@ -37,6 +37,7 @@ def test_linux_execution_channels_transfer_gate_input_and_output_without_leaks()
         b"ffconcat version 1.0\n"
         b"file 'rtsp://camera:secret@192.0.2.10:8554/live'\n"
         b"option rtsp_transport tcp\n"
+        b"option rtsp_flags no_redirect\n"
         b"option rw_timeout 5000000\n"
     )
     received = ReceivedProbeInput(
@@ -159,6 +160,7 @@ def test_linux_execution_channel_close_cannot_close_a_reused_descriptor(
             b"ffconcat version 1.0\n"
             b"file 'rtsp://192.0.2.10:8554/live'\n"
             b"option rtsp_transport tcp\n"
+            b"option rtsp_flags no_redirect\n"
             b"option rw_timeout 5000000\n"
         ),
     )
@@ -227,6 +229,7 @@ def test_linux_execution_channel_retries_a_close_interrupted_before_syscall(
             b"ffconcat version 1.0\n"
             b"file 'rtsp://192.0.2.10:8554/live'\n"
             b"option rtsp_transport tcp\n"
+            b"option rtsp_flags no_redirect\n"
             b"option rw_timeout 5000000\n"
         ),
     )

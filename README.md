@@ -102,8 +102,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   and 259 and in privileged amd64/arm64 CI, but a narrow root broker still
 >   needs to integrate it with the already green exact cgroup `IP:port` guard
 >   and its attach/readback/run canaries;
->   no-redirect ffprobe build and privileged amd64/arm64 evidence are still
->   mandatory. Foundation evidence is
+>   an exact-source no-redirect ffprobe candidate and its five-line sealed-input
+>   contract now exist, while architecture digests, release admission and the
+>   privileged amd64/arm64 execution evidence are still mandatory. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
 >   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
 >   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),

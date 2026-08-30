@@ -24,6 +24,38 @@
       }
     }
   },
+  "probe_ffprobe": {
+    "status": "source-only",
+    "version": "9b6c896-rtsp-proxy.1",
+    "source_repository": "https://github.com/FFmpeg/FFmpeg",
+    "source_commit": "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b",
+    "source_date_epoch": 1785458830,
+    "compiler": "gcc",
+    "compiler_major": 13,
+    "patch": "patches/ffmpeg-n8.1.2-34-g9b6c8969e0/0001-refuse-rtsp-redirects.patch",
+    "patch_sha256": "5b7085eb141882a744f8231fbe6d60fcca34a42e2e4b3c63001cf11c7bcde8bc",
+    "configure_flags": [
+      "--prefix=/usr/local/libexec/rtsp-proxy-probe",
+      "--extra-version=-rtsp-proxy.1",
+      "--disable-autodetect",
+      "--disable-doc",
+      "--disable-debug",
+      "--disable-everything",
+      "--disable-ffmpeg",
+      "--disable-ffplay",
+      "--disable-x86asm",
+      "--enable-network",
+      "--enable-ffprobe",
+      "--enable-protocol=file,pipe,tcp",
+      "--enable-demuxer=concat,rtsp,sdp,rtp",
+      "--enable-parser=h264,hevc,opus",
+      "--enable-decoder=h264,hevc,opus",
+      "--extra-cflags=-O2 -fno-ident",
+      "--extra-ldflags=-Wl,--build-id=none"
+    ],
+    "provenance": "controlled source build candidate; architecture digests and native matrix pending",
+    "architectures": {}
+  },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260731",
     "release_tag": "autobuild-2026-07-31-14-10",

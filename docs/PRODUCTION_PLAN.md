@@ -1250,8 +1250,8 @@ generation. The default empty CIDR set is deny-all. A policy change invalidates
 prior admissions until explicit source re-registration.
 Probe work carries that generation and never resolves a hostname. Admission hides credentials plus
 path/query material from diagnostics, pins one literal
-`rtsp://` destination and generates the pinned TCP/microsecond-timeout ffconcat
-input without persisting source URL or credentials.
+`rtsp://` destination and generates the pinned TCP/no-redirect/
+microsecond-timeout ffconcat input without persisting source URL or credentials.
 
 Re-registration is executable through the ordinary camera update seam: when
 the endpoint row is missing or its policy digest differs, resubmitting the same
@@ -1289,6 +1289,9 @@ impact is measured.
   independent review and native amd64/arm64
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
   green; broker service and executor still disabled);
+- [ ] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe
+  candidate after immutable amd64/arm64 digests, behavioral redirect refusal,
+  release admission and privileged executor evidence are green;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and

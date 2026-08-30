@@ -23,6 +23,7 @@ _FFCONCAT = (
     b"ffconcat version 1.0\n"
     b"file 'rtsp://camera:secret@192.0.2.10:8554/live'\n"
     b"option rtsp_transport tcp\n"
+    b"option rtsp_flags no_redirect\n"
     b"option rw_timeout 5000000\n"
 )
 _F_GET_SEALS = 1034
@@ -180,6 +181,8 @@ def test_probe_input_rejects_an_unsealed_descriptor() -> None:
         b"",
         b"rtsp://camera:secret@192.0.2.10/live\n",
         _FFCONCAT.replace(b"rtsp_transport tcp", b"rtsp_transport udp"),
+        _FFCONCAT.replace(b"rtsp_flags no_redirect", b"rtsp_flags prefer_tcp"),
+        _FFCONCAT.replace(b"option rtsp_flags no_redirect\n", b""),
         _FFCONCAT.replace(b"rw_timeout 5000000", b"rw_timeout 0"),
         _FFCONCAT.replace(b"rw_timeout 5000000", b"rw_timeout 05000000"),
         _FFCONCAT.replace(b"5000000", b"5" * 5_000),

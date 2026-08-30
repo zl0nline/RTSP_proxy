@@ -90,9 +90,10 @@ closed.
   source URL is unchanged: missing/mismatched admission state forces a new
   generation and camera revision rather than returning the normal no-op.
   Probe scheduling carries only that immutable generation; it never accepts a
-  hostname or performs DNS. The ffconcat builder
-  fixes `rtsp_transport=tcp` and `rw_timeout` in microseconds. Credentials and
-  path/query token material are excluded from object representations.
+  hostname or performs DNS. The ffconcat builder fixes `rtsp_transport=tcp`,
+  the controlled demuxer's `rtsp_flags=no_redirect` and `rw_timeout` in
+  microseconds. Credentials and path/query token material are excluded from
+  object representations.
 
 ## Deliberately open gates
 
@@ -109,8 +110,9 @@ Before any source executor is enabled, the project still requires:
    `manage-units`;
 2. a root-attached cgroup `connect4`/`connect6` guard proving the exact admitted
    IP and port before credentials/run release;
-3. a controlled, provenance-retained ffprobe build that refuses RTSP redirects,
-   forces quiet output and returns only a size-bounded allowlisted result;
+3. promotion of the current exact-source no-redirect ffprobe candidate only
+   after both-architecture digests, release admission, quiet-output and
+   size-bounded allowlisted-result evidence are retained;
 4. integration of the reviewed sealed-memfd, AF_UNIX/SCM_RIGHTS and direct
    transient-unit primitives with `/proc`, journal, cancellation, cleanup and
    resource-exhaustion tests; and

@@ -44,7 +44,11 @@ def test_endpoint_admission_resolves_once_and_emits_only_a_literal_target() -> N
     assert payload.startswith(b"ffconcat version 1.0\nfile '")
     assert b"camera:secret@10.40.0.11:554/live/main" in payload
     assert b"example" not in payload
-    assert payload.endswith(b"option rtsp_transport tcp\noption rw_timeout 5000000\n")
+    assert payload.endswith(
+        b"option rtsp_transport tcp\n"
+        b"option rtsp_flags no_redirect\n"
+        b"option rw_timeout 5000000\n"
+    )
 
 
 @pytest.mark.parametrize(

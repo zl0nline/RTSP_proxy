@@ -180,6 +180,7 @@ def serialize_probe_input(
         f"ffconcat version 1.0\n"
         f"file 'rtsp://{userinfo}{authority}:{port}{path_and_query}'\n"
         "option rtsp_transport tcp\n"
+        "option rtsp_flags no_redirect\n"
         f"option rw_timeout {io_timeout_microseconds}\n"
     ).encode()
     if len(payload) > PROBE_INPUT_MAX_BYTES:
@@ -203,17 +204,18 @@ def parse_probe_input_payload(payload: bytes) -> ProbeInputContract:
         raise ValueError("probe_input_payload_invalid") from None
     lines = text.splitlines(keepends=True)
     if (
-        len(lines) != 4
+        len(lines) != 5
         or lines[0] != "ffconcat version 1.0\n"
         or not lines[1].startswith("file 'rtsp://")
         or not lines[1].endswith("'\n")
         or "'" in lines[1][6:-2]
         or lines[2] != "option rtsp_transport tcp\n"
-        or not lines[3].startswith("option rw_timeout ")
-        or not lines[3].endswith("\n")
+        or lines[3] != "option rtsp_flags no_redirect\n"
+        or not lines[4].startswith("option rw_timeout ")
+        or not lines[4].endswith("\n")
     ):
         raise ValueError("probe_input_payload_invalid")
-    timeout_text = lines[3][len("option rw_timeout ") : -1]
+    timeout_text = lines[4][len("option rw_timeout ") : -1]
     if (
         not 6 <= len(timeout_text) <= 8
         or not timeout_text.isascii()

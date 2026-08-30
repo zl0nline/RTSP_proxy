@@ -466,6 +466,38 @@ def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
     assert "go test -race ./internal/auth ./internal/core ./internal/servers/rtsp" in builder
 
 
+def test_probe_ffprobe_source_build_has_immutable_patch_provenance() -> None:
+    catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
+    probe = catalog["probe_ffprobe"]
+    patch = Path(probe["patch"])
+
+    assert probe["status"] == "source-only"
+    assert probe["source_repository"] == "https://github.com/FFmpeg/FFmpeg"
+    assert probe["source_commit"] == "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b"
+    assert probe["source_date_epoch"] == 1_785_458_830
+    assert probe["version"] == "9b6c896-rtsp-proxy.1"
+    assert hashlib.sha256(patch.read_bytes()).hexdigest() == probe["patch_sha256"]
+    assert probe["architectures"] == {}
+
+    result = subprocess.run(
+        ["sh", "-n", "tools/build_probe_ffprobe.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    builder = Path("tools/build_probe_ffprobe.sh").read_text(encoding="utf-8")
+    assert "git -C \"$source_root\" apply --check" in builder
+    flags = probe["configure_flags"]
+    assert "--disable-autodetect" in flags
+    assert "--disable-ffmpeg" in flags
+    assert "--disable-x86asm" in flags
+    assert "--enable-protocol=file,pipe,tcp" in flags
+    assert "--enable-demuxer=concat,rtsp,sdp,rtp" in flags
+    assert "--extra-version=-rtsp-proxy.1" in flags
+
+
 def test_load_fixture_builder_has_valid_bash_syntax() -> None:
     result = subprocess.run(
         ["bash", "-n", "tools/load/prepare_fixture.sh"],
