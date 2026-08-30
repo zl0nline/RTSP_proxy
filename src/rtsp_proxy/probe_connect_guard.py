@@ -1934,8 +1934,8 @@ class ProbeConnectGuardManager:
                 if ownership is None:
                     return lease
                 record.ownership = ownership
-                publication_uncertain = True
                 try:
+                    publication_uncertain = True
                     ownership.publish(lease)
                 except BaseException as publish_error:
                     try:
@@ -1968,7 +1968,7 @@ class ProbeConnectGuardManager:
                 self._release_operation(
                     record,
                     preserve_active=(
-                        ownership is None or published_owned or publication_uncertain
+                        ownership is None or published_owned
                     ),
                 )
 

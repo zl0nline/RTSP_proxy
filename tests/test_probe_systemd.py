@@ -929,12 +929,20 @@ def test_systemd_manager_releases_operation_when_finalizer_is_interrupted(
                 timeout_seconds=1.0,
             )
 
-        unit_name = f"rtsp-probe-{_REQUEST_ID.hex}.service"
-        record = manager._units[unit_name]
-        assert record.operation_lock.acquire(blocking=False)
-        record.operation_lock.release()
-        assert record.lease is not None
-        manager.cancel(record.lease)
+        monkeypatch.undo()
+        assert manager.retry_pending_cleanup() == 0
+        assert len(transport.recoveries) == 1
+        replacement = manager.start(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+        )
+        manager.cancel(replacement)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
