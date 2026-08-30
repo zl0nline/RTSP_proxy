@@ -42,7 +42,7 @@ from rtsp_proxy.probe_systemd_dbus import DbusNextSystemdTransport
 pytestmark = [pytest.mark.contract]
 
 _WRONG_IPV4_ADDRESS = "127.0.0.2"
-_WRONG_IPV6_ADDRESS = "fd00::2"
+_WRONG_IPV6_ADDRESS = "::ffff:127.0.0.3"
 
 _CHILD = """
 import json
@@ -209,28 +209,6 @@ def _mkdir_owned(path: Path, resources: _OwnedResources) -> None:
     resources.own(f"directory {path}", path.rmdir)
 
 
-def _install_ipv6_loopback_alias(resources: _OwnedResources) -> None:
-    ip = "/usr/sbin/ip"
-    if not Path(ip).is_file():
-        raise RuntimeError("probe_guard_ip_tool_missing")
-    _run(ip, "-6", "address", "add", f"{_WRONG_IPV6_ADDRESS}/128", "dev", "lo")
-    def remove_alias() -> None:
-        _run(
-            ip,
-            "-6",
-            "address",
-            "delete",
-            f"{_WRONG_IPV6_ADDRESS}/128",
-            "dev",
-            "lo",
-        )
-
-    resources.own(
-        "IPv6 wrong-address loopback alias",
-        remove_alias,
-    )
-
-
 def test_command_failure_exposes_native_diagnostic() -> None:
     with pytest.raises(
         RuntimeError,
@@ -246,7 +224,7 @@ def test_command_failure_exposes_native_diagnostic() -> None:
 def _listener(family: socket.AddressFamily, host: str, port: int) -> socket.socket:
     listener = socket.socket(family, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if family is socket.AF_INET6:
+    if family is socket.AF_INET6 and not host.startswith("::ffff:"):
         listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     listener.bind((host, port))
     listener.listen(16)
@@ -547,7 +525,6 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
     ipv6_program = program_pins / "rtsp_probe_guard_ipv6"
     target_map = map_pins / "allowed_target"
     with _managed_resources() as resources:
-        _install_ipv6_loopback_alias(resources)
         for family, host in (
             (socket.AF_INET, "127.0.0.1"),
             (socket.AF_INET, _WRONG_IPV4_ADDRESS),
@@ -722,7 +699,6 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
     stopping = threading.Event()
 
     with _managed_resources() as resources:
-        _install_ipv6_loopback_alias(resources)
         for family, host in (
             (socket.AF_INET, "127.0.0.1"),
             (socket.AF_INET, _WRONG_IPV4_ADDRESS),
@@ -854,7 +830,6 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     ownership_root = secure_root / "ownership"
 
     with _managed_resources() as resources:
-        _install_ipv6_loopback_alias(resources)
         stopping = threading.Event()
         wrong_address = (
             _WRONG_IPV4_ADDRESS

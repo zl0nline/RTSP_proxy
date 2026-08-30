@@ -6,15 +6,17 @@ import os
 import platform
 import selectors
 import shutil
-import subprocess
+import signal
 import sys
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from multiprocessing.connection import Connection
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -2336,7 +2338,7 @@ def test_bpftool_backend_executes_the_verified_inode_not_a_replaced_path(
     def swap_during_process_start(
         owner: probe_connect_guard._ProcessOwner,
         arguments: tuple[str, ...],
-        **keywords: object,
+        **keywords: Any,
     ) -> None:
         nonlocal swapped
         executed_paths.append(arguments[0])
@@ -2623,40 +2625,45 @@ def test_bpftool_command_owns_process_before_selector_setup(
     assert process.stderr.closed
 
 
-def test_bpftool_command_owns_process_before_popen_init_returns(
+def test_bpftool_command_owns_pid_before_unblocking_process_interruption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_init = subprocess.Popen.__init__
-    spawned: list[subprocess.Popen[bytes]] = []
+    original_spawn = os.posix_spawn
+    spawned: list[int] = []
 
-    def interrupt_after_spawn(
-        process: subprocess.Popen[bytes],
-        *arguments: object,
-        **keywords: object,
-    ) -> None:
-        original_init(  # type: ignore[call-overload]
-            process,
-            *arguments,
+    def queue_interrupt_after_spawn(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        pid = original_spawn(
+            path,
+            arguments,
+            environment,
             **keywords,
         )
-        spawned.append(process)
-        raise KeyboardInterrupt("popen return interrupted")
+        spawned.append(pid)
+        os.kill(os.getpid(), signal.SIGINT)
+        return pid
 
-    monkeypatch.setattr(subprocess.Popen, "__init__", interrupt_after_spawn)
+    monkeypatch.setattr(os, "posix_spawn", queue_interrupt_after_spawn)
     try:
-        with pytest.raises(KeyboardInterrupt, match="popen return interrupted"):
+        with pytest.raises(KeyboardInterrupt):
             probe_connect_guard._run_command(
                 (sys.executable, "-c", "import time; time.sleep(30)"),
                 timeout_seconds=1.0,
             )
 
         assert len(spawned) == 1
-        assert spawned[0].poll() is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(spawned[0], os.WNOHANG)
     finally:
-        for process in spawned:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=2)
+        for pid in spawned:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
 
 
 @pytest.mark.parametrize("failure", ["nonzero", "invalid_utf8", "timeout"])

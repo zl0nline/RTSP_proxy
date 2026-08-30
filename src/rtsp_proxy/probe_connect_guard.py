@@ -8,6 +8,7 @@ import platform
 import re
 import secrets
 import selectors
+import signal
 import stat
 import subprocess
 import time
@@ -21,7 +22,7 @@ from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from threading import Lock
-from typing import NoReturn, Protocol, cast
+from typing import IO, NoReturn, Protocol, cast
 from uuid import UUID
 
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
@@ -1581,8 +1582,55 @@ class _CommandBudget:
 
 
 @dataclass(slots=True)
+class _SpawnedProcess:
+    arguments: tuple[str, ...]
+    pid: int | None = None
+    stdout: IO[bytes] | None = None
+    stderr: IO[bytes] | None = None
+    returncode: int | None = None
+    wait_lock: Lock = field(default_factory=Lock, repr=False)
+
+    def poll(self) -> int | None:
+        with self.wait_lock:
+            if self.returncode is not None:
+                return self.returncode
+            if self.pid is None:
+                return None
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if waited_pid == 0:
+                return None
+            self.returncode = os.waitstatus_to_exitcode(status)
+            return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            returncode = self.poll()
+            if returncode is not None:
+                return returncode
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                assert timeout is not None
+                raise subprocess.TimeoutExpired(self.arguments, timeout)
+            time.sleep(
+                0.01
+                if deadline is None
+                else min(0.01, max(0.0, deadline - time.monotonic()))
+            )
+
+    def terminate(self) -> None:
+        if self.pid is None:
+            raise ProcessLookupError
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        if self.pid is None:
+            raise ProcessLookupError
+        os.kill(self.pid, signal.SIGKILL)
+
+
+@dataclass(slots=True)
 class _ProcessOwner:
-    process: subprocess.Popen[bytes] | None = None
+    process: _SpawnedProcess | None = None
 
 
 class ProbeConnectGuardManager:
@@ -2636,24 +2684,100 @@ def _run_command(
 def _spawn_owned_process(
     owner: _ProcessOwner,
     arguments: tuple[str, ...],
-    **keywords: object,
+    *,
+    stdin: int,
+    stdout: int,
+    stderr: int,
+    text: bool,
+    env: dict[str, str],
+    pass_fds: tuple[int, ...],
 ) -> None:
-    """Publish Popen ownership before its initializer can create a child."""
+    """Spawn with signals blocked until the kernel PID is ledger-owned."""
 
-    process_type = subprocess.Popen
-    process = cast(
-        subprocess.Popen[bytes],
-        process_type.__new__(process_type),
-    )
+    if (
+        stdin != subprocess.DEVNULL
+        or stdout != subprocess.PIPE
+        or stderr != subprocess.PIPE
+        or text is not False
+        or not arguments
+    ):
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+    process = _SpawnedProcess(arguments=arguments)
     owner.process = process
-    process_type.__init__(  # type: ignore[call-overload]
-        process,
-        arguments,
-        **keywords,
-    )
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    devnull = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+    parent_descriptors = [
+        stdout_read,
+        stdout_write,
+        stderr_read,
+        stderr_write,
+        devnull,
+    ]
+    blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    try:
+        occupied_descriptors = {
+            0,
+            1,
+            2,
+            *pass_fds,
+            *parent_descriptors,
+        }
+        descriptor_mapping: dict[int, int] = {}
+        next_descriptor = 64
+        for descriptor in pass_fds:
+            while next_descriptor in occupied_descriptors:
+                next_descriptor += 1
+            descriptor_mapping[descriptor] = next_descriptor
+            occupied_descriptors.add(next_descriptor)
+            next_descriptor += 1
+        bound_arguments = tuple(
+            _replace_descriptor_argument(argument, descriptor_mapping)
+            for argument in arguments
+        )
+        file_actions = [
+            (os.POSIX_SPAWN_DUP2, devnull, 0),
+            (os.POSIX_SPAWN_DUP2, stdout_write, 1),
+            (os.POSIX_SPAWN_DUP2, stderr_write, 2),
+            *(
+                (os.POSIX_SPAWN_DUP2, source, destination)
+                for source, destination in descriptor_mapping.items()
+            ),
+        ]
+        process.pid = os.posix_spawn(
+            bound_arguments[0],
+            bound_arguments,
+            env,
+            file_actions=file_actions,
+            setsigmask=previous_mask,
+        )
+        for descriptor in (stdout_write, stderr_write, devnull):
+            os.close(descriptor)
+            parent_descriptors.remove(descriptor)
+        process.stdout = os.fdopen(stdout_read, "rb", buffering=0)
+        parent_descriptors.remove(stdout_read)
+        process.stderr = os.fdopen(stderr_read, "rb", buffering=0)
+        parent_descriptors.remove(stderr_read)
+    finally:
+        for descriptor in reversed(parent_descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def _terminate_and_reap(process: subprocess.Popen[bytes]) -> BaseException | None:
+def _replace_descriptor_argument(
+    argument: str,
+    descriptor_mapping: dict[int, int],
+) -> str:
+    for source, destination in descriptor_mapping.items():
+        prefix = f"/proc/self/fd/{source}"
+        if argument == prefix or argument.startswith(f"{prefix}/"):
+            return f"/proc/self/fd/{destination}{argument[len(prefix):]}"
+    return argument
+
+
+def _terminate_and_reap(process: _SpawnedProcess) -> BaseException | None:
     try:
         if process.poll() is None:
             process.terminate()
