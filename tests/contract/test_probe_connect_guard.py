@@ -18,6 +18,7 @@ from typing import IO
 
 import pytest
 
+from rtsp_proxy import probe_connect_guard
 from rtsp_proxy.probe_broker import ProbeBrokerRequest
 from rtsp_proxy.probe_connect_guard import (
     BpftoolProbeConnectGuardBackend,
@@ -61,6 +62,33 @@ print(json.dumps({
     "denied_ipv6": connected(socket.AF_INET6, "::1", denied_port),
 }, sort_keys=True), flush=True)
 """
+
+
+def _trusted_artifact_identity(
+    bpftool_path: Path,
+    object_path: Path,
+    *,
+    ipv4_program_tag: str,
+    ipv6_program_tag: str,
+) -> ProbeConnectGuardArtifactIdentity:
+    catalog = probe_connect_guard._load_packaged_artifact_catalog()
+    architecture = probe_connect_guard._linux_architecture(os.uname().machine)
+    release = catalog.cleanup_release(
+        catalog.current_release_id,
+        architecture=architecture,
+    )
+    bpftool_sha256 = _sha256_path(bpftool_path)
+    assert release.activation_compatible
+    assert bpftool_sha256 in release.bpftool_sha256
+    assert _sha256_path(object_path) == release.object_sha256
+    assert ipv4_program_tag == release.ipv4_program_tag
+    assert ipv6_program_tag == release.ipv6_program_tag
+    return ProbeConnectGuardArtifactIdentity(
+        bpftool_sha256=bpftool_sha256,
+        object_sha256=release.object_sha256,
+        ipv4_program_tag=release.ipv4_program_tag,
+        ipv6_program_tag=release.ipv6_program_tag,
+    )
 
 
 class _OwnedResources:
@@ -699,9 +727,9 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
                 object_path=secure_object,
                 pin_root=pin_root,
                 ownership_root=ownership_root,
-                artifact_identity=ProbeConnectGuardArtifactIdentity(
-                    bpftool_sha256=_sha256_path(bpftool_path),
-                    object_sha256=_sha256_path(secure_object),
+                artifact_identity=_trusted_artifact_identity(
+                    bpftool_path,
+                    secure_object,
                     ipv4_program_tag=ipv4_tag,
                     ipv6_program_tag=ipv6_tag,
                 ),
@@ -859,9 +887,9 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
                 object_path=secure_object,
                 pin_root=pin_root,
                 ownership_root=ownership_root,
-                artifact_identity=ProbeConnectGuardArtifactIdentity(
-                    bpftool_sha256=_sha256_path(bpftool_path),
-                    object_sha256=_sha256_path(secure_object),
+                artifact_identity=_trusted_artifact_identity(
+                    bpftool_path,
+                    secure_object,
                     ipv4_program_tag=ipv4_tag,
                     ipv6_program_tag=ipv6_tag,
                 ),

@@ -73,6 +73,7 @@ jobs:
           uv pip sync --python .artifacts/clean-venv/bin/python .artifacts/runtime-requirements.txt
           uv pip install --python .artifacts/clean-venv/bin/python --no-deps dist/rtsp_proxy-0.1.0-py3-none-any.whl
           RTSP_PROXY_ROLE=web .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.runtime import create_app_from_environment; assert create_app_from_environment().title == "RTSP Proxy Control Plane"'
+          .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.probe_connect_guard import _load_packaged_artifact_catalog; catalog = _load_packaged_artifact_catalog(); assert catalog.current_release_id == "0.1.0"'
 
       - name: Verify packaged migrations against native PostgreSQL
         run: |
@@ -184,6 +185,14 @@ jobs:
             RTSP_PROXY_PROBE_GUARD_BPF_OBJECT="$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o" \
             "$PWD/.venv/bin/python" -m pytest -q -s -p no:cacheprovider \
             tests/contract/test_probe_connect_guard.py
+
+      - name: Upload verified probe connect-guard object
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: probe-connect-guard-${{ matrix.arch }}
+          path: .artifacts/probe/rtsp_probe_connect_guard.bpf.o
+          if-no-files-found: error
 
   browser-e2e:
     # This is an external Chromium-client gate. agent-browser does not publish

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import selectors
 import stat
@@ -10,6 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
+from importlib.resources import files
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
@@ -57,6 +59,62 @@ class ProbeConnectGuardArtifactIdentity:
             for tag in (self.ipv4_program_tag, self.ipv6_program_tag)
         ):
             raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeConnectGuardArtifactRelease:
+    release_id: str
+    architecture: str
+    object_sha256: str
+    ipv4_program_tag: str
+    ipv6_program_tag: str
+    bpftool_sha256: frozenset[str]
+    activation_compatible: bool
+    cleanup_compatible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeConnectGuardArtifactCatalog:
+    current_release_id: str
+    releases: tuple[_ProbeConnectGuardArtifactRelease, ...]
+
+    def activation_release(
+        self,
+        identity: ProbeConnectGuardArtifactIdentity,
+        *,
+        architecture: str,
+    ) -> _ProbeConnectGuardArtifactRelease:
+        matches = [
+            release
+            for release in self.releases
+            if release.release_id == self.current_release_id
+            and release.architecture == architecture
+            and release.activation_compatible
+            and release.object_sha256 == identity.object_sha256
+            and release.ipv4_program_tag == identity.ipv4_program_tag
+            and release.ipv6_program_tag == identity.ipv6_program_tag
+            and identity.bpftool_sha256 in release.bpftool_sha256
+        ]
+        if len(matches) != 1:
+            raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid")
+        return matches[0]
+
+    def cleanup_release(
+        self,
+        release_id: str,
+        *,
+        architecture: str,
+    ) -> _ProbeConnectGuardArtifactRelease:
+        matches = [
+            release
+            for release in self.releases
+            if release.release_id == release_id
+            and release.architecture == architecture
+            and release.cleanup_compatible
+        ]
+        if len(matches) != 1:
+            raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        return matches[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +214,23 @@ class BpftoolProbeConnectGuardBackend:
             raise ProbeConnectGuardError("probe_guard_tool_invalid")
         if not isinstance(artifact_identity, ProbeConnectGuardArtifactIdentity):
             raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid")
+        architecture = _linux_architecture(platform.machine())
+        # Production is the root-owned, direct-command branch and must use the
+        # wheel-packaged catalog. The injected command/non-root branch is the
+        # explicit adapter boundary used by unprivileged unit tests only.
+        catalog = (
+            _test_artifact_catalog(artifact_identity, architecture=architecture)
+            if run is not None or trusted_owner_uid != 0
+            else _load_packaged_artifact_catalog()
+        )
+        activation_release = catalog.activation_release(
+            artifact_identity,
+            architecture=architecture,
+        )
         self._identity = artifact_identity
+        self._artifact_catalog = catalog
+        self._artifact_release = activation_release
+        self._architecture = architecture
         self._bpftool = _trusted_path(
             bpftool_path,
             owner_uid=trusted_owner_uid,
@@ -282,7 +356,7 @@ class BpftoolProbeConnectGuardBackend:
         self._require_artifact_identity()
         paths = self._paths(scope)
         budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
-        self._require_receipt(scope, paths.receipt)
+        self._require_receipt(scope, paths.receipt, require_current=True)
         self._require_exact_pin_inventory(paths)
         map_inventory = self._json_command(
             "-j",
@@ -360,7 +434,7 @@ class BpftoolProbeConnectGuardBackend:
         if not _path_lexists(paths.scope):
             self._remove_receipt(paths.receipt)
             return
-        self._require_receipt(scope, paths.receipt)
+        ownership = self._require_receipt(scope, paths.receipt)
         self._require_exact_partial_inventory(paths)
         program_ids: dict[str, int] = {}
         for attach_type, program_path in (
@@ -371,9 +445,9 @@ class BpftoolProbeConnectGuardBackend:
                 program_ids[attach_type] = self._program_id(
                     program_path,
                     expected_tag=(
-                        self._identity.ipv4_program_tag
+                        ownership.artifact_release.ipv4_program_tag
                         if attach_type == self._IPV4_ATTACH
-                        else self._identity.ipv6_program_tag
+                        else ownership.artifact_release.ipv6_program_tag
                     ),
                     expected_map_id=None,
                     budget=budget,
@@ -384,12 +458,7 @@ class BpftoolProbeConnectGuardBackend:
             else set()
         )
         for attach_type, program_id in program_ids.items():
-            matches = [
-                item for item in attachments if item == (program_id, attach_type)
-            ]
-            if len(matches) > 1:
-                raise ProbeConnectGuardError("probe_guard_ownership_invalid")
-            if matches:
+            if (program_id, attach_type) in attachments:
                 program_path = (
                     paths.ipv4 if attach_type == self._IPV4_ATTACH else paths.ipv6
                 )
@@ -462,6 +531,7 @@ class BpftoolProbeConnectGuardBackend:
         payload = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
+            artifact_release_id=self._artifact_release.release_id,
             phase=0,
             scope_device=0,
             scope_inode=0,
@@ -523,6 +593,7 @@ class BpftoolProbeConnectGuardBackend:
         expected = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
+            artifact_release_id=self._artifact_release.release_id,
             phase=0,
             scope_device=0,
             scope_inode=0,
@@ -530,6 +601,7 @@ class BpftoolProbeConnectGuardBackend:
         replacement = _receipt_bytes(
             scope,
             object_sha256=self._identity.object_sha256,
+            artifact_release_id=self._artifact_release.release_id,
             phase=1,
             scope_device=scope_metadata.st_dev,
             scope_inode=scope_metadata.st_ino,
@@ -560,9 +632,23 @@ class BpftoolProbeConnectGuardBackend:
             if descriptor >= 0:
                 os.close(descriptor)
 
-    def _require_receipt(self, scope: ProbeConnectGuardScope, path: Path) -> None:
+    def _require_receipt(
+        self,
+        scope: ProbeConnectGuardScope,
+        path: Path,
+        *,
+        require_current: bool = False,
+    ) -> _GuardOwnership:
         ownership = self._ownership_from_receipt(path)
-        if ownership.scope != scope or ownership.phase != 1:
+        if (
+            ownership.scope != scope
+            or ownership.phase != 1
+            or (
+                require_current
+                and ownership.artifact_release.release_id
+                != self._artifact_release.release_id
+            )
+        ):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
         try:
             scope_metadata = self._paths(scope).scope.lstat()
@@ -577,6 +663,7 @@ class BpftoolProbeConnectGuardBackend:
             or scope_metadata.st_ino != ownership.scope_inode
         ):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid")
+        return ownership
 
     def _ownership_from_receipt(self, path: Path) -> _GuardOwnership:
         flags = os.O_RDONLY | os.O_CLOEXEC
@@ -620,6 +707,7 @@ class BpftoolProbeConnectGuardBackend:
             phase = decoded["phase"]
             scope_device_raw = decoded["scope_device"]
             scope_inode_raw = decoded["scope_inode"]
+            artifact_release_id = decoded["artifact_release_id"]
             if (
                 isinstance(phase, bool)
                 or not isinstance(phase, int)
@@ -628,16 +716,26 @@ class BpftoolProbeConnectGuardBackend:
                 or not re.fullmatch(r"[0-9]{20}", scope_device_raw)
                 or not isinstance(scope_inode_raw, str)
                 or not re.fullmatch(r"[0-9]{20}", scope_inode_raw)
+                or not isinstance(artifact_release_id, str)
+                or not re.fullmatch(
+                    r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}",
+                    artifact_release_id,
+                )
             ):
                 raise ValueError
             scope_device = int(scope_device_raw)
             scope_inode = int(scope_inode_raw)
+            artifact_release = self._artifact_catalog.cleanup_release(
+                artifact_release_id,
+                architecture=self._architecture,
+            )
         except (KeyError, TypeError, ValueError, RuntimeError):
             raise ProbeConnectGuardError("probe_guard_ownership_invalid") from None
         if (
             not isinstance(decoded, dict)
             or set(decoded) != {
                 "address",
+                "artifact_release_id",
                 "cgroup_path",
                 "object_sha256",
                 "phase",
@@ -649,10 +747,11 @@ class BpftoolProbeConnectGuardBackend:
                 "version",
             }
             or decoded["version"] != 2
-            or decoded["object_sha256"] != self._identity.object_sha256
+            or decoded["object_sha256"] != artifact_release.object_sha256
             or _receipt_bytes(
                 scope,
-                object_sha256=self._identity.object_sha256,
+                object_sha256=artifact_release.object_sha256,
+                artifact_release_id=artifact_release.release_id,
                 phase=phase,
                 scope_device=scope_device,
                 scope_inode=scope_inode,
@@ -671,6 +770,7 @@ class BpftoolProbeConnectGuardBackend:
             phase=phase,
             scope_device=scope_device,
             scope_inode=scope_inode,
+            artifact_release=artifact_release,
         )
 
     def _receipt_inventory(self) -> list[Path]:
@@ -921,6 +1021,7 @@ class _GuardOwnership:
     phase: int
     scope_device: int
     scope_inode: int
+    artifact_release: _ProbeConnectGuardArtifactRelease
 
 
 @dataclass(frozen=True, slots=True)
@@ -1300,6 +1401,7 @@ def _receipt_bytes(
     scope: ProbeConnectGuardScope,
     *,
     object_sha256: str,
+    artifact_release_id: str,
     phase: int,
     scope_device: int,
     scope_inode: int,
@@ -1308,6 +1410,7 @@ def _receipt_bytes(
         json.dumps(
             {
                 "address": str(scope.target.address),
+                "artifact_release_id": artifact_release_id,
                 "cgroup_path": str(scope.cgroup_path),
                 "object_sha256": object_sha256,
                 "phase": phase,
@@ -1322,6 +1425,169 @@ def _receipt_bytes(
             separators=(",", ":"),
         ).encode("utf-8")
         + b"\n"
+    )
+
+
+def _linux_architecture(machine: str) -> str:
+    aliases = {
+        "amd64": "amd64",
+        "x86_64": "amd64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+    }
+    try:
+        return aliases[machine.strip().lower()]
+    except (AttributeError, KeyError):
+        raise ProbeConnectGuardError(
+            "probe_guard_artifact_identity_invalid"
+        ) from None
+
+
+def _load_packaged_artifact_catalog() -> _ProbeConnectGuardArtifactCatalog:
+    try:
+        resource = files("rtsp_proxy").joinpath(
+            "artifacts",
+            "probe_connect_guard.json",
+        )
+        payload = resource.read_bytes()
+    except (OSError, AttributeError):
+        raise ProbeConnectGuardError(
+            "probe_guard_artifact_identity_invalid"
+        ) from None
+    return _parse_artifact_catalog(payload)
+
+
+def _parse_artifact_catalog(payload: bytes) -> _ProbeConnectGuardArtifactCatalog:
+    try:
+        decoded = json.loads(payload)
+        if (
+            not isinstance(decoded, dict)
+            or set(decoded) != {"current_release_id", "releases", "schema_version"}
+            or decoded["schema_version"] != 1
+            or not isinstance(decoded["current_release_id"], str)
+            or not re.fullmatch(
+                r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}",
+                decoded["current_release_id"],
+            )
+            or not isinstance(decoded["releases"], dict)
+            or not decoded["releases"]
+        ):
+            raise ValueError
+        releases: list[_ProbeConnectGuardArtifactRelease] = []
+        for release_id, raw_release in decoded["releases"].items():
+            if (
+                not isinstance(release_id, str)
+                or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}", release_id)
+                or not isinstance(raw_release, dict)
+                or set(raw_release)
+                != {
+                    "activation_compatible",
+                    "architectures",
+                    "cleanup_compatible",
+                }
+                or not isinstance(raw_release["activation_compatible"], bool)
+                or not isinstance(raw_release["cleanup_compatible"], bool)
+                or not isinstance(raw_release["architectures"], dict)
+                or not raw_release["architectures"]
+            ):
+                raise ValueError
+            for architecture, raw_identity in raw_release["architectures"].items():
+                if (
+                    architecture not in {"amd64", "arm64"}
+                    or not isinstance(raw_identity, dict)
+                    or set(raw_identity)
+                    != {
+                        "bpftool_sha256",
+                        "ipv4_program_tag",
+                        "ipv6_program_tag",
+                        "object_sha256",
+                    }
+                ):
+                    raise ValueError
+                tool_digests = raw_identity["bpftool_sha256"]
+                if (
+                    not isinstance(tool_digests, list)
+                    or not tool_digests
+                    or len(tool_digests) != len(set(tool_digests))
+                    or any(
+                        not isinstance(digest, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                        for digest in tool_digests
+                    )
+                    or not isinstance(raw_identity["object_sha256"], str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        raw_identity["object_sha256"],
+                    )
+                    or not isinstance(raw_identity["ipv4_program_tag"], str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{16}",
+                        raw_identity["ipv4_program_tag"],
+                    )
+                    or not isinstance(raw_identity["ipv6_program_tag"], str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{16}",
+                        raw_identity["ipv6_program_tag"],
+                    )
+                ):
+                    raise ValueError
+                releases.append(
+                    _ProbeConnectGuardArtifactRelease(
+                        release_id=release_id,
+                        architecture=architecture,
+                        object_sha256=raw_identity["object_sha256"],
+                        ipv4_program_tag=raw_identity["ipv4_program_tag"],
+                        ipv6_program_tag=raw_identity["ipv6_program_tag"],
+                        bpftool_sha256=frozenset(tool_digests),
+                        activation_compatible=raw_release["activation_compatible"],
+                        cleanup_compatible=raw_release["cleanup_compatible"],
+                    )
+                )
+        catalog = _ProbeConnectGuardArtifactCatalog(
+            current_release_id=decoded["current_release_id"],
+            releases=tuple(releases),
+        )
+        current_architectures = {
+            release.architecture
+            for release in catalog.releases
+            if release.release_id == catalog.current_release_id
+            and release.activation_compatible
+            and release.cleanup_compatible
+        }
+        if current_architectures != {"amd64", "arm64"}:
+            raise ValueError
+        return catalog
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise ProbeConnectGuardError(
+            "probe_guard_artifact_identity_invalid"
+        ) from None
+
+
+def _test_artifact_catalog(
+    identity: ProbeConnectGuardArtifactIdentity,
+    *,
+    architecture: str,
+) -> _ProbeConnectGuardArtifactCatalog:
+    return _ProbeConnectGuardArtifactCatalog(
+        current_release_id="test-fixture",
+        releases=(
+            _ProbeConnectGuardArtifactRelease(
+                release_id="test-fixture",
+                architecture=architecture,
+                object_sha256=identity.object_sha256,
+                ipv4_program_tag=identity.ipv4_program_tag,
+                ipv6_program_tag=identity.ipv6_program_tag,
+                bpftool_sha256=frozenset({identity.bpftool_sha256}),
+                activation_compatible=True,
+                cleanup_compatible=True,
+            ),
+        ),
     )
 
 
