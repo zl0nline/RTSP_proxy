@@ -33,10 +33,10 @@
     "compiler": "gcc",
     "compiler_major": 13,
     "patch": "patches/ffmpeg-n8.1.2-34-g9b6c8969e0/0001-refuse-rtsp-redirects.patch",
-    "patch_sha256": "5b7085eb141882a744f8231fbe6d60fcca34a42e2e4b3c63001cf11c7bcde8bc",
+    "patch_sha256": "66b3baf962f76e67ac90d863d55fbc404d2cd805a534463614aa79322b554dcf",
     "configure_flags": [
       "--prefix=/usr/local/libexec/rtsp-proxy-probe",
-      "--extra-version=-rtsp-proxy.1",
+      "--extra-version=rtsp-proxy.1",
       "--disable-autodetect",
       "--disable-doc",
       "--disable-debug",

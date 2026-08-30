@@ -6,7 +6,8 @@ Subject: [PATCH] avformat/rtsp: add an opt-in no-redirect flag
 Deep probes admit one literal IP and port into a cgroup connect guard. Following
 an RTSP 3xx response would make the demuxer attempt a different destination
 that was not admitted by the broker. Add a demuxer-only flag that refuses the
-redirect before copying or logging the Location URL.
+redirect before applying the Location URL to the demuxer or emitting FFmpeg's
+default redirect log. Response parsing still occurs before this decision.
 
 The default remains unchanged for ordinary FFmpeg users.
 ---

@@ -495,7 +495,7 @@ def test_probe_ffprobe_source_build_has_immutable_patch_provenance() -> None:
     assert "--disable-x86asm" in flags
     assert "--enable-protocol=file,pipe,tcp" in flags
     assert "--enable-demuxer=concat,rtsp,sdp,rtp" in flags
-    assert "--extra-version=-rtsp-proxy.1" in flags
+    assert "--extra-version=rtsp-proxy.1" in flags
 
 
 def test_load_fixture_builder_has_valid_bash_syntax() -> None:

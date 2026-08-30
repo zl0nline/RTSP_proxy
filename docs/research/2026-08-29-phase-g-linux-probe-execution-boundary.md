@@ -314,8 +314,9 @@ Option 1 matches the current ADR. The existing third-party ffprobe artifact is
 therefore adequate for compatibility work, not production source probes.
 
 Follow-up on 2026-08-30: the project added an exact-source opt-in
-`rtsp_flags=no_redirect` patch that refuses a 3xx before copying or logging its
-`Location` value. The ordinary demuxer default remains unchanged. The source
+`rtsp_flags=no_redirect` patch that refuses a 3xx before applying its parsed
+`Location` value or emitting FFmpeg's default redirect log. The mandatory quiet
+launcher also suppresses response-level diagnostics. The ordinary demuxer default remains unchanged. The source
 candidate and five-line input contract do not become production evidence until
 both architecture digests, native behavioral tests and release admission are
 retained.
