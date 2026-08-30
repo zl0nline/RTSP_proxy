@@ -75,6 +75,12 @@ class _DisconnectInterruptionBus(_FakeBus):
         raise KeyboardInterrupt()
 
 
+class _DisconnectAndWaitFailureBus(_DisconnectFailureBus):
+    async def wait_for_disconnect(self) -> None:
+        self.disconnect_waited = True
+        raise RuntimeError("injected disconnect wait failure")
+
+
 def _request() -> ProbeBrokerRequest:
     return ProbeBrokerRequest(
         request_id=UUID("447a1c4e-4c79-4c50-8e51-42c4dfa5fb19"),
@@ -213,6 +219,29 @@ def test_dbus_transport_disconnects_and_sanitizes_a_remote_failure(
     assert "secret" not in str(raised.value)
 
 
+def test_dbus_transport_sanitizes_combined_operation_and_disconnect_failures(
+    descriptors: ProbeTransientDescriptors,
+) -> None:
+    bus = _DisconnectAndWaitFailureBus(
+        reply=RuntimeError("secret-bearing systemd failure")
+    )
+    recovery_bus = _FakeBus(reply=_no_such_unit())
+    manager = SystemdProbeManager(
+        transport=DbusNextSystemdTransport(
+            bus_factory=_BusSequence(bus, recovery_bus)
+        )
+    )
+
+    with pytest.raises(ProbeSystemdError, match=r"^probe_transient_start_failed$") as raised:
+        manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+
+    assert bus.disconnected
+    assert bus.disconnect_waited
+    assert recovery_bus.disconnected
+    assert recovery_bus.disconnect_waited
+    assert "secret" not in str(raised.value)
+
+
 def test_dbus_transport_uses_one_deadline_for_connect_and_call(
     descriptors: ProbeTransientDescriptors,
 ) -> None:
@@ -268,6 +297,51 @@ def test_dbus_transport_stops_and_reads_back_the_exact_unit_during_recovery() ->
     ]
     assert bus.disconnected
     assert bus.disconnect_waited
+
+
+def test_dbus_transport_waits_until_the_recovered_unit_is_absent() -> None:
+    bus = _SequencedReplyBus(_method_return(), _method_return(), _no_such_unit())
+    transport = DbusNextSystemdTransport(
+        bus_factory=lambda deadline: _factory(bus, deadline)
+    )
+
+    transport.recover(
+        "rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service",
+        timeout_seconds=1.0,
+    )
+
+    assert [message.member for message in bus.messages] == [
+        "StopUnit",
+        "GetUnit",
+        "GetUnit",
+    ]
+    assert bus.disconnected
+    assert bus.disconnect_waited
+
+
+def test_dbus_transport_rejects_an_invalid_start_reply_and_recovers(
+    descriptors: ProbeTransientDescriptors,
+) -> None:
+    invalid_reply = Message(
+        message_type=MessageType.METHOD_RETURN,
+        reply_serial=1,
+        signature="s",
+        body=["not-an-object-path"],
+    )
+    start_bus = _FakeBus(reply=invalid_reply)
+    recovery_bus = _FakeBus(reply=_no_such_unit())
+    manager = SystemdProbeManager(
+        transport=DbusNextSystemdTransport(
+            bus_factory=_BusSequence(start_bus, recovery_bus)
+        )
+    )
+
+    with pytest.raises(ProbeSystemdError, match=r"^probe_transient_start_failed$"):
+        manager.start(_request(), descriptors=descriptors, timeout_seconds=1.0)
+
+    assert start_bus.disconnected
+    assert start_bus.disconnect_waited
+    assert [message.member for message in recovery_bus.messages] == ["StopUnit"]
 
 
 def test_dbus_transport_rejects_recovery_outside_the_probe_namespace() -> None:

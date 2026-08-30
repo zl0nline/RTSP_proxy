@@ -66,6 +66,17 @@ class _InterruptingJobPath(str):
         raise KeyboardInterrupt
 
 
+class _FailingJobPath(str):
+    def startswith(
+        self,
+        prefix: str | tuple[str, ...],
+        start: SupportsIndex | None = 0,
+        end: SupportsIndex | None = None,
+    ) -> bool:
+        del prefix, start, end
+        raise RuntimeError("injected response inspection failure")
+
+
 def _request(*, address: str = "192.0.2.10") -> ProbeBrokerRequest:
     return ProbeBrokerRequest(
         request_id=_REQUEST_ID,
@@ -441,6 +452,26 @@ def test_systemd_manager_stops_the_unit_on_output_timeout() -> None:
         os.close(output_write_fd)
 
 
+def test_systemd_manager_rejects_empty_output_and_collects_the_unit() -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+    os.close(output_write_fd)
+    output_write_fd = -1
+    try:
+        with pytest.raises(ProbeSystemdError, match="probe_transient_output_invalid"):
+            manager.read_output(
+                lease,
+                output_fd=output_read_fd,
+                timeout_seconds=1.0,
+            )
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        if output_write_fd >= 0:
+            os.close(output_write_fd)
+
+
 def test_systemd_manager_rejects_a_non_reader_output_descriptor_and_stops() -> None:
     manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
     try:
@@ -647,6 +678,120 @@ def test_systemd_manager_recovers_when_interrupted_after_start_reply() -> None:
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
+
+
+@pytest.mark.parametrize(
+    "job_path",
+    [
+        "not-a-systemd-job-path",
+        _FailingJobPath("not-observed"),
+    ],
+)
+def test_systemd_manager_recovers_after_an_invalid_start_reply(job_path: str) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(ProbeSystemdReply(job_path=job_path))
+    manager = SystemdProbeManager(transport=transport)
+    try:
+        with pytest.raises(
+            ProbeSystemdError,
+            match=r"^probe_transient_response_invalid$",
+        ):
+            manager.start(
+                _request(),
+                descriptors=ProbeTransientDescriptors(
+                    run_gate_fd=100,
+                    sealed_input_fd=101,
+                    output_read_fd=output_read_fd,
+                    output_write_fd=output_write_fd,
+                ),
+                timeout_seconds=1.0,
+            )
+
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+@pytest.mark.parametrize("interruption", [False, True])
+def test_systemd_manager_recovers_after_an_unexpected_output_reader_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: bool,
+) -> None:
+    manager, transport, lease, output_read_fd, output_write_fd = _start_with_output_pipe()
+
+    def fail_read(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        if interruption:
+            raise KeyboardInterrupt
+        raise RuntimeError("injected output reader failure")
+
+    monkeypatch.setattr("rtsp_proxy.probe_systemd._read_bounded_output", fail_read)
+    try:
+        expected = KeyboardInterrupt if interruption else ProbeSystemdError
+        match = None if interruption else r"^probe_transient_output_failed$"
+        with pytest.raises(expected, match=match):
+            manager.read_output(
+                lease,
+                output_fd=output_read_fd,
+                timeout_seconds=1.0,
+            )
+
+        assert transport.recoveries == [
+            ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
+        ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_groups_an_interrupted_pending_cleanup_retry() -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42"),
+        recovery=TimeoutError("injected cleanup timeout"),
+    )
+    manager = SystemdProbeManager(transport=transport)
+    try:
+        lease = manager.start(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+        )
+        with pytest.raises(ProbeSystemdError, match="probe_transient_cleanup_pending"):
+            manager.cancel(lease)
+
+        transport.recovery = KeyboardInterrupt()
+        with pytest.raises(BaseExceptionGroup) as interrupted:
+            manager.retry_pending_cleanup()
+        assert any(
+            isinstance(error, KeyboardInterrupt)
+            for error in interrupted.value.exceptions
+        )
+
+        transport.recovery = None
+        assert manager.retry_pending_cleanup() == 0
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_rejects_a_non_lease_cleanup_request() -> None:
+    manager = SystemdProbeManager(
+        transport=_RecordingTransport(
+            ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+        )
+    )
+
+    with pytest.raises(ProbeSystemdError, match="probe_transient_lease_invalid"):
+        manager.cancel(cast(ProbeTransientLease, object()))
 
 
 def test_systemd_manager_retains_reservation_interrupted_before_transport(
