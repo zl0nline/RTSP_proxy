@@ -339,7 +339,6 @@ def test_guard_manager_preserves_lease_when_interrupted_after_publication(
         for index, source_line in enumerate(source_lines)
         if source_line.strip() == "published_owned = True"
     )
-
     def interrupt_after_publication(frame: Any, event: str, arg: Any) -> Any:
         del arg
         if (
@@ -351,9 +350,11 @@ def test_guard_manager_preserves_lease_when_interrupted_after_publication(
             raise KeyboardInterrupt("guard interrupted after publication")
         return interrupt_after_publication
 
-    sys.settrace(interrupt_after_publication)
-    try:
-        with pytest.raises(KeyboardInterrupt, match="guard interrupted after publication"):
+    interruptions: list[BaseException] = []
+
+    def install() -> None:
+        sys.settrace(interrupt_after_publication)
+        try:
             manager.install_owned(
                 request_id=scope.request_id,
                 unit_name=scope.unit_name,
@@ -362,8 +363,19 @@ def test_guard_manager_preserves_lease_when_interrupted_after_publication(
                 timeout_seconds=3.0,
                 ownership=ledger,
             )
-    finally:
-        sys.settrace(None)
+        except BaseException as error:
+            interruptions.append(error)
+        finally:
+            sys.settrace(None)
+
+    thread = Thread(target=install)
+    thread.start()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert len(interruptions) == 1
+    assert isinstance(interruptions[0], KeyboardInterrupt)
+    assert str(interruptions[0]) == "guard interrupted after publication"
 
     lease = ledger.value
     assert lease is not None
@@ -389,7 +401,6 @@ def test_guard_manager_recovers_lease_when_interrupted_before_publication(
         for index, source_line in enumerate(source_lines)
         if source_line.strip() == "ownership.publish(lease)"
     )
-
     def interrupt_before_publication(frame: Any, event: str, arg: Any) -> Any:
         del arg
         if (
@@ -401,9 +412,11 @@ def test_guard_manager_recovers_lease_when_interrupted_before_publication(
             raise KeyboardInterrupt("guard interrupted before publication")
         return interrupt_before_publication
 
-    sys.settrace(interrupt_before_publication)
-    try:
-        with pytest.raises(KeyboardInterrupt, match="guard interrupted before publication"):
+    interruptions: list[BaseException] = []
+
+    def install() -> None:
+        sys.settrace(interrupt_before_publication)
+        try:
             manager.install_owned(
                 request_id=scope.request_id,
                 unit_name=scope.unit_name,
@@ -412,8 +425,19 @@ def test_guard_manager_recovers_lease_when_interrupted_before_publication(
                 timeout_seconds=3.0,
                 ownership=ledger,
             )
-    finally:
-        sys.settrace(None)
+        except BaseException as error:
+            interruptions.append(error)
+        finally:
+            sys.settrace(None)
+
+    thread = Thread(target=install)
+    thread.start()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert len(interruptions) == 1
+    assert isinstance(interruptions[0], KeyboardInterrupt)
+    assert str(interruptions[0]) == "guard interrupted before publication"
 
     assert ledger.value is None
     assert backend.removed == [scope]
