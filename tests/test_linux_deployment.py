@@ -420,6 +420,22 @@ def test_packaged_migration_ci_asserts_the_current_application_schema() -> None:
     assert f'= "{APPLICATION_SCHEMA}"' in migration_step
 
 
+def test_systemd_validation_stages_probe_broker_entrypoint() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    validation_step = workflow.split("- name: Validate systemd units", 1)[1].split(
+        "- name: Validate owned nftables policy",
+        1,
+    )[0]
+
+    assert (
+        "/opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-broker"
+        in validation_step
+    )
+    assert validation_step.index("rtsp-proxy-probe-broker") < validation_step.index(
+        "systemd-analyze verify"
+    )
+
+
 def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     media = catalog["mediamtx"]

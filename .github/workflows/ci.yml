@@ -155,6 +155,8 @@ jobs:
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-nft-reconcile
           sudo install -m 0755 tests/fixtures/probe_systemd_launcher.py \
             /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-launcher
+          sudo install -m 0755 /usr/bin/true \
+            /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-broker
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/bin/mediamtx
           sudo ln -s releases/ci /opt/rtsp-proxy/current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
