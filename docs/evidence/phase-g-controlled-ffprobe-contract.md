@@ -1,11 +1,11 @@
 # Phase G controlled ffprobe artifact and launcher contract
 
 - Date: 2026-08-30
-- Status: artifact/release amd64+arm64 CI green; launcher implementation and
-  direct-Linux amd64 mechanism green; independent review and integrated native
-  executor evidence pending
-- Launcher commit: `b85c4587bcde2e68a35a9827abb6db3d5dfb95f5`
-- Artifact CI: [run 33323810984](https://github.com/zl0nline/RTSP_proxy/actions/runs/33323810984)
+- Status: artifact/release and launcher/result amd64+arm64 CI green;
+  independent Spec/Standards review green; integrated native executor evidence
+  pending
+- Launcher/result commit: `92cec7405f5789f1cb305807f641e7fa247c096d`
+- CI: [run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101)
   — all nine jobs passed
 - Deployment: direct Linux/system manager, no Docker
 - Production decision: NO-GO
@@ -22,7 +22,7 @@ bound in both `deploy/artifact-catalog.json` and the packaged trust catalog.
 Release schema v3 stages the artifact only at
 `libexec/rtsp-proxy-probe/ffprobe`. The installed candidate wheel's own
 verifier checks architecture, version, packaged digest, release-manifest
-digest, on-disk checksum and version output. CI run 33323810984 rebuilt and
+digest, on-disk checksum and version output. CI run 33325835101 rebuilt and
 exercised the controlled binary on amd64 and arm64, then installed the wheel in
 an isolated release venv and verified the same staged architecture artifact.
 The behavioral contract proves ordinary H264 OPTIONS/DESCRIBE/SETUP/PLAY over
@@ -62,6 +62,14 @@ passed 40 controlled-artifact/launcher tests: zero RTP and corrupt H264 were
 rejected, while generated SPS/PPS/IDR produced the required decoded video
 frame. These are mechanism results, not integrated production evidence.
 
+CI run 33325835101 repeated that exact controlled-artifact contract on amd64
+and arm64: each architecture passed all five redirect/ordinary-media/
+zero-RTP/corrupt-media cases. Both application jobs passed 1,445 tests, the
+independent 90% gate at 90.08%, the installed clean-wheel launcher EOF contract
+and the privileged transient policy. Both release jobs verified the staged
+architecture-specific artifact. Independent Spec and Standards review found no
+remaining High/Medium issue in this slice.
+
 ## Deliberately excluded
 
 The root-owned authenticated broker service is still absent and the launcher
@@ -70,6 +78,5 @@ needs to prove, on native amd64 and arm64, that the exact cgroup connect guard
 is attached and read back before gate release, the real staged controlled
 binary returns an allowlisted result, deadlines/cancellation collect the unit,
 and repeated failure/restart leaves no descriptor, unit, cgroup or BPF residue.
-Independent Spec and Standards review of the launcher slice is also pending.
 ADR 0004 remains Proposed, Phase G remains IN PROGRESS and Production remains
 NO-GO.

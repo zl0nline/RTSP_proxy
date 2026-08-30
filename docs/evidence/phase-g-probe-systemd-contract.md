@@ -53,6 +53,14 @@ The application coverage, lint, type, packaging, migration, release,
 pull/load and external-browser jobs all passed; there were seven successful
 jobs in total.
 
+The follow-up launcher/result hardening in
+[CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101)
+passed all nine jobs at commit `92cec7405f5789f1cb305807f641e7fa247c096d`.
+Both privileged application jobs proved effective soft/hard core limits `[0,0]`
+before the fixture read its source-secret canary, then aborted and left the
+canary absent from the unit journal. The same jobs exercised the installed
+clean-wheel launcher and passed the independent 90% coverage gate at 90.08%.
+
 ## Deliberately excluded
 
 There is still no installed root-owned broker socket/service and no production

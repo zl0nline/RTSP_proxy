@@ -104,9 +104,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   and its attach/readback/run canaries;
 >   the exact-source no-redirect ffprobe is now reproducible, digest-pinned and
 >   release-admitted on amd64/arm64. Its fixed quiet launcher and strict
->   decoded-frame result contract are implemented and direct-Linux amd64 green, but
->   independent review and the privileged amd64/arm64 end-to-end executor
->   transaction remain mandatory. Foundation evidence is
+>   decoded-frame result contract are independently reviewed and native
+>   amd64/arm64 CI green, but the privileged end-to-end executor transaction
+>   remains mandatory. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
 >   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
 >   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),
@@ -127,8 +127,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254),
 >   including its privileged amd64 and arm64 tests; see the
 >   [systemd contract](docs/evidence/phase-g-probe-systemd-contract.md).
->   The controlled artifact/release path is green in all nine jobs of
->   [CI run 33323810984](https://github.com/zl0nline/RTSP_proxy/actions/runs/33323810984);
+>   The controlled artifact, launcher/result and release path are green in all
+>   nine jobs of
+>   [CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101);
 >   launcher scope and remaining gates are recorded in the
 >   [controlled-ffprobe contract](docs/evidence/phase-g-controlled-ffprobe-contract.md).
 > - Production: **NO-GO** до всех evidence gates.

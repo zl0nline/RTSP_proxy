@@ -1294,9 +1294,13 @@ impact is measured.
   ordinary RTSP/TCP plus redirect-refusal behavior and clean-wheel release
   admission (all nine jobs green in
   [CI run 33323810984](https://github.com/zl0nline/RTSP_proxy/actions/runs/33323810984));
-- [ ] complete independent review and privileged amd64/arm64 evidence for the
-  fixed quiet launcher, strict bounded first-decodable-frame result and full
-  systemd+BPF+ffprobe cancellation/residue transaction;
+- [x] fixed quiet gate-before-input launcher, strict bounded decoded-frame
+  result, SDP-only/corrupt-media rejection, clean-wheel entrypoint and
+  `LimitCORE=0` transient policy (independent Spec/Standards review PASS; all
+  nine amd64/arm64 jobs green in
+  [CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101));
+- [ ] complete privileged amd64/arm64 evidence for the full integrated root
+  broker + systemd + BPF + ffprobe cancellation/residue transaction;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
