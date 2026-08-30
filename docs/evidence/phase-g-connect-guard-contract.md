@@ -32,6 +32,20 @@ in the amd64 and arm64 `test` jobs, while all seven jobs completed successfully 
 [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424)
 at commit `bb3790b`.
 
+The command boundary was subsequently hardened against interruption during
+descriptor allocation/transfer, signal-mask mutation and `posix_spawn` PID
+publication. The parent now owns anonymous channels and a pre-opened
+`/proc/thread-self/children` inventory before spawn, keeps the child behind a
+gate with termination signals blocked, executes the wrapper through the
+current `/proc/self/exe` inode, and gives inventory recovery a separate bounded
+budget before PID-report fallback. Direct Linux regressions include delayed
+and zombie wrappers plus transient inventory-read failure and prove exact reap
+and descriptor parity. Independent Spec and Standards re-review passed; all
+seven jobs, including the privileged amd64 and arm64 connect-guard steps,
+completed successfully in
+[CI run 33314959484](https://github.com/zl0nline/RTSP_proxy/actions/runs/33314959484)
+at commit `ab705c1`.
+
 ## Deliberately excluded
 
 There is still no production probe executor. This slice does not grant the

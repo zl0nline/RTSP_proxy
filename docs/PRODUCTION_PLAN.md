@@ -1280,9 +1280,10 @@ impact is measured.
   (compatibility mechanism only);
 - [x] versioned exact-tuple cgroup `connect4`/`connect6` map ABI and privileged
   attach-before-release/ownership-safe cleanup contract (direct-Linux amd64,
-  independent review and privileged amd64/arm64
-  [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424)
-  green; executor still disabled);
+  independent review and privileged amd64/arm64; final signal/PID/FD ownership
+  hardening is green in all seven jobs of
+  [CI run 33314959484](https://github.com/zl0nline/RTSP_proxy/actions/runs/33314959484);
+  executor still disabled);
 - [x] anonymous canonical ffconcat input primitive with a 16 KiB cap,
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
   independent review and native amd64/arm64

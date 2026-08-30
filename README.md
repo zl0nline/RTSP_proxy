@@ -107,8 +107,9 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
 >   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
 >   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),
->   whose native matrix passed in
->   [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424).
+>   whose native matrix and final interruption/PID/FD ownership hardening are
+>   green in all seven jobs of
+>   [CI run 33314959484](https://github.com/zl0nline/RTSP_proxy/actions/runs/33314959484).
 >   The canonical sealed-memfd input primitive is also reviewed and native
 >   amd64/arm64 green in
 >   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877).
