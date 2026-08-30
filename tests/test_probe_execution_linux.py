@@ -293,6 +293,72 @@ def test_linux_cgroup_resolver_returns_only_the_exact_transient_unit(
         resolver.resolve(unit_name="foreign.service", timeout_seconds=1.0)
 
 
+def test_linux_cgroup_resolver_waits_for_the_transient_slice_and_unit(
+    tmp_path: Path,
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    unit_name = f"rtsp-probe-{uuid4().hex}.service"
+    expected = cgroup_root / "rtsp-probe.slice" / unit_name
+    cgroup_root.mkdir()
+    (cgroup_root / "cgroup.controllers").write_text(
+        "cpu memory pids\n",
+        encoding="ascii",
+    )
+    samples = iter((0.0, 0.1))
+
+    def create_transient_cgroup(_seconds: float) -> None:
+        expected.mkdir(parents=True)
+        (expected / "cgroup.procs").write_text("123\n", encoding="ascii")
+
+    resolver = LinuxSystemdCgroupResolver(
+        cgroup_root=cgroup_root,
+        monotonic=lambda: next(samples),
+        sleep=create_transient_cgroup,
+    )
+
+    assert resolver.resolve(unit_name=unit_name, timeout_seconds=1.0) == expected
+
+
+@pytest.mark.parametrize("linked_component", ["slice", "unit", "cgroup.procs"])
+def test_linux_cgroup_resolver_rejects_transient_cgroup_symlinks(
+    tmp_path: Path,
+    linked_component: str,
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    slice_path = cgroup_root / "rtsp-probe.slice"
+    unit_name = f"rtsp-probe-{uuid4().hex}.service"
+    expected = slice_path / unit_name
+    cgroup_root.mkdir()
+    (cgroup_root / "cgroup.controllers").write_text(
+        "cpu memory pids\n",
+        encoding="ascii",
+    )
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    if linked_component == "slice":
+        slice_path.symlink_to(foreign, target_is_directory=True)
+    else:
+        slice_path.mkdir()
+        if linked_component == "unit":
+            expected.symlink_to(foreign, target_is_directory=True)
+        else:
+            expected.mkdir()
+            foreign_file = tmp_path / "foreign-procs"
+            foreign_file.write_text("123\n", encoding="ascii")
+            (expected / "cgroup.procs").symlink_to(foreign_file)
+
+    resolver = LinuxSystemdCgroupResolver(
+        cgroup_root=cgroup_root,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(
+        ProbeExecutionLinuxError,
+        match="probe_execution_cgroup_invalid",
+    ):
+        resolver.resolve(unit_name=unit_name, timeout_seconds=1.0)
+
+
 @pytest.mark.parametrize(
     "invalid_sample",
     [float("nan"), float("inf"), float("-inf"), RuntimeError()],

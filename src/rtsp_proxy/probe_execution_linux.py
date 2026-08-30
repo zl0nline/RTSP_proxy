@@ -268,14 +268,11 @@ class LinuxSystemdCgroupResolver:
             and root.is_absolute()
             and _directory_without_symlink(root)
             and _regular_file_without_symlink(root / "cgroup.controllers")
-            and _directory_without_symlink(slice_path)
         ):
             raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
         deadline = self._clock_sample() + float(timeout_seconds)
         while True:
-            if _directory_without_symlink(expected) and _regular_file_without_symlink(
-                expected / "cgroup.procs"
-            ):
+            if self._transient_cgroup_ready(slice_path, expected):
                 return expected
             remaining = deadline - self._clock_sample()
             if not isfinite(remaining):
@@ -301,6 +298,40 @@ class LinuxSystemdCgroupResolver:
         ):
             raise ProbeExecutionLinuxError("probe_execution_cgroup_unavailable")
         return float(sample)
+
+    @staticmethod
+    def _transient_cgroup_ready(slice_path: Path, expected: Path) -> bool:
+        try:
+            slice_metadata = slice_path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise ProbeExecutionLinuxError(
+                "probe_execution_cgroup_unavailable"
+            ) from None
+        if not stat.S_ISDIR(slice_metadata.st_mode):
+            raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
+        try:
+            expected_metadata = expected.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise ProbeExecutionLinuxError(
+                "probe_execution_cgroup_unavailable"
+            ) from None
+        if not stat.S_ISDIR(expected_metadata.st_mode):
+            raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
+        try:
+            procs_metadata = (expected / "cgroup.procs").lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise ProbeExecutionLinuxError(
+                "probe_execution_cgroup_unavailable"
+            ) from None
+        if not stat.S_ISREG(procs_metadata.st_mode):
+            raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
+        return True
 
 
 def _close_operations(*operations: Callable[[], None]) -> list[BaseException]:
