@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-import errno
-import fcntl
+import io
 import os
 import re
 import stat
@@ -26,17 +25,17 @@ class ProbeExecutionLinuxError(RuntimeError):
 
 
 class _OwnedPipe:
-    """Two fd slots owned before Linux fills them in one ``pipe2`` call."""
+    """Two native pipe slots transferred into object-owned file handles."""
 
     def __init__(self) -> None:
-        self._descriptors = (ctypes.c_int * 2)(-1, -1)
-        self._closing_identities: list[tuple[int, int, int, int] | None] = [
-            None,
-            None,
-        ]
+        self._raw_descriptors = (ctypes.c_int * 2)(-1, -1)
+        self._endpoints = (
+            _OwnedFileDescriptor("rb"),
+            _OwnedFileDescriptor("wb"),
+        )
 
     def acquire(self) -> None:
-        if self._descriptors[0] >= 0 or self._descriptors[1] >= 0:
+        if self._raw_descriptors[0] >= 0 or self._raw_descriptors[1] >= 0:
             raise ProbeExecutionLinuxError("probe_execution_channels_invalid")
         libc = ctypes.CDLL(None, use_errno=True)
         try:
@@ -45,16 +44,18 @@ class _OwnedPipe:
             raise ProbeExecutionLinuxError("probe_execution_linux_required") from None
         pipe2.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
         pipe2.restype = ctypes.c_int
-        if pipe2(self._descriptors, os.O_CLOEXEC) != 0:
+        if pipe2(self._raw_descriptors, os.O_CLOEXEC) != 0:
             raise ProbeExecutionLinuxError("probe_execution_channel_allocation_failed")
+        self._settle_raw_descriptor(0)
+        self._settle_raw_descriptor(1)
 
     @property
     def read_descriptor(self) -> int:
-        return self._require(0)
+        return self._endpoints[0].descriptor
 
     @property
     def write_descriptor(self) -> int:
-        return self._require(1)
+        return self._endpoints[1].descriptor
 
     def close_read(self) -> None:
         self._close(0)
@@ -66,51 +67,66 @@ class _OwnedPipe:
         errors: list[BaseException] = []
         for index in (1, 0):
             try:
-                self._close(index)
+                self._settle_raw_descriptor(index)
+            except BaseException as error:
+                errors.append(_sanitize_cleanup_error(error))
+                continue
+            try:
+                self._endpoints[index].close()
             except BaseException as error:
                 errors.append(_sanitize_cleanup_error(error))
         return errors
 
-    def _require(self, index: int) -> int:
-        descriptor = int(self._descriptors[index])
-        if descriptor < 0:
-            raise ProbeExecutionLinuxError("probe_execution_channels_closed")
-        return descriptor
-
     def _close(self, index: int) -> None:
-        descriptor = int(self._descriptors[index])
+        self._settle_raw_descriptor(index)
+        self._endpoints[index].close()
+
+    def _settle_raw_descriptor(self, index: int) -> None:
+        descriptor = int(self._raw_descriptors[index])
         if descriptor < 0:
             return
-        expected = self._closing_identities[index]
-        try:
-            if expected is None:
-                expected = _descriptor_identity(descriptor)
-                self._closing_identities[index] = expected
-            elif _descriptor_state(descriptor, expected) != "same":
-                self._clear(index)
-                return
-            os.close(descriptor)
-            self._clear(index)
-        except BaseException as error:
-            inspection_error: BaseException | None = None
-            try:
-                if expected is not None and _descriptor_state(descriptor, expected) != "same":
-                    self._clear(index)
-            except BaseException as observed_error:
-                inspection_error = observed_error
-            if inspection_error is not None:
-                raise BaseExceptionGroup(
-                    "probe execution descriptor close and inspection failed",
-                    [
-                        _sanitize_cleanup_error(error),
-                        _sanitize_cleanup_error(inspection_error),
-                    ],
-                ) from None
-            raise _sanitize_cleanup_error(error) from None
+        endpoint = self._endpoints[index]
+        if not endpoint.owns(descriptor):
+            endpoint.adopt(descriptor)
+        if not endpoint.owns(descriptor):
+            raise ProbeExecutionLinuxError("probe_execution_channel_allocation_failed")
+        self._raw_descriptors[index] = -1
 
-    def _clear(self, index: int) -> None:
-        self._descriptors[index] = -1
-        self._closing_identities[index] = None
+
+class _OwnedFileDescriptor:
+    """A pre-created C owner whose close state is not reconstructed from fd metadata."""
+
+    def __init__(self, mode: str) -> None:
+        self._mode = mode
+        self._stream = io.FileIO.__new__(io.FileIO)
+
+    @property
+    def descriptor(self) -> int:
+        try:
+            return self._stream.fileno()
+        except (OSError, ValueError):
+            raise ProbeExecutionLinuxError("probe_execution_channels_closed") from None
+
+    def owns(self, descriptor: int) -> bool:
+        try:
+            return self._stream.fileno() == descriptor
+        except (OSError, ValueError):
+            return False
+
+    def adopt(self, descriptor: int) -> None:
+        if self._initialized():
+            raise ProbeExecutionLinuxError("probe_execution_channel_allocation_failed")
+        io.FileIO.__init__(self._stream, descriptor, mode=self._mode, closefd=True)
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def _initialized(self) -> bool:
+        try:
+            _ = self._stream.name
+        except AttributeError:
+            return False
+        return True
 
 
 class LinuxProbeExecutionChannels:
@@ -333,22 +349,3 @@ def _regular_file_without_symlink(path: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
-
-
-def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
-    metadata = os.fstat(descriptor)
-    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-    return metadata.st_dev, metadata.st_ino, metadata.st_mode, flags & os.O_ACCMODE
-
-
-def _descriptor_state(
-    descriptor: int,
-    expected: tuple[int, int, int, int],
-) -> str:
-    try:
-        observed = _descriptor_identity(descriptor)
-    except OSError as error:
-        if error.errno == errno.EBADF:
-            return "gone"
-        raise
-    return "same" if observed == expected else "different"

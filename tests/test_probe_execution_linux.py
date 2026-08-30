@@ -5,6 +5,7 @@ import sys
 from contextlib import suppress
 from ipaddress import ip_address
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -142,7 +143,6 @@ def test_linux_channel_factory_publishes_owner_before_reading_input() -> None:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux descriptor contract")
 def test_linux_execution_channel_close_cannot_close_a_reused_descriptor(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     before = set(os.listdir("/proc/self/fd"))
     received = ReceivedProbeInput(
@@ -166,38 +166,48 @@ def test_linux_execution_channel_close_cannot_close_a_reused_descriptor(
     LinuxProbeExecutionChannelFactory().create_owned(received, publish=published.append)
     channels = published[0]
     victim = channels.output_fd
-    native_close = os.close
-    replacement = -1
+    replacement_source = os.dup(victim)
+    target_owner: object | None = None
 
-    def close_then_interrupt(descriptor: int) -> None:
-        nonlocal replacement
-        native_close(descriptor)
-        if descriptor == victim and replacement < 0:
-            candidate = os.open(os.devnull, os.O_RDONLY)
-            if candidate != victim:
-                os.dup2(candidate, victim)
-                native_close(candidate)
-            replacement = victim
+    def interrupt_after_close(
+        _frame: FrameType,
+        event: str,
+        argument: object,
+    ) -> None:
+        nonlocal target_owner
+        owner = getattr(argument, "__self__", None)
+        if event == "c_call" and getattr(argument, "__name__", None) == "close":
+            if owner is None:
+                return
+            try:
+                descriptor = owner.fileno()
+            except (AttributeError, OSError, ValueError):
+                return
+            if descriptor == victim:
+                target_owner = owner
+        elif event == "c_return" and owner is target_owner:
+            sys.setprofile(None)
+            os.dup2(replacement_source, victim, inheritable=False)
             raise KeyboardInterrupt("close interrupted")
 
-    monkeypatch.setattr(os, "close", close_then_interrupt)
+    sys.setprofile(interrupt_after_close)
     try:
         with pytest.raises(KeyboardInterrupt, match="close interrupted"):
             channels.close()
         channels.close()
-        os.fstat(replacement)
+        os.fstat(victim)
     finally:
-        monkeypatch.undo()
+        sys.setprofile(None)
         received.close()
         with suppress(OSError):
-            native_close(replacement)
+            os.close(victim)
+        os.close(replacement_source)
 
     assert set(os.listdir("/proc/self/fd")) == before
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux descriptor contract")
 def test_linux_execution_channel_retries_a_close_interrupted_before_syscall(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     before = set(os.listdir("/proc/self/fd"))
     received = ReceivedProbeInput(
@@ -221,17 +231,26 @@ def test_linux_execution_channel_retries_a_close_interrupted_before_syscall(
     LinuxProbeExecutionChannelFactory().create_owned(received, publish=published.append)
     channels = published[0]
     victim = channels.output_fd
-    native_close = os.close
-    interrupted = False
 
-    def interrupt_before_close(descriptor: int) -> None:
-        nonlocal interrupted
-        if descriptor == victim and not interrupted:
-            interrupted = True
+    def interrupt_before_close(
+        _frame: FrameType,
+        event: str,
+        argument: object,
+    ) -> None:
+        if event != "c_call" or getattr(argument, "__name__", None) != "close":
+            return
+        owner = getattr(argument, "__self__", None)
+        if owner is None:
+            return
+        try:
+            descriptor = owner.fileno()
+        except (AttributeError, OSError, ValueError):
+            return
+        if descriptor == victim:
+            sys.setprofile(None)
             raise KeyboardInterrupt("close interrupted")
-        native_close(descriptor)
 
-    monkeypatch.setattr(os, "close", interrupt_before_close)
+    sys.setprofile(interrupt_before_close)
     try:
         with pytest.raises(KeyboardInterrupt, match="close interrupted"):
             channels.close()
@@ -240,10 +259,10 @@ def test_linux_execution_channel_retries_a_close_interrupted_before_syscall(
         with pytest.raises(OSError):
             os.fstat(victim)
     finally:
-        monkeypatch.undo()
+        sys.setprofile(None)
         received.close()
         with suppress(OSError):
-            native_close(victim)
+            os.close(victim)
 
     assert set(os.listdir("/proc/self/fd")) == before
 
