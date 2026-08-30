@@ -80,6 +80,10 @@ def test_probe_broker_runtime_loads_only_one_absolute_host_tool_path(
             "RTSP_PROXY_PROBE_BPFTOOL": "/usr/bin/bpftool",
             "RTSP_PROXY_PROBE_ALLOWED_CIDRS": "10.20.0.0/16,10.20.0.0/16",
         },
+        {
+            "RTSP_PROXY_PROBE_BPFTOOL": "/usr/bin/bpftool",
+            "RTSP_PROXY_PROBE_ALLOWED_CIDRS": "10.20.0.0/16, 2001:db8::/64",
+        },
     ],
 )
 def test_probe_broker_runtime_rejects_ambiguous_host_tool_path(
@@ -124,11 +128,49 @@ def test_probe_broker_peer_rejects_split_primary_group(
         resolve_probe_broker_peer()
 
 
+def test_probe_broker_peer_rejects_missing_service_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_user(_name: str) -> object:
+        raise KeyError("rtsp-proxy")
+
+    monkeypatch.setattr(pwd, "getpwnam", missing_user)
+
+    with pytest.raises(ProbeBrokerRuntimeError, match="probe_broker_peer_invalid"):
+        resolve_probe_broker_peer()
+
+
 def test_systemd_activation_listener_rejects_wrong_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
     monkeypatch.setenv("LISTEN_FDS", "2")
+
+    with pytest.raises(ProbeBrokerRuntimeError, match="probe_broker_socket_activation_invalid"):
+        systemd_activation_listener()
+
+
+def test_systemd_activation_listener_rejects_non_decimal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LISTEN_PID", "not-a-pid")
+    monkeypatch.setenv("LISTEN_FDS", "1")
+
+    with pytest.raises(ProbeBrokerRuntimeError, match="probe_broker_socket_activation_invalid"):
+        systemd_activation_listener()
+
+
+def test_systemd_activation_listener_sanitizes_missing_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
+    monkeypatch.setenv("LISTEN_FDS", "1")
+
+    def missing_socket(*, fileno: int) -> socket.socket:
+        assert fileno == runtime_module._SYSTEMD_LISTEN_FD
+        raise OSError("privileged descriptor detail")
+
+    monkeypatch.setattr(socket, "socket", missing_socket)
 
     with pytest.raises(ProbeBrokerRuntimeError, match="probe_broker_socket_activation_invalid"):
         systemd_activation_listener()
