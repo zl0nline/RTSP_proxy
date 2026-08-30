@@ -5,6 +5,7 @@ import os
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from rtsp_proxy.probe_executor import create_sealed_probe_input
 from rtsp_proxy.probe_launcher import PROBE_FFPROBE_ARGV, ProbeFfprobeResultDecoder
 from rtsp_proxy.probes import ProbeExecutionResult, ProbeOutcome
 
@@ -152,7 +154,11 @@ def test_controlled_probe_ffprobe_keeps_default_redirect_behavior_opt_in() -> No
     assert result.redirect_target_connected is True
 
 
-def _run_h264_media_probe(rtp_payloads: tuple[bytes, ...]) -> _MediaProbeResult:
+def _run_h264_media_probe(
+    rtp_payloads: tuple[bytes, ...],
+    *,
+    sealed_fd_two: bool = False,
+) -> _MediaProbeResult:
     assert PROBE_FFPROBE_BINARY is not None
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -249,13 +255,32 @@ def _run_h264_media_probe(rtp_payloads: tuple[bytes, ...]) -> _MediaProbeResult:
         "option rtsp_flags no_redirect\n"
         "option rw_timeout 2000000\n"
     ).encode("ascii")
-    completed = subprocess.run(
-        _fixed_probe_argv(),
-        input=payload,
-        check=False,
-        capture_output=True,
-        timeout=6.0,
-    )
+    if sealed_fd_two:
+        if sys.platform != "linux":
+            pytest.skip("sealed fd 2 probe input requires Linux")
+        input_fd = create_sealed_probe_input(payload)
+        try:
+            completed = subprocess.run(
+                [
+                    str(Path(PROBE_FFPROBE_BINARY).resolve(strict=True)),
+                    *PROBE_FFPROBE_ARGV[1:],
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=input_fd,
+                check=False,
+                timeout=6.0,
+            )
+        finally:
+            os.close(input_fd)
+    else:
+        completed = subprocess.run(
+            _fixed_probe_argv(),
+            input=payload,
+            check=False,
+            capture_output=True,
+            timeout=6.0,
+        )
     server.join(1.0)
     listener.close()
 
@@ -302,6 +327,23 @@ def test_controlled_probe_ffprobe_requires_a_decodable_h264_frame() -> None:
         completed_at=completed_at,
         video_codec="h264",
     )
+
+
+def test_controlled_probe_ffprobe_reads_sealed_input_from_fd_two() -> None:
+    result = _run_h264_media_probe(
+        (
+            bytes.fromhex("6742d00b8c69c807844235"),
+            bytes.fromhex("68ce3c80"),
+            bytes.fromhex("65b8000409fffff87a28000827fc"),
+        ),
+        sealed_fd_two=True,
+    )
+
+    assert result.completed.returncode == 0
+    assert result.requests == _expected_h264_requests(result.port)
+    assert ProbeFfprobeResultDecoder(
+        clock=lambda: datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    ).decode(result.completed.stdout).outcome is ProbeOutcome.HEALTHY
 
 
 @pytest.mark.parametrize(

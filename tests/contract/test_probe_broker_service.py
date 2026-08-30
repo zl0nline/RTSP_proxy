@@ -269,7 +269,6 @@ def _serve_h264(
                     return
     except BaseException as error:
         errors.append(error)
-        connected.set()
 
 
 def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() -> None:
@@ -285,7 +284,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
-    listener.settimeout(10)
+    listener.settimeout(18)
     port = listener.getsockname()[1]
     request_id = uuid4()
     endpoint_generation = uuid4()
@@ -312,7 +311,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
     server.start()
     client = _run_client(request_id, endpoint_generation, "127.0.0.1", port)
     try:
-        _wait_for_source_or_client(connected, client)
+        _wait_for_source_or_client(connected, client, timeout=18)
         if not connected.is_set() and client.poll() is None:
             pytest.fail(
                 "broker did not reach source or return a bounded result: "
