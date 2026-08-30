@@ -41,6 +41,42 @@ def _service_property(name: str) -> str:
     return observed.stdout.strip()
 
 
+def _service_snapshot() -> dict[str, str]:
+    return {
+        name: _service_property(name)
+        for name in (
+            "ActiveState",
+            "SubState",
+            "Result",
+            "ExecMainCode",
+            "ExecMainStatus",
+            "NRestarts",
+        )
+    }
+
+
+def _safe_client_outcome(payload: bytes) -> dict[str, str | None] | str:
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "invalid"
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {
+            "audio_codec",
+            "failure_class",
+            "outcome",
+            "video_codec",
+        }
+        or decoded["audio_codec"] not in {None, "opus"}
+        or decoded["failure_class"] not in {None, "executor"}
+        or decoded["outcome"] not in {"healthy", "inconclusive"}
+        or decoded["video_codec"] not in {None, "h264", "hevc"}
+    ):
+        return "invalid"
+    return decoded
+
+
 def _run_client(
     request_id: UUID,
     endpoint_generation: UUID,
@@ -95,6 +131,19 @@ def _wait_until(predicate: object, *, failure: str, timeout: float = 10) -> None
             return
         time.sleep(0.02)
     pytest.fail(failure)
+
+
+def _wait_for_source_or_client(
+    connected: threading.Event,
+    client: subprocess.Popen[bytes],
+    *,
+    timeout: float = 10,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if connected.is_set() or client.poll() is not None:
+            return
+        time.sleep(0.02)
 
 
 def _unit_is_collected(unit_name: str) -> bool:
@@ -263,7 +312,25 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
     server.start()
     client = _run_client(request_id, endpoint_generation, "127.0.0.1", port)
     try:
-        assert connected.wait(timeout=10)
+        _wait_for_source_or_client(connected, client)
+        if not connected.is_set() and client.poll() is None:
+            pytest.fail(
+                "broker did not reach source or return a bounded result: "
+                f"service={_service_snapshot()}, "
+                f"cgroup={cgroup.exists()}, scope={scope.exists()}, "
+                f"receipt={receipt.exists()}"
+            )
+        if not connected.is_set():
+            stdout, stderr = client.communicate(timeout=2)
+            pytest.fail(
+                "broker returned before source connection: "
+                f"returncode={client.returncode}, "
+                f"outcome={_safe_client_outcome(stdout)}, "
+                f"stderr_generic={stderr == b'probe_broker_client_failed\n'}, "
+                f"service={_service_snapshot()}, "
+                f"cgroup={cgroup.exists()}, scope={scope.exists()}, "
+                f"receipt={receipt.exists()}"
+            )
         assert errors == []
         _wait_until(cgroup.is_dir, failure="probe cgroup was not created")
         assert scope.is_dir()
