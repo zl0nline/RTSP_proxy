@@ -173,12 +173,16 @@ jobs:
           mkdir -p .artifacts/probe
           tools/probe/build_connect_guard.sh \
             "$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o"
+          sha256sum \
+            "$bpftool_path" \
+            "$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o"
           sudo env \
             PYTHONPATH="$PWD/src" \
             RTSP_PROXY_RUN_PROBE_BPF_CONTRACT=1 \
+            RTSP_PROXY_PRINT_PROBE_GUARD_IDENTITY=1 \
             RTSP_PROXY_BPFTOOL="$bpftool_path" \
             RTSP_PROXY_PROBE_GUARD_BPF_OBJECT="$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o" \
-            "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
+            "$PWD/.venv/bin/python" -m pytest -q -s -p no:cacheprovider \
             tests/contract/test_probe_connect_guard.py
 
   browser-e2e:

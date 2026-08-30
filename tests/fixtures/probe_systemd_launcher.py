@@ -1,8 +1,11 @@
 #!/usr/bin/python3
 from __future__ import annotations
 
+import json
 import os
+import socket
 import time
+from urllib.parse import urlsplit
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -27,6 +30,33 @@ def main() -> int:
         return 0
     if b"/probe-systemd-cancel" in payload:
         time.sleep(60)
+        return 0
+    if b"/probe-connect-guard-systemd" in payload:
+        try:
+            file_line = next(
+                line for line in payload.decode("utf-8").splitlines()
+                if line.startswith("file '") and line.endswith("'")
+            )
+            target = urlsplit(file_line[6:-1])
+            if target.hostname is None or target.port is None:
+                return 23
+            results: dict[str, bool] = {}
+            for label, port in (
+                ("allowed", target.port),
+                ("denied", target.port + 1),
+            ):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(1.0)
+                    results[label] = connection.connect_ex(
+                        (target.hostname, port)
+                    ) == 0
+        except (OSError, StopIteration, UnicodeError, ValueError):
+            return 24
+        _write_all(
+            1,
+            json.dumps(results, sort_keys=True, separators=(",", ":")).encode()
+            + b"\n",
+        )
         return 0
     _write_all(1, b'{"status":"fixture-ok"}\n')
     return 0
