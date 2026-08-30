@@ -17,7 +17,7 @@ from ipaddress import ip_address
 from multiprocessing.connection import Connection
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -2683,6 +2683,41 @@ def test_bpftool_command_owns_pid_before_unblocking_process_interruption(
                 os.waitpid(pid, 0)
 
 
+def test_bpftool_command_restores_signal_mask_when_blocking_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_sigmask = signal.pthread_sigmask
+    original_mask = original_sigmask(signal.SIG_BLOCK, set())
+    interrupted = False
+
+    def interrupt_after_block(
+        operation: int,
+        mask: set[int | signal.Signals],
+    ) -> set[int | signal.Signals]:
+        nonlocal interrupted
+        previous = original_sigmask(operation, mask)
+        if operation == signal.SIG_BLOCK and mask and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("signal mask mutation interrupted")
+        return previous
+
+    monkeypatch.setattr(signal, "pthread_sigmask", interrupt_after_block)
+    try:
+        with pytest.raises(
+            KeyboardInterrupt,
+            match="signal mask mutation interrupted",
+        ):
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "raise SystemExit(0)"),
+                timeout_seconds=1.0,
+            )
+        observed_mask = original_sigmask(signal.SIG_BLOCK, set())
+    finally:
+        original_sigmask(signal.SIG_SETMASK, original_mask)
+
+    assert observed_mask == original_mask
+
+
 @pytest.mark.skipif(
     not Path("/proc/self/fd").is_dir(),
     reason="spawn ownership is a Linux production boundary",
@@ -2738,6 +2773,98 @@ def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
                 os.kill(pid, signal.SIGKILL)
             with suppress(ChildProcessError):
                 os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/thread-self/children").is_file(),
+    reason="direct-child recovery is a Linux production boundary",
+)
+def test_bpftool_command_recovers_zombie_before_pid_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = os.posix_spawn
+    spawned: list[int] = []
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_SPAWN_WRAPPER",
+        "import time; time.sleep(30)\n" + probe_connect_guard._SPAWN_WRAPPER,
+    )
+
+    def interrupt_after_child_becomes_zombie(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        pid = original_spawn(path, arguments, environment, **keywords)
+        spawned.append(pid)
+        os.kill(pid, signal.SIGKILL)
+        linux_os = cast(Any, os)
+        while linux_os.waitid(
+            linux_os.P_PID,
+            pid,
+            linux_os.WEXITED | os.WNOHANG | linux_os.WNOWAIT,
+        ) is None:
+            time.sleep(0.001)
+        raise KeyboardInterrupt("spawn return interrupted after child exit")
+
+    monkeypatch.setattr(os, "posix_spawn", interrupt_after_child_becomes_zombie)
+    try:
+        with pytest.raises(BaseException) as raised:
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "raise SystemExit(0)"),
+                timeout_seconds=1.0,
+            )
+
+        assert isinstance(raised.value, KeyboardInterrupt) or (
+            isinstance(raised.value, BaseExceptionGroup)
+            and any(
+                isinstance(error, KeyboardInterrupt)
+                for error in raised.value.exceptions
+            )
+        )
+        assert len(spawned) == 1
+        with pytest.raises(ChildProcessError):
+            os.waitpid(spawned[0], os.WNOHANG)
+    finally:
+        for pid in spawned:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+
+def test_bpftool_command_requires_direct_child_inventory_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawn_called = False
+
+    def fail_child_inventory() -> set[int]:
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+
+    def unexpected_spawn(*args: Any, **kwargs: Any) -> int:
+        nonlocal spawn_called
+        spawn_called = True
+        raise AssertionError("spawn must not run without child inventory")
+
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_thread_child_pids",
+        fail_child_inventory,
+        raising=False,
+    )
+    monkeypatch.setattr(os, "posix_spawn", unexpected_spawn)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=1.0,
+        )
+
+    assert spawn_called is False
 
 
 @pytest.mark.skipif(

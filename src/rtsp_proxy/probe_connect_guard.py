@@ -2818,13 +2818,15 @@ def _spawn_owned_process(
     blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
     primary_error: BaseException | None = None
     try:
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         child_signal_mask = tuple(int(item) for item in previous_mask)
         guarded_child_signal_mask = tuple(
             sorted({*child_signal_mask, *(int(item) for item in blocked_signals)})
         )
         for pipe in pipes:
             pipe.acquire()
+        child_pids_before_spawn = _thread_child_pids()
         process = _SpawnedProcess(arguments=arguments)
         owner.process = process
         child_descriptors = (*pass_fds, pid_pipe.write_descriptor, gate_pipe.read_descriptor)
@@ -2897,7 +2899,10 @@ def _spawn_owned_process(
                 deadline=recovery_deadline,
             )
             if recovered_pid is None:
-                recovered_pid = _recover_gated_spawn_pid(spawn_nonce)
+                recovered_pid = _recover_gated_spawn_pid(
+                    spawn_nonce,
+                    child_pids_before_spawn=child_pids_before_spawn,
+                )
             if recovered_pid is not None:
                 process.pid = recovered_pid
             gate_pipe.close_write()
@@ -2993,22 +2998,42 @@ def _read_reported_spawn_pid(
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
 
 
-def _recover_gated_spawn_pid(spawn_nonce: str) -> int | None:
+def _thread_child_pids() -> set[int] | None:
     children_path = Path("/proc/thread-self/children")
     if not children_path.is_file():
+        if sys.platform == "linux":
+            raise ProbeConnectGuardError(
+                "probe_guard_kernel_operation_failed"
+            ) from None
         return None
     try:
         children_payload = children_path.read_bytes()
         if len(children_payload) > 8_192:
             raise ValueError
-        child_pids = tuple(
+        child_pids = {
             int(item) for item in children_payload.decode("ascii").split()
-        )
+        }
+        if any(child_pid <= 0 for child_pid in child_pids):
+            raise ValueError
     except (OSError, UnicodeDecodeError, ValueError):
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+    return child_pids
+
+
+def _recover_gated_spawn_pid(
+    spawn_nonce: str,
+    *,
+    child_pids_before_spawn: set[int] | None,
+) -> int | None:
+    child_pids_after_spawn = _thread_child_pids()
+    if child_pids_before_spawn is None or child_pids_after_spawn is None:
+        return None
+    candidate_pids = child_pids_after_spawn.difference(child_pids_before_spawn)
+    if len(candidate_pids) == 1:
+        return next(iter(candidate_pids))
     expected_nonce = spawn_nonce.encode("ascii")
     matches: list[int] = []
-    for child_pid in child_pids:
+    for child_pid in candidate_pids:
         try:
             with Path(f"/proc/{child_pid}/cmdline").open("rb") as stream:
                 command_line = stream.read(65_537)
