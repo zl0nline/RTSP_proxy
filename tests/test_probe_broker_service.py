@@ -175,6 +175,57 @@ def test_probe_broker_service_maps_execution_failure_to_inconclusive() -> None:
     assert worker.is_alive() is False
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+def test_probe_broker_service_maps_invalid_executor_result_to_inconclusive() -> None:
+    executor = _Executor()
+    executor.result = object()  # type: ignore[assignment]
+    service = _service(executor)
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    descriptor = create_sealed_probe_input(_FFCONCAT)
+    worker = Thread(target=_serve_once, args=(service, server))
+    worker.start()
+    try:
+        send_probe_broker_request(client, _request(), descriptor, timeout_seconds=1)
+        result = receive_probe_broker_response(
+            client,
+            expected_request=_request(),
+            timeout_seconds=1,
+        )
+        assert result.outcome is ProbeOutcome.INCONCLUSIVE
+        assert result.failure_class is ProbeFailureClass.EXECUTOR
+    finally:
+        client.close()
+        worker.join(timeout=2)
+        server.close()
+    assert executor.events == ["execute", "retry"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+def test_probe_broker_service_does_not_execute_after_fatal_cleanup() -> None:
+    executor = _Executor()
+    service = _service(executor)
+    service._publish_cleanup_failure()
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    descriptor = create_sealed_probe_input(_FFCONCAT)
+    worker = Thread(target=_serve_once, args=(service, server))
+    worker.start()
+    try:
+        send_probe_broker_request(client, _request(), descriptor, timeout_seconds=1)
+        result = receive_probe_broker_response(
+            client,
+            expected_request=_request(),
+            timeout_seconds=1,
+        )
+        assert result.outcome is ProbeOutcome.INCONCLUSIVE
+        assert result.failure_class is ProbeFailureClass.EXECUTOR
+    finally:
+        client.close()
+        worker.join(timeout=2)
+        server.close()
+    assert executor.events == []
+    assert worker.is_alive() is False
+
+
 def test_probe_broker_service_refuses_readiness_until_startup_recovery_completes() -> None:
     executor = _Executor(unresolved=1)
     service = _service(executor)
@@ -285,6 +336,23 @@ def test_probe_broker_service_sanitizes_recovery_failure() -> None:
 
     with pytest.raises(ProbeBrokerServiceError, match=r"^probe_broker_recovery_failed$"):
         _service(executor).reconcile_startup()
+
+
+def test_probe_broker_service_sanitizes_wall_clock_failure() -> None:
+    def fail_clock() -> int:
+        raise OSError("privileged clock detail")
+
+    service = _service(_Executor(), wall_clock_ms=fail_clock)
+
+    with pytest.raises(ProbeBrokerServiceError, match=r"^probe_broker_clock_invalid$"):
+        service._remaining_request_seconds(_request().deadline_unix_ms)
+
+
+def test_probe_broker_service_rejects_invalid_wall_clock_value() -> None:
+    service = _service(_Executor(), wall_clock_ms=lambda: 0)
+
+    with pytest.raises(ProbeBrokerServiceError, match=r"^probe_broker_clock_invalid$"):
+        service._remaining_request_seconds(_request().deadline_unix_ms)
 
 
 class _FiniteUnixListener(socket.socket):

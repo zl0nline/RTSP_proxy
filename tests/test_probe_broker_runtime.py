@@ -146,7 +146,10 @@ def test_systemd_activation_listener_rejects_wrong_contract(
     monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
     monkeypatch.setenv("LISTEN_FDS", "2")
 
-    with pytest.raises(ProbeBrokerRuntimeError, match="probe_broker_socket_activation_invalid"):
+    with pytest.raises(
+        ProbeBrokerRuntimeError,
+        match=r"^probe_broker_socket_activation_invalid$",
+    ):
         systemd_activation_listener()
 
 
@@ -172,8 +175,14 @@ def test_systemd_activation_listener_sanitizes_missing_descriptor(
 
     monkeypatch.setattr(socket, "socket", missing_socket)
 
-    with pytest.raises(ProbeBrokerRuntimeError, match="probe_broker_socket_activation_invalid"):
+    with pytest.raises(
+        ProbeBrokerRuntimeError,
+        match=r"^probe_broker_socket_activation_invalid$",
+    ) as raised:
         systemd_activation_listener()
+
+    assert "privileged descriptor detail" not in str(raised.value)
+    assert raised.value.__cause__ is None
 
 
 def test_probe_broker_console_script_is_packaged() -> None:
