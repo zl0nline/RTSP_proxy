@@ -13,6 +13,7 @@ Linux amd64/arm64 имеют одинаковые functional/security/release ga
 │   └── <release-id>/
 │       ├── .venv/
 │       ├── bin/{mediamtx,ffmpeg,ffprobe}
+│       ├── libexec/rtsp-proxy-probe/ffprobe
 │       ├── dist/rtsp_proxy-<version>-py3-none-any.whl
 │       ├── release-manifest.json
 │       └── uv.lock

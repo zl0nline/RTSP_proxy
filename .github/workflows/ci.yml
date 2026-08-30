@@ -100,6 +100,7 @@ jobs:
           uv pip install --python .artifacts/clean-venv/bin/python --no-deps dist/rtsp_proxy-0.1.0-py3-none-any.whl
           RTSP_PROXY_ROLE=web .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.runtime import create_app_from_environment; assert create_app_from_environment().title == "RTSP Proxy Control Plane"'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.probe_connect_guard import _load_packaged_artifact_catalog; catalog = _load_packaged_artifact_catalog(); assert catalog.current_release_id == "0.1.0"'
+          .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_ffprobe_identity; amd64 = trusted_probe_ffprobe_identity("amd64"); arm64 = trusted_probe_ffprobe_identity("arm64"); assert amd64[0] == arm64[0] == "9b6c896-rtsp-proxy.1"; assert amd64[1] != arm64[1]'
 
       - name: Verify packaged migrations against native PostgreSQL
         run: |
@@ -429,7 +430,22 @@ jobs:
              | .git_commit = $git_commit' \
             "deploy/release-manifest.${{ matrix.arch }}.example.json" \
             > .artifacts/release/release-manifest.json
-          uv run rtsp-proxy-verify-release --manifest .artifacts/release/release-manifest.json
+          uv export \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file .artifacts/release-requirements.txt
+          uv venv --python 3.12 .artifacts/release-venv
+          uv pip sync \
+            --python .artifacts/release-venv/bin/python \
+            .artifacts/release-requirements.txt
+          uv pip install \
+            --python .artifacts/release-venv/bin/python \
+            --no-deps \
+            dist/rtsp_proxy-0.1.0-py3-none-any.whl
+          .artifacts/release-venv/bin/rtsp-proxy-verify-release \
+            --manifest .artifacts/release/release-manifest.json
 
       - name: Verify effective listener contract
         env:

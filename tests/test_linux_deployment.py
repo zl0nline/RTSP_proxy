@@ -370,7 +370,8 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
     assert "Verify native release manifest end to end" in workflow
-    assert "uv run rtsp-proxy-verify-release --manifest" in workflow
+    assert ".artifacts/release-venv/bin/rtsp-proxy-verify-release" in workflow
+    assert "trusted_probe_ffprobe_identity" in workflow
     assert "Download controlled probe ffprobe" in workflow
     assert ".artifacts/release/libexec/rtsp-proxy-probe/ffprobe" in workflow
 

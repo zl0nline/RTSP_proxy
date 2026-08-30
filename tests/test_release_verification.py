@@ -232,6 +232,53 @@ def test_packaged_probe_ffprobe_catalog_covers_both_linux_architectures(
     assert amd64_digest != arm64_digest
 
 
+class _FakePackagedResource:
+    def __init__(self, payload: str) -> None:
+        self._payload = payload
+
+    def joinpath(self, *_parts: str) -> "_FakePackagedResource":
+        return self
+
+    def read_text(self, *, encoding: str) -> str:
+        assert encoding == "utf-8"
+        return self._payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",
+        '{"schema_version":2}',
+        '{"schema_version":1,"version":"candidate","architectures":{}}',
+        (
+            '{"schema_version":1,"version":7,'
+            '"architectures":{"amd64":{"binary_sha256":"'
+            + "0" * 64
+            + '"}}}'
+        ),
+        (
+            '{"schema_version":1,"version":"candidate",'
+            '"architectures":{"amd64":{"binary_sha256":"not-a-digest"}}}'
+        ),
+    ],
+)
+def test_malformed_packaged_probe_ffprobe_catalog_fails_closed(
+    payload: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "rtsp_proxy.release.files",
+        lambda _package: _FakePackagedResource(payload),
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="trusted_artifact_catalog_invalid",
+    ):
+        trusted_probe_ffprobe_identity("amd64")
+
+
 def test_stock_or_self_declared_mediamtx_is_rejected_before_execution(tmp_path: Path) -> None:
     manifest_path = write_release(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
