@@ -58,6 +58,7 @@ class _Executor:
         unresolved: int = 0,
         cleanup_unresolved: int = 0,
         cleanup_error: BaseException | None = None,
+        cleanup_wait_for: Event | None = None,
     ) -> None:
         self.result = result or ProbeExecutionResult(
             outcome=ProbeOutcome.HEALTHY,
@@ -68,6 +69,7 @@ class _Executor:
         self.unresolved = unresolved
         self.cleanup_unresolved = cleanup_unresolved
         self.cleanup_error = cleanup_error
+        self.cleanup_wait_for = cleanup_wait_for
         self.events: list[str] = []
 
     def reconcile_startup(self, *, timeout_seconds: float) -> int:
@@ -92,6 +94,8 @@ class _Executor:
     def retry_pending_cleanup(self, *, timeout_seconds: float) -> int:
         assert timeout_seconds > 0
         self.events.append("retry")
+        if self.cleanup_wait_for is not None:
+            assert self.cleanup_wait_for.wait(timeout=5)
         if self.cleanup_error is not None:
             error = self.cleanup_error
             self.cleanup_error = None
@@ -478,12 +482,15 @@ def test_probe_broker_worker_cleanup_interruption_stops_acceptance(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
 def test_probe_broker_fatal_cleanup_atomically_closes_queued_admission() -> None:
-    executor = _Executor(cleanup_error=KeyboardInterrupt("cleanup interrupted"))
+    second_accept_waiting = Event()
+    release_second_accept = Event()
+    executor = _Executor(
+        cleanup_error=KeyboardInterrupt("cleanup interrupted"),
+        cleanup_wait_for=second_accept_waiting,
+    )
     service = _service(executor)
     first_client, first_server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     second_client, second_server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    second_accept_waiting = Event()
-    release_second_accept = Event()
     listener = _AdmissionBarrierListener(
         first_server,
         second_server,
