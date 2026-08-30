@@ -1,8 +1,8 @@
 # Phase G probe-broker transport contract
 
 - Date: 2026-08-30
-- Status: implementation and direct-Linux amd64 contract green; independent
-  review and native amd64/arm64 CI pending
+- Status: implementation, direct-Linux amd64 contract and independent Spec/
+  Standards review green; native amd64/arm64 CI pending
 - Production decision: NO-GO
 
 ## Scope
@@ -29,12 +29,13 @@ producer and the future privileged broker:
 - the returned ownership object is context-managed, secret-free in diagnostics
   and supports one explicit detach for the next trusted boundary.
 
-The direct Linux test on `grob` passed 19 cases covering exact peer credentials,
+The direct Linux test on `grob` passed 30 cases covering canonical codec and
+policy validation, exact peer credentials,
 successful one-fd transfer, sender consumption, CLOEXEC, target/deadline/peer
 rejection, zero/two/three descriptors, one absolute sender/receiver deadline,
 slow-drip and expires-during-read rejection, interruption during descriptor
-registration and result handoff, and `/proc/self/fd` leak checks. The temporary
-test tree was removed afterward.
+registration and result handoff, grouped ownership failures, and `/proc/self/fd`
+leak checks. The temporary test tree was removed afterward.
 
 ## Deliberately excluded
 

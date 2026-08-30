@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from ipaddress import ip_address
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -17,6 +18,7 @@ import rtsp_proxy.probe_broker as broker_module
 from rtsp_proxy.probe_broker import (
     ProbeBrokerError,
     ProbeBrokerRequest,
+    ReceivedProbeInput,
     receive_probe_broker_request,
     send_probe_broker_request,
 )
@@ -47,6 +49,12 @@ def _fixed_wall_clock(value: int) -> Callable[[], int]:
         return value
 
     return read
+
+
+def _unix_socket_without_peer() -> socket.socket:
+    connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    peer.close()
+    return connection
 
 
 def test_broker_request_codec_is_deterministic_bounded_and_secret_free() -> None:
@@ -85,6 +93,71 @@ def test_broker_request_decoder_rejects_noncanonical_or_unbounded_input(
         ProbeBrokerRequest.decode(payload)
 
 
+def test_broker_request_rejects_invalid_fields_and_noncanonical_encoding() -> None:
+    with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+        ProbeBrokerRequest(
+            request_id=UUID(int=0),
+            endpoint_generation=_GENERATION,
+            target=_request().target,
+            deadline_unix_ms=_NOW_MS,
+        )
+    oversized = ProbeBrokerRequest(
+        request_id=_REQUEST_ID,
+        endpoint_generation=_GENERATION,
+        target=_request().target,
+        deadline_unix_ms=10**2_000,
+    )
+    with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+        oversized.encode()
+    with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+        ProbeBrokerRequest.decode(b"{")
+    with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+        ProbeBrokerRequest.decode(
+            _request().encode().replace(str(_REQUEST_ID).encode(), b"z" * 36)
+        )
+    with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+        ProbeBrokerRequest.decode(_request().encode() + b" ")
+
+
+def test_received_probe_input_detach_close_and_cleanup_failure_contract() -> None:
+    detached_read, detached_write = os.pipe()
+    detached = ReceivedProbeInput(request=_request(), _descriptor=detached_read)
+    try:
+        assert detached.detach() == detached_read
+        with pytest.raises(ProbeBrokerError, match="probe_broker_descriptor_closed"):
+            _ = detached.descriptor
+        detached.close()
+    finally:
+        os.close(detached_read)
+        os.close(detached_write)
+
+    failed_read, failed_write = os.pipe()
+    os.close(failed_read)
+    failed = ReceivedProbeInput(request=_request(), _descriptor=failed_read)
+    try:
+        with pytest.raises(
+            ProbeBrokerError,
+            match="probe_broker_descriptor_close_failed",
+        ):
+            failed.close()
+    finally:
+        os.close(failed_write)
+
+    grouped_read, grouped_write = os.pipe()
+    os.close(grouped_read)
+    grouped = ReceivedProbeInput(request=_request(), _descriptor=grouped_read)
+    try:
+        with pytest.raises(BaseExceptionGroup) as captured, grouped:
+            raise RuntimeError("public operation failed")
+        assert [type(error) for error in captured.value.exceptions] == [
+            RuntimeError,
+            ProbeBrokerError,
+        ]
+        assert "secret" not in str(captured.value)
+    finally:
+        os.close(grouped_write)
+
+
 def test_broker_sender_rejects_a_boolean_descriptor_without_closing_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,6 +170,137 @@ def test_broker_sender_rejects_a_boolean_descriptor_without_closing_it(
     try:
         with pytest.raises(ProbeBrokerError, match="probe_broker_descriptor_invalid"):
             send_probe_broker_request(sender, _request(), True, timeout_seconds=1)
+    finally:
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "connection_factory",
+        "broker_request",
+        "timeout_seconds",
+        "monotonic",
+        "reason",
+    ),
+    [
+        (
+            lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+            _request(),
+            1,
+            time.monotonic,
+            "probe_broker_socket_invalid",
+        ),
+        (
+            _unix_socket_without_peer,
+            _request(),
+            float("nan"),
+            time.monotonic,
+            "probe_broker_policy_invalid",
+        ),
+        (
+            _unix_socket_without_peer,
+            cast(ProbeBrokerRequest, object()),
+            1,
+            time.monotonic,
+            "probe_broker_request_invalid",
+        ),
+        (
+            _unix_socket_without_peer,
+            _request(),
+            1,
+            lambda: float("nan"),
+            "probe_broker_policy_invalid",
+        ),
+    ],
+)
+def test_broker_sender_consumes_owned_fd_on_policy_failure(
+    connection_factory: Callable[[], socket.socket],
+    broker_request: ProbeBrokerRequest,
+    timeout_seconds: float,
+    monotonic: Callable[[], float],
+    reason: str,
+) -> None:
+    connection = connection_factory()
+    descriptor, writer = os.pipe()
+    try:
+        with pytest.raises(ProbeBrokerError, match=reason):
+            send_probe_broker_request(
+                connection,
+                broker_request,
+                descriptor,
+                timeout_seconds=timeout_seconds,
+                monotonic=monotonic,
+            )
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        os.close(writer)
+        connection.close()
+
+
+def test_broker_sender_preserves_primary_and_descriptor_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    descriptor, writer = os.pipe()
+
+    def fail_close(closing_descriptor: int) -> None:
+        assert closing_descriptor == descriptor
+        raise OSError("simulated close failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "close", fail_close)
+            with pytest.raises(BaseExceptionGroup) as captured:
+                send_probe_broker_request(
+                    sender,
+                    _request(),
+                    descriptor,
+                    timeout_seconds=float("nan"),
+                )
+        assert [type(error) for error in captured.value.exceptions] == [
+            ProbeBrokerError,
+            ProbeBrokerError,
+        ]
+        assert "secret" not in str(captured.value)
+    finally:
+        os.close(descriptor)
+        os.close(writer)
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS contract")
+@pytest.mark.parametrize(
+    ("expected_uid", "wall_clock_ms", "monotonic"),
+    [
+        (True, lambda: _NOW_MS, time.monotonic),
+        (os.getuid(), lambda: 0, time.monotonic),
+        (
+            os.getuid(),
+            lambda: (_ for _ in ()).throw(ValueError("clock unavailable")),
+            time.monotonic,
+        ),
+        (os.getuid(), lambda: _NOW_MS, lambda: float("nan")),
+    ],
+)
+def test_broker_receiver_rejects_invalid_policy_before_reading(
+    expected_uid: int,
+    wall_clock_ms: Callable[[], int],
+    monotonic: Callable[[], float],
+) -> None:
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with pytest.raises(ProbeBrokerError, match="probe_broker_policy_invalid"):
+            receive_probe_broker_request(
+                receiver,
+                expected_uid=expected_uid,
+                expected_gid=os.getgid(),
+                request_timeout_seconds=1,
+                wall_clock_ms=wall_clock_ms,
+                monotonic=monotonic,
+            )
     finally:
         sender.close()
         receiver.close()
