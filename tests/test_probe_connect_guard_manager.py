@@ -28,10 +28,42 @@ from rtsp_proxy.probe_connect_guard import (
     ProbeConnectGuardArtifactIdentity,
     ProbeConnectGuardBackend,
     ProbeConnectGuardError,
+    ProbeConnectGuardLease,
     ProbeConnectGuardManager,
     ProbeConnectGuardScope,
 )
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
+
+
+class _GuardLedger:
+    def __init__(
+        self,
+        *,
+        publish_interrupt: str | None = None,
+        release_interrupt: str | None = None,
+    ) -> None:
+        self.value: ProbeConnectGuardLease | None = None
+        self.publish_interrupt = publish_interrupt
+        self.release_interrupt = release_interrupt
+
+    def publish(self, value: ProbeConnectGuardLease) -> None:
+        if self.publish_interrupt == "before_publish":
+            raise KeyboardInterrupt("guard publish interrupted before ownership")
+        self.value = value
+        if self.publish_interrupt == "after_publish":
+            raise KeyboardInterrupt("guard publish interrupted after ownership")
+
+    def owns(self, value: ProbeConnectGuardLease) -> bool:
+        return self.value is value
+
+    def release(self, value: ProbeConnectGuardLease) -> None:
+        if self.value is not value:
+            raise RuntimeError("guard ownership mismatch")
+        if self.release_interrupt == "before_release":
+            raise KeyboardInterrupt("guard release interrupted before ownership")
+        self.value = None
+        if self.release_interrupt == "after_release":
+            raise KeyboardInterrupt("guard release interrupted after ownership")
 
 
 @dataclass(slots=True)
@@ -158,6 +190,100 @@ def test_guard_manager_installs_verifies_and_releases_one_exact_scope(
     assert backend.removed == backend.installed
     with pytest.raises(ProbeConnectGuardError, match="probe_guard_lease_invalid"):
         manager.release(lease, timeout_seconds=3.0)
+
+
+@pytest.mark.parametrize(
+    ("interruption", "owns_lease", "remove_count"),
+    [
+        ("before_publish", False, 1),
+        ("after_publish", True, 0),
+    ],
+)
+def test_guard_manager_transfers_or_recovers_install_ownership_atomically(
+    tmp_path: Path,
+    interruption: str,
+    owns_lease: bool,
+    remove_count: int,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger(publish_interrupt=interruption)
+
+    with pytest.raises(KeyboardInterrupt, match="guard publish interrupted"):
+        manager.install_owned(
+            request_id=scope.request_id,
+            unit_name=scope.unit_name,
+            cgroup_path=scope.cgroup_path,
+            target=scope.target,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+
+    assert (ledger.value is not None) is owns_lease
+    assert len(backend.removed) == remove_count
+    if ledger.value is not None:
+        manager.ensure_released(
+            ledger.value,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+        assert ledger.value is None
+        assert len(backend.removed) == 1
+
+
+@pytest.mark.parametrize(
+    ("release_interruption", "ledger_retains_lease"),
+    [
+        ("before_release", True),
+        ("after_release", False),
+    ],
+)
+def test_guard_manager_makes_released_handoff_retryable(
+    tmp_path: Path,
+    release_interruption: str,
+    ledger_retains_lease: bool,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger(release_interrupt=release_interruption)
+    manager.install_owned(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+
+    with pytest.raises(KeyboardInterrupt, match="guard release interrupted"):
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert (ledger.value is lease) is ledger_retains_lease
+    assert backend.removed == [scope]
+
+    if ledger.value is lease:
+        ledger.release_interrupt = None
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+        assert ledger.value is None
+        assert backend.removed == [scope]
+
+    replacement = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    manager.release(replacement, timeout_seconds=3.0)
 
 
 def test_guard_manager_reconciles_zero_residue_before_first_install(

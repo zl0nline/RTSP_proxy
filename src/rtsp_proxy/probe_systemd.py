@@ -15,6 +15,7 @@ from uuid import UUID
 
 from rtsp_proxy.probe_broker import ProbeBrokerRequest
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
+from rtsp_proxy.probe_ownership import OwnershipLedger
 
 _PROBE_LAUNCHER = "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-probe-launcher"
 _PROBE_SLICE = "rtsp-probe.slice"
@@ -139,7 +140,13 @@ class ProbeTransientLease:
 
 @dataclass(slots=True)
 class _UnitRecord:
-    state: Literal["starting", "active", "cleaning", "cleanup_pending"]
+    state: Literal[
+        "starting",
+        "active",
+        "cleaning",
+        "cleanup_pending",
+        "collected",
+    ]
     output_read_fd: int
     output_pipe_identity: tuple[int, int]
     lease: ProbeTransientLease | None = None
@@ -184,6 +191,40 @@ class SystemdProbeManager:
         descriptors: ProbeTransientDescriptors,
         timeout_seconds: float,
     ) -> ProbeTransientLease:
+        lease = self._start(
+            request,
+            descriptors=descriptors,
+            timeout_seconds=timeout_seconds,
+            ownership=None,
+        )
+        assert lease is not None
+        return lease
+
+    def start_owned(
+        self,
+        request: ProbeBrokerRequest,
+        *,
+        descriptors: ProbeTransientDescriptors,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeTransientLease],
+    ) -> None:
+        """Publish an accepted lease or recover it before returning failure."""
+
+        _ = self._start(
+            request,
+            descriptors=descriptors,
+            timeout_seconds=timeout_seconds,
+            ownership=ownership,
+        )
+
+    def _start(
+        self,
+        request: ProbeBrokerRequest,
+        *,
+        descriptors: ProbeTransientDescriptors,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeTransientLease] | None,
+    ) -> ProbeTransientLease | None:
         if not isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 60:
             raise ProbeSystemdError("probe_transient_timeout_invalid")
         unit = build_probe_transient_unit(request, descriptors=descriptors)
@@ -211,13 +252,62 @@ class SystemdProbeManager:
                 record=record,
                 timeout_seconds=timeout_seconds,
             )
-            return lease
+            if ownership is None:
+                return lease
+            try:
+                ownership.publish(lease)
+            except BaseException as error:
+                if ownership.owns(lease):
+                    raise _sanitize_interruption(error) from None
+                self._recover_reserved_start(
+                    unit.unit_name,
+                    record,
+                    failure=(
+                        "probe_transient_start_failed"
+                        if isinstance(error, Exception)
+                        else None
+                    ),
+                    interruption=(
+                        None
+                        if isinstance(error, Exception)
+                        else _sanitize_interruption(error)
+                    ),
+                )
+            return None
         finally:
+            published = (
+                ownership is not None
+                and record.lease is not None
+                and ownership.owns(record.lease)
+            )
             self._release_operation(
                 unit.unit_name,
                 record,
-                preserve_active=lease is not None and sys.exc_info()[0] is None,
+                preserve_active=(
+                    published
+                    or (
+                        ownership is None
+                        and lease is not None
+                        and sys.exc_info()[0] is None
+                    )
+                ),
             )
+
+    def ensure_collected(
+        self,
+        lease: ProbeTransientLease,
+        *,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeTransientLease],
+    ) -> None:
+        """Collect one exact owned unit and release its caller ledger slot."""
+
+        _ = self._cleanup_lease(
+            lease,
+            output_fd=None,
+            timeout_seconds=timeout_seconds,
+            ownership=ownership,
+        )
 
     def _start_reserved(
         self,
@@ -316,6 +406,7 @@ class SystemdProbeManager:
         *,
         output_fd: int,
         timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeTransientLease] | None = None,
     ) -> bytes:
         """Read one bounded result and always collect its exact transient unit."""
 
@@ -323,6 +414,7 @@ class SystemdProbeManager:
             lease,
             output_fd=output_fd,
             timeout_seconds=timeout_seconds,
+            ownership=ownership,
         )
         if output is None:
             raise ProbeSystemdError("probe_transient_output_failed")
@@ -376,6 +468,7 @@ class SystemdProbeManager:
         *,
         output_fd: int | None,
         timeout_seconds: float | None,
+        ownership: OwnershipLedger[ProbeTransientLease] | None = None,
     ) -> bytes | None:
         if not isinstance(lease, ProbeTransientLease):
             raise ProbeSystemdError("probe_transient_lease_invalid")
@@ -393,9 +486,22 @@ class SystemdProbeManager:
                     raise ProbeSystemdError("probe_transient_lease_invalid")
                 if record.lease is not lease:
                     raise ProbeSystemdError("probe_transient_lease_invalid")
-                if record.state != "active":
+                if record.state == "collected" and ownership is not None:
+                    release_collected = True
+                elif record.state != "active":
                     raise ProbeSystemdError("probe_transient_cleanup_in_progress")
-                record.state = "cleaning"
+                else:
+                    record.state = "cleaning"
+                    release_collected = False
+            if release_collected:
+                assert ownership is not None
+                self._release_collected_ownership(
+                    lease.unit_name,
+                    record,
+                    lease,
+                    ownership,
+                )
+                return None
             output: bytes | None = None
             failure: str | None = None
             interruption: BaseException | None = None
@@ -419,12 +525,23 @@ class SystemdProbeManager:
                     failure = "probe_transient_output_failed"
                 except BaseException as error:
                     interruption = _sanitize_interruption(error)
-            recovery = self._recover_cleaning_record(lease.unit_name, record)
+            recovery = self._recover_cleaning_record(
+                lease.unit_name,
+                record,
+                retain_collected=ownership is not None,
+            )
             _raise_after_recovery(
                 failure=failure,
                 interruption=interruption,
                 recovery=recovery,
             )
+            if ownership is not None:
+                self._release_collected_ownership(
+                    lease.unit_name,
+                    record,
+                    lease,
+                    ownership,
+                )
             return output
         finally:
             if acquired:
@@ -501,6 +618,7 @@ class SystemdProbeManager:
         record: _UnitRecord,
         *,
         timeout_seconds: float = _PROBE_RECOVERY_TIMEOUT_SECONDS,
+        retain_collected: bool = False,
     ) -> _RecoveryOutcome:
         try:
             recovery = self._attempt_recovery(
@@ -514,8 +632,28 @@ class SystemdProbeManager:
                 collected=False,
                 interruption=_sanitize_interruption(error),
             )
-        self._finish_recovery(unit_name, record, recovery)
+        self._finish_recovery(
+            unit_name,
+            record,
+            recovery,
+            retain_collected=retain_collected,
+        )
         return recovery
+
+    def _release_collected_ownership(
+        self,
+        unit_name: str,
+        record: _UnitRecord,
+        lease: ProbeTransientLease,
+        ownership: OwnershipLedger[ProbeTransientLease],
+    ) -> None:
+        try:
+            ownership.release(lease)
+        except BaseException:
+            if not ownership.owns(lease):
+                self._remove_record(unit_name, record)
+            raise
+        self._remove_record(unit_name, record)
 
     def _mark_cleaning(self, unit_name: str, record: _UnitRecord) -> None:
         with self._units_lock:
@@ -538,12 +676,17 @@ class SystemdProbeManager:
         unit_name: str,
         record: _UnitRecord,
         recovery: _RecoveryOutcome,
+        *,
+        retain_collected: bool = False,
     ) -> None:
         with self._units_lock:
             if self._units.get(unit_name) is not record or record.state != "cleaning":
                 raise ProbeSystemdError("probe_transient_state_invalid")
             if recovery.collected:
-                del self._units[unit_name]
+                if retain_collected:
+                    record.state = "collected"
+                else:
+                    del self._units[unit_name]
             else:
                 self._mark_cleanup_pending_locked(record)
 

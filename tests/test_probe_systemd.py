@@ -55,6 +55,37 @@ class _RecordingTransport(ProbeSystemdTransport):
             raise self.recovery
 
 
+class _LeaseLedger:
+    def __init__(
+        self,
+        *,
+        interrupt: str | None = None,
+        release_interrupt: str | None = None,
+    ) -> None:
+        self.value: ProbeTransientLease | None = None
+        self.interrupt = interrupt
+        self.release_interrupt = release_interrupt
+
+    def publish(self, value: ProbeTransientLease) -> None:
+        if self.interrupt == "before_publish":
+            raise KeyboardInterrupt("publish interrupted before ownership")
+        self.value = value
+        if self.interrupt == "after_publish":
+            raise KeyboardInterrupt("publish interrupted after ownership")
+
+    def owns(self, value: ProbeTransientLease) -> bool:
+        return self.value is value
+
+    def release(self, value: ProbeTransientLease) -> None:
+        if self.value is not value:
+            raise RuntimeError("lease ownership mismatch")
+        if self.release_interrupt == "before_release":
+            raise KeyboardInterrupt("release interrupted before ownership")
+        self.value = None
+        if self.release_interrupt == "after_release":
+            raise KeyboardInterrupt("release interrupted after ownership")
+
+
 class _InterruptingJobPath(str):
     def startswith(
         self,
@@ -709,6 +740,120 @@ def test_systemd_manager_recovers_after_an_invalid_start_reply(job_path: str) ->
         assert transport.recoveries == [
             ("rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service", 7.0)
         ]
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+@pytest.mark.parametrize(
+    ("interruption", "owns_lease", "recovery_count"),
+    [
+        ("before_publish", False, 1),
+        ("after_publish", True, 0),
+    ],
+)
+def test_systemd_manager_transfers_or_recovers_start_ownership_atomically(
+    interruption: str,
+    owns_lease: bool,
+    recovery_count: int,
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    ledger = _LeaseLedger(interrupt=interruption)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="publish interrupted"):
+            manager.start_owned(
+                _request(),
+                descriptors=ProbeTransientDescriptors(
+                    run_gate_fd=100,
+                    sealed_input_fd=101,
+                    output_read_fd=output_read_fd,
+                    output_write_fd=output_write_fd,
+                ),
+                timeout_seconds=1.0,
+                ownership=ledger,
+            )
+
+        assert (ledger.value is not None) is owns_lease
+        assert len(transport.recoveries) == recovery_count
+        if ledger.value is not None:
+            manager.ensure_collected(
+                ledger.value,
+                timeout_seconds=1.0,
+                ownership=ledger,
+            )
+            assert ledger.value is None
+            assert len(transport.recoveries) == 1
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+@pytest.mark.parametrize(
+    ("release_interruption", "ledger_retains_lease"),
+    [
+        ("before_release", True),
+        ("after_release", False),
+    ],
+)
+def test_systemd_manager_makes_collected_handoff_retryable(
+    release_interruption: str,
+    ledger_retains_lease: bool,
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+    ledger = _LeaseLedger(release_interrupt=release_interruption)
+    try:
+        manager.start_owned(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+            ownership=ledger,
+        )
+        lease = ledger.value
+        assert lease is not None
+
+        with pytest.raises(KeyboardInterrupt, match="release interrupted"):
+            manager.ensure_collected(
+                lease,
+                timeout_seconds=1.0,
+                ownership=ledger,
+            )
+        assert (ledger.value is lease) is ledger_retains_lease
+        assert len(transport.recoveries) == 1
+
+        if ledger.value is lease:
+            ledger.release_interrupt = None
+            manager.ensure_collected(
+                lease,
+                timeout_seconds=1.0,
+                ownership=ledger,
+            )
+            assert ledger.value is None
+            assert len(transport.recoveries) == 1
+
+        replacement = manager.start(
+            _request(),
+            descriptors=ProbeTransientDescriptors(
+                run_gate_fd=100,
+                sealed_input_fd=101,
+                output_read_fd=output_read_fd,
+                output_write_fd=output_write_fd,
+            ),
+            timeout_seconds=1.0,
+        )
+        manager.cancel(replacement)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)

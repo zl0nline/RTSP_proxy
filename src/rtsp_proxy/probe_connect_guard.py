@@ -28,6 +28,7 @@ from typing import BinaryIO, NoReturn, Protocol, cast
 from uuid import UUID
 
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
+from rtsp_proxy.probe_ownership import OwnershipLedger
 
 _COMMAND_OUTPUT_MAX_BYTES = 65_536
 _COMMAND_CLEANUP_SECONDS = 1.0
@@ -1822,6 +1823,48 @@ class ProbeConnectGuardManager:
         target: ProbeConnectGuardTarget,
         timeout_seconds: float,
     ) -> ProbeConnectGuardLease:
+        lease = self._install(
+            request_id=request_id,
+            unit_name=unit_name,
+            cgroup_path=cgroup_path,
+            target=target,
+            timeout_seconds=timeout_seconds,
+            ownership=None,
+        )
+        assert lease is not None
+        return lease
+
+    def install_owned(
+        self,
+        *,
+        request_id: UUID,
+        unit_name: str,
+        cgroup_path: Path,
+        target: ProbeConnectGuardTarget,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
+    ) -> None:
+        """Publish a verified guard lease or remove it before failure returns."""
+
+        _ = self._install(
+            request_id=request_id,
+            unit_name=unit_name,
+            cgroup_path=cgroup_path,
+            target=target,
+            timeout_seconds=timeout_seconds,
+            ownership=ownership,
+        )
+
+    def _install(
+        self,
+        *,
+        request_id: UUID,
+        unit_name: str,
+        cgroup_path: Path,
+        target: ProbeConnectGuardTarget,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeConnectGuardLease] | None,
+    ) -> ProbeConnectGuardLease | None:
         self._validate_scope(
             request_id=request_id,
             unit_name=unit_name,
@@ -1882,8 +1925,22 @@ class ProbeConnectGuardManager:
                         raise ProbeConnectGuardError("probe_guard_state_invalid")
                     record.lease = lease
                     record.state = "active"
-                return lease
+                if ownership is None:
+                    return lease
+                try:
+                    ownership.publish(lease)
+                except BaseException:
+                    if ownership.owns(lease):
+                        raise
+                    raise
+                return None
             except BaseException as primary_error:
+                if (
+                    ownership is not None
+                    and record.lease is not None
+                    and ownership.owns(record.lease)
+                ):
+                    raise
                 self._cleanup_failed_install(
                     record,
                     deadline=deadline,
@@ -1900,12 +1957,47 @@ class ProbeConnectGuardManager:
         *,
         timeout_seconds: float,
     ) -> None:
+        self._release(
+            lease,
+            timeout_seconds=timeout_seconds,
+            ownership=None,
+        )
+
+    def ensure_released(
+        self,
+        lease: ProbeConnectGuardLease,
+        *,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
+    ) -> None:
+        """Remove one exact owned guard and release its caller ledger slot."""
+
+        self._release(
+            lease,
+            timeout_seconds=timeout_seconds,
+            ownership=ownership,
+        )
+
+    def _release(
+        self,
+        lease: ProbeConnectGuardLease,
+        *,
+        timeout_seconds: float,
+        ownership: OwnershipLedger[ProbeConnectGuardLease] | None,
+    ) -> None:
         if not isinstance(lease, ProbeConnectGuardLease):
             raise ProbeConnectGuardError("probe_guard_lease_invalid")
         self._validate_timeout(timeout_seconds)
         with self._lock:
             record = self._active.get(lease.unit_name)
-            if record is None or record.lease is not lease or record.state != "active":
+            if (
+                record is None
+                or record.lease is not lease
+                or (
+                    record.state != "active"
+                    and not (ownership is not None and record.state == "released")
+                )
+            ):
                 raise ProbeConnectGuardError("probe_guard_lease_invalid")
         operation_acquired = False
         try:
@@ -1916,10 +2008,21 @@ class ProbeConnectGuardManager:
                 if (
                     self._active.get(lease.unit_name) is not record
                     or record.lease is not lease
-                    or record.state != "active"
+                    or (
+                        record.state != "active"
+                        and not (
+                            ownership is not None and record.state == "released"
+                        )
+                    )
                 ):
                     raise ProbeConnectGuardError("probe_guard_lease_invalid")
-                record.state = "cleaning"
+                already_released = record.state == "released"
+                if not already_released:
+                    record.state = "cleaning"
+            if already_released:
+                assert ownership is not None
+                self._release_owned_record(record, lease, ownership)
+                return
             try:
                 self._backend.remove(record.scope, timeout_seconds=timeout_seconds)
             except BaseException as error:
@@ -1932,10 +2035,35 @@ class ProbeConnectGuardManager:
             with self._lock:
                 if self._active.get(lease.unit_name) is not record:
                     raise ProbeConnectGuardError("probe_guard_state_invalid")
-                del self._active[lease.unit_name]
+                if ownership is None:
+                    del self._active[lease.unit_name]
+                else:
+                    record.state = "released"
+            if ownership is not None:
+                self._release_owned_record(record, lease, ownership)
         finally:
             if operation_acquired:
                 self._release_operation(record)
+
+    def _release_owned_record(
+        self,
+        record: _GuardRecord,
+        lease: ProbeConnectGuardLease,
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
+    ) -> None:
+        try:
+            ownership.release(lease)
+        except BaseException:
+            if not ownership.owns(lease):
+                self._remove_active_record(record)
+            raise
+        self._remove_active_record(record)
+
+    def _remove_active_record(self, record: _GuardRecord) -> None:
+        with self._lock:
+            if self._active.get(record.scope.unit_name) is not record:
+                raise ProbeConnectGuardError("probe_guard_state_invalid")
+            del self._active[record.scope.unit_name]
 
     def retry_pending_cleanup(self, *, timeout_seconds: float) -> int:
         """Retry cleanup for every currently unresolved owned scope."""

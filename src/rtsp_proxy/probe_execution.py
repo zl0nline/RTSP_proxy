@@ -12,6 +12,7 @@ from uuid import UUID
 from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
 from rtsp_proxy.probe_connect_guard import ProbeConnectGuardLease
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
+from rtsp_proxy.probe_ownership import OwnershipLedger
 from rtsp_proxy.probe_systemd import ProbeTransientDescriptors, ProbeTransientLease
 from rtsp_proxy.probes import ProbeExecutionResult
 
@@ -57,6 +58,9 @@ class _OwnerSlot[Owned]:
             raise ProbeExecutionError("probe_execution_ownership_invalid")
         self.value = None
 
+    def owns(self, value: Owned) -> bool:
+        return self.value is value
+
 
 class ProbeExecutionChannelFactory(Protocol):
     def create_owned(
@@ -75,7 +79,7 @@ class _SystemdController(Protocol):
         *,
         descriptors: ProbeTransientDescriptors,
         timeout_seconds: float,
-        publish: Callable[[ProbeTransientLease], None],
+        ownership: OwnershipLedger[ProbeTransientLease],
     ) -> None:
         """Publish the lease before a committed unit can escape this call."""
 
@@ -85,7 +89,7 @@ class _SystemdController(Protocol):
         *,
         output_fd: int,
         timeout_seconds: float,
-        collected: Callable[[ProbeTransientLease], None],
+        ownership: OwnershipLedger[ProbeTransientLease],
     ) -> bytes:
         """Call collected only after the exact unit is definitively gone."""
 
@@ -94,7 +98,7 @@ class _SystemdController(Protocol):
         lease: ProbeTransientLease,
         *,
         timeout_seconds: float,
-        collected: Callable[[ProbeTransientLease], None],
+        ownership: OwnershipLedger[ProbeTransientLease],
     ) -> None:
         """Idempotently collect the exact unit and then call collected."""
 
@@ -112,7 +116,7 @@ class _GuardController(Protocol):
         cgroup_path: Path,
         target: ProbeConnectGuardTarget,
         timeout_seconds: float,
-        publish: Callable[[ProbeConnectGuardLease], None],
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
     ) -> None:
         """Publish the lease before a committed guard can escape this call."""
 
@@ -121,7 +125,7 @@ class _GuardController(Protocol):
         lease: ProbeConnectGuardLease,
         *,
         timeout_seconds: float,
-        released: Callable[[ProbeConnectGuardLease], None],
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
     ) -> None:
         """Idempotently remove the exact guard and then call released."""
 
@@ -278,7 +282,7 @@ class ProbeExecutionBroker:
                 request,
                 descriptors=execution_channels.descriptors,
                 timeout_seconds=self._remaining(deadline),
-                publish=ownership.systemd.publish,
+                ownership=ownership.systemd,
             )
             execution_channels.close_child_ends()
             unit_name = f"rtsp-probe-{request.request_id.hex}.service"
@@ -292,7 +296,7 @@ class ProbeExecutionBroker:
                 cgroup_path=cgroup_path,
                 target=request.target,
                 timeout_seconds=self._remaining(deadline),
-                publish=ownership.guard.publish,
+                ownership=ownership.guard,
             )
             self._require_request_live(request)
             _ = self._remaining(deadline)
@@ -302,7 +306,7 @@ class ProbeExecutionBroker:
                 systemd_lease,
                 output_fd=execution_channels.output_fd,
                 timeout_seconds=self._remaining(deadline),
-                collected=ownership.systemd.release,
+                ownership=ownership.systemd,
             )
             result = self._decode_result(raw_result)
         except BaseException as error:
@@ -390,7 +394,7 @@ class ProbeExecutionBroker:
                     self._systemd.ensure_collected(
                         systemd_lease,
                         timeout_seconds=remaining,
-                        collected=ownership.systemd.release,
+                        ownership=ownership.systemd,
                     )
                 except BaseException as error:
                     errors.append(error)
@@ -406,7 +410,7 @@ class ProbeExecutionBroker:
                     self._guard.ensure_released(
                         guard_lease,
                         timeout_seconds=remaining,
-                        released=ownership.guard.release,
+                        ownership=ownership.guard,
                     )
                 except BaseException as error:
                     errors.append(error)

@@ -15,6 +15,7 @@ from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
 from rtsp_proxy.probe_connect_guard import ProbeConnectGuardLease
 from rtsp_proxy.probe_execution import ProbeExecutionBroker, ProbeExecutionError
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
+from rtsp_proxy.probe_ownership import OwnershipLedger
 from rtsp_proxy.probe_systemd import ProbeTransientDescriptors, ProbeTransientLease
 from rtsp_proxy.probes import ProbeExecutionResult, ProbeOutcome
 
@@ -128,7 +129,7 @@ class _Systemd:
         *,
         descriptors: ProbeTransientDescriptors,
         timeout_seconds: float,
-        publish: Callable[[ProbeTransientLease], None],
+        ownership: OwnershipLedger[ProbeTransientLease],
     ) -> None:
         del descriptors
         assert timeout_seconds > 0
@@ -144,7 +145,7 @@ class _Systemd:
         if self.start_error is not None and not self.publish_before_start_error:
             raise self.start_error
         if self.publish_on_start:
-            publish(self.lease)
+            ownership.publish(self.lease)
         if self.start_error is not None:
             raise self.start_error
 
@@ -154,7 +155,7 @@ class _Systemd:
         *,
         output_fd: int,
         timeout_seconds: float,
-        collected: Callable[[ProbeTransientLease], None],
+        ownership: OwnershipLedger[ProbeTransientLease],
     ) -> bytes:
         assert lease is self.lease
         assert output_fd == 102
@@ -165,7 +166,7 @@ class _Systemd:
         if self.read_release is not None:
             assert self.read_release.wait(timeout=5.0)
         if self.collect_before_read_error:
-            collected(lease)
+            ownership.release(lease)
         if self.read_error is not None:
             raise self.read_error
         return self.output
@@ -175,7 +176,7 @@ class _Systemd:
         lease: ProbeTransientLease,
         *,
         timeout_seconds: float,
-        collected: Callable[[ProbeTransientLease], None],
+        ownership: OwnershipLedger[ProbeTransientLease],
     ) -> None:
         assert lease is self.lease
         assert timeout_seconds > 0
@@ -185,7 +186,7 @@ class _Systemd:
         if self.cancel_release is not None:
             assert self.cancel_release.wait(timeout=5.0)
         if self.collect_on_cancel:
-            collected(lease)
+            ownership.release(lease)
         if self.cancel_error is not None:
             raise self.cancel_error
 
@@ -226,7 +227,7 @@ class _Guard:
         cgroup_path: Path,
         target: ProbeConnectGuardTarget,
         timeout_seconds: float,
-        publish: Callable[[ProbeConnectGuardLease], None],
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
     ) -> None:
         del cgroup_path
         kwargs = {"timeout_seconds": timeout_seconds}
@@ -239,7 +240,7 @@ class _Guard:
         )
         if self.install_error is not None and not self.publish_before_install_error:
             raise self.install_error
-        publish(self.lease)
+        ownership.publish(self.lease)
         if self.install_error is not None:
             raise self.install_error
 
@@ -248,13 +249,13 @@ class _Guard:
         lease: ProbeConnectGuardLease,
         *,
         timeout_seconds: float,
-        released: Callable[[ProbeConnectGuardLease], None],
+        ownership: OwnershipLedger[ProbeConnectGuardLease],
     ) -> None:
         assert lease is self.lease
         assert timeout_seconds > 0
         self.events.append("guard.release")
         if self.release_callback:
-            released(lease)
+            ownership.release(lease)
         if self.release_error is not None:
             raise self.release_error
 
