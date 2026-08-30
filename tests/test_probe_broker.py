@@ -307,6 +307,78 @@ def test_broker_receiver_rejects_invalid_policy_before_reading(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS contract")
+def test_broker_receiver_rejects_an_oversized_frame_before_payload() -> None:
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sender.sendall(struct.pack("!I", 1_025))
+        with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+            receive_probe_broker_request(
+                receiver,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                request_timeout_seconds=1,
+                wall_clock_ms=lambda: _NOW_MS,
+            )
+    finally:
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS contract")
+def test_broker_receiver_rejects_an_unsealed_descriptor_without_leaking() -> None:
+    baseline = len(os.listdir("/proc/self/fd"))
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        payload = _request().encode()
+        frame = struct.pack("!I", len(payload)) + payload
+        sender.sendmsg(
+            [frame],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [descriptor]))],
+        )
+        with pytest.raises(ProbeBrokerError, match="probe_broker_descriptor_invalid"):
+            receive_probe_broker_request(
+                receiver,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                request_timeout_seconds=1,
+                wall_clock_ms=lambda: _NOW_MS,
+            )
+    finally:
+        os.close(descriptor)
+        sender.close()
+        receiver.close()
+    assert len(os.listdir("/proc/self/fd")) == baseline
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS contract")
+def test_broker_receiver_rejects_a_deadline_outside_the_bounded_window() -> None:
+    baseline = len(os.listdir("/proc/self/fd"))
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    descriptor = create_sealed_probe_input(_FFCONCAT)
+    request = ProbeBrokerRequest(
+        request_id=_REQUEST_ID,
+        endpoint_generation=_GENERATION,
+        target=_request().target,
+        deadline_unix_ms=_NOW_MS + 60_001,
+    )
+    try:
+        send_probe_broker_request(sender, request, descriptor, timeout_seconds=1)
+        with pytest.raises(ProbeBrokerError, match="probe_broker_request_invalid"):
+            receive_probe_broker_request(
+                receiver,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                request_timeout_seconds=1,
+                wall_clock_ms=lambda: _NOW_MS,
+            )
+    finally:
+        sender.close()
+        receiver.close()
+    assert len(os.listdir("/proc/self/fd")) == baseline
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS contract")
 def test_broker_transport_authenticates_peer_and_receives_one_bound_sealed_fd() -> None:
     sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     descriptor = create_sealed_probe_input(_FFCONCAT)

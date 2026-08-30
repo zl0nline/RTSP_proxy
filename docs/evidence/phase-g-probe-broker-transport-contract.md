@@ -29,10 +29,11 @@ producer and the future privileged broker:
 - the returned ownership object is context-managed, secret-free in diagnostics
   and supports one explicit detach for the next trusted boundary.
 
-The direct Linux test on `grob` passed 30 cases covering canonical codec and
+The direct Linux test on `grob` passed 33 cases covering canonical codec and
 policy validation, exact peer credentials,
 successful one-fd transfer, sender consumption, CLOEXEC, target/deadline/peer
-rejection, zero/two/three descriptors, one absolute sender/receiver deadline,
+rejection, oversized frames, unsealed and zero/two/three descriptors, bounded
+request deadlines, one absolute sender/receiver I/O deadline,
 slow-drip and expires-during-read rejection, interruption during descriptor
 registration and result handoff, grouped ownership failures, and `/proc/self/fd`
 leak checks. The temporary test tree was removed afterward.
