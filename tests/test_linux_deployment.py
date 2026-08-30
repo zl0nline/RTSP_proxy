@@ -466,12 +466,12 @@ def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
     assert "go test -race ./internal/auth ./internal/core ./internal/servers/rtsp" in builder
 
 
-def test_probe_ffprobe_source_build_has_immutable_build_provenance() -> None:
+def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     probe = catalog["probe_ffprobe"]
     patch = Path(probe["patch"])
 
-    assert probe["status"] == "source-only"
+    assert probe["status"] == "digest-pinned-native-candidate"
     assert probe["source_repository"] == "https://github.com/FFmpeg/FFmpeg"
     assert probe["source_commit"] == "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b"
     assert probe["source_date_epoch"] == 1_785_458_830
@@ -489,7 +489,18 @@ def test_probe_ffprobe_source_build_has_immutable_build_provenance() -> None:
     }
     assert probe["cflags"] == ["-O2", "-fno-ident"]
     assert probe["source_prefix_map"] == "/usr/src/ffmpeg"
-    assert probe["architectures"] == {}
+    assert probe["architectures"] == {
+        "amd64": {
+            "binary_sha256": (
+                "f4daff8216f93062965b4947982cafe50cf97363c4e7b01c66f455e7a37463f3"
+            )
+        },
+        "arm64": {
+            "binary_sha256": (
+                "cfebf1bf05e18d6d5dd680d890ec8bd0a6ae1e7db303bdc1ca131f51ae7ce557"
+            )
+        },
+    }
 
     result = subprocess.run(
         ["sh", "-n", "tools/build_probe_ffprobe.sh"],
