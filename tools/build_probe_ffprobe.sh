@@ -119,7 +119,6 @@ while IFS= read -r flag; do
     set -- "$@" "$flag"
 done < "$flags_file"
 cflags=$(jq --exit-status --raw-output '.probe_ffprobe.cflags | join(" ")' "$catalog")
-set -- "$@" "--extra-cflags=$cflags -ffile-prefix-map=$source_root=$source_prefix_map"
 
 mkdir "$object_root"
 (
@@ -128,6 +127,7 @@ mkdir "$object_root"
     export TZ=UTC
     export SOURCE_DATE_EPOCH="$source_date_epoch"
     export ZERO_AR_DATE=1
+    export CFLAGS="$cflags -ffile-prefix-map=$source_root=$source_prefix_map"
     "$source_root/configure" "$@"
     make -j2 ffprobe
 )

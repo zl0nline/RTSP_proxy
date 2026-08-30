@@ -289,10 +289,11 @@ jobs:
         run: uv run pytest -q tests/contract/test_probe_ffprobe.py
 
       - name: Upload controlled probe ffprobe candidate
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: probe-ffprobe-${{ matrix.arch }}
-          path: .artifacts/probe-ffprobe/ffprobe
+          path: .artifacts/probe-ffprobe/ffprobe*
           if-no-files-found: error
 
   browser-e2e:

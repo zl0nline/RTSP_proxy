@@ -502,7 +502,10 @@ def test_probe_ffprobe_source_build_has_immutable_build_provenance() -> None:
     builder = Path("tools/build_probe_ffprobe.sh").read_text(encoding="utf-8")
     assert "git -C \"$source_root\" apply --check" in builder
     assert "dpkg-query" in builder
-    assert "-ffile-prefix-map=$source_root=$source_prefix_map" in builder
+    assert (
+        'export CFLAGS="$cflags -ffile-prefix-map=$source_root=$source_prefix_map"'
+        in builder
+    )
     flags = probe["configure_flags"]
     assert "--disable-autodetect" in flags
     assert "--disable-ffmpeg" in flags
