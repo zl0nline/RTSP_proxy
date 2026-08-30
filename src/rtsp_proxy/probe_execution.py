@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import math
-import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from threading import Lock
+from typing import Protocol
+from uuid import UUID
 
-from rtsp_proxy.probe_broker import ReceivedProbeInput
+from rtsp_proxy.probe_broker import ProbeBrokerRequest, ReceivedProbeInput
+from rtsp_proxy.probe_connect_guard import ProbeConnectGuardLease
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
-from rtsp_proxy.probe_systemd import ProbeTransientDescriptors
+from rtsp_proxy.probe_systemd import ProbeTransientDescriptors, ProbeTransientLease
+from rtsp_proxy.probes import ProbeExecutionResult
+
+_MAX_EXECUTION_SECONDS = 60.0
+_MAX_OUTPUT_BYTES = 65_536
+_CLEANUP_RESERVE_SECONDS = 5.0
 
 
 class ProbeExecutionError(RuntimeError):
@@ -17,6 +25,8 @@ class ProbeExecutionError(RuntimeError):
 
 
 class _ExecutionChannels(Protocol):
+    """Idempotently closable parent/child descriptor ownership bundle."""
+
     descriptors: ProbeTransientDescriptors
     output_fd: int
 
@@ -27,28 +37,62 @@ class _ExecutionChannels(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(slots=True)
+class _OwnerSlot[Owned]:
+    """Pre-published destination for an interrupt-safe ownership handoff."""
+
+    value: Owned | None = None
+
+    def publish(self, value: Owned) -> None:
+        if self.value is not None:
+            raise ProbeExecutionError("probe_execution_ownership_invalid")
+        self.value = value
+
+    def release(self, value: Owned) -> None:
+        if self.value is not value:
+            raise ProbeExecutionError("probe_execution_ownership_invalid")
+        self.value = None
+
+
 class _ExecutionChannelFactory(Protocol):
-    def create(self, *, sealed_input_fd: int) -> _ExecutionChannels: ...
+    def create_owned(
+        self,
+        received: ReceivedProbeInput,
+        *,
+        publish: Callable[[_ExecutionChannels], None],
+    ) -> None:
+        """Duplicate the sealed input and publish every new descriptor owner."""
 
 
 class _SystemdController(Protocol):
-    def start(
+    def start_owned(
         self,
-        request: Any,
+        request: ProbeBrokerRequest,
         *,
         descriptors: ProbeTransientDescriptors,
         timeout_seconds: float,
-    ) -> Any: ...
+        publish: Callable[[ProbeTransientLease], None],
+    ) -> None:
+        """Publish the lease before a committed unit can escape this call."""
 
     def read_output(
         self,
-        lease: Any,
+        lease: ProbeTransientLease,
         *,
         output_fd: int,
         timeout_seconds: float,
-    ) -> bytes: ...
+        collected: Callable[[ProbeTransientLease], None],
+    ) -> bytes:
+        """Call collected only after the exact unit is definitively gone."""
 
-    def cancel(self, lease: Any) -> None: ...
+    def cancel(
+        self,
+        lease: ProbeTransientLease,
+        *,
+        timeout_seconds: float,
+        collected: Callable[[ProbeTransientLease], None],
+    ) -> None:
+        """Boundedly collect the exact unit and then call collected."""
 
 
 class _CgroupResolver(Protocol):
@@ -56,17 +100,49 @@ class _CgroupResolver(Protocol):
 
 
 class _GuardController(Protocol):
-    def install(
+    def install_owned(
         self,
         *,
-        request_id: Any,
+        request_id: UUID,
         unit_name: str,
         cgroup_path: Path,
         target: ProbeConnectGuardTarget,
         timeout_seconds: float,
-    ) -> Any: ...
+        publish: Callable[[ProbeConnectGuardLease], None],
+    ) -> None:
+        """Publish the lease before a committed guard can escape this call."""
 
-    def release(self, lease: Any, *, timeout_seconds: float) -> None: ...
+    def release(
+        self,
+        lease: ProbeConnectGuardLease,
+        *,
+        timeout_seconds: float,
+        released: Callable[[ProbeConnectGuardLease], None],
+    ) -> None:
+        """Remove the exact guard and then call released."""
+
+
+class _ResultDecoder(Protocol):
+    def decode(self, payload: bytes) -> ProbeExecutionResult:
+        """Return only a bounded, typed, secret-free probe result."""
+
+
+@dataclass(slots=True)
+class _ExecutionOwnership:
+    received: ReceivedProbeInput
+    channels: _OwnerSlot[_ExecutionChannels] = field(default_factory=_OwnerSlot)
+    systemd: _OwnerSlot[ProbeTransientLease] = field(default_factory=_OwnerSlot)
+    guard: _OwnerSlot[ProbeConnectGuardLease] = field(default_factory=_OwnerSlot)
+    received_closed: bool = False
+
+    @property
+    def collected(self) -> bool:
+        return (
+            self.channels.value is None
+            and self.systemd.value is None
+            and self.guard.value is None
+            and self.received_closed
+        )
 
 
 class ProbeExecutionBroker:
@@ -79,51 +155,49 @@ class ProbeExecutionBroker:
         guard: _GuardController,
         cgroups: _CgroupResolver,
         channels: _ExecutionChannelFactory,
+        decoder: _ResultDecoder,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_clock_ms: Callable[[], int] = lambda: int(time.time() * 1_000),
     ) -> None:
         self._systemd = systemd
         self._guard = guard
         self._cgroups = cgroups
         self._channels = channels
+        self._decoder = decoder
         self._monotonic = monotonic
+        self._wall_clock_ms = wall_clock_ms
+        self._active: dict[UUID, _ExecutionOwnership] = {}
+        self._active_lock = Lock()
 
     def execute(
         self,
         received: ReceivedProbeInput,
         *,
         timeout_seconds: float,
-    ) -> bytes:
+    ) -> ProbeExecutionResult:
         if not isinstance(received, ReceivedProbeInput):
             raise ProbeExecutionError("probe_execution_request_invalid")
-        if (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, (int, float))
-            or not math.isfinite(timeout_seconds)
-            or not 0 < timeout_seconds <= 60
-        ):
-            raise ProbeExecutionError("probe_execution_timeout_invalid")
-        try:
-            deadline = self._monotonic() + timeout_seconds
-        except (ArithmeticError, OSError, TypeError, ValueError):
-            raise ProbeExecutionError("probe_execution_timeout_invalid") from None
-        if not math.isfinite(deadline):
-            raise ProbeExecutionError("probe_execution_timeout_invalid")
-
+        timeout = self._validate_timeout(timeout_seconds)
         request = received.request
-        sealed_input_fd = received.detach()
-        execution_channels: _ExecutionChannels | None = None
-        systemd_lease: Any = None
-        guard_lease: Any = None
+        deadline = self._execution_deadline(request, timeout_seconds=timeout)
+        ownership = _ExecutionOwnership(received=received)
         primary_error: BaseException | None = None
-        result: bytes | None = None
+        result: ProbeExecutionResult | None = None
         try:
-            execution_channels = self._channels.create(
-                sealed_input_fd=sealed_input_fd,
+            with self._active_lock:
+                if request.request_id in self._active:
+                    raise ProbeExecutionError("probe_execution_already_active")
+                self._active[request.request_id] = ownership
+            self._channels.create_owned(
+                received,
+                publish=ownership.channels.publish,
             )
-            systemd_lease = self._systemd.start(
+            execution_channels = self._require_channels(ownership)
+            self._systemd.start_owned(
                 request,
                 descriptors=execution_channels.descriptors,
                 timeout_seconds=self._remaining(deadline),
+                publish=ownership.systemd.publish,
             )
             execution_channels.close_child_ends()
             unit_name = f"rtsp-probe-{request.request_id.hex}.service"
@@ -131,90 +205,275 @@ class ProbeExecutionBroker:
                 unit_name=unit_name,
                 timeout_seconds=self._remaining(deadline),
             )
-            guard_lease = self._guard.install(
+            self._guard.install_owned(
                 request_id=request.request_id,
                 unit_name=unit_name,
                 cgroup_path=cgroup_path,
                 target=request.target,
                 timeout_seconds=self._remaining(deadline),
+                publish=ownership.guard.publish,
             )
+            self._require_request_live(request)
             execution_channels.release_gate()
-            consumed_systemd_lease = systemd_lease
-            systemd_lease = None
-            result = self._systemd.read_output(
-                consumed_systemd_lease,
+            systemd_lease = self._require_systemd_lease(ownership)
+            raw_result = self._systemd.read_output(
+                systemd_lease,
                 output_fd=execution_channels.output_fd,
                 timeout_seconds=self._remaining(deadline),
+                collected=ownership.systemd.release,
             )
+            result = self._decode_result(raw_result)
         except BaseException as error:
             primary_error = error
 
-        cleanup_errors: list[BaseException] = []
-        if guard_lease is not None:
-            consumed_guard_lease = guard_lease
-            guard_lease = None
-            try:
-                self._guard.release(
-                    consumed_guard_lease,
-                    timeout_seconds=self._cleanup_timeout(deadline),
-                )
-            except BaseException as error:
-                cleanup_errors.append(error)
-        if systemd_lease is not None:
-            consumed_systemd_lease = systemd_lease
-            systemd_lease = None
-            try:
-                self._systemd.cancel(consumed_systemd_lease)
-            except BaseException as error:
-                cleanup_errors.append(error)
-        if execution_channels is not None:
-            try:
-                execution_channels.close()
-            except BaseException as error:
-                cleanup_errors.append(error)
-        else:
-            try:
-                os.close(sealed_input_fd)
-            except BaseException as error:
-                cleanup_errors.append(error)
+        with self._active_lock:
+            owns_record = self._active.get(request.request_id) is ownership
+        if not owns_record:
+            self._raise_failures(primary_error, [])
+            raise ProbeExecutionError("probe_execution_failed")
+        cleanup_deadline = self._cleanup_deadline()
+        cleanup_errors = self._cleanup_ownership(ownership, deadline=cleanup_deadline)
+        if ownership.collected:
+            self._remove_ownership(request.request_id, ownership)
 
-        if primary_error is not None:
-            if cleanup_errors and (
-                not isinstance(primary_error, Exception)
-                or any(not isinstance(error, Exception) for error in cleanup_errors)
-            ):
-                raise BaseExceptionGroup(
-                    "probe execution and cleanup were interrupted",
-                    [primary_error, *cleanup_errors],
-                ) from None
-            if not isinstance(primary_error, Exception):
-                raise primary_error from None
-            raise ProbeExecutionError("probe_execution_failed") from None
-        if cleanup_errors:
-            if any(not isinstance(error, Exception) for error in cleanup_errors):
-                raise BaseExceptionGroup(
-                    "probe execution cleanup was interrupted",
-                    cleanup_errors,
-                ) from None
-            raise ProbeExecutionError("probe_execution_cleanup_failed") from None
-        if not isinstance(result, bytes) or not result:
+        self._raise_failures(primary_error, cleanup_errors)
+        if not ownership.collected:
+            raise ProbeExecutionError("probe_execution_cleanup_pending")
+        if not isinstance(result, ProbeExecutionResult):
             raise ProbeExecutionError("probe_execution_result_invalid")
         return result
 
-    def _remaining(self, deadline: float) -> float:
+    def retry_pending_cleanup(self, *, timeout_seconds: float) -> int:
+        timeout = self._validate_timeout(timeout_seconds)
+        deadline = self._monotonic_deadline(timeout)
+        with self._active_lock:
+            pending = tuple(self._active.items())
+        interruptions: list[BaseException] = []
+        for request_id, ownership in pending:
+            if self._remaining_or_none(deadline) is None:
+                break
+            errors = self._cleanup_ownership(ownership, deadline=deadline)
+            interruptions.extend(
+                error for error in errors if not isinstance(error, Exception)
+            )
+            if ownership.collected:
+                self._remove_ownership(request_id, ownership)
+        if interruptions:
+            raise BaseExceptionGroup(
+                "probe execution cleanup retry was interrupted",
+                [_sanitize_interruption(error) for error in interruptions],
+            ) from None
+        with self._active_lock:
+            return len(self._active)
+
+    def _cleanup_ownership(
+        self,
+        ownership: _ExecutionOwnership,
+        *,
+        deadline: float,
+    ) -> list[BaseException]:
+        errors: list[BaseException] = []
+        systemd_lease = ownership.systemd.value
+        if systemd_lease is not None:
+            remaining = self._remaining_or_none(deadline)
+            if remaining is not None:
+                try:
+                    self._systemd.cancel(
+                        systemd_lease,
+                        timeout_seconds=remaining,
+                        collected=ownership.systemd.release,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+        if ownership.systemd.value is not None:
+            return errors
+
+        guard_lease = ownership.guard.value
+        if guard_lease is not None:
+            remaining = self._remaining_or_none(deadline)
+            if remaining is not None:
+                try:
+                    self._guard.release(
+                        guard_lease,
+                        timeout_seconds=remaining,
+                        released=ownership.guard.release,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+        if ownership.guard.value is not None:
+            return errors
+
+        execution_channels = ownership.channels.value
+        if execution_channels is not None:
+            try:
+                execution_channels.close()
+                ownership.channels.release(execution_channels)
+            except BaseException as error:
+                errors.append(error)
+        if ownership.channels.value is not None:
+            return errors
+
+        if not ownership.received_closed:
+            try:
+                ownership.received.close()
+                ownership.received_closed = True
+            except BaseException as error:
+                errors.append(error)
+        return errors
+
+    def _execution_deadline(
+        self,
+        request: ProbeBrokerRequest,
+        *,
+        timeout_seconds: float,
+    ) -> float:
+        remaining_request = self._request_remaining_seconds(request)
+        return self._monotonic_deadline(min(timeout_seconds, remaining_request))
+
+    def _request_remaining_seconds(self, request: ProbeBrokerRequest) -> float:
         try:
-            remaining = deadline - self._monotonic()
+            observed_at = self._wall_clock_ms()
         except (ArithmeticError, OSError, TypeError, ValueError):
             raise ProbeExecutionError("probe_execution_timeout") from None
-        if not math.isfinite(remaining) or remaining <= 0:
+        if isinstance(observed_at, bool) or not isinstance(observed_at, int):
+            raise ProbeExecutionError("probe_execution_timeout")
+        remaining_ms = request.deadline_unix_ms - observed_at
+        if remaining_ms <= 0:
+            raise ProbeExecutionError("probe_execution_timeout")
+        if remaining_ms > int(_MAX_EXECUTION_SECONDS * 1_000):
+            raise ProbeExecutionError("probe_execution_request_invalid")
+        return remaining_ms / 1_000
+
+    def _require_request_live(self, request: ProbeBrokerRequest) -> None:
+        _ = self._request_remaining_seconds(request)
+
+    def _monotonic_deadline(self, timeout_seconds: float) -> float:
+        try:
+            deadline = self._monotonic() + timeout_seconds
+        except (ArithmeticError, OSError, TypeError, ValueError):
+            raise ProbeExecutionError("probe_execution_timeout_invalid") from None
+        if not math.isfinite(deadline):
+            raise ProbeExecutionError("probe_execution_timeout_invalid")
+        return deadline
+
+    def _cleanup_deadline(self) -> float:
+        try:
+            return self._monotonic_deadline(_CLEANUP_RESERVE_SECONDS)
+        except ProbeExecutionError:
+            return 0.0
+
+    def _remaining(self, deadline: float) -> float:
+        remaining = self._remaining_or_none(deadline)
+        if remaining is None:
             raise ProbeExecutionError("probe_execution_timeout")
         return remaining
 
-    def _cleanup_timeout(self, deadline: float) -> float:
+    def _remaining_or_none(self, deadline: float) -> float | None:
         try:
             remaining = deadline - self._monotonic()
         except (ArithmeticError, OSError, TypeError, ValueError):
-            remaining = 0.0
-        if not math.isfinite(remaining):
-            remaining = 0.0
-        return min(5.0, max(0.1, remaining))
+            return None
+        if not math.isfinite(remaining) or remaining <= 0:
+            return None
+        return remaining
+
+    @staticmethod
+    def _validate_timeout(timeout_seconds: float) -> float:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= _MAX_EXECUTION_SECONDS
+        ):
+            raise ProbeExecutionError("probe_execution_timeout_invalid")
+        return float(timeout_seconds)
+
+    def _decode_result(self, payload: bytes) -> ProbeExecutionResult:
+        if not isinstance(payload, bytes) or not 1 <= len(payload) <= _MAX_OUTPUT_BYTES:
+            raise ProbeExecutionError("probe_execution_result_invalid")
+        try:
+            result = self._decoder.decode(payload)
+        except Exception:
+            raise ProbeExecutionError("probe_execution_result_invalid") from None
+        if not isinstance(result, ProbeExecutionResult):
+            raise ProbeExecutionError("probe_execution_result_invalid")
+        return result
+
+    @staticmethod
+    def _require_channels(ownership: _ExecutionOwnership) -> _ExecutionChannels:
+        channels = ownership.channels.value
+        if channels is None:
+            raise ProbeExecutionError("probe_execution_ownership_invalid")
+        return channels
+
+    @staticmethod
+    def _require_systemd_lease(
+        ownership: _ExecutionOwnership,
+    ) -> ProbeTransientLease:
+        lease = ownership.systemd.value
+        if lease is None:
+            raise ProbeExecutionError("probe_execution_ownership_invalid")
+        return lease
+
+    def _remove_ownership(
+        self,
+        request_id: UUID,
+        ownership: _ExecutionOwnership,
+    ) -> None:
+        with self._active_lock:
+            if self._active.get(request_id) is ownership:
+                self._active.pop(request_id)
+
+    @staticmethod
+    def _raise_failures(
+        primary: BaseException | None,
+        cleanup: list[BaseException],
+    ) -> None:
+        if primary is None and not cleanup:
+            return
+        sanitized_cleanup = [_sanitize_cleanup(error) for error in cleanup]
+        if primary is not None and not isinstance(primary, Exception):
+            interrupted = _sanitize_interruption(primary)
+            if sanitized_cleanup:
+                raise BaseExceptionGroup(
+                    "probe execution and cleanup were interrupted",
+                    [interrupted, *sanitized_cleanup],
+                ) from None
+            raise interrupted from None
+        if any(not isinstance(error, Exception) for error in cleanup):
+            failures: list[BaseException] = []
+            if primary is not None:
+                failures.append(ProbeExecutionError("probe_execution_failed"))
+            failures.extend(sanitized_cleanup)
+            raise BaseExceptionGroup(
+                "probe execution cleanup was interrupted",
+                failures,
+            ) from None
+        if primary is not None and cleanup:
+            raise ProbeExecutionError("probe_execution_and_cleanup_failed") from None
+        if primary is not None:
+            if isinstance(primary, ProbeExecutionError):
+                raise primary from None
+            raise ProbeExecutionError("probe_execution_failed") from None
+        raise ProbeExecutionError("probe_execution_cleanup_failed") from None
+
+
+def _sanitize_cleanup(error: BaseException) -> BaseException:
+    if isinstance(error, Exception):
+        return ProbeExecutionError("probe_execution_cleanup_failed")
+    return _sanitize_interruption(error)
+
+
+def _sanitize_interruption(error: BaseException) -> BaseException:
+    if isinstance(error, BaseExceptionGroup):
+        return BaseExceptionGroup(
+            "probe execution was interrupted",
+            [_sanitize_interruption(item) for item in error.exceptions],
+        )
+    if isinstance(error, KeyboardInterrupt):
+        return KeyboardInterrupt("probe_execution_interrupted")
+    if isinstance(error, SystemExit):
+        return SystemExit(1)
+    return BaseException("probe_execution_interrupted")
