@@ -519,6 +519,7 @@ jobs:
               /etc/rtsp-proxy/probe-broker.env \
               /opt/rtsp-proxy/current
             sudo rm -rf \
+              /run/rtsp-proxy-probe-contract \
               /opt/rtsp-proxy/releases/probe-contract \
               /sys/fs/bpf/rtsp-proxy-probe-broker
             sudo systemctl daemon-reload
@@ -552,6 +553,11 @@ jobs:
           sudo chmod -R go-w "$broker_release"
           sudo ln -s releases/probe-contract /opt/rtsp-proxy/current
           sudo install -d -o root -g root -m 0755 /etc/rtsp-proxy
+          sudo install -d -o root -g root -m 0755 \
+            /run/rtsp-proxy-probe-contract
+          sudo install -o root -g root -m 0755 \
+            tests/fixtures/probe_broker_client.py \
+            /run/rtsp-proxy-probe-contract/client.py
           sudo install -o root -g root -m 0600 \
             tests/fixtures/probe-broker.env /etc/rtsp-proxy/probe-broker.env
           sudo install -d -o root -g root -m 0700 \
@@ -570,6 +576,7 @@ jobs:
           sudo env \
             RTSP_PROXY_RUN_PROBE_BROKER_CONTRACT=1 \
             RTSP_PROXY_BPFTOOL="$broker_bpftool" \
+            RTSP_PROXY_PROBE_BROKER_CLIENT=/run/rtsp-proxy-probe-contract/client.py \
             "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
             tests/contract/test_probe_broker_service.py
           sudo systemctl is-active --quiet rtsp-proxy-probe-broker.service

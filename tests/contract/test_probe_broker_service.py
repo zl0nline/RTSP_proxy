@@ -24,7 +24,7 @@ pytestmark = [
 ]
 
 _BROKER_UNIT = "rtsp-proxy-probe-broker.service"
-_BROKER_CLIENT = Path("tests/fixtures/probe_broker_client.py").resolve()
+_BROKER_CLIENT_ENV = "RTSP_PROXY_PROBE_BROKER_CLIENT"
 _PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
 _OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
 _SECRET_CANARY = "probe-broker-secret-canary"
@@ -49,10 +49,19 @@ def _run_client(
     *,
     drop_privileges: bool = True,
 ) -> subprocess.Popen[bytes]:
+    raw_client = os.environ.get(_BROKER_CLIENT_ENV, "")
+    client_path = Path(raw_client)
+    if (
+        not client_path.is_absolute()
+        or not client_path.is_file()
+        or client_path.stat().st_uid != 0
+        or client_path.stat().st_mode & 0o022
+    ):
+        pytest.fail("exact root-owned broker client fixture is required")
     interpreter = "/opt/rtsp-proxy/current/.venv/bin/python"
     arguments = [
         interpreter,
-        str(_BROKER_CLIENT),
+        str(client_path),
         str(request_id),
         str(endpoint_generation),
         address,

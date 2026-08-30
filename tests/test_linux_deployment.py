@@ -436,6 +436,20 @@ def test_systemd_validation_stages_probe_broker_entrypoint() -> None:
     )
 
 
+def test_native_broker_ci_stages_client_outside_the_release() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    transaction_step = workflow.split(
+        "- name: Verify installed root broker transaction",
+        1,
+    )[1].split("- name: Verify effective listener contract", 1)[0]
+
+    client_path = "/run/rtsp-proxy-probe-contract/client.py"
+    assert client_path in transaction_step
+    assert "tests/fixtures/probe_broker_client.py" in transaction_step
+    assert f"RTSP_PROXY_PROBE_BROKER_CLIENT={client_path}" in transaction_step
+    assert "/opt/rtsp-proxy/releases/probe-contract/client.py" not in transaction_step
+
+
 def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     media = catalog["mediamtx"]
