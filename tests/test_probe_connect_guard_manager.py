@@ -844,6 +844,7 @@ class _FakeBpftool:
                 pin.chmod(0o600)
             return ""
         if command[:2] == ("cgroup", "attach"):
+            assert command[-1] == "multi"
             self.attachments[str(command[3])] = (
                 101 if command[3] == "cgroup_inet4_connect" else 102
             )

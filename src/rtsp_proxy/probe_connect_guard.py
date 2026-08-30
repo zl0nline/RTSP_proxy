@@ -485,6 +485,7 @@ class BpftoolProbeConnectGuardBackend:
                 self._IPV4_ATTACH,
                 "pinned",
                 str(paths.ipv4),
+                "multi",
                 budget=budget,
             )
             self._command(
@@ -494,6 +495,7 @@ class BpftoolProbeConnectGuardBackend:
                 self._IPV6_ATTACH,
                 "pinned",
                 str(paths.ipv6),
+                "multi",
                 budget=budget,
             )
             key = (0).to_bytes(4, "little")
