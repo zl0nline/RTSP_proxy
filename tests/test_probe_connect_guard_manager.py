@@ -2783,7 +2783,9 @@ def test_bpftool_command_recovers_zombie_before_pid_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_spawn = os.posix_spawn
+    original_pread = os.pread
     spawned: list[int] = []
+    inventory_reads = 0
     monkeypatch.setattr(
         probe_connect_guard,
         "_SPAWN_WRAPPER",
@@ -2808,7 +2810,19 @@ def test_bpftool_command_recovers_zombie_before_pid_report(
             time.sleep(0.001)
         raise KeyboardInterrupt("spawn return interrupted after child exit")
 
+    def fail_first_post_spawn_inventory_read(
+        descriptor: int,
+        length: int,
+        offset: int,
+    ) -> bytes:
+        nonlocal inventory_reads
+        inventory_reads += 1
+        if inventory_reads == 2:
+            raise OSError("injected owned inventory read failure")
+        return original_pread(descriptor, length, offset)
+
     monkeypatch.setattr(os, "posix_spawn", interrupt_after_child_becomes_zombie)
+    monkeypatch.setattr(os, "pread", fail_first_post_spawn_inventory_read)
     try:
         with pytest.raises(BaseException) as raised:
             probe_connect_guard._run_command(
@@ -2834,12 +2848,12 @@ def test_bpftool_command_recovers_zombie_before_pid_report(
                 os.waitpid(pid, 0)
 
 
-def test_bpftool_command_requires_direct_child_inventory_before_spawn(
+def test_bpftool_command_requires_owned_child_inventory_before_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spawn_called = False
 
-    def fail_child_inventory() -> set[int]:
+    def fail_child_inventory(_inventory: Any) -> None:
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
 
     def unexpected_spawn(*args: Any, **kwargs: Any) -> int:
@@ -2848,10 +2862,9 @@ def test_bpftool_command_requires_direct_child_inventory_before_spawn(
         raise AssertionError("spawn must not run without child inventory")
 
     monkeypatch.setattr(
-        probe_connect_guard,
-        "_thread_child_pids",
+        probe_connect_guard._OwnedThreadChildInventory,
+        "acquire",
         fail_child_inventory,
-        raising=False,
     )
     monkeypatch.setattr(os, "posix_spawn", unexpected_spawn)
 

@@ -24,7 +24,7 @@ from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
 from threading import Lock
-from typing import NoReturn, Protocol, cast
+from typing import BinaryIO, NoReturn, Protocol, cast
 from uuid import UUID
 
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
@@ -1733,6 +1733,66 @@ class _OwnedPipeReader:
         self._pipe.close_transferred_read()
 
 
+class _OwnedThreadChildInventory:
+    """Pre-spawn ownership of the calling thread's Linux child inventory."""
+
+    def __init__(self) -> None:
+        self._stream: BinaryIO | None = None
+
+    def acquire(self) -> None:
+        if self._stream is not None:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        if sys.platform != "linux":
+            return
+        try:
+            self._stream = Path("/proc/thread-self/children").open(  # noqa: SIM115
+                "rb",
+                buffering=0,
+            )
+        except OSError:
+            raise ProbeConnectGuardError(
+                "probe_guard_kernel_operation_failed"
+            ) from None
+
+    def snapshot(self, *, deadline: float | None = None) -> set[int] | None:
+        if self._stream is None:
+            return None
+        while True:
+            try:
+                payload = os.pread(self._stream.fileno(), 8_193, 0)
+                break
+            except OSError:
+                if deadline is None:
+                    raise ProbeConnectGuardError(
+                        "probe_guard_kernel_operation_failed"
+                    ) from None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProbeConnectGuardError(
+                        "probe_guard_kernel_operation_failed"
+                    ) from None
+                time.sleep(min(0.01, remaining))
+        if len(payload) > 8_192:
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        try:
+            child_pids = {
+                int(item) for item in payload.decode("ascii").split()
+            }
+        except (UnicodeDecodeError, ValueError):
+            raise ProbeConnectGuardError(
+                "probe_guard_kernel_operation_failed"
+            ) from None
+        if any(child_pid <= 0 for child_pid in child_pids):
+            raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+        return child_pids
+
+    def close(self) -> None:
+        if self._stream is None:
+            return
+        self._stream.close()
+        self._stream = None
+
+
 class ProbeConnectGuardManager:
     """Own install/read-back/release for exact per-probe cgroup guards."""
 
@@ -2813,6 +2873,7 @@ def _spawn_owned_process(
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
     previous_mask: set[int | signal.Signals] | None = None
     process: _SpawnedProcess | None = None
+    child_inventory = _OwnedThreadChildInventory()
     pipes = tuple(_OwnedSpawnPipe() for _index in range(4))
     stdout_pipe, stderr_pipe, pid_pipe, gate_pipe = pipes
     blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
@@ -2826,7 +2887,8 @@ def _spawn_owned_process(
         )
         for pipe in pipes:
             pipe.acquire()
-        child_pids_before_spawn = _thread_child_pids()
+        child_inventory.acquire()
+        child_pids_before_spawn = child_inventory.snapshot()
         process = _SpawnedProcess(arguments=arguments)
         owner.process = process
         child_descriptors = (*pass_fds, pid_pipe.write_descriptor, gate_pipe.read_descriptor)
@@ -2901,7 +2963,9 @@ def _spawn_owned_process(
             if recovered_pid is None:
                 recovered_pid = _recover_gated_spawn_pid(
                     spawn_nonce,
+                    child_inventory=child_inventory,
                     child_pids_before_spawn=child_pids_before_spawn,
+                    deadline=recovery_deadline,
                 )
             if recovered_pid is not None:
                 process.pid = recovered_pid
@@ -2929,6 +2993,10 @@ def _spawn_owned_process(
         raise
     finally:
         cleanup_errors = [error for pipe in reversed(pipes) for error in pipe.close()]
+        try:
+            child_inventory.close()
+        except BaseException as error:
+            cleanup_errors.append(_sanitize_cleanup_error(error))
         if previous_mask is not None:
             try:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
@@ -2998,34 +3066,14 @@ def _read_reported_spawn_pid(
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
 
 
-def _thread_child_pids() -> set[int] | None:
-    children_path = Path("/proc/thread-self/children")
-    if not children_path.is_file():
-        if sys.platform == "linux":
-            raise ProbeConnectGuardError(
-                "probe_guard_kernel_operation_failed"
-            ) from None
-        return None
-    try:
-        children_payload = children_path.read_bytes()
-        if len(children_payload) > 8_192:
-            raise ValueError
-        child_pids = {
-            int(item) for item in children_payload.decode("ascii").split()
-        }
-        if any(child_pid <= 0 for child_pid in child_pids):
-            raise ValueError
-    except (OSError, UnicodeDecodeError, ValueError):
-        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
-    return child_pids
-
-
 def _recover_gated_spawn_pid(
     spawn_nonce: str,
     *,
+    child_inventory: _OwnedThreadChildInventory,
     child_pids_before_spawn: set[int] | None,
+    deadline: float,
 ) -> int | None:
-    child_pids_after_spawn = _thread_child_pids()
+    child_pids_after_spawn = child_inventory.snapshot(deadline=deadline)
     if child_pids_before_spawn is None or child_pids_after_spawn is None:
         return None
     candidate_pids = child_pids_after_spawn.difference(child_pids_before_spawn)
