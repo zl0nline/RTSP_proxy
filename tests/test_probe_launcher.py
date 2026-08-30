@@ -42,6 +42,7 @@ def _launcher(
     expected_digest: str | None = None,
     input_validator: Callable[[int], int] | None = None,
     execve: Callable[[int, tuple[str, ...], Mapping[str, str]], object] | None = None,
+    identity_provider: Callable[[str], tuple[str, Sha256]] | None = None,
 ) -> LinuxProbeFfprobeLauncher:
     payload = binary.read_bytes()
     digest = expected_digest or hashlib.sha256(payload).hexdigest()
@@ -50,7 +51,8 @@ def _launcher(
         trusted_owner_uid=os.getuid(),
         gate_reader=gate_reader or _GateReader(b"R", b""),
         input_validator=input_validator or (lambda descriptor: descriptor),
-        identity_provider=lambda _machine: ("probe-test", Sha256(root=digest)),
+        identity_provider=identity_provider
+        or (lambda _machine: ("probe-test", Sha256(root=digest))),
         machine=lambda: "x86_64",
         execve=execve or (lambda _fd, _argv, _env: None),
     )
@@ -111,6 +113,21 @@ def test_launcher_releases_only_the_fixed_fd_bound_command(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
+    ("binary_path", "trusted_owner_uid"),
+    [(Path("relative/ffprobe"), 0), (Path("/absolute/ffprobe"), True)],
+)
+def test_launcher_rejects_an_invalid_local_policy(
+    binary_path: Path,
+    trusted_owner_uid: int,
+) -> None:
+    with pytest.raises(ProbeLauncherError, match=r"^probe_launcher_policy_invalid$"):
+        LinuxProbeFfprobeLauncher(
+            binary_path=binary_path,
+            trusted_owner_uid=trusted_owner_uid,
+        )
+
+
+@pytest.mark.parametrize(
     "chunks",
     [
         (b"", b""),
@@ -142,6 +159,16 @@ def test_launcher_rejects_any_noncanonical_gate_before_reading_input(
     assert input_reads == []
 
 
+def test_launcher_sanitizes_a_gate_read_failure(tmp_path: Path) -> None:
+    binary = _binary(tmp_path)
+
+    def failing_gate(_descriptor: int, _maximum: int) -> bytes:
+        raise OSError("injected gate failure")
+
+    with pytest.raises(ProbeLauncherError, match=r"^probe_launcher_gate_invalid$"):
+        _launcher(binary, gate_reader=failing_gate).launch()
+
+
 def test_launcher_rejects_an_untrusted_binary_without_executing_it(
     tmp_path: Path,
 ) -> None:
@@ -157,6 +184,63 @@ def test_launcher_rejects_an_untrusted_binary_without_executing_it(
         launcher.launch()
 
     assert executed == []
+
+
+@pytest.mark.parametrize("invalid_identity", [RuntimeError("secret"), object()])
+def test_launcher_rejects_an_invalid_packaged_identity_without_disclosure(
+    tmp_path: Path,
+    invalid_identity: object,
+) -> None:
+    binary = _binary(tmp_path)
+
+    def identity_provider(_machine: str) -> tuple[str, Sha256]:
+        if isinstance(invalid_identity, BaseException):
+            raise invalid_identity
+        return "probe-test", invalid_identity  # type: ignore[return-value]
+
+    launcher = _launcher(binary, identity_provider=identity_provider)
+
+    with pytest.raises(ProbeLauncherError) as raised:
+        launcher.launch()
+
+    assert str(raised.value) == "probe_launcher_binary_invalid"
+    assert "secret" not in repr(raised.value)
+
+
+def test_launcher_rejects_missing_no_follow_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = _binary(tmp_path)
+    monkeypatch.delattr("rtsp_proxy.probe_launcher.os.O_NOFOLLOW")
+
+    with pytest.raises(ProbeLauncherError, match=r"^probe_launcher_binary_invalid$"):
+        _launcher(binary).launch()
+
+
+@pytest.mark.parametrize("failure", ["error", "short", "growth"])
+def test_launcher_rejects_ambiguous_binary_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    binary = _binary(tmp_path)
+    real_pread = os.pread
+    size = binary.stat().st_size
+
+    def failing_pread(descriptor: int, count: int, offset: int) -> bytes:
+        if failure == "error":
+            raise OSError("injected read failure")
+        if failure == "short":
+            return b""
+        if offset == size:
+            return b"x"
+        return real_pread(descriptor, count, offset)
+
+    monkeypatch.setattr("rtsp_proxy.probe_launcher.os.pread", failing_pread)
+
+    with pytest.raises(ProbeLauncherError, match=r"^probe_launcher_binary_invalid$"):
+        _launcher(binary).launch()
 
 
 def test_launcher_closes_the_binary_if_exec_unexpectedly_returns(
@@ -216,6 +300,30 @@ def test_launcher_main_fails_quietly_off_linux(
     assert capsys.readouterr() == ("", "")
 
 
+def test_launcher_main_fails_quietly_on_linux_gate_eof(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    original_stdin = os.dup(0)
+    gate_read, gate_write = os.pipe()
+    os.close(gate_write)
+    try:
+        os.dup2(gate_read, 0)
+        os.close(gate_read)
+        monkeypatch.setattr("rtsp_proxy.probe_launcher.sys.platform", "linux")
+        monkeypatch.setattr(
+            "rtsp_proxy.probe_launcher.os.supports_fd",
+            {os.execve},
+        )
+
+        assert main() == 70
+    finally:
+        os.dup2(original_stdin, 0)
+        os.close(original_stdin)
+
+    assert capfd.readouterr() == ("", "")
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux fd exec and memfd")
 def test_linux_launcher_executes_the_verified_inode_after_the_gate(
     tmp_path: Path,
@@ -271,7 +379,8 @@ def test_result_decoder_accepts_only_allowlisted_streams() -> None:
     decoder = ProbeFfprobeResultDecoder(clock=lambda: NOW)
 
     assert decoder.decode(
-        b'{"programs":[],"stream_groups":[],"streams":['
+        b'{"frames":[{"media_type":"video"},{"media_type":"audio"}],'
+        b'"programs":[],"stream_groups":[],"streams":['
         b'{"codec_name":"hevc","codec_type":"video"},'
         b'{"codec_name":"opus","codec_type":"audio"}]}'
     ) == ProbeExecutionResult(
@@ -286,22 +395,40 @@ def test_result_decoder_accepts_only_allowlisted_streams() -> None:
     "payload",
     [
         b"{}",
-        b'{"programs":[],"stream_groups":[],"streams":[]}',
-        b'{"programs":[{}],"stream_groups":[],"streams":['
+        b'{"frames":[],"programs":[],"stream_groups":[],"streams":[]}',
+        b'{"frames":[],"programs":[{}],"stream_groups":[],"streams":['
         b'{"codec_name":"h264","codec_type":"video"}]}',
-        b'{"programs":[],"stream_groups":[{}],"streams":['
+        b'{"frames":[],"programs":[],"stream_groups":[{}],"streams":['
         b'{"codec_name":"h264","codec_type":"video"}]}',
-        b'{"programs":[],"stream_groups":[],"streams":['
+        b'{"frames":[],"programs":[],"stream_groups":[],"streams":['
         b'{"codec_name":"aac","codec_type":"audio"}]}',
-        b'{"programs":[],"stream_groups":[],"streams":['
+        b'{"frames":[],"programs":[],"stream_groups":[],"streams":['
         b'{"codec_name":"h264","codec_type":"video"},'
         b'{"codec_name":"hevc","codec_type":"video"}]}',
-        b'{"programs":[],"stream_groups":[],"streams":['
+        b'{"frames":[],"programs":[],"stream_groups":[],"streams":['
         b'{"codec_name":"h264","codec_type":"video","url":"secret"}]}',
-        b'{"programs":[],"programs":[],"stream_groups":[],"streams":['
+        b'{"frames":[],"programs":[],"programs":[],"stream_groups":[],'
+        b'"streams":['
         b'{"codec_name":"h264","codec_type":"video"}]}',
-        b'{"programs":[],"stream_groups":[],"streams":['
+        b'{"frames":[],"programs":[],"stream_groups":[],"streams":['
         b'{"codec_name":"h264","codec_name":"hevc","codec_type":"video"}]}',
+        b'{"frames":[],"programs":[],"stream_groups":[],"streams":['
+        b'{"codec_name":"h264","codec_type":"video"}]}',
+        b'{"frames":[{"media_type":"audio"}],"programs":[],'
+        b'"stream_groups":[],"streams":['
+        b'{"codec_name":"h264","codec_type":"video"}]}',
+        b'{"frames":[{"media_type":"video","url":"secret"}],'
+        b'"programs":[],"stream_groups":[],"streams":['
+        b'{"codec_name":"h264","codec_type":"video"}]}',
+        b'{"frames":[{"media_type":"video"}],"programs":[],'
+        b'"stream_groups":[],"streams":['
+        b'{"codec_name":"h264","codec_type":1}]}',
+        b'{"frames":[{"media_type":"video"}],"programs":[],'
+        b'"stream_groups":[],"streams":['
+        b'{"codec_name":"h264","codec_type":"video"},'
+        b'{"codec_name":"opus","codec_type":"audio"}]}',
+        b'{"frames":NaN,"programs":[],"stream_groups":[],"streams":['
+        b'{"codec_name":"h264","codec_type":"video"}]}',
         b"not-json-secret-canary",
     ],
 )
@@ -322,6 +449,7 @@ def test_result_decoder_rejects_an_invalid_completion_clock() -> None:
 
     with pytest.raises(ValueError, match=r"^probe_ffprobe_result_invalid$"):
         decoder.decode(
-            b'{"programs":[],"stream_groups":[],"streams":['
+            b'{"frames":[{"media_type":"video"}],"programs":[],'
+            b'"stream_groups":[],"streams":['
             b'{"codec_name":"h264","codec_type":"video"}]}'
         )

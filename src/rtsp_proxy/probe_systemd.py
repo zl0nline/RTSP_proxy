@@ -990,6 +990,7 @@ def _fixed_properties(descriptors: ProbeTransientDescriptors) -> tuple[ProbeSyst
         _property("MemoryMax", "t", 134_217_728),
         _property("MemorySwapMax", "t", 0),
         _property("TasksMax", "t", 8),
+        _property("LimitCORE", "t", 0),
         _property("LimitNOFILE", "t", 64),
         _property("CPUQuotaPerSecUSec", "t", 500_000),
         _property("RuntimeMaxUSec", "t", 35_000_000),

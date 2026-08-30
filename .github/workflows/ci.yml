@@ -101,6 +101,18 @@ jobs:
           RTSP_PROXY_ROLE=web .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.runtime import create_app_from_environment; assert create_app_from_environment().title == "RTSP Proxy Control Plane"'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.probe_connect_guard import _load_packaged_artifact_catalog; catalog = _load_packaged_artifact_catalog(); assert catalog.current_release_id == "0.1.0"'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_ffprobe_identity; amd64 = trusted_probe_ffprobe_identity("amd64"); arm64 = trusted_probe_ffprobe_identity("arm64"); assert amd64[0] == arm64[0] == "9b6c896-rtsp-proxy.1"; assert amd64[1] != arm64[1]'
+          launcher_stdout=$(mktemp)
+          launcher_stderr=$(mktemp)
+          if .artifacts/clean-venv/bin/rtsp-proxy-probe-launcher \
+              </dev/null >"$launcher_stdout" 2>"$launcher_stderr"; then
+            echo "probe launcher unexpectedly accepted EOF input" >&2
+            exit 1
+          else
+            launcher_status=$?
+          fi
+          test "$launcher_status" -eq 70
+          test ! -s "$launcher_stdout"
+          test ! -s "$launcher_stderr"
 
       - name: Verify packaged migrations against native PostgreSQL
         run: |

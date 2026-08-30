@@ -41,16 +41,26 @@ same inode is executed with fd-based `execve`; only `LANG=C` and `LC_ALL=C`
 survive. Argv is fixed to quiet concat input on `pipe:2`, TCP-only nested
 protocols and the `codec_name`/`codec_type` JSON projection.
 
-The decoder accepts at most 64 KiB of unique-key UTF-8 JSON. Root keys are
-exactly `programs`, `stream_groups` and `streams`; the first two must be empty.
-One or two streams are accepted, with no duplicate media type: video is H264 or
-HEVC and audio is Opus. URL, metadata, programs, raw errors, unknown codecs,
-duplicate keys and malformed output fail with one secret-free error class.
+The invocation also caps input work at 64 packets and requests decoded-frame
+`media_type`. `-show_frames` precedes `-show_entries`; this order is part of the
+fixed contract because the reverse order makes ffprobe emit non-allowlisted
+frame metadata. SDP stream declarations without a decoded frame are not a
+healthy result.
 
-The focused local set passed 183 tests. A temporary isolated checkout on
-`grob` passed 61 Linux tests, including real sealed-memfd validation and
-`execve(fd)` after the run gate; the temporary directory was removed. These are
-mechanism results, not integrated production evidence.
+The decoder accepts at most 64 KiB of unique-key UTF-8 JSON. Root keys are
+exactly `frames`, `programs`, `stream_groups` and `streams`; the middle two must
+be empty. One or two streams are accepted, with no duplicate media type: video
+is H264 or HEVC and audio is Opus. Every declared media type must have at least
+one decoded frame and at most 128 bounded frame rows are accepted. URL,
+metadata, programs, raw errors, unknown codecs, duplicate keys, SDP-only output
+and malformed output fail with one secret-free error class.
+
+The initial focused local set passed 183 tests. An isolated checkout on `grob`
+passed 61 Linux launcher/descriptor tests, including real sealed-memfd
+validation and `execve(fd)` after the run gate. A follow-up exact-candidate run
+passed 40 controlled-artifact/launcher tests: zero RTP and corrupt H264 were
+rejected, while generated SPS/PPS/IDR produced the required decoded video
+frame. These are mechanism results, not integrated production evidence.
 
 ## Deliberately excluded
 

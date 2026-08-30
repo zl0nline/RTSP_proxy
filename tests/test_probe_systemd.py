@@ -185,6 +185,7 @@ def test_transient_unit_is_an_exact_typed_start_transient_unit_request() -> None
         "MemoryMax": ("t", 134_217_728),
         "MemorySwapMax": ("t", 0),
         "TasksMax": ("t", 8),
+        "LimitCORE": ("t", 0),
         "LimitNOFILE": ("t", 64),
         "CPUQuotaPerSecUSec": ("t", 500_000),
         "RuntimeMaxUSec": ("t", 35_000_000),

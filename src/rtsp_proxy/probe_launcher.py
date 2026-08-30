@@ -28,10 +28,13 @@ PROBE_FFPROBE_ARGV = (
     "0",
     "-protocol_whitelist",
     "file,pipe,rtsp,rtp,tcp",
+    "-read_intervals",
+    "%+#64",
     "-i",
     "pipe:2",
+    "-show_frames",
     "-show_entries",
-    "stream=codec_name,codec_type",
+    "stream=codec_name,codec_type:frame=media_type",
     "-of",
     "json",
 )
@@ -174,6 +177,7 @@ class ProbeFfprobeResultDecoder:
         try:
             root = _decode_unique_json(payload)
             if not isinstance(root, dict) or set(root) != {
+                "frames",
                 "programs",
                 "stream_groups",
                 "streams",
@@ -202,6 +206,19 @@ class ProbeFfprobeResultDecoder:
                 if codec_type in codecs or codec_name not in allowed.get(codec_type, ()):
                     raise ValueError
                 codecs[codec_type] = codec_name
+            frames = root["frames"]
+            if not isinstance(frames, list) or not 1 <= len(frames) <= 128:
+                raise ValueError
+            decoded_types: set[str] = set()
+            for frame in frames:
+                if not isinstance(frame, dict) or set(frame) != {"media_type"}:
+                    raise ValueError
+                media_type = frame["media_type"]
+                if not isinstance(media_type, str) or media_type not in codecs:
+                    raise ValueError
+                decoded_types.add(media_type)
+            if decoded_types != set(codecs):
+                raise ValueError
             completed_at = self._clock()
             if (
                 not isinstance(completed_at, datetime)

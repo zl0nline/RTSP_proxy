@@ -8,9 +8,13 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+
+from rtsp_proxy.probe_launcher import PROBE_FFPROBE_ARGV, ProbeFfprobeResultDecoder
+from rtsp_proxy.probes import ProbeExecutionResult, ProbeOutcome
 
 PROBE_FFPROBE_BINARY = os.environ.get("PROBE_FFPROBE_BINARY")
 pytestmark = pytest.mark.skipif(
@@ -25,6 +29,20 @@ class _ProbeResult:
     stdout: bytes
     stderr: bytes
     redirect_target_connected: bool
+
+
+@dataclass(frozen=True)
+class _MediaProbeResult:
+    completed: subprocess.CompletedProcess[bytes]
+    requests: tuple[str, ...]
+    port: int
+
+
+def _fixed_probe_argv() -> list[str]:
+    assert PROBE_FFPROBE_BINARY is not None
+    argv = [str(Path(PROBE_FFPROBE_BINARY).resolve(strict=True)), *PROBE_FFPROBE_ARGV[1:]]
+    argv[argv.index("pipe:2")] = "pipe:0"
+    return argv
 
 
 def _run_redirect_probe(*, refuse_redirect: bool) -> _ProbeResult:
@@ -83,23 +101,7 @@ def _run_redirect_probe(*, refuse_redirect: bool) -> _ProbeResult:
     def run_probe() -> None:
         completed.append(
             subprocess.run(
-                [
-                    str(Path(PROBE_FFPROBE_BINARY).resolve(strict=True)),
-                    "-v",
-                    "quiet",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-protocol_whitelist",
-                    "file,pipe,rtsp,rtp,tcp",
-                    "-i",
-                    "pipe:0",
-                    "-show_entries",
-                    "stream=index",
-                    "-of",
-                    "json",
-                ],
+                _fixed_probe_argv(),
                 input=payload,
                 check=False,
                 capture_output=True,
@@ -150,7 +152,7 @@ def test_controlled_probe_ffprobe_keeps_default_redirect_behavior_opt_in() -> No
     assert result.redirect_target_connected is True
 
 
-def test_controlled_probe_ffprobe_completes_ordinary_h264_rtsp_tcp() -> None:
+def _run_h264_media_probe(rtp_payloads: tuple[bytes, ...]) -> _MediaProbeResult:
     assert PROBE_FFPROBE_BINARY is not None
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -195,7 +197,7 @@ def test_controlled_probe_ffprobe_completes_ordinary_h264_rtsp_tcp() -> None:
                         "c=IN IP4 127.0.0.1\r\n"
                         "a=rtpmap:96 H264/90000\r\n"
                         "a=fmtp:96 packetization-mode=1;"
-                        "sprop-parameter-sets=Z0IAH5WoFAFuQA==,aM4xUg==\r\n"
+                        "sprop-parameter-sets=Z0LQC4xpyAeEQjU=,aM48gA==\r\n"
                         "a=control:trackID=0\r\n"
                     ).encode("ascii")
                     headers = (
@@ -224,15 +226,15 @@ def test_controlled_probe_ffprobe_completes_ordinary_h264_rtsp_tcp() -> None:
                     + body
                 )
                 if method == b"PLAY":
-                    for sequence in range(1, 4):
+                    for sequence, rtp_payload in enumerate(rtp_payloads, start=1):
                         rtp = struct.pack(
                             "!BBHII",
                             0x80,
-                            0x80 | 96,
+                            (0x80 if sequence == len(rtp_payloads) else 0) | 96,
                             sequence,
-                            sequence * 3_600,
+                            3_600,
                             0x12345678,
-                        ) + b"\x65\x88\x84\x00\x0a\xf2\x62\x80"
+                        ) + rtp_payload
                         connection.sendall(b"$\x00" + struct.pack("!H", len(rtp)) + rtp)
                         time.sleep(0.04)
                     time.sleep(0.2)
@@ -248,23 +250,7 @@ def test_controlled_probe_ffprobe_completes_ordinary_h264_rtsp_tcp() -> None:
         "option rw_timeout 2000000\n"
     ).encode("ascii")
     completed = subprocess.run(
-        [
-            str(Path(PROBE_FFPROBE_BINARY).resolve(strict=True)),
-            "-v",
-            "quiet",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-protocol_whitelist",
-            "file,pipe,rtsp,rtp,tcp",
-            "-i",
-            "pipe:0",
-            "-show_entries",
-            "stream=codec_name,codec_type",
-            "-of",
-            "json",
-        ],
+        _fixed_probe_argv(),
         input=payload,
         check=False,
         capture_output=True,
@@ -274,17 +260,63 @@ def test_controlled_probe_ffprobe_completes_ordinary_h264_rtsp_tcp() -> None:
     listener.close()
 
     assert not server.is_alive()
-    assert completed.returncode == 0
-    assert completed.stderr == b""
-    assert requests == [
+    return _MediaProbeResult(
+        completed=completed,
+        requests=tuple(requests),
+        port=port,
+    )
+
+
+def _expected_h264_requests(port: int) -> tuple[str, ...]:
+    return (
         f"OPTIONS rtsp://127.0.0.1:{port}/live RTSP/1.0",
         f"DESCRIBE rtsp://127.0.0.1:{port}/live RTSP/1.0",
         f"SETUP rtsp://127.0.0.1:{port}/live/trackID=0 RTSP/1.0",
         f"PLAY rtsp://127.0.0.1:{port}/live/ RTSP/1.0",
-    ]
-    output = json.loads(completed.stdout)
-    assert output == {
-        "programs": [],
-        "stream_groups": [],
-        "streams": [{"codec_name": "h264", "codec_type": "video"}],
-    }
+    )
+
+
+def test_controlled_probe_ffprobe_requires_a_decodable_h264_frame() -> None:
+    result = _run_h264_media_probe(
+        (
+            bytes.fromhex("6742d00b8c69c807844235"),
+            bytes.fromhex("68ce3c80"),
+            bytes.fromhex("65b8000409fffff87a28000827fc"),
+        ),
+    )
+
+    assert result.completed.returncode == 0
+    assert result.completed.stderr == b""
+    assert result.requests == _expected_h264_requests(result.port)
+    output = json.loads(result.completed.stdout)
+    assert output["programs"] == []
+    assert output["stream_groups"] == []
+    assert output["streams"] == [{"codec_name": "h264", "codec_type": "video"}]
+    assert output["frames"]
+    assert all(frame == {"media_type": "video"} for frame in output["frames"])
+    completed_at = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    assert ProbeFfprobeResultDecoder(clock=lambda: completed_at).decode(
+        result.completed.stdout
+    ) == ProbeExecutionResult(
+        outcome=ProbeOutcome.HEALTHY,
+        completed_at=completed_at,
+        video_codec="h264",
+    )
+
+
+@pytest.mark.parametrize(
+    "rtp_payloads",
+    [(), (b"\x00\x00\x00",) * 3],
+    ids=["zero-rtp", "corrupt-h264"],
+)
+def test_controlled_probe_ffprobe_rejects_metadata_without_a_decodable_frame(
+    rtp_payloads: tuple[bytes, ...],
+) -> None:
+    result = _run_h264_media_probe(rtp_payloads)
+
+    assert result.completed.stderr == b""
+    assert result.requests == _expected_h264_requests(result.port)
+    with pytest.raises(ValueError, match=r"^probe_ffprobe_result_invalid$"):
+        ProbeFfprobeResultDecoder(
+            clock=lambda: datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+        ).decode(result.completed.stdout)

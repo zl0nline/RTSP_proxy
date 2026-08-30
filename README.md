@@ -104,7 +104,7 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   and its attach/readback/run canaries;
 >   the exact-source no-redirect ffprobe is now reproducible, digest-pinned and
 >   release-admitted on amd64/arm64. Its fixed quiet launcher and strict
->   codec-only result decoder are implemented and direct-Linux amd64 green, but
+>   decoded-frame result contract are implemented and direct-Linux amd64 green, but
 >   independent review and the privileged amd64/arm64 end-to-end executor
 >   transaction remain mandatory. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see

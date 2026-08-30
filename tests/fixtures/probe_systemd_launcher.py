@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import socket
 import time
 from ipaddress import ip_address
@@ -29,6 +30,17 @@ def main() -> int:
     if b"/probe-systemd-overflow" in payload:
         _write_all(1, b"x" * 65_537)
         return 0
+    if b"/probe-systemd-core-limit" in payload:
+        _write_all(
+            1,
+            json.dumps(
+                {"core_limit": list(resource.getrlimit(resource.RLIMIT_CORE))},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            + b"\n",
+        )
+        os.abort()
     if b"/probe-systemd-cancel" in payload:
         time.sleep(60)
         return 0
