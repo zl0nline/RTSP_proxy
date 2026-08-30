@@ -2682,6 +2682,67 @@ def test_bpftool_command_owns_pid_before_unblocking_process_interruption(
                 os.waitpid(pid, 0)
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor ownership is a Linux production boundary",
+)
+def test_bpftool_command_closes_descriptors_when_pipe_acquisition_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_pipe = os.pipe
+    calls = 0
+
+    def fail_second_pipe() -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected pipe failure")
+        return original_pipe()
+
+    before = set(Path("/proc/self/fd").iterdir())
+    monkeypatch.setattr(os, "pipe", fail_second_pipe)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=1.0,
+        )
+
+    assert set(Path("/proc/self/fd").iterdir()) == before
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor inheritance is a Linux production boundary",
+)
+def test_bpftool_command_closes_unrelated_inheritable_descriptors() -> None:
+    unrelated_read, unrelated_write = os.pipe()
+    try:
+        os.set_inheritable(unrelated_read, True)
+        observed = probe_connect_guard._run_command(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; fd=int(sys.argv[1]); "
+                    "\ntry: os.fstat(fd)"
+                    "\nexcept OSError: print('closed')"
+                    "\nelse: print('visible')"
+                ),
+                str(unrelated_read),
+            ),
+            timeout_seconds=1.0,
+        )
+    finally:
+        os.close(unrelated_read)
+        os.close(unrelated_write)
+
+    assert observed == "closed\n"
+
+
 @pytest.mark.parametrize("failure", ["nonzero", "invalid_utf8", "timeout"])
 def test_bpftool_backend_bounds_command_exit_encoding_and_deadline(
     tmp_path: Path,

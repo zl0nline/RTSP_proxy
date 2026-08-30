@@ -51,6 +51,8 @@ import sys
 
 allowed_port = int(sys.argv[1])
 denied_port = int(sys.argv[2])
+wrong_ipv4_address = sys.argv[3]
+wrong_ipv6_address = sys.argv[4]
 sys.stdin.buffer.read(1)
 
 def connected(family, host, port):
@@ -61,10 +63,10 @@ def connected(family, host, port):
 print(json.dumps({
     "allowed_ipv4": connected(socket.AF_INET, "127.0.0.1", allowed_port),
     "denied_ipv4": connected(socket.AF_INET, "127.0.0.1", denied_port),
-    "wrong_ipv4": connected(socket.AF_INET, "127.0.0.2", allowed_port),
+    "wrong_ipv4": connected(socket.AF_INET, wrong_ipv4_address, allowed_port),
     "allowed_ipv6": connected(socket.AF_INET6, "::1", allowed_port),
     "denied_ipv6": connected(socket.AF_INET6, "::1", denied_port),
-    "wrong_ipv6": connected(socket.AF_INET6, "fd00::2", allowed_port),
+    "wrong_ipv6": connected(socket.AF_INET6, wrong_ipv6_address, allowed_port),
 }, sort_keys=True), flush=True)
 """
 
@@ -298,7 +300,15 @@ def _start_child(
     write_cgroup: Callable[[Path, int], None] | None = None,
 ) -> subprocess.Popen[str]:
     child = subprocess.Popen(
-        [sys.executable, "-c", _CHILD, str(allowed_port), str(denied_port)],
+        [
+            sys.executable,
+            "-c",
+            _CHILD,
+            str(allowed_port),
+            str(denied_port),
+            _WRONG_IPV4_ADDRESS,
+            _WRONG_IPV6_ADDRESS,
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -550,6 +560,20 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
         resources.own("listener stop signal", stopping.set)
 
         _mkdir_owned(cgroup, resources)
+        unrestricted = _start_child(
+            cgroup,
+            allowed_port,
+            denied_port,
+            resources,
+        )
+        assert _release(unrestricted) == {
+            "allowed_ipv4": True,
+            "denied_ipv4": True,
+            "wrong_ipv4": True,
+            "allowed_ipv6": True,
+            "denied_ipv6": True,
+            "wrong_ipv6": True,
+        }
         _mkdir_owned(pin_root, resources)
         _mkdir_owned(program_pins, resources)
         _mkdir_owned(map_pins, resources)
@@ -816,10 +840,17 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     unit_name = f"rtsp-probe-{request_id.hex}.service"
     allowed_port, denied_port = _free_adjacent_ports()
     target = ProbeConnectGuardTarget(ip_address(target_host), allowed_port)
+    wrong_address = (
+        _WRONG_IPV4_ADDRESS
+        if target_family == socket.AF_INET
+        else _WRONG_IPV6_ADDRESS
+    )
     payload = serialize_probe_input(
         address=target.address,
         port=target.port,
-        path_and_query="/probe-connect-guard-systemd",
+        path_and_query=(
+            f"/probe-connect-guard-systemd?wrong_address={wrong_address}"
+        ),
         username="contract",
         password="not-logged",
         io_timeout_microseconds=1_000_000,
@@ -831,11 +862,6 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
 
     with _managed_resources() as resources:
         stopping = threading.Event()
-        wrong_address = (
-            _WRONG_IPV4_ADDRESS
-            if target_family == socket.AF_INET
-            else _WRONG_IPV6_ADDRESS
-        )
         listeners = [
             _listener(target_family, target_host, allowed_port),
             _listener(target_family, target_host, denied_port),

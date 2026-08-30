@@ -2702,21 +2702,27 @@ def _spawn_owned_process(
         or not arguments
     ):
         raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
-    process = _SpawnedProcess(arguments=arguments)
-    owner.process = process
-    stdout_read, stdout_write = os.pipe()
-    stderr_read, stderr_write = os.pipe()
-    devnull = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
-    parent_descriptors = [
-        stdout_read,
-        stdout_write,
-        stderr_read,
-        stderr_write,
-        devnull,
-    ]
-    blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    parent_descriptors: list[int] = []
+    previous_mask: set[int | signal.Signals] | None = None
+    process: _SpawnedProcess | None = None
     try:
+        stdout_read, stdout_write = os.pipe()
+        parent_descriptors.extend((stdout_read, stdout_write))
+        stderr_read, stderr_write = os.pipe()
+        parent_descriptors.extend((stderr_read, stderr_write))
+        devnull = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        parent_descriptors.append(devnull)
+    except BaseException:
+        for descriptor in reversed(parent_descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
+    blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+    try:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+        child_signal_mask = tuple(int(item) for item in previous_mask)
+        process = _SpawnedProcess(arguments=arguments)
+        owner.process = process
         occupied_descriptors = {
             0,
             1,
@@ -2744,13 +2750,18 @@ def _spawn_owned_process(
                 (os.POSIX_SPAWN_DUP2, source, destination)
                 for source, destination in descriptor_mapping.items()
             ),
+            *(
+                (os.POSIX_SPAWN_CLOSE, descriptor)
+                for descriptor in _inheritable_descriptors()
+                if descriptor not in {0, 1, 2, *descriptor_mapping.values()}
+            ),
         ]
         process.pid = os.posix_spawn(
             bound_arguments[0],
             bound_arguments,
             env,
             file_actions=file_actions,
-            setsigmask=previous_mask,
+            setsigmask=child_signal_mask,
         )
         for descriptor in (stdout_write, stderr_write, devnull):
             os.close(descriptor)
@@ -2763,7 +2774,27 @@ def _spawn_owned_process(
         for descriptor in reversed(parent_descriptors):
             with suppress(OSError):
                 os.close(descriptor)
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def _inheritable_descriptors() -> tuple[int, ...]:
+    descriptor_directory = Path("/proc/self/fd")
+    if not descriptor_directory.is_dir():
+        descriptor_directory = Path("/dev/fd")
+    try:
+        entries = tuple(descriptor_directory.iterdir())
+    except OSError:
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+    descriptors: list[int] = []
+    for entry in entries:
+        try:
+            descriptor = int(entry.name)
+            if descriptor >= 3 and os.get_inheritable(descriptor):
+                descriptors.append(descriptor)
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(set(descriptors)))
 
 
 def _replace_descriptor_argument(
