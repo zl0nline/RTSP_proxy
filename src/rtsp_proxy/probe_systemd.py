@@ -292,6 +292,7 @@ class SystemdProbeManager:
             published_owned = True
             return None
         finally:
+            preserve_active = True
             try:
                 preserve_active = published_owned or (
                     ownership is None

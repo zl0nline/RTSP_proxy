@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import multiprocessing
 import os
@@ -317,6 +318,56 @@ def test_guard_manager_releases_operation_when_ownership_check_is_interrupted(
     lease = ledger.value
     assert lease is not None
 
+    manager.ensure_released(
+        lease,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    assert ledger.value is None
+    assert backend.removed == [scope]
+
+
+def test_guard_manager_preserves_lease_when_interrupted_after_publication(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    source_lines, first_line = inspect.getsourcelines(ProbeConnectGuardManager._install)
+    target_line = first_line + next(
+        index
+        for index, source_line in enumerate(source_lines)
+        if source_line.strip() == "published_owned = True"
+    )
+
+    def interrupt_after_publication(frame: Any, event: str, arg: Any) -> Any:
+        del arg
+        if (
+            frame.f_code is ProbeConnectGuardManager._install.__code__
+            and event == "line"
+            and frame.f_lineno == target_line
+        ):
+            sys.settrace(None)
+            raise KeyboardInterrupt("guard interrupted after publication")
+        return interrupt_after_publication
+
+    sys.settrace(interrupt_after_publication)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="guard interrupted after publication"):
+            manager.install_owned(
+                request_id=scope.request_id,
+                unit_name=scope.unit_name,
+                cgroup_path=scope.cgroup_path,
+                target=scope.target,
+                timeout_seconds=3.0,
+                ownership=ledger,
+            )
+    finally:
+        sys.settrace(None)
+
+    lease = ledger.value
+    assert lease is not None
+    assert backend.removed == []
     manager.ensure_released(
         lease,
         timeout_seconds=3.0,

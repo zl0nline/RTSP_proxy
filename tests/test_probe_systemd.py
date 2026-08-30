@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import traceback
 from dataclasses import replace
 from ipaddress import ip_address
@@ -893,6 +894,47 @@ def test_systemd_manager_releases_operation_when_ownership_check_is_interrupted(
             ownership=ledger,
         )
         assert ledger.value is None
+    finally:
+        os.close(output_read_fd)
+        os.close(output_write_fd)
+
+
+def test_systemd_manager_releases_operation_when_finalizer_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_read_fd, output_write_fd = os.pipe()
+    transport = _RecordingTransport(
+        ProbeSystemdReply(job_path="/org/freedesktop/systemd1/job/42")
+    )
+    manager = SystemdProbeManager(transport=transport)
+
+    class _InterruptingSys:
+        platform = sys.platform
+
+        @staticmethod
+        def exc_info() -> Never:
+            raise KeyboardInterrupt("systemd finalizer interrupted")
+
+    monkeypatch.setattr("rtsp_proxy.probe_systemd.sys", _InterruptingSys)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="systemd finalizer interrupted"):
+            manager.start(
+                _request(),
+                descriptors=ProbeTransientDescriptors(
+                    run_gate_fd=100,
+                    sealed_input_fd=101,
+                    output_read_fd=output_read_fd,
+                    output_write_fd=output_write_fd,
+                ),
+                timeout_seconds=1.0,
+            )
+
+        unit_name = f"rtsp-probe-{_REQUEST_ID.hex}.service"
+        record = manager._units[unit_name]
+        assert record.operation_lock.acquire(blocking=False)
+        record.operation_lock.release()
+        assert record.lease is not None
+        manager.cancel(record.lease)
     finally:
         os.close(output_read_fd)
         os.close(output_write_fd)
