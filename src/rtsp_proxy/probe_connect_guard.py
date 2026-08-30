@@ -2955,17 +2955,20 @@ def _spawn_owned_process(
             pid_pipe.close_write()
             gate_pipe.close_read()
             recovery_deadline = time.monotonic() + _COMMAND_CLEANUP_SECONDS
-            recovered_pid = _read_reported_spawn_pid(
-                pid_pipe,
-                required=False,
-                deadline=recovery_deadline,
-            )
-            if recovered_pid is None:
+            try:
                 recovered_pid = _recover_gated_spawn_pid(
                     spawn_nonce,
                     child_inventory=child_inventory,
                     child_pids_before_spawn=child_pids_before_spawn,
                     deadline=recovery_deadline,
+                )
+            except ProbeConnectGuardError:
+                recovered_pid = None
+            if recovered_pid is None:
+                recovered_pid = _read_reported_spawn_pid(
+                    pid_pipe,
+                    required=False,
+                    deadline=time.monotonic() + _COMMAND_CLEANUP_SECONDS,
                 )
             if recovered_pid is not None:
                 process.pid = recovered_pid

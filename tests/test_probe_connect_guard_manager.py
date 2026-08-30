@@ -2726,8 +2726,14 @@ def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_spawn = os.posix_spawn
-    original_pid_report = probe_connect_guard._read_reported_spawn_pid
+    original_pread = os.pread
     spawned: list[int] = []
+    inventory_reads = 0
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_SPAWN_WRAPPER",
+        "import time; time.sleep(30)\n" + probe_connect_guard._SPAWN_WRAPPER,
+    )
 
     def interrupt_after_spawn(
         path: str,
@@ -2739,17 +2745,19 @@ def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
         spawned.append(pid)
         raise KeyboardInterrupt("spawn return interrupted")
 
-    def force_proc_recovery(*args: Any, **kwargs: Any) -> int | None:
-        recovered = original_pid_report(*args, **kwargs)
-        assert recovered is not None
-        return None
+    def fail_first_post_spawn_inventory_read(
+        descriptor: int,
+        length: int,
+        offset: int,
+    ) -> bytes:
+        nonlocal inventory_reads
+        inventory_reads += 1
+        if inventory_reads == 2:
+            raise OSError("injected owned inventory read failure")
+        return original_pread(descriptor, length, offset)
 
     monkeypatch.setattr(os, "posix_spawn", interrupt_after_spawn)
-    monkeypatch.setattr(
-        probe_connect_guard,
-        "_read_reported_spawn_pid",
-        force_proc_recovery,
-    )
+    monkeypatch.setattr(os, "pread", fail_first_post_spawn_inventory_read)
     try:
         with pytest.raises(BaseException) as raised:
             probe_connect_guard._run_command(
