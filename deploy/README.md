@@ -457,7 +457,13 @@ process; a third fails with retryable `node_disruption_busy` before mutation.
 
 ## Artifact catalog and activation
 
-`artifact-catalog.json` pins FFmpeg/ffprobe URLs and digests. MediaMTX is built
+`artifact-catalog.json` pins the general FFmpeg/ffprobe URLs and digests. The
+controlled source-probe ffprobe is a separate release artifact under
+`libexec/rtsp-proxy-probe/ffprobe`: its exact FFmpeg source, local no-redirect
+patch, Ubuntu snapshot/toolchain and reproducible amd64/arm64 digests are bound
+by both the deployment catalog and the packaged verifier trust catalog. It is
+not interchangeable with `bin/ffprobe`, and release verification does not yet
+enable the Phase G executor. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
 two SHA-256-bound production patches, one deterministic race-regression patch,
 and Go `1.26.5`; resulting amd64/arm64 binary

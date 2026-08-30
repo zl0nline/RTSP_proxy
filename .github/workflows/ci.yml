@@ -341,6 +341,7 @@ jobs:
 
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})
+    needs: probe-ffprobe-contract
     strategy:
       fail-fast: false
       matrix:
@@ -371,6 +372,12 @@ jobs:
           go-version: "1.26.5"
           cache: false
 
+      - name: Download controlled probe ffprobe (${{ matrix.arch }})
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: probe-ffprobe-${{ matrix.arch }}
+          path: .artifacts/probe-ffprobe
+
       - name: Build pinned patched MediaMTX (${{ matrix.arch }})
         run: |
           mkdir -p .artifacts/mediamtx
@@ -398,10 +405,16 @@ jobs:
       - name: Verify native release manifest end to end
         run: |
           uv build
-          mkdir -p .artifacts/release/bin .artifacts/release/dist
+          mkdir -p \
+            .artifacts/release/bin \
+            .artifacts/release/dist \
+            .artifacts/release/libexec/rtsp-proxy-probe
           install -m 0755 .artifacts/mediamtx/mediamtx .artifacts/release/bin/mediamtx
           install -m 0755 .artifacts/ffmpeg/bin/ffmpeg .artifacts/release/bin/ffmpeg
           install -m 0755 .artifacts/ffmpeg/bin/ffprobe .artifacts/release/bin/ffprobe
+          install -m 0755 \
+            .artifacts/probe-ffprobe/ffprobe \
+            .artifacts/release/libexec/rtsp-proxy-probe/ffprobe
           install -m 0644 uv.lock .artifacts/release/uv.lock
           install -m 0644 dist/rtsp_proxy-0.1.0-py3-none-any.whl .artifacts/release/dist/
           lock_sha256=$(sha256sum .artifacts/release/uv.lock | awk '{print $1}')

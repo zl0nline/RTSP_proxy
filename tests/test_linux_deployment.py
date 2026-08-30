@@ -371,6 +371,8 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
 
     assert "Verify native release manifest end to end" in workflow
     assert "uv run rtsp-proxy-verify-release --manifest" in workflow
+    assert "Download controlled probe ffprobe" in workflow
+    assert ".artifacts/release/libexec/rtsp-proxy-probe/ffprobe" in workflow
 
 
 def test_native_ci_enforces_coverage_with_an_independent_exit_gate() -> None:
@@ -469,6 +471,9 @@ def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
 def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None:
     catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
     probe = catalog["probe_ffprobe"]
+    trusted_probe = json.loads(
+        Path("src/rtsp_proxy/artifacts/probe_ffprobe.json").read_text(encoding="utf-8")
+    )
     patch = Path(probe["patch"])
 
     assert probe["status"] == "digest-pinned-native-candidate"
@@ -500,6 +505,11 @@ def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None
                 "cfebf1bf05e18d6d5dd680d890ec8bd0a6ae1e7db303bdc1ca131f51ae7ce557"
             )
         },
+    }
+    assert trusted_probe == {
+        "schema_version": 1,
+        "version": probe["version"],
+        "architectures": probe["architectures"],
     }
 
     result = subprocess.run(

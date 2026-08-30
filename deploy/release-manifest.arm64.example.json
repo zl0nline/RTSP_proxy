@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "release_id": "0.12.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
@@ -22,6 +22,12 @@
     "binary_sha256": "9b889f62901440bbcd5b7a555af20bdd14a0ea03f2a91c1fed17c1b1ce0d5e05",
     "ffprobe_binary": "bin/ffprobe",
     "ffprobe_sha256": "c856b07b94c2f8d4ff5157cb069dc7af1067ea7045d6de42408d1fecd221ab24"
+  },
+  "probe_ffprobe": {
+    "version": "9b6c896-rtsp-proxy.1",
+    "linux_arch": "arm64",
+    "binary": "libexec/rtsp-proxy-probe/ffprobe",
+    "binary_sha256": "cfebf1bf05e18d6d5dd680d890ec8bd0a6ae1e7db303bdc1ca131f51ae7ce557"
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",
