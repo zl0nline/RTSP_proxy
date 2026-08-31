@@ -103,8 +103,10 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   integrates it with the already green exact cgroup `IP:port` guard and its
 >   attach/readback/run canaries. Its installed success, policy denial,
 >   deadline-driven cancellation, crash recovery, bounded-output/result failure,
->   video/audio/mixed and zero-residue matrix is native amd64/arm64 CI green;
->   explicit caller/shutdown cancellation and production scheduling remain open;
+>   video/audio/mixed, exact IPv6, redirect-refusal and zero-residue matrix is
+>   native amd64/arm64 CI green through the installed production client with
+>   mutual `SO_PEERCRED`; explicit caller/shutdown cancellation and production
+>   scheduling remain open;
 >   the exact-source no-redirect ffprobe is now reproducible, digest-pinned and
 >   release-admitted on amd64/arm64. Its fixed quiet launcher and strict
 >   decoded-frame result contract are independently reviewed and native
@@ -122,8 +124,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   independent-review and native amd64/arm64 CI green in
 >   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
 >   the root broker/executor remains an unpromoted integrated candidate, but its
->   installed success/failure matrix is native amd64/arm64 green in
->   [CI run 33432355260](https://github.com/zl0nline/RTSP_proxy/actions/runs/33432355260).
+>   installed eleven-case success/failure matrix is native amd64/arm64 green in
+>   [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327).
 >   Production scheduling remains disabled. See the
 >   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md),
 >   [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md)

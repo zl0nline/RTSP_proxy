@@ -1290,7 +1290,7 @@ impact is measured.
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
   green; the installed integrated broker success/failure matrix is native
   amd64/arm64 green in
-  [CI run 33432355260](https://github.com/zl0nline/RTSP_proxy/actions/runs/33432355260));
+  [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327));
 - [x] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe as a
   distinct reproducible amd64/arm64 release artifact with immutable digests,
   ordinary RTSP/TCP plus redirect-refusal behavior and clean-wheel release
@@ -1305,15 +1305,19 @@ impact is measured.
   exact peer and target policy, sealed descriptor handoff, nested systemd
   cgroup resolution, exact BPF tuple readback before gate release, decoded H264
   result and zero unit/cgroup/pin/receipt residue (all nine jobs green in
-  [CI run 33432355260](https://github.com/zl0nline/RTSP_proxy/actions/runs/33432355260));
+  [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327));
 - [x] integrated deadline-driven cancellation, output-flood, malformed-result,
   broker-crash recovery, repeated no-media failure, video/audio/mixed decoded
-  media, control-plane/unrelated-UID `/proc` isolation and zero-residue matrix
-  on native amd64/arm64 (nine installed broker contracts and all nine jobs green
-  in [CI run 33432355260](https://github.com/zl0nline/RTSP_proxy/actions/runs/33432355260));
+  media, exact IPv6 target, redirect-secret refusal, control-plane/unrelated-UID
+  `/proc` isolation and zero-residue matrix through the installed production
+  client on native amd64/arm64 (eleven installed broker contracts and all nine
+  jobs green in
+  [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327));
+- [x] production unprivileged AF_UNIX client with root `SO_PEERCRED`, sealed-fd
+  request handoff and normalized infrastructure failure, plus DNS-free exact
+  persisted endpoint restoration under the current site/policy/source digest;
 - [ ] define and prove explicit caller/shutdown cancellation plus the remaining
-  integrated IPv6/special-range/redirect/alternate-protocol cases before broker
-  promotion;
+  integrated special-range/alternate-protocol cases before broker promotion;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
@@ -1322,7 +1326,7 @@ impact is measured.
   transport tests, green in
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
   the socket-activated broker/executor candidate's installed success/failure
-  matrix is native amd64/arm64 green in CI run 33432355260, but explicit
+  matrix is native amd64/arm64 green in CI run 33439334327, but explicit
   cancellation and remaining network-policy cases still block promotion);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
@@ -1331,11 +1335,12 @@ impact is measured.
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
   the root-broker wiring remains unpromoted; its integrated success/failure
-  matrix is native amd64/arm64 green in CI run 33432355260 and explicit
+  matrix is native amd64/arm64 green in CI run 33439334327 and explicit
   caller/shutdown cancellation is still pending);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] promote the reviewed broker/executor after integrated native evidence,
-  then implement the periodic risk-based producer and durable health-state
+  then implement encrypted source-secret references, the authoritative camera
+  probe profile, periodic risk-based producer and durable health-state
   orchestration;
 - per-node 100-camera matrix;
 - multi-node server ladder and 24h soak;

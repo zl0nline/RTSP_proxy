@@ -1,10 +1,11 @@
 # Phase G integrated probe-broker contract
 
-- Date: 2026-08-31
-- Status: installed success/failure matrix native amd64/arm64 CI green;
-  explicit caller/shutdown cancellation and remaining policy matrix pending
-- Commit: `b9057f2378d6f28402dddc4684536fed6d72cdd5`
-- CI: [run 33432355260](https://github.com/zl0nline/RTSP_proxy/actions/runs/33432355260)
+- Date: 2026-09-01
+- Status: installed production-client success/failure matrix, exact IPv6 target
+  and redirect refusal native amd64/arm64 CI green; explicit caller/shutdown
+  cancellation and remaining policy matrix pending
+- Commit: `e5d12e071c64ce70633f067e8b84c864d101058d`
+- CI: [run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327)
   — all nine jobs passed
 - Deployment: direct Linux/system manager, no Docker
 - Production decision: NO-GO
@@ -14,8 +15,10 @@
 Both architecture-specific `media-binaries-contract` jobs installed the clean
 wheel and schema-v4 release under `/opt/rtsp-proxy/releases/probe-contract`,
 activated the documented `current` symlink, and started the shipped
-socket-activated root broker with its bounded systemd policy. The test client
-ran as the fixed `rtsp-proxy` identity; a root peer and an admitted-identity
+socket-activated root broker with its bounded systemd policy. The installed
+fixture invoked the wheel's production `UnixProbeBrokerClient` as the fixed
+`rtsp-proxy` identity. The broker verified that peer's UID/GID and the client
+verified the root broker with `SO_PEERCRED`; a root peer and an admitted-identity
 request outside the configured CIDR were rejected without creating a transient
 unit, BPF scope or ownership receipt.
 
@@ -39,6 +42,15 @@ proved it absent from `cmdline` and `environ`; both the control-plane UID and an
 unrelated service UID were unable to open sealed fd 2 through `/proc`. Effective
 broker CPU, memory, swap, task, fd and core-dump limits were also read back.
 
+An exact IPv6 `::1` contract independently completed the same decoded H264
+transaction with a bracketed RTSP authority and exact `connect6` tuple, then
+proved zero unit, pin and receipt residue. Loopback is used only by the isolated
+native fixture; ordinary camera admission continues to reject special ranges.
+A redirect response containing a unique secret canary was rejected by the
+controlled ffprobe before any connection to the redirected listener. The
+canary was absent from client output, stderr and the broker journal, and cleanup
+again left no unit, BPF scope or receipt.
+
 The installed failure matrix additionally proved:
 
 - a stalled RTSP source exhausts the absolute request deadline, cancels the
@@ -52,16 +64,17 @@ The installed failure matrix additionally proved:
 - a separate fault release that writes literal malformed JSON is rejected by
   the strict result decoder and collected identically.
 
-Each architecture's installed broker contract passed all nine cases. Both
-application jobs passed 1,529 tests with 45 expected skips and the
-independent coverage gate at 90.02%. The adjacent release, controlled-ffprobe,
+Each architecture's installed broker contract passed all eleven cases. Both
+application jobs passed 1,545 tests with 47 expected skips and the
+independent coverage gate at 90.03%. The adjacent release, controlled-ffprobe,
 direct systemd, exact connect-guard, load/pull and browser jobs also passed.
 
 ## Deliberately excluded
 
 This evidence does not yet define or prove explicit caller/shutdown cancellation
 independently of the absolute request deadline. The remaining integrated
-IPv6/special-range, redirect and alternate-protocol policy cases also stay open.
-The periodic risk-based producer and durable health-state orchestration are not
-wired to this broker. ADR 0004 therefore remains Proposed, Phase G remains IN
-PROGRESS and Production remains NO-GO.
+special-range and alternate-protocol policy cases also stay open. The periodic
+risk-based producer, encrypted source-secret reference, authoritative camera
+probe profile and durable health-state orchestration are not wired to this
+broker. ADR 0004 therefore remains Proposed, Phase G remains IN PROGRESS and
+Production remains NO-GO.
