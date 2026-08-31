@@ -846,7 +846,7 @@ def test_installed_broker_deadline_collects_stalled_probe_and_remains_available(
     assert _service_property("SubState") == "running"
 
 
-def test_installed_broker_restart_recovers_inflight_probe_before_readiness() -> None:
+def test_installed_broker_restart_recovers_inflight_probe_on_startup() -> None:
     if os.geteuid() != 0:
         pytest.fail("installed broker contract requires root")
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

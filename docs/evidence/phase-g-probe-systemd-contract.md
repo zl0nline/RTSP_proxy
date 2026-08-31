@@ -65,10 +65,11 @@ clean-wheel launcher and passed the independent 90% coverage gate at 90.08%.
 ## Deliberately excluded
 
 An installed root-owned socket/service and production-shaped executor now exist
-as an unpromoted integrated candidate. CI run 33426435190 proves on amd64 and
+as an unpromoted integrated candidate. CI run 33432355260 proves on amd64 and
 arm64 that the broker authenticates its AF_UNIX peer, revalidates site/CIDR
 policy, attaches and reads back both cgroup BPF hooks before releasing the gate,
-returns a decoded H264 result and collects unit/cgroup/pin/receipt residue. The
-integrated timeout, cancellation, output-flood, malformed-result, broker-restart
-and repeated-failure matrix is still pending. ADR 0004 therefore remains
-Proposed, Phase G stays IN PROGRESS and Production remains NO-GO.
+returns decoded video/audio/mixed results, bounds timeout/output/result failure,
+recovers broker crashes and repeated failures, and collects unit/cgroup/pin/
+receipt residue. Explicit caller/shutdown cancellation and the remaining
+integrated policy cases are still pending. ADR 0004 therefore remains Proposed,
+Phase G stays IN PROGRESS and Production remains NO-GO.

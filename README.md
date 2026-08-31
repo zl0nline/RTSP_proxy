@@ -101,14 +101,14 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   direct system-manager transient-unit primitive is now green on systemd 255
 >   and 259 and in privileged amd64/arm64 CI. A narrow root-broker candidate now
 >   integrates it with the already green exact cgroup `IP:port` guard and its
->   attach/readback/run canaries. Its installed success/denial/zero-residue
->   transaction is native amd64/arm64 CI green; the cancellation, timeout,
->   restart and adversarial failure matrix remains mandatory before promotion;
+>   attach/readback/run canaries. Its installed success, policy denial,
+>   deadline-driven cancellation, crash recovery, bounded-output/result failure,
+>   video/audio/mixed and zero-residue matrix is native amd64/arm64 CI green;
+>   explicit caller/shutdown cancellation and production scheduling remain open;
 >   the exact-source no-redirect ffprobe is now reproducible, digest-pinned and
 >   release-admitted on amd64/arm64. Its fixed quiet launcher and strict
 >   decoded-frame result contract are independently reviewed and native
->   amd64/arm64 CI green, but the privileged end-to-end executor transaction
->   remains mandatory. Foundation evidence is
+>   amd64/arm64 CI green. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
 >   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
 >   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),
@@ -122,8 +122,8 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   independent-review and native amd64/arm64 CI green in
 >   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
 >   the root broker/executor remains an unpromoted integrated candidate, but its
->   installed success/denial transaction is native amd64/arm64 green in
->   [CI run 33426435190](https://github.com/zl0nline/RTSP_proxy/actions/runs/33426435190).
+>   installed success/failure matrix is native amd64/arm64 green in
+>   [CI run 33432355260](https://github.com/zl0nline/RTSP_proxy/actions/runs/33432355260).
 >   Production scheduling remains disabled. See the
 >   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md),
 >   [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md)

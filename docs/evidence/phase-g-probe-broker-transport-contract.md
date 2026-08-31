@@ -51,8 +51,9 @@ A socket-activated root broker and executor are now implemented as an
 unpromoted integrated candidate. They add filesystem ownership for the socket,
 fixed-name-to-UID peer resolution, root-owned site/CIDR revalidation,
 system-manager transient properties, BPF attach/readback/run gating and bounded
-normalized responses. CI run 33426435190 proves complete descriptor handoff,
-controlled no-redirect ffprobe execution, policy denial and successful-path
-zero residue on amd64 and arm64. Cancellation, timeout, output-flood, restart and
-repeated-failure cleanup remain pending before promotion. ADR 0004 therefore
-stays Proposed and Phase G remains IN PROGRESS / Production NO-GO.
+normalized responses. CI run 33432355260 proves complete descriptor handoff,
+controlled no-redirect ffprobe execution, policy denial, deadline cancellation,
+output/result failure, crash recovery, repeated failure and zero residue on
+amd64 and arm64. Explicit caller/shutdown cancellation and the remaining
+integrated network-policy cases stay pending before promotion. ADR 0004
+therefore stays Proposed and Phase G remains IN PROGRESS / Production NO-GO.

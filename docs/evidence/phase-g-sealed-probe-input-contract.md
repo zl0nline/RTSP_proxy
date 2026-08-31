@@ -3,8 +3,8 @@
 - Date: 2026-08-30
 - Last reviewed: 2026-08-31
 - Status: five-line no-redirect sealed input, independent review and native
-  amd64/arm64 controlled-artifact plus integrated success/denial matrix green;
-  integrated failure matrix pending
+  amd64/arm64 controlled-artifact plus integrated success/failure matrix green;
+  explicit cancellation/policy cases pending
 - Production decision: NO-GO
 
 ## Scope
@@ -45,9 +45,11 @@ This primitive does not itself run ffprobe. The exact-source controlled binary,
 redirect contract, architecture digests and release admission are now complete.
 A separately documented transport covers authenticated `SO_PEERCRED` plus one
 `SCM_RIGHTS` descriptor, and a socket-activated root service/system-manager/BPF
-executor now exists as an unpromoted integrated candidate. CI run 33426435190
+executor now exists as an unpromoted integrated candidate. CI run 33432355260
 proves its sealed-descriptor handoff, attach/readback-before-release, decoded
-H264 result, policy denial and successful-path zero residue on amd64 and arm64.
-The bounded timeout/cancellation/output-flood/restart failure matrix remains
-pending. Consequently ADR 0004 stays Proposed, production scheduling stays
-disabled and Phase G remains IN PROGRESS / Production NO-GO.
+video/audio/mixed results, policy denial, deadline cancellation, bounded output/
+result failure, crash recovery, repeated failure and zero residue on amd64 and
+arm64. Explicit caller/shutdown cancellation and the remaining integrated
+network-policy cases stay pending. Consequently ADR 0004 stays Proposed,
+production scheduling stays disabled and Phase G remains IN PROGRESS /
+Production NO-GO.

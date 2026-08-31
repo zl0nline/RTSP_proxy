@@ -3,8 +3,8 @@
 - Date: 2026-08-30
 - Last reviewed: 2026-08-31
 - Status: artifact/release and launcher/result amd64+arm64 CI green;
-  independent Spec/Standards review green; integrated installed success/denial
-  transaction amd64+arm64 green, failure matrix pending
+  independent Spec/Standards review green; integrated installed success/failure
+  matrix amd64+arm64 green, explicit cancellation/policy cases pending
 - Launcher/result commit: `92cec7405f5789f1cb305807f641e7fa247c096d`
 - CI: [run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101)
   — all nine jobs passed
@@ -77,10 +77,12 @@ remaining High/Medium issue in this slice.
 
 The root-owned authenticated socket-activated broker and executor are now an
 implemented integrated candidate, but they are not reachable from production
-scheduling. CI run 33426435190 proves on amd64 and arm64 that the exact cgroup
+scheduling. CI run 33432355260 proves on amd64 and arm64 that the exact cgroup
 connect guard is attached and read back before release, the staged controlled
-binary returns the allowlisted decoded H264 result, rejected peer/target input
-starts no unit, and the successful path leaves no unit, cgroup, BPF pin or
-ownership receipt. The timeout/cancellation/output-flood/malformed-result and
-repeated failure/restart matrix remains open. ADR 0004 remains Proposed, Phase G
-remains IN PROGRESS and Production remains NO-GO.
+binary returns allowlisted decoded H264, Opus and mixed results, rejected
+peer/target input starts no unit, and every tested path leaves no unit, cgroup,
+BPF pin or ownership receipt. CI run 33432355260 adds deadline cancellation,
+output-flood, malformed-result, repeated failure and broker-crash recovery. The
+explicit caller/shutdown cancellation and remaining integrated policy cases
+stay open. ADR 0004 remains Proposed, Phase G remains IN PROGRESS and Production
+remains NO-GO.
