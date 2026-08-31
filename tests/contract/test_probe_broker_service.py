@@ -479,8 +479,11 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
         assert scope.is_dir()
         assert receipt.is_file()
         assert _guard_attach_types(bpftool, cgroup) == {
+            "cgroup_device",
             "cgroup_inet4_connect",
             "cgroup_inet6_connect",
+            "cgroup_inet_egress",
+            "cgroup_inet_ingress",
         }
         allow_responses.set()
         stdout, stderr = client.communicate(timeout=15)
