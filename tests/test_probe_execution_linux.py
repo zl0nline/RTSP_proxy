@@ -278,7 +278,7 @@ def test_linux_cgroup_resolver_returns_only_the_exact_transient_unit(
 ) -> None:
     cgroup_root = tmp_path / "cgroup"
     unit_name = f"rtsp-probe-{uuid4().hex}.service"
-    expected = cgroup_root / "rtsp-probe.slice" / unit_name
+    expected = cgroup_root / "rtsp.slice" / "rtsp-probe.slice" / unit_name
     expected.mkdir(parents=True)
     (cgroup_root / "cgroup.controllers").write_text("cpu memory pids\n", encoding="ascii")
     (expected / "cgroup.procs").write_text("123\n", encoding="ascii")
@@ -287,7 +287,7 @@ def test_linux_cgroup_resolver_returns_only_the_exact_transient_unit(
 
     assert resolver.resolve(unit_name=unit_name, timeout_seconds=1.0) == expected
 
-    foreign = cgroup_root / "rtsp-probe.slice" / "foreign.service"
+    foreign = cgroup_root / "rtsp.slice" / "rtsp-probe.slice" / "foreign.service"
     foreign.mkdir()
     with pytest.raises(RuntimeError, match="probe_execution_cgroup_invalid"):
         resolver.resolve(unit_name="foreign.service", timeout_seconds=1.0)
@@ -298,7 +298,7 @@ def test_linux_cgroup_resolver_waits_for_the_transient_slice_and_unit(
 ) -> None:
     cgroup_root = tmp_path / "cgroup"
     unit_name = f"rtsp-probe-{uuid4().hex}.service"
-    expected = cgroup_root / "rtsp-probe.slice" / unit_name
+    expected = cgroup_root / "rtsp.slice" / "rtsp-probe.slice" / unit_name
     cgroup_root.mkdir()
     (cgroup_root / "cgroup.controllers").write_text(
         "cpu memory pids\n",
@@ -319,13 +319,17 @@ def test_linux_cgroup_resolver_waits_for_the_transient_slice_and_unit(
     assert resolver.resolve(unit_name=unit_name, timeout_seconds=1.0) == expected
 
 
-@pytest.mark.parametrize("linked_component", ["slice", "unit", "cgroup.procs"])
+@pytest.mark.parametrize(
+    "linked_component",
+    ["parent_slice", "probe_slice", "unit", "cgroup.procs"],
+)
 def test_linux_cgroup_resolver_rejects_transient_cgroup_symlinks(
     tmp_path: Path,
     linked_component: str,
 ) -> None:
     cgroup_root = tmp_path / "cgroup"
-    slice_path = cgroup_root / "rtsp-probe.slice"
+    parent_slice_path = cgroup_root / "rtsp.slice"
+    slice_path = parent_slice_path / "rtsp-probe.slice"
     unit_name = f"rtsp-probe-{uuid4().hex}.service"
     expected = slice_path / unit_name
     cgroup_root.mkdir()
@@ -335,10 +339,13 @@ def test_linux_cgroup_resolver_rejects_transient_cgroup_symlinks(
     )
     foreign = tmp_path / "foreign"
     foreign.mkdir()
-    if linked_component == "slice":
+    if linked_component == "parent_slice":
+        parent_slice_path.symlink_to(foreign, target_is_directory=True)
+    elif linked_component == "probe_slice":
+        parent_slice_path.mkdir()
         slice_path.symlink_to(foreign, target_is_directory=True)
     else:
-        slice_path.mkdir()
+        slice_path.mkdir(parents=True)
         if linked_component == "unit":
             expected.symlink_to(foreign, target_is_directory=True)
         else:
@@ -359,14 +366,18 @@ def test_linux_cgroup_resolver_rejects_transient_cgroup_symlinks(
         resolver.resolve(unit_name=unit_name, timeout_seconds=1.0)
 
 
-@pytest.mark.parametrize("failed_component", ["slice", "unit", "cgroup.procs"])
+@pytest.mark.parametrize(
+    "failed_component",
+    ["parent_slice", "probe_slice", "unit", "cgroup.procs"],
+)
 def test_linux_cgroup_resolver_fails_closed_on_transient_cgroup_io_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failed_component: str,
 ) -> None:
     cgroup_root = tmp_path / "cgroup"
-    slice_path = cgroup_root / "rtsp-probe.slice"
+    parent_slice_path = cgroup_root / "rtsp.slice"
+    slice_path = parent_slice_path / "rtsp-probe.slice"
     unit_name = f"rtsp-probe-{uuid4().hex}.service"
     expected = slice_path / unit_name
     expected.mkdir(parents=True)
@@ -377,7 +388,8 @@ def test_linux_cgroup_resolver_fails_closed_on_transient_cgroup_io_error(
     procs_path = expected / "cgroup.procs"
     procs_path.write_text("123\n", encoding="ascii")
     failed_path = {
-        "slice": slice_path,
+        "parent_slice": parent_slice_path,
+        "probe_slice": slice_path,
         "unit": expected,
         "cgroup.procs": procs_path,
     }[failed_component]
@@ -410,7 +422,7 @@ def test_linux_cgroup_resolver_rejects_an_invalid_clock_without_sleeping(
     invalid_sample: object,
 ) -> None:
     cgroup_root = tmp_path / "cgroup"
-    (cgroup_root / "rtsp-probe.slice").mkdir(parents=True)
+    (cgroup_root / "rtsp.slice" / "rtsp-probe.slice").mkdir(parents=True)
     (cgroup_root / "cgroup.controllers").write_text("cpu memory pids\n", encoding="ascii")
     samples = iter((0.0, invalid_sample))
 

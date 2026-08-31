@@ -261,7 +261,8 @@ class LinuxSystemdCgroupResolver:
         ):
             raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
         root = self._cgroup_root
-        slice_path = root / "rtsp-probe.slice"
+        parent_slice_path = root / "rtsp.slice"
+        slice_path = parent_slice_path / "rtsp-probe.slice"
         expected = slice_path / unit_name
         if not (
             isinstance(root, Path)
@@ -272,7 +273,11 @@ class LinuxSystemdCgroupResolver:
             raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
         deadline = self._clock_sample() + float(timeout_seconds)
         while True:
-            if self._transient_cgroup_ready(slice_path, expected):
+            if self._transient_cgroup_ready(
+                parent_slice_path,
+                slice_path,
+                expected,
+            ):
                 return expected
             remaining = deadline - self._clock_sample()
             if not isfinite(remaining):
@@ -300,17 +305,22 @@ class LinuxSystemdCgroupResolver:
         return float(sample)
 
     @staticmethod
-    def _transient_cgroup_ready(slice_path: Path, expected: Path) -> bool:
-        try:
-            slice_metadata = slice_path.lstat()
-        except FileNotFoundError:
-            return False
-        except OSError:
-            raise ProbeExecutionLinuxError(
-                "probe_execution_cgroup_unavailable"
-            ) from None
-        if not stat.S_ISDIR(slice_metadata.st_mode):
-            raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
+    def _transient_cgroup_ready(
+        parent_slice_path: Path,
+        slice_path: Path,
+        expected: Path,
+    ) -> bool:
+        for directory in (parent_slice_path, slice_path):
+            try:
+                metadata = directory.lstat()
+            except FileNotFoundError:
+                return False
+            except OSError:
+                raise ProbeExecutionLinuxError(
+                    "probe_execution_cgroup_unavailable"
+                ) from None
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ProbeExecutionLinuxError("probe_execution_cgroup_invalid")
         try:
             expected_metadata = expected.lstat()
         except FileNotFoundError:

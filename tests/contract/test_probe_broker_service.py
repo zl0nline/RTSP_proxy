@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -29,6 +30,9 @@ _PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
 _OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
 _SECRET_CANARY = "probe-broker-secret-canary"
 _SAFE_JOURNAL_FIELDS = ("EXIT_CODE", "EXIT_STATUS", "JOB_RESULT", "UNIT_RESULT")
+_SYSTEMD_EXIT = re.compile(
+    r"Main process exited, code=([a-z-]+), status=([0-9]{1,3})(?:/[A-Z0-9_-]+)?"
+)
 
 
 def _service_property(name: str) -> str:
@@ -72,6 +76,7 @@ def _unit_exit_snapshot(unit_name: str) -> dict[str, tuple[str, ...]]:
         timeout=3,
     )
     values: dict[str, set[str]] = {field: set() for field in _SAFE_JOURNAL_FIELDS}
+    process_exit: set[str] = set()
     for line in observed.stdout.splitlines()[:128]:
         try:
             entry = json.loads(line)
@@ -79,6 +84,11 @@ def _unit_exit_snapshot(unit_name: str) -> dict[str, tuple[str, ...]]:
             continue
         if not isinstance(entry, dict):
             continue
+        message = entry.get("MESSAGE")
+        if isinstance(message, str):
+            match = _SYSTEMD_EXIT.search(message)
+            if match is not None:
+                process_exit.add(f"{match.group(1)}:{match.group(2)}")
         for field in _SAFE_JOURNAL_FIELDS:
             value = entry.get(field)
             if isinstance(value, int) and not isinstance(value, bool):
@@ -89,6 +99,8 @@ def _unit_exit_snapshot(unit_name: str) -> dict[str, tuple[str, ...]]:
                 and all(character.isalnum() or character in "_.:-" for character in value)
             ):
                 values[field].add(value)
+    if process_exit:
+        values["PROCESS_EXIT"] = process_exit
     return {
         field: tuple(sorted(field_values))
         for field, field_values in values.items()
