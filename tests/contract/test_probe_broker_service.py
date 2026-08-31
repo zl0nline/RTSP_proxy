@@ -435,7 +435,7 @@ def _assert_failed_probe_is_collected(request_id: UUID, *, label: str) -> None:
     assert _service_property("ActiveState") == "active"
 
 
-def _serve_h264(
+def _serve_probe_media(
     listener: socket.socket,
     *,
     port: int,
@@ -444,8 +444,10 @@ def _serve_h264(
     requests: list[str],
     errors: list[BaseException],
     send_media: bool = True,
+    profile: str = "video",
 ) -> None:
     try:
+        assert profile in {"video", "audio", "mixed"}
         connection, _address = listener.accept()
         connected.set()
         assert allow_responses.wait(timeout=10)
@@ -472,18 +474,33 @@ def _serve_h264(
                 if method == b"OPTIONS":
                     headers = b"Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n"
                 elif method == b"DESCRIBE":
-                    body = (
+                    session = (
                         "v=0\r\n"
                         "o=- 0 0 IN IP4 127.0.0.1\r\n"
                         "s=probe\r\n"
                         "t=0 0\r\n"
                         "a=control:*\r\n"
+                    )
+                    video = (
                         "m=video 0 RTP/AVP 96\r\n"
                         "c=IN IP4 127.0.0.1\r\n"
                         "a=rtpmap:96 H264/90000\r\n"
                         "a=fmtp:96 packetization-mode=1;"
                         "sprop-parameter-sets=Z0LQC4xpyAeEQjU=,aM48gA==\r\n"
                         "a=control:trackID=0\r\n"
+                    )
+                    audio_payload_type = 97 if profile == "mixed" else 96
+                    audio_track = 1 if profile == "mixed" else 0
+                    audio = (
+                        f"m=audio 0 RTP/AVP {audio_payload_type}\r\n"
+                        "c=IN IP4 127.0.0.1\r\n"
+                        f"a=rtpmap:{audio_payload_type} opus/48000/2\r\n"
+                        f"a=control:trackID={audio_track}\r\n"
+                    )
+                    body = (
+                        session
+                        + (video if profile in {"video", "mixed"} else "")
+                        + (audio if profile in {"audio", "mixed"} else "")
                     ).encode("ascii")
                     headers = (
                         b"Content-Type: application/sdp\r\n"
@@ -492,8 +509,15 @@ def _serve_h264(
                         + b"/live/\r\n"
                     )
                 elif method == b"SETUP":
+                    transport = next(
+                        line.split(b":", 1)[1].strip()
+                        for line in lines
+                        if line.lower().startswith(b"transport:")
+                    )
                     headers = (
-                        b"Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+                        b"Transport: "
+                        + transport
+                        + b"\r\n"
                         b"Session: test-session;timeout=60\r\n"
                     )
                 elif method == b"PLAY":
@@ -514,22 +538,43 @@ def _serve_h264(
                     if not send_media:
                         time.sleep(0.2)
                         return
-                    payloads = (
-                        bytes.fromhex("6742d00b8c69c807844235"),
-                        bytes.fromhex("68ce3c80"),
-                        bytes.fromhex("65b8000409fffff87a28000827fc"),
-                    )
-                    for sequence, payload in enumerate(payloads, start=1):
-                        rtp = struct.pack(
-                            "!BBHII",
-                            0x80,
-                            (0x80 if sequence == len(payloads) else 0) | 96,
-                            sequence,
-                            3_600,
-                            0x12345678,
-                        ) + payload
-                        connection.sendall(b"$\x00" + struct.pack("!H", len(rtp)) + rtp)
-                        time.sleep(0.04)
+                    if profile in {"video", "mixed"}:
+                        payloads = (
+                            bytes.fromhex("6742d00b8c69c807844235"),
+                            bytes.fromhex("68ce3c80"),
+                            bytes.fromhex("65b8000409fffff87a28000827fc"),
+                        )
+                        for sequence, payload in enumerate(payloads, start=1):
+                            rtp = struct.pack(
+                                "!BBHII",
+                                0x80,
+                                (0x80 if sequence == len(payloads) else 0) | 96,
+                                sequence,
+                                3_600,
+                                0x12345678,
+                            ) + payload
+                            connection.sendall(
+                                b"$\x00" + struct.pack("!H", len(rtp)) + rtp
+                            )
+                    if profile in {"audio", "mixed"}:
+                        channel = 2 if profile == "mixed" else 0
+                        payload_type = 97 if profile == "mixed" else 96
+                        for sequence in range(1, 9):
+                            rtp = struct.pack(
+                                "!BBHII",
+                                0x80,
+                                0x80 | payload_type,
+                                sequence,
+                                (sequence - 1) * 960,
+                                0x87654321,
+                            ) + bytes.fromhex("f8fffe")
+                            connection.sendall(
+                                b"$"
+                                + bytes((channel,))
+                                + struct.pack("!H", len(rtp))
+                                + rtp
+                            )
+                            time.sleep(0.02)
                     time.sleep(0.2)
                     return
     except BaseException as error:
@@ -561,7 +606,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
     requests: list[str] = []
     errors: list[BaseException] = []
     server = threading.Thread(
-        target=_serve_h264,
+        target=_serve_probe_media,
         args=(listener,),
         kwargs={
             "port": port,
@@ -675,6 +720,77 @@ def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit
         assert _unit_is_collected(unit_name)
         assert not (_PIN_ROOT / request_id.hex).exists()
         assert not (_OWNERSHIP_ROOT / f"{request_id.hex}.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_video", "expected_audio", "expected_setups"),
+    (
+        ("audio", None, "opus", 1),
+        ("mixed", "h264", "opus", 2),
+    ),
+)
+def test_installed_broker_decodes_audio_and_mixed_profiles(
+    profile: str,
+    expected_video: str | None,
+    expected_audio: str,
+    expected_setups: int,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+    request_id = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    connected = threading.Event()
+    allow_responses = threading.Event()
+    allow_responses.set()
+    requests: list[str] = []
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_probe_media,
+        args=(listener,),
+        kwargs={
+            "port": port,
+            "connected": connected,
+            "allow_responses": allow_responses,
+            "requests": requests,
+            "errors": errors,
+            "profile": profile,
+        },
+        daemon=True,
+    )
+    server.start()
+    client = _run_client(request_id, uuid4(), "127.0.0.1", port)
+    try:
+        stdout, stderr = client.communicate(timeout=15)
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        listener.close()
+
+    assert errors == []
+    assert server.is_alive() is False
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": expected_audio,
+        "failure_class": None,
+        "outcome": "healthy",
+        "video_codec": expected_video,
+    }
+    assert sum(request.startswith("SETUP ") for request in requests) == expected_setups
+    assert requests[-1] == f"PLAY rtsp://127.0.0.1:{port}/live/ RTSP/1.0"
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="media probe remained")
+    _wait_until(lambda: not scope.exists(), failure="media BPF scope remained")
+    assert not receipt.exists()
 
 
 def test_installed_broker_deadline_collects_stalled_probe_and_remains_available() -> None:
@@ -830,7 +946,7 @@ def test_installed_broker_repeated_no_media_results_are_inconclusive_and_collect
         requests: list[str] = []
         errors: list[BaseException] = []
         server = threading.Thread(
-            target=_serve_h264,
+            target=_serve_probe_media,
             args=(listener,),
             kwargs={
                 "port": port,
