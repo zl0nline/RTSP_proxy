@@ -155,8 +155,11 @@ def test_probe_broker_service_returns_only_the_normalized_execution_result() -> 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
 def test_probe_broker_service_maps_execution_failure_to_inconclusive(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    caplog.set_level(logging.WARNING, logger="rtsp_proxy.probe_broker_service")
+    logger_name = "rtsp_proxy.probe_broker_service"
+    monkeypatch.setattr(logging.getLogger(logger_name), "disabled", False)
+    caplog.set_level(logging.WARNING, logger=logger_name)
     executor = _Executor(error=RuntimeError("secret from privileged boundary"))
     service = _service(executor)
     client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
