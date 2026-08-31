@@ -1288,8 +1288,9 @@ impact is measured.
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
   independent review and native amd64/arm64
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
-  green; the integrated broker candidate is now implemented but its native
-  amd64/arm64 transaction gate is still pending);
+  green; the installed integrated broker success/denial transaction is native
+  amd64/arm64 green in
+  [CI run 33426435190](https://github.com/zl0nline/RTSP_proxy/actions/runs/33426435190));
 - [x] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe as a
   distinct reproducible amd64/arm64 release artifact with immutable digests,
   ordinary RTSP/TCP plus redirect-refusal behavior and clean-wheel release
@@ -1300,8 +1301,14 @@ impact is measured.
   `LimitCORE=0` transient policy (independent Spec/Standards review PASS; all
   nine amd64/arm64 jobs green in
   [CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101));
-- [ ] complete privileged amd64/arm64 evidence for the full integrated root
-  broker + systemd + BPF + ffprobe cancellation/residue transaction;
+- [x] privileged amd64/arm64 installed root-broker success/denial transaction:
+  exact peer and target policy, sealed descriptor handoff, nested systemd
+  cgroup resolution, exact BPF tuple readback before gate release, decoded H264
+  result and zero unit/cgroup/pin/receipt residue (all nine jobs green in
+  [CI run 33426435190](https://github.com/zl0nline/RTSP_proxy/actions/runs/33426435190));
+- [ ] complete the integrated timeout, cancellation, output-flood, malformed
+  result, broker restart and repeated-failure zero-residue matrix on native
+  amd64/arm64;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
@@ -1309,16 +1316,18 @@ impact is measured.
   Standards review green; all seven jobs, including the amd64/arm64 full-suite
   transport tests, green in
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
-  the socket-activated broker/executor candidate is staged but not yet
-  promoted by integrated native CI);
+  the socket-activated broker/executor candidate's installed success/denial
+  transaction is native amd64/arm64 green in CI run 33426435190, but it is not
+  promoted before the remaining failure matrix);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
   immutable input plus release gate, 64 KiB output cap and exact collection
   (direct Linux systemd 259 and independently reviewed; privileged systemd 255
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
-  the root-broker wiring exists as an unpromoted candidate and the integrated
-  BPF+ffprobe transaction is still pending);
+  the root-broker wiring remains unpromoted; its integrated success/denial path
+  is native amd64/arm64 green in CI run 33426435190 and its failure matrix is
+  still pending);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] promote the reviewed broker/executor after integrated native evidence,
   then implement the periodic risk-based producer and durable health-state

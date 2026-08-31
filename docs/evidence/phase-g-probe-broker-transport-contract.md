@@ -1,6 +1,7 @@
 # Phase G probe-broker transport contract
 
 - Date: 2026-08-30
+- Last reviewed: 2026-08-31
 - Status: implementation, direct-Linux amd64 contract, independent Spec/
   Standards review and native amd64/arm64 CI green
 - Production decision: NO-GO
@@ -50,7 +51,8 @@ A socket-activated root broker and executor are now implemented as an
 unpromoted integrated candidate. They add filesystem ownership for the socket,
 fixed-name-to-UID peer resolution, root-owned site/CIDR revalidation,
 system-manager transient properties, BPF attach/readback/run gating and bounded
-normalized responses. Native amd64/arm64 CI still has to prove the complete
-descriptor handoff, controlled no-redirect ffprobe execution, cancellation,
-restart and zero-residue transaction before promotion. ADR 0004 therefore stays
-Proposed and Phase G remains IN PROGRESS / Production NO-GO.
+normalized responses. CI run 33426435190 proves complete descriptor handoff,
+controlled no-redirect ffprobe execution, policy denial and successful-path
+zero residue on amd64 and arm64. Cancellation, timeout, output-flood, restart and
+repeated-failure cleanup remain pending before promotion. ADR 0004 therefore
+stays Proposed and Phase G remains IN PROGRESS / Production NO-GO.

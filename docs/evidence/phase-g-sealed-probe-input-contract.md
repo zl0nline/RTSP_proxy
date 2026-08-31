@@ -1,8 +1,10 @@
 # Phase G sealed probe-input contract
 
 - Date: 2026-08-30
+- Last reviewed: 2026-08-31
 - Status: five-line no-redirect sealed input, independent review and native
-  amd64/arm64 controlled-artifact matrix green; integrated executor CI pending
+  amd64/arm64 controlled-artifact plus integrated success/denial matrix green;
+  integrated failure matrix pending
 - Production decision: NO-GO
 
 ## Scope
@@ -43,8 +45,9 @@ This primitive does not itself run ffprobe. The exact-source controlled binary,
 redirect contract, architecture digests and release admission are now complete.
 A separately documented transport covers authenticated `SO_PEERCRED` plus one
 `SCM_RIGHTS` descriptor, and a socket-activated root service/system-manager/BPF
-executor now exists as an unpromoted integrated candidate. Native amd64/arm64
-CI must still prove its complete attach/readback/run, bounded output,
-cancellation/restart and zero-residue transaction. Consequently ADR 0004 stays
-Proposed, production scheduling stays disabled and Phase G remains IN PROGRESS /
-Production NO-GO.
+executor now exists as an unpromoted integrated candidate. CI run 33426435190
+proves its sealed-descriptor handoff, attach/readback-before-release, decoded
+H264 result, policy denial and successful-path zero residue on amd64 and arm64.
+The bounded timeout/cancellation/output-flood/restart failure matrix remains
+pending. Consequently ADR 0004 stays Proposed, production scheduling stays
+disabled and Phase G remains IN PROGRESS / Production NO-GO.

@@ -1,6 +1,7 @@
 # Phase G direct systemd probe contract
 
 - Date: 2026-08-30
+- Last reviewed: 2026-08-31
 - Status: implementation, direct-Linux amd64 contract, independent Spec/
   Standards review and privileged native amd64/arm64 CI green
 - Commit: `e1481f3d97a9d687db769ff7d3b80025ae556d56`
@@ -64,10 +65,10 @@ clean-wheel launcher and passed the independent 90% coverage gate at 90.08%.
 ## Deliberately excluded
 
 An installed root-owned socket/service and production-shaped executor now exist
-as an unpromoted integrated candidate. The controlled no-redirect artifact,
-fixed quiet launcher and strict decoded-frame result contract remain separately
-proven; native amd64/arm64 CI must still prove that the broker authenticates its
-AF_UNIX peer, revalidates site/CIDR policy, attaches and reads back both cgroup
-BPF hooks before releasing the gate, and performs end-to-end cancellation,
-restart and residue cleanup. ADR 0004 therefore remains Proposed, Phase G stays
-IN PROGRESS and Production remains NO-GO.
+as an unpromoted integrated candidate. CI run 33426435190 proves on amd64 and
+arm64 that the broker authenticates its AF_UNIX peer, revalidates site/CIDR
+policy, attaches and reads back both cgroup BPF hooks before releasing the gate,
+returns a decoded H264 result and collects unit/cgroup/pin/receipt residue. The
+integrated timeout, cancellation, output-flood, malformed-result, broker-restart
+and repeated-failure matrix is still pending. ADR 0004 therefore remains
+Proposed, Phase G stays IN PROGRESS and Production remains NO-GO.
