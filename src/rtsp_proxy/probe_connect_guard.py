@@ -399,15 +399,21 @@ class BpftoolProbeConnectGuardBackend:
         try:
             self._require_artifact_identity()
         except ProbeConnectGuardError:
+            _LOGGER.warning("probe guard backend failure: artifact")
             raise ProbeConnectGuardInstallRejected(
                 "probe_guard_artifact_identity_invalid"
             ) from None
         paths = self._paths(scope)
         budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
-        coordinator = self._acquire_coordinator(shared=True, budget=budget)
+        try:
+            coordinator = self._acquire_coordinator(shared=True, budget=budget)
+        except Exception:
+            _LOGGER.warning("probe guard backend failure: coordinator")
+            raise
         retain_coordinator = False
         try:
             if paths.scope.exists() or paths.receipt.exists():
+                _LOGGER.warning("probe guard backend failure: ownership")
                 raise ProbeConnectGuardInstallRejected(
                     "probe_guard_already_active"
                 )
@@ -428,6 +434,8 @@ class BpftoolProbeConnectGuardBackend:
                 _fsync_directory(self._pin_root)
                 self._finalize_receipt(scope, paths.receipt, paths.scope)
             except BaseException as primary_error:
+                if isinstance(primary_error, Exception):
+                    _LOGGER.warning("probe guard backend failure: ownership")
                 cleanup_errors: list[BaseException] = []
                 try:
                     self._cleanup_preload_reservation(
@@ -469,8 +477,12 @@ class BpftoolProbeConnectGuardBackend:
                 ) from None
             self._remember_scope_coordinator(scope, coordinator)
             coordinator = -1
-            for path in (paths.programs, paths.maps):
-                os.mkdir(path, mode=0o700)
+            try:
+                for path in (paths.programs, paths.maps):
+                    os.mkdir(path, mode=0o700)
+            except Exception:
+                _LOGGER.warning("probe guard backend failure: pins")
+                raise
             self._install_command(
                 "load",
                 "prog",
@@ -1981,14 +1993,22 @@ class ProbeConnectGuardManager:
                     raise ProbeConnectGuardError("probe_guard_already_active")
                 self._active[unit_name] = record
             try:
-                self._backend.install(
-                    scope,
-                    timeout_seconds=self._remaining(deadline),
-                )
-                self._backend.verify(
-                    scope,
-                    timeout_seconds=self._remaining(deadline),
-                )
+                try:
+                    self._backend.install(
+                        scope,
+                        timeout_seconds=self._remaining(deadline),
+                    )
+                except Exception:
+                    _LOGGER.warning("probe guard manager failure: install")
+                    raise
+                try:
+                    self._backend.verify(
+                        scope,
+                        timeout_seconds=self._remaining(deadline),
+                    )
+                except Exception:
+                    _LOGGER.warning("probe guard manager failure: verify")
+                    raise
                 lease = ProbeConnectGuardLease(
                     request_id=request_id,
                     unit_name=unit_name,

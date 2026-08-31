@@ -37,6 +37,10 @@ _BROKER_FAILURE = re.compile(
     r"probe broker executor failure: (probe_execution_[a-z_]+)"
 )
 _GUARD_FAILURE = re.compile(r"probe guard install failure: (load|attach4|attach6|map)")
+_GUARD_BACKEND_FAILURE = re.compile(
+    r"probe guard backend failure: (artifact|coordinator|ownership|pins)"
+)
+_GUARD_MANAGER_FAILURE = re.compile(r"probe guard manager failure: (install|verify)")
 
 
 def _service_property(name: str) -> str:
@@ -134,7 +138,12 @@ def _broker_failure_snapshot() -> tuple[str, ...]:
             value := next(
                 (
                     match.group(1)
-                    for pattern in (_BROKER_FAILURE, _GUARD_FAILURE)
+                    for pattern in (
+                        _BROKER_FAILURE,
+                        _GUARD_FAILURE,
+                        _GUARD_BACKEND_FAILURE,
+                        _GUARD_MANAGER_FAILURE,
+                    )
                     if (match := pattern.fullmatch(line)) is not None
                 ),
                 None,
