@@ -340,6 +340,7 @@ def _serve_h264(
     allow_responses: threading.Event,
     requests: list[str],
     errors: list[BaseException],
+    send_media: bool = True,
 ) -> None:
     try:
         connection, _address = listener.accept()
@@ -407,6 +408,9 @@ def _serve_h264(
                     + body
                 )
                 if method == b"PLAY":
+                    if not send_media:
+                        time.sleep(0.2)
+                        return
                     payloads = (
                         bytes.fromhex("6742d00b8c69c807844235"),
                         bytes.fromhex("68ce3c80"),
@@ -621,3 +625,156 @@ def test_installed_broker_deadline_collects_stalled_probe_and_remains_available(
     assert not receipt.exists()
     assert _service_property("ActiveState") == "active"
     assert _service_property("SubState") == "running"
+
+
+def test_installed_broker_restart_recovers_inflight_probe_before_readiness() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    request_id = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    cgroup = Path("/sys/fs/cgroup/rtsp.slice/rtsp-probe.slice") / unit_name
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    connected = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_stalled_source,
+        args=(listener,),
+        kwargs={"connected": connected, "release": release, "errors": errors},
+        daemon=True,
+    )
+    server.start()
+    client = _run_client(
+        request_id,
+        uuid4(),
+        "127.0.0.1",
+        listener.getsockname()[1],
+    )
+    try:
+        _wait_for_source_or_client(connected, client, timeout=10)
+        assert connected.is_set(), _service_snapshot()
+        _wait_until(
+            cgroup.is_dir,
+            failure="probe cgroup was not created before broker restart",
+        )
+        assert scope.is_dir()
+        assert receipt.is_file()
+        prior_restarts = int(_service_property("NRestarts"))
+        subprocess.run(
+            [
+                "systemctl",
+                "kill",
+                "--kill-whom=main",
+                "--signal=SIGKILL",
+                _BROKER_UNIT,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        _wait_until(
+            lambda: (
+                _service_property("ActiveState") == "active"
+                and _service_property("SubState") == "running"
+                and int(_service_property("NRestarts")) > prior_restarts
+            ),
+            failure="broker did not restart after forced interruption",
+            timeout=15,
+        )
+        stdout, stderr = client.communicate(timeout=5)
+    finally:
+        release.set()
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        listener.close()
+
+    assert errors == []
+    assert server.is_alive() is False
+    assert client.returncode == 1
+    assert stdout == b""
+    assert stderr == b"probe_broker_client_failed\n"
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="restarted probe remained")
+    _wait_until(lambda: not scope.exists(), failure="restarted BPF scope remained")
+    assert not receipt.exists()
+
+
+def test_installed_broker_repeated_no_media_results_are_inconclusive_and_collected() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    for _attempt in range(3):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10)
+        port = listener.getsockname()[1]
+        request_id = uuid4()
+        unit_name = f"rtsp-probe-{request_id.hex}.service"
+        scope = _PIN_ROOT / request_id.hex
+        receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+        connected = threading.Event()
+        allow_responses = threading.Event()
+        allow_responses.set()
+        requests: list[str] = []
+        errors: list[BaseException] = []
+        server = threading.Thread(
+            target=_serve_h264,
+            args=(listener,),
+            kwargs={
+                "port": port,
+                "connected": connected,
+                "allow_responses": allow_responses,
+                "requests": requests,
+                "errors": errors,
+                "send_media": False,
+            },
+            daemon=True,
+        )
+        server.start()
+        client = _run_client(
+            request_id,
+            uuid4(),
+            "127.0.0.1",
+            port,
+        )
+        try:
+            stdout, stderr = client.communicate(timeout=15)
+        finally:
+            if client.poll() is None:
+                client.kill()
+                client.wait(timeout=2)
+            server.join(timeout=2)
+            listener.close()
+
+        assert errors == []
+        assert server.is_alive() is False
+        assert client.returncode == 0
+        assert stderr == b""
+        assert json.loads(stdout) == {
+            "audio_codec": None,
+            "failure_class": "executor",
+            "outcome": "inconclusive",
+            "video_codec": None,
+        }
+        assert requests[-1] == (
+            f"PLAY rtsp://127.0.0.1:{port}/live/ RTSP/1.0"
+        )
+        _wait_until(
+            lambda unit_name=unit_name: _unit_is_collected(unit_name),
+            failure="no-media probe unit remained",
+        )
+        _wait_until(
+            lambda scope=scope: not scope.exists(),
+            failure="no-media BPF scope remained",
+        )
+        assert not receipt.exists()
+        assert _service_property("ActiveState") == "active"
