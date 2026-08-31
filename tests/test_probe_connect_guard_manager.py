@@ -1131,6 +1131,131 @@ def test_kernel_bpf_query_layout_matches_linux_uapi() -> None:
     assert query.revision.offset == 56
 
 
+class _FakeBpfSyscall:
+    def __init__(
+        self,
+        *,
+        result: int = 0,
+        program_ids: tuple[int, ...] = (101, 102),
+        reported_count: int | None = None,
+    ) -> None:
+        self.restype: object = None
+        self.result = result
+        self.program_ids = program_ids
+        self.reported_count = reported_count
+        self.calls: list[tuple[int, int, int, int]] = []
+
+    def __call__(
+        self,
+        syscall_number: int,
+        command: int,
+        raw_query: Any,
+        size: int,
+    ) -> int:
+        query_pointer = ctypes.cast(
+            raw_query,
+            ctypes.POINTER(probe_connect_guard._BpfProgramQuery),
+        )
+        query = query_pointer.contents
+        self.calls.append((syscall_number, command, query.attach_type, size))
+        ids = ctypes.cast(query.program_ids, ctypes.POINTER(ctypes.c_uint32))
+        for index, program_id in enumerate(self.program_ids):
+            ids[index] = program_id
+        query.program_count = (
+            len(self.program_ids)
+            if self.reported_count is None
+            else self.reported_count
+        )
+        return self.result
+
+
+def test_kernel_bpf_query_returns_exact_program_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    syscall = _FakeBpfSyscall(program_ids=(101, 9001))
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: type("FakeLibc", (), {"syscall": syscall})(),
+    )
+
+    assert probe_connect_guard._query_cgroup_program_ids(
+        17,
+        attach_type=10,
+        architecture="amd64",
+    ) == (101, 9001)
+    assert syscall.calls == [(321, 16, 10, 64)]
+    assert syscall.restype is ctypes.c_long
+
+
+@pytest.mark.parametrize(
+    ("architecture", "syscall", "message"),
+    [
+        ("unknown", _FakeBpfSyscall(), "probe_guard_readback_invalid"),
+        ("arm64", _FakeBpfSyscall(result=-1), "probe_guard_readback_invalid"),
+        (
+            "arm64",
+            _FakeBpfSyscall(reported_count=257),
+            "probe_guard_readback_invalid",
+        ),
+        (
+            "arm64",
+            _FakeBpfSyscall(program_ids=(0,)),
+            "probe_guard_readback_invalid",
+        ),
+        (
+            "arm64",
+            _FakeBpfSyscall(program_ids=(101, 101)),
+            "probe_guard_readback_invalid",
+        ),
+    ],
+)
+def test_kernel_bpf_query_rejects_untrusted_results(
+    architecture: str,
+    syscall: _FakeBpfSyscall,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: type("FakeLibc", (), {"syscall": syscall})(),
+    )
+
+    with pytest.raises(ProbeConnectGuardError, match=message):
+        probe_connect_guard._query_cgroup_program_ids(
+            17,
+            attach_type=11,
+            architecture=architecture,
+        )
+
+
+def test_kernel_cgroup_attachment_query_rejects_duplicate_and_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cgroup = tmp_path / "probe.service"
+    cgroup.mkdir()
+    alias = tmp_path / "alias.service"
+    alias.symlink_to(cgroup, target_is_directory=True)
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_query_cgroup_program_ids",
+        lambda *_args, **_kwargs: (101,),
+    )
+
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_readback_invalid"):
+        probe_connect_guard._kernel_cgroup_attachments(alias)
+
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_query_cgroup_program_ids",
+        lambda *_args, **_kwargs: (101, 101),
+    )
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_readback_invalid"):
+        probe_connect_guard._kernel_cgroup_attachments(cgroup)
+
+
 def test_bpftool_backend_cleans_owned_pins_after_transient_cgroup_vanishes(
     tmp_path: Path,
 ) -> None:
