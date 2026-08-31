@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -130,6 +132,36 @@ def test_client_normalizes_unavailable_broker_without_exposing_endpoint(
         failure_class=ProbeFailureClass.EXECUTOR,
     )
     assert "secret" not in repr(endpoint)
+
+
+@pytest.mark.parametrize("address", ("127.0.0.1", "::1"))
+def test_installed_fixture_reaches_client_for_explicit_contract_target(
+    address: str,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tests/fixtures/probe_broker_client.py",
+            str(uuid4()),
+            str(uuid4()),
+            address,
+            "9",
+            "1000",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "audio_codec": None,
+        "failure_class": "executor",
+        "outcome": "inconclusive",
+        "video_codec": None,
+    }
 
 
 def test_client_rejects_unexpected_broker_identity(tmp_path: Path) -> None:

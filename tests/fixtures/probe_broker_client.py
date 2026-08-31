@@ -3,12 +3,33 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from ipaddress import ip_address, ip_network
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from uuid import UUID
 
 from rtsp_proxy.probe_client import UnixProbeBrokerClient
-from rtsp_proxy.probe_security import ProbeEndpointAdmission
+from rtsp_proxy.probe_security import AdmittedProbeEndpoint, ProbeEndpointAdmission
+
+
+def _contract_endpoint(
+    *, endpoint_generation: UUID, address: IPv4Address | IPv6Address, port: int
+) -> AdmittedProbeEndpoint:
+    admitted = ProbeEndpointAdmission(
+        site_key="contract",
+        allowed_networks=(ip_network("10.0.0.8/32"),),
+        resolve=lambda _hostname: ("10.0.0.8",),
+        new_generation=lambda: endpoint_generation,
+    ).admit(
+        f"rtsp://contract:probe-broker-secret-canary@camera.invalid:{port}/live"
+    )
+    # The installed broker contract intentionally uses local listeners. Camera
+    # admission rejects loopback; this test-only replacement represents an
+    # identity that has already crossed that separate policy boundary.
+    return replace(
+        admitted,
+        identity=replace(admitted.identity, address=address),
+    )
 
 
 def main() -> int:
@@ -22,17 +43,10 @@ def main() -> int:
         deadline_after_ms = int(sys.argv[5])
         if not 10 <= deadline_after_ms <= 60_000:
             raise ValueError
-        prefix_length = 32 if address.version == 4 else 128
-        authority = str(address) if address.version == 4 else f"[{address}]"
-        endpoint = ProbeEndpointAdmission(
-            site_key="contract",
-            allowed_networks=(
-                ip_network(f"{address}/{prefix_length}"),
-            ),
-            resolve=lambda _hostname: (),
-            new_generation=lambda: endpoint_generation,
-        ).admit(
-            f"rtsp://contract:probe-broker-secret-canary@{authority}:{port}/live"
+        endpoint = _contract_endpoint(
+            endpoint_generation=endpoint_generation,
+            address=address,
+            port=port,
         )
         result = UnixProbeBrokerClient().execute(
             request_id=request_id,
