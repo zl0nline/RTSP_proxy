@@ -445,9 +445,12 @@ def _serve_probe_media(
     errors: list[BaseException],
     send_media: bool = True,
     profile: str = "video",
+    host: str = "127.0.0.1",
 ) -> None:
     try:
         assert profile in {"video", "audio", "mixed"}
+        ip_version = "IP6" if ":" in host else "IP4"
+        authority = f"[{host}]" if ip_version == "IP6" else host
         connection, _address = listener.accept()
         connected.set()
         assert allow_responses.wait(timeout=10)
@@ -476,14 +479,14 @@ def _serve_probe_media(
                 elif method == b"DESCRIBE":
                     session = (
                         "v=0\r\n"
-                        "o=- 0 0 IN IP4 127.0.0.1\r\n"
+                        f"o=- 0 0 IN {ip_version} {host}\r\n"
                         "s=probe\r\n"
                         "t=0 0\r\n"
                         "a=control:*\r\n"
                     )
                     video = (
                         "m=video 0 RTP/AVP 96\r\n"
-                        "c=IN IP4 127.0.0.1\r\n"
+                        f"c=IN {ip_version} {host}\r\n"
                         "a=rtpmap:96 H264/90000\r\n"
                         "a=fmtp:96 packetization-mode=1;"
                         "sprop-parameter-sets=Z0LQC4xpyAeEQjU=,aM48gA==\r\n"
@@ -493,7 +496,7 @@ def _serve_probe_media(
                     audio_track = 1 if profile == "mixed" else 0
                     audio = (
                         f"m=audio 0 RTP/AVP {audio_payload_type}\r\n"
-                        "c=IN IP4 127.0.0.1\r\n"
+                        f"c=IN {ip_version} {host}\r\n"
                         f"a=rtpmap:{audio_payload_type} opus/48000/2\r\n"
                         f"a=control:trackID={audio_track}\r\n"
                     )
@@ -504,7 +507,7 @@ def _serve_probe_media(
                     ).encode("ascii")
                     headers = (
                         b"Content-Type: application/sdp\r\n"
-                        b"Content-Base: rtsp://127.0.0.1:"
+                        + f"Content-Base: rtsp://{authority}:".encode("ascii")
                         + str(port).encode("ascii")
                         + b"/live/\r\n"
                     )
@@ -697,6 +700,70 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
         timeout=3,
     )
     assert _SECRET_CANARY not in journal.stdout + journal.stderr
+
+
+def test_installed_broker_executes_exact_ipv6_target_and_cleans_guard() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    listener.bind(("::1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+    request_id = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    connected = threading.Event()
+    allow_responses = threading.Event()
+    allow_responses.set()
+    requests: list[str] = []
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_probe_media,
+        args=(listener,),
+        kwargs={
+            "port": port,
+            "connected": connected,
+            "allow_responses": allow_responses,
+            "requests": requests,
+            "errors": errors,
+            "host": "::1",
+        },
+        daemon=True,
+    )
+    server.start()
+    client = _run_client(request_id, uuid4(), "::1", port)
+    try:
+        stdout, stderr = client.communicate(timeout=15)
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        listener.close()
+
+    assert errors == []
+    assert server.is_alive() is False
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": None,
+        "outcome": "healthy",
+        "video_codec": "h264",
+    }
+    assert requests == [
+        f"OPTIONS rtsp://[::1]:{port}/live RTSP/1.0",
+        f"DESCRIBE rtsp://[::1]:{port}/live RTSP/1.0",
+        f"SETUP rtsp://[::1]:{port}/live/trackID=0 RTSP/1.0",
+        f"PLAY rtsp://[::1]:{port}/live/ RTSP/1.0",
+    ]
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="IPv6 probe remained")
+    _wait_until(lambda: not scope.exists(), failure="IPv6 BPF scope remained")
+    assert not receipt.exists()
 
 
 def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit() -> None:
