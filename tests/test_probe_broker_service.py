@@ -152,7 +152,9 @@ def test_probe_broker_service_returns_only_the_normalized_execution_result() -> 
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
-def test_probe_broker_service_maps_execution_failure_to_inconclusive() -> None:
+def test_probe_broker_service_maps_execution_failure_to_inconclusive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     executor = _Executor(error=RuntimeError("secret from privileged boundary"))
     service = _service(executor)
     client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -172,6 +174,8 @@ def test_probe_broker_service_maps_execution_failure_to_inconclusive() -> None:
             failure_class=ProbeFailureClass.EXECUTOR,
         )
         assert "secret" not in repr(result)
+        assert "probe broker executor failure: probe_execution_failed" in caplog.text
+        assert "secret from privileged boundary" not in caplog.text
     finally:
         client.close()
         worker.join(timeout=2)

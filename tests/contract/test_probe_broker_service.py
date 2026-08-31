@@ -33,6 +33,9 @@ _SAFE_JOURNAL_FIELDS = ("EXIT_CODE", "EXIT_STATUS", "JOB_RESULT", "UNIT_RESULT")
 _SYSTEMD_EXIT = re.compile(
     r"Main process exited, code=([a-z-]+), status=([0-9]{1,3})(?:/[A-Z0-9_-]+)?"
 )
+_BROKER_FAILURE = re.compile(
+    r"probe broker executor failure: (probe_execution_[a-z_]+)"
+)
 
 
 def _service_property(name: str) -> str:
@@ -108,6 +111,28 @@ def _unit_exit_snapshot(unit_name: str) -> dict[str, tuple[str, ...]]:
     }
 
 
+def _broker_failure_snapshot() -> tuple[str, ...]:
+    observed = subprocess.run(
+        [
+            "journalctl",
+            "--unit=rtsp-proxy-probe-broker.service",
+            "--boot",
+            "--no-pager",
+            "--output=cat",
+            "--lines=64",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    return tuple(
+        match.group(1)
+        for line in observed.stdout.splitlines()
+        if (match := _BROKER_FAILURE.fullmatch(line)) is not None
+    )
+
+
 def _probe_unit_snapshot(unit_name: str) -> dict[str, str]:
     observed = subprocess.run(
         [
@@ -128,7 +153,7 @@ def _probe_unit_snapshot(unit_name: str) -> dict[str, str]:
         for line in observed.stdout.splitlines()
         if "=" in line
     )
-    expected_control_group = f"/rtsp-probe.slice/{unit_name}"
+    expected_control_group = f"/rtsp.slice/rtsp-probe.slice/{unit_name}"
     control_group = values.pop("ControlGroup", "")
     values["ControlGroup"] = (
         "expected"
@@ -374,7 +399,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
     request_id = uuid4()
     endpoint_generation = uuid4()
     unit_name = f"rtsp-probe-{request_id.hex}.service"
-    cgroup = Path("/sys/fs/cgroup/rtsp-probe.slice") / unit_name
+    cgroup = Path("/sys/fs/cgroup/rtsp.slice/rtsp-probe.slice") / unit_name
     scope = _PIN_ROOT / request_id.hex
     receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
     connected = threading.Event()
@@ -402,8 +427,9 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
                 "broker did not reach source or return a bounded result: "
                 f"service={_service_snapshot()}, "
                 f"cgroup={cgroup.exists()}, scope={scope.exists()}, "
-                f"receipt={receipt.exists()}, unit={_probe_unit_snapshot(unit_name)}, "
-                f"unit_exit={_unit_exit_snapshot(unit_name)}"
+                    f"receipt={receipt.exists()}, unit={_probe_unit_snapshot(unit_name)}, "
+                    f"unit_exit={_unit_exit_snapshot(unit_name)}, "
+                    f"broker_failure={_broker_failure_snapshot()}"
             )
         if not connected.is_set():
             stdout, stderr = client.communicate(timeout=2)
@@ -414,8 +440,9 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
                 f"stderr_generic={stderr == b'probe_broker_client_failed\n'}, "
                 f"service={_service_snapshot()}, "
                 f"cgroup={cgroup.exists()}, scope={scope.exists()}, "
-                f"receipt={receipt.exists()}, unit={_probe_unit_snapshot(unit_name)}, "
-                f"unit_exit={_unit_exit_snapshot(unit_name)}"
+                    f"receipt={receipt.exists()}, unit={_probe_unit_snapshot(unit_name)}, "
+                    f"unit_exit={_unit_exit_snapshot(unit_name)}, "
+                    f"broker_failure={_broker_failure_snapshot()}"
             )
         assert errors == []
         _wait_until(cgroup.is_dir, failure="probe cgroup was not created")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import socket
 import time
@@ -21,6 +22,19 @@ from rtsp_proxy.probes import ProbeExecutionResult, ProbeFailureClass, ProbeOutc
 
 _MAX_WORKERS = 128
 _MAX_EXECUTION_SECONDS = 60.0
+_LOGGER = logging.getLogger(__name__)
+_SAFE_EXECUTION_FAILURES = frozenset(
+    {
+        "probe_execution_failed_channels",
+        "probe_execution_failed_systemd",
+        "probe_execution_failed_cgroup",
+        "probe_execution_failed_guard",
+        "probe_execution_failed_release",
+        "probe_execution_failed_output",
+        "probe_execution_result_invalid",
+        "probe_execution_timeout",
+    }
+)
 
 
 class ProbeBrokerServiceError(RuntimeError):
@@ -136,7 +150,12 @@ class ProbeBrokerService:
                 )
                 if not isinstance(result, ProbeExecutionResult):
                     raise ProbeBrokerServiceError("probe_broker_execution_failed")
-            except Exception:
+            except Exception as error:
+                code = str(error)
+                _LOGGER.warning(
+                    "probe broker executor failure: %s",
+                    code if code in _SAFE_EXECUTION_FAILURES else "probe_execution_failed",
+                )
                 result = ProbeExecutionResult(
                     outcome=ProbeOutcome.INCONCLUSIVE,
                     completed_at=self._completed_at(),

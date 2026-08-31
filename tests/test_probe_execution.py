@@ -407,7 +407,7 @@ def test_probe_execution_cancels_transient_when_guard_install_fails() -> None:
     received = _received_request()
     guard = _Guard(events, install_error=RuntimeError("guard failed"))
 
-    with pytest.raises(ProbeExecutionError, match="probe_execution_failed"):
+    with pytest.raises(ProbeExecutionError, match="probe_execution_failed_guard"):
         _broker(events, guard=guard).execute(received, timeout_seconds=5.0)
 
     assert events == [
@@ -426,7 +426,7 @@ def test_probe_execution_releases_guard_after_output_failure_without_double_canc
     received = _received_request()
     systemd = _Systemd(events, read_error=RuntimeError("output failed"))
 
-    with pytest.raises(ProbeExecutionError, match="probe_execution_failed"):
+    with pytest.raises(ProbeExecutionError, match="probe_execution_failed_output"):
         _broker(events, systemd=systemd).execute(received, timeout_seconds=5.0)
 
     assert events == [

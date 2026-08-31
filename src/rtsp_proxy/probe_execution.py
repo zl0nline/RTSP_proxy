@@ -285,6 +285,7 @@ class ProbeExecutionBroker:
         received = ownership.received
         primary_error: BaseException | None = None
         result: ProbeExecutionResult | None = None
+        stage = "channels"
         try:
             with self._active_lock:
                 if not self._recovery_ready:
@@ -303,6 +304,7 @@ class ProbeExecutionBroker:
                 publish=ownership.channels.publish,
             )
             execution_channels = self._require_channels(ownership)
+            stage = "systemd"
             self._systemd.start_owned(
                 request,
                 descriptors=execution_channels.descriptors,
@@ -311,10 +313,12 @@ class ProbeExecutionBroker:
             )
             execution_channels.close_child_ends()
             unit_name = f"rtsp-probe-{request.request_id.hex}.service"
+            stage = "cgroup"
             cgroup_path = self._cgroups.resolve(
                 unit_name=unit_name,
                 timeout_seconds=self._remaining(deadline),
             )
+            stage = "guard"
             self._guard.install_owned(
                 request_id=request.request_id,
                 unit_name=unit_name,
@@ -325,17 +329,25 @@ class ProbeExecutionBroker:
             )
             self._require_request_live(request)
             _ = self._remaining(deadline)
+            stage = "release"
             execution_channels.release_gate()
             systemd_lease = self._require_systemd_lease(ownership)
+            stage = "output"
             raw_result = self._systemd.read_output(
                 systemd_lease,
                 output_fd=execution_channels.output_fd,
                 timeout_seconds=self._remaining(deadline),
                 ownership=ownership.systemd,
             )
+            stage = "result"
             result = self._decode_result(raw_result)
         except BaseException as error:
-            primary_error = error
+            primary_error = (
+                ProbeExecutionError(f"probe_execution_failed_{stage}")
+                if isinstance(error, Exception)
+                and not isinstance(error, ProbeExecutionError)
+                else error
+            )
 
         with self._active_lock:
             owns_record = self._active.get(request.request_id) is ownership
