@@ -781,9 +781,14 @@ def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit
         )
         stdout, stderr = client.communicate(timeout=5)
 
-        assert client.returncode == 1
-        assert stdout == b""
-        assert stderr == b"probe_broker_client_failed\n"
+        assert client.returncode == 0
+        assert stderr == b""
+        assert json.loads(stdout) == {
+            "audio_codec": None,
+            "failure_class": "executor",
+            "outcome": "inconclusive",
+            "video_codec": None,
+        }
         assert _unit_is_collected(unit_name)
         assert not (_PIN_ROOT / request_id.hex).exists()
         assert not (_OWNERSHIP_ROOT / f"{request_id.hex}.json").exists()
@@ -903,9 +908,14 @@ def test_installed_broker_deadline_collects_stalled_probe_and_remains_available(
 
     assert errors == []
     assert server.is_alive() is False
-    assert client.returncode == 1
-    assert stdout == b""
-    assert stderr == b"probe_broker_client_failed\n"
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": "executor",
+        "outcome": "inconclusive",
+        "video_codec": None,
+    }
     _wait_until(lambda: _unit_is_collected(unit_name), failure="timed-out probe remained")
     _wait_until(lambda: not scope.exists(), failure="timed-out BPF scope remained")
     assert not receipt.exists()
@@ -985,9 +995,14 @@ def test_installed_broker_restart_recovers_inflight_probe_on_startup() -> None:
 
     assert errors == []
     assert server.is_alive() is False
-    assert client.returncode == 1
-    assert stdout == b""
-    assert stderr == b"probe_broker_client_failed\n"
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": "executor",
+        "outcome": "inconclusive",
+        "video_codec": None,
+    }
     _wait_until(lambda: _unit_is_collected(unit_name), failure="restarted probe remained")
     _wait_until(lambda: not scope.exists(), failure="restarted BPF scope remained")
     assert not receipt.exists()
