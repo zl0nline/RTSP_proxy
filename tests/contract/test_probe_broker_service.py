@@ -284,6 +284,57 @@ def _serve_stalled_source(
         errors.append(error)
 
 
+def _serve_redirect_source(
+    listener: socket.socket,
+    *,
+    redirect_port: int,
+    secret_canary: str,
+    errors: list[BaseException],
+) -> None:
+    try:
+        connection, _address = listener.accept()
+        connection.settimeout(5)
+        pending = b""
+        with connection:
+            while True:
+                while b"\r\n\r\n" not in pending:
+                    part = connection.recv(4_096)
+                    if not part:
+                        return
+                    pending += part
+                request, pending = pending.split(b"\r\n\r\n", 1)
+                lines = request.split(b"\r\n")
+                method = lines[0].split(b" ", 1)[0]
+                cseq = next(
+                    line.split(b":", 1)[1].strip()
+                    for line in lines
+                    if line.lower().startswith(b"cseq:")
+                )
+                if method == b"OPTIONS":
+                    response = (
+                        b"RTSP/1.0 200 OK\r\nCSeq: "
+                        + cseq
+                        + b"\r\nPublic: OPTIONS, DESCRIBE\r\nContent-Length: 0\r\n\r\n"
+                    )
+                elif method == b"DESCRIBE":
+                    response = (
+                        b"RTSP/1.0 302 Found\r\nCSeq: "
+                        + cseq
+                        + b"\r\nLocation: rtsp://127.0.0.1:"
+                        + str(redirect_port).encode("ascii")
+                        + b"/"
+                        + secret_canary.encode("ascii")
+                        + b"\r\nContent-Length: 0\r\n\r\n"
+                    )
+                else:
+                    raise AssertionError("redirect source received an unexpected method")
+                connection.sendall(response)
+                if method == b"DESCRIBE":
+                    return
+    except BaseException as error:
+        errors.append(error)
+
+
 def _wait_until(predicate: object, *, failure: str, timeout: float = 10) -> None:
     assert callable(predicate)
     deadline = time.monotonic() + timeout
@@ -764,6 +815,79 @@ def test_installed_broker_executes_exact_ipv6_target_and_cleans_guard() -> None:
     _wait_until(lambda: _unit_is_collected(unit_name), failure="IPv6 probe remained")
     _wait_until(lambda: not scope.exists(), failure="IPv6 BPF scope remained")
     assert not receipt.exists()
+
+
+def test_installed_broker_refuses_redirect_without_secret_or_residue() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    source = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    source.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    source.bind(("127.0.0.1", 0))
+    source.listen(1)
+    source.settimeout(10)
+    redirect = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    redirect.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    redirect.bind(("127.0.0.1", 0))
+    redirect.listen(1)
+    redirect.settimeout(0.5)
+    request_id = uuid4()
+    secret_canary = f"redirect-secret-{request_id.hex}"
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_redirect_source,
+        args=(source,),
+        kwargs={
+            "redirect_port": redirect.getsockname()[1],
+            "secret_canary": secret_canary,
+            "errors": errors,
+        },
+        daemon=True,
+    )
+    server.start()
+    client = _run_client(
+        request_id,
+        uuid4(),
+        "127.0.0.1",
+        source.getsockname()[1],
+    )
+    try:
+        stdout, stderr = client.communicate(timeout=15)
+        with pytest.raises(TimeoutError):
+            redirected, _ = redirect.accept()
+            redirected.close()
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        source.close()
+        redirect.close()
+
+    assert errors == []
+    assert server.is_alive() is False
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": "executor",
+        "outcome": "inconclusive",
+        "video_codec": None,
+    }
+    assert secret_canary.encode() not in stdout + stderr
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="redirect probe remained")
+    _wait_until(lambda: not scope.exists(), failure="redirect BPF scope remained")
+    assert not receipt.exists()
+    journal = subprocess.run(
+        ["journalctl", "--unit", _BROKER_UNIT, "--no-pager", "--output=cat"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert secret_canary not in journal.stdout + journal.stderr
 
 
 def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit() -> None:

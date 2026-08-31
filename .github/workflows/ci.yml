@@ -45,8 +45,9 @@ jobs:
           Components: main universe
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
-          sudo apt-get update
-          sudo apt-get install --yes --allow-downgrades --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --allow-downgrades --no-install-recommends \
             clang-18=1:18.1.3-1ubuntu1 \
             libbpf-dev=1:1.3.0-2build2 \
             libelf-dev=0.190-1.1ubuntu0.1 \
@@ -182,7 +183,8 @@ jobs:
 
       - name: Validate owned nftables policy
         run: |
-          sudo apt-get install --yes --no-install-recommends nftables
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --no-install-recommends nftables
           sudo nft --check --file deploy/nftables/rtsp-proxy.nft
           sudo install -d -m 0700 /run/rtsp-proxy-nftables
           sudo install -d -m 0755 /etc/rtsp-proxy
@@ -286,13 +288,14 @@ jobs:
           Components: main universe
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
           mapfile -t pinned_packages < <(
             jq --raw-output \
               '.probe_ffprobe.build_environment.packages | to_entries[] | .key + "=" + .value' \
               deploy/artifact-catalog.json
           )
-          sudo apt-get install --yes --allow-downgrades --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --allow-downgrades --no-install-recommends \
             "${pinned_packages[@]}"
 
       - name: Build controlled no-redirect ffprobe (${{ matrix.arch }})
@@ -407,8 +410,9 @@ jobs:
           Components: main universe
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
-          sudo apt-get update
-          sudo apt-get install --yes --allow-downgrades --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --allow-downgrades --no-install-recommends \
             linux-tools-generic=6.8.0-138.138
           test "$(dpkg-query --show --showformat='${Version}' linux-tools-generic)" = \
             '6.8.0-138.138'
@@ -628,8 +632,9 @@ jobs:
 
       - name: Install native GStreamer build and runtime packages
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --no-install-recommends \
             iproute2 \
             libgstrtspserver-1.0-dev \
             gstreamer1.0-tools \

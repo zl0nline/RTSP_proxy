@@ -566,6 +566,13 @@ def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None
         "architectures": probe["architectures"],
     }
 
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    retry_options = "-o Acquire::Retries=10 -o Acquire::https::Timeout=30"
+    assert workflow.count("sudo apt-get") == 9
+    assert workflow.count(f"sudo apt-get {retry_options}") == 9
+    assert workflow.count(probe["build_environment"]["ubuntu_snapshot"]) == 2
+    assert "'.probe_ffprobe.build_environment.ubuntu_snapshot'" in workflow
+
     result = subprocess.run(
         ["sh", "-n", "tools/build_probe_ffprobe.sh"],
         check=False,
