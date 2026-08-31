@@ -27,6 +27,8 @@ pytestmark = [
 
 _BROKER_UNIT = "rtsp-proxy-probe-broker.service"
 _BROKER_CLIENT_ENV = "RTSP_PROXY_PROBE_BROKER_CLIENT"
+_CONTRACT_RELEASE = Path("/opt/rtsp-proxy/releases/probe-contract")
+_CURRENT_RELEASE = Path("/opt/rtsp-proxy/current")
 _PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
 _OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
 _SECRET_CANARY = "probe-broker-secret-canary"
@@ -236,7 +238,7 @@ def _run_client(
         or client_path.stat().st_mode & 0o022
     ):
         pytest.fail("exact root-owned broker client fixture is required")
-    interpreter = "/opt/rtsp-proxy/current/.venv/bin/python"
+    interpreter = str(_CONTRACT_RELEASE / ".venv/bin/python")
     arguments = [
         interpreter,
         str(client_path),
@@ -375,6 +377,12 @@ def _assert_probe_secret_isolated_from_proc(unit_name: str) -> None:
         assert observed.stdout == b""
 
 
+def _activate_test_release(target: str) -> None:
+    replacement = _CURRENT_RELEASE.with_name(f".current-{uuid4().hex}")
+    replacement.symlink_to(target)
+    os.replace(replacement, _CURRENT_RELEASE)
+
+
 def _serve_h264(
     listener: socket.socket,
     *,
@@ -482,9 +490,8 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
     bpftool = os.environ.get("RTSP_PROXY_BPFTOOL", "")
     if not Path(bpftool).is_absolute() or not Path(bpftool).is_file():
         pytest.fail("exact bpftool path is required")
-    current_release = Path("/opt/rtsp-proxy/current")
-    assert current_release.is_symlink()
-    assert current_release.resolve() == Path("/opt/rtsp-proxy/releases/probe-contract")
+    assert _CURRENT_RELEASE.is_symlink()
+    assert _CURRENT_RELEASE.resolve() == _CONTRACT_RELEASE
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -822,3 +829,64 @@ def test_installed_broker_repeated_no_media_results_are_inconclusive_and_collect
         )
         assert not receipt.exists()
         assert _service_property("ActiveState") == "active"
+
+
+def test_installed_broker_stops_output_flood_and_leaves_no_residue() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    failure_release = Path("/opt/rtsp-proxy/releases/probe-output-flood")
+    assert not failure_release.exists()
+    launcher = failure_release / ".venv/bin/rtsp-proxy-probe-launcher"
+    launcher.parent.mkdir(parents=True, mode=0o755)
+    launcher.write_text(
+        "#!/usr/bin/python3\n"
+        "import os\n"
+        "if os.read(0, 2) != b'R':\n"
+        "    raise SystemExit(70)\n"
+        "payload = b'x' * 131072\n"
+        "while payload:\n"
+        "    payload = payload[os.write(1, payload):]\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    original_target = os.readlink(_CURRENT_RELEASE)
+    assert original_target == "releases/probe-contract"
+    request_id = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    switched = False
+    client: subprocess.Popen[bytes] | None = None
+    try:
+        _activate_test_release("releases/probe-output-flood")
+        switched = True
+        client = _run_client(
+            request_id,
+            uuid4(),
+            "127.0.0.1",
+            9,
+            deadline_after_ms=5_000,
+        )
+        stdout, stderr = client.communicate(timeout=12)
+    finally:
+        if client is not None and client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        if switched:
+            _activate_test_release(original_target)
+        shutil.rmtree(failure_release, ignore_errors=True)
+
+    assert client is not None
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": "executor",
+        "outcome": "inconclusive",
+        "video_codec": None,
+    }
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="flooded probe remained")
+    _wait_until(lambda: not scope.exists(), failure="flooded BPF scope remained")
+    assert not receipt.exists()
+    assert _CURRENT_RELEASE.resolve() == _CONTRACT_RELEASE
+    assert _service_property("ActiveState") == "active"

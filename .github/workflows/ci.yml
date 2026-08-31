@@ -521,6 +521,7 @@ jobs:
             sudo rm -rf \
               /run/rtsp-proxy-probe-contract \
               /opt/rtsp-proxy/releases/probe-contract \
+              /opt/rtsp-proxy/releases/probe-output-flood \
               /sys/fs/bpf/rtsp-proxy-probe-broker
             sudo systemctl daemon-reload
             if [[ "$mounted_bpffs" == 1 ]]; then
