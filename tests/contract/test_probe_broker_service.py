@@ -383,6 +383,58 @@ def _activate_test_release(target: str) -> None:
     os.replace(replacement, _CURRENT_RELEASE)
 
 
+def _run_fault_launcher(
+    *,
+    release_name: str,
+    launcher_source: str,
+) -> tuple[UUID, int, bytes, bytes]:
+    failure_release = Path("/opt/rtsp-proxy/releases") / release_name
+    assert not failure_release.exists()
+    launcher = failure_release / ".venv/bin/rtsp-proxy-probe-launcher"
+    launcher.parent.mkdir(parents=True, mode=0o755)
+    launcher.write_text(launcher_source, encoding="utf-8")
+    launcher.chmod(0o755)
+    original_target = os.readlink(_CURRENT_RELEASE)
+    assert original_target == "releases/probe-contract"
+    request_id = uuid4()
+    switched = False
+    client: subprocess.Popen[bytes] | None = None
+    try:
+        _activate_test_release(f"releases/{release_name}")
+        switched = True
+        client = _run_client(
+            request_id,
+            uuid4(),
+            "127.0.0.1",
+            9,
+            deadline_after_ms=5_000,
+        )
+        stdout, stderr = client.communicate(timeout=12)
+    finally:
+        if client is not None and client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        if switched:
+            _activate_test_release(original_target)
+        if failure_release.exists():
+            shutil.rmtree(failure_release)
+    assert client is not None
+    assert isinstance(client.returncode, int)
+    assert _CURRENT_RELEASE.resolve() == _CONTRACT_RELEASE
+    assert not failure_release.exists()
+    return request_id, client.returncode, stdout, stderr
+
+
+def _assert_failed_probe_is_collected(request_id: UUID, *, label: str) -> None:
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    _wait_until(lambda: _unit_is_collected(unit_name), failure=f"{label} probe remained")
+    _wait_until(lambda: not scope.exists(), failure=f"{label} BPF scope remained")
+    assert not receipt.exists()
+    assert _service_property("ActiveState") == "active"
+
+
 def _serve_h264(
     listener: socket.socket,
     *,
@@ -834,50 +886,19 @@ def test_installed_broker_repeated_no_media_results_are_inconclusive_and_collect
 def test_installed_broker_stops_output_flood_and_leaves_no_residue() -> None:
     if os.geteuid() != 0:
         pytest.fail("installed broker contract requires root")
-    failure_release = Path("/opt/rtsp-proxy/releases/probe-output-flood")
-    assert not failure_release.exists()
-    launcher = failure_release / ".venv/bin/rtsp-proxy-probe-launcher"
-    launcher.parent.mkdir(parents=True, mode=0o755)
-    launcher.write_text(
-        "#!/usr/bin/python3\n"
-        "import os\n"
-        "if os.read(0, 2) != b'R':\n"
-        "    raise SystemExit(70)\n"
-        "payload = b'x' * 131072\n"
-        "while payload:\n"
-        "    payload = payload[os.write(1, payload):]\n",
-        encoding="utf-8",
+    request_id, returncode, stdout, stderr = _run_fault_launcher(
+        release_name="probe-output-flood",
+        launcher_source=(
+            "#!/usr/bin/python3\n"
+            "import os\n"
+            "if os.read(0, 2) != b'R':\n"
+            "    raise SystemExit(70)\n"
+            "payload = b'x' * 131072\n"
+            "while payload:\n"
+            "    payload = payload[os.write(1, payload):]\n"
+        ),
     )
-    launcher.chmod(0o755)
-    original_target = os.readlink(_CURRENT_RELEASE)
-    assert original_target == "releases/probe-contract"
-    request_id = uuid4()
-    unit_name = f"rtsp-probe-{request_id.hex}.service"
-    scope = _PIN_ROOT / request_id.hex
-    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
-    switched = False
-    client: subprocess.Popen[bytes] | None = None
-    try:
-        _activate_test_release("releases/probe-output-flood")
-        switched = True
-        client = _run_client(
-            request_id,
-            uuid4(),
-            "127.0.0.1",
-            9,
-            deadline_after_ms=5_000,
-        )
-        stdout, stderr = client.communicate(timeout=12)
-    finally:
-        if client is not None and client.poll() is None:
-            client.kill()
-            client.wait(timeout=2)
-        if switched:
-            _activate_test_release(original_target)
-        shutil.rmtree(failure_release, ignore_errors=True)
-
-    assert client is not None
-    assert client.returncode == 0
+    assert returncode == 0
     assert stderr == b""
     assert json.loads(stdout) == {
         "audio_codec": None,
@@ -885,8 +906,28 @@ def test_installed_broker_stops_output_flood_and_leaves_no_residue() -> None:
         "outcome": "inconclusive",
         "video_codec": None,
     }
-    _wait_until(lambda: _unit_is_collected(unit_name), failure="flooded probe remained")
-    _wait_until(lambda: not scope.exists(), failure="flooded BPF scope remained")
-    assert not receipt.exists()
-    assert _CURRENT_RELEASE.resolve() == _CONTRACT_RELEASE
-    assert _service_property("ActiveState") == "active"
+    _assert_failed_probe_is_collected(request_id, label="flooded")
+
+
+def test_installed_broker_rejects_malformed_result_and_leaves_no_residue() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    request_id, returncode, stdout, stderr = _run_fault_launcher(
+        release_name="probe-malformed-result",
+        launcher_source=(
+            "#!/usr/bin/python3\n"
+            "import os\n"
+            "if os.read(0, 2) != b'R':\n"
+            "    raise SystemExit(70)\n"
+            "os.write(1, b'{')\n"
+        ),
+    )
+    assert returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None,
+        "failure_class": "executor",
+        "outcome": "inconclusive",
+        "video_codec": None,
+    }
+    _assert_failed_probe_is_collected(request_id, label="malformed-result")
