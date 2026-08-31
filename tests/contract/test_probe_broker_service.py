@@ -43,7 +43,10 @@ _GUARD_BACKEND_FAILURE = re.compile(
 _GUARD_MANAGER_FAILURE = re.compile(r"probe guard manager failure: (install|verify)")
 _GUARD_VERIFY_FAILURE = re.compile(
     r"probe guard verify failure: "
-    r"(artifact|receipt|pins|map_show|program4|program6|map_lookup|map_key|map_value|"
+    r"(artifact|receipt|pins|map_show|program4|program6|map_lookup|"
+    r"map_key_decode|map_key_value|map_value_decode|map_value_version|"
+    r"map_value_family|map_value_port|map_value_address|map_value_reserved|"
+    r"map_value_length|"
     r"attachments|attachment_match)"
 )
 

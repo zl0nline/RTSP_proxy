@@ -593,12 +593,27 @@ class BpftoolProbeConnectGuardBackend:
                 *_hex_bytes(key),
                 budget=budget,
             )
-            stage = "map_key"
-            if _json_bytes(lookup, "key") != key:
+            stage = "map_key_decode"
+            observed_key = _json_bytes(lookup, "key")
+            stage = "map_key_value"
+            if observed_key != key:
                 raise ProbeConnectGuardError("probe_guard_readback_invalid")
-            stage = "map_value"
-            if _json_bytes(lookup, "value") != scope.target.map_value():
+            stage = "map_value_decode"
+            observed_value = _json_bytes(lookup, "value")
+            expected_value = scope.target.map_value()
+            stage = "map_value_length"
+            if len(observed_value) != len(expected_value):
                 raise ProbeConnectGuardError("probe_guard_readback_invalid")
+            for failure_stage, start, end in (
+                ("map_value_version", 0, 4),
+                ("map_value_family", 4, 8),
+                ("map_value_port", 8, 12),
+                ("map_value_address", 12, 28),
+                ("map_value_reserved", 28, 32),
+            ):
+                stage = failure_stage
+                if observed_value[start:end] != expected_value[start:end]:
+                    raise ProbeConnectGuardError("probe_guard_readback_invalid")
             stage = "attachments"
             attachments = (
                 self._attachments(scope.cgroup_path, budget=budget)
