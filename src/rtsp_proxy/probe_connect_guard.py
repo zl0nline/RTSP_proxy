@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import fcntl
 import json
+import logging
 import os
 import platform
 import re
@@ -32,6 +33,7 @@ from rtsp_proxy.probe_ownership import OwnershipLedger
 
 _COMMAND_OUTPUT_MAX_BYTES = 65_536
 _COMMAND_CLEANUP_SECONDS = 1.0
+_LOGGER = logging.getLogger(__name__)
 _SPAWN_WRAPPER = """
 import os
 import signal
@@ -469,7 +471,8 @@ class BpftoolProbeConnectGuardBackend:
             coordinator = -1
             for path in (paths.programs, paths.maps):
                 os.mkdir(path, mode=0o700)
-            self._command(
+            self._install_command(
+                "load",
                 "prog",
                 "loadall",
                 str(self._object),
@@ -478,7 +481,8 @@ class BpftoolProbeConnectGuardBackend:
                 str(paths.maps),
                 budget=budget,
             )
-            self._command(
+            self._install_command(
+                "attach4",
                 "cgroup",
                 "attach",
                 str(scope.cgroup_path),
@@ -488,7 +492,8 @@ class BpftoolProbeConnectGuardBackend:
                 "multi",
                 budget=budget,
             )
-            self._command(
+            self._install_command(
+                "attach6",
                 "cgroup",
                 "attach",
                 str(scope.cgroup_path),
@@ -499,7 +504,8 @@ class BpftoolProbeConnectGuardBackend:
                 budget=budget,
             )
             key = (0).to_bytes(4, "little")
-            self._command(
+            self._install_command(
+                "map",
                 "map",
                 "update",
                 "pinned",
@@ -1416,6 +1422,18 @@ class BpftoolProbeConnectGuardBackend:
             if not isinstance(error, Exception):
                 raise
             raise ProbeConnectGuardError("probe_guard_kernel_operation_failed") from None
+
+    def _install_command(
+        self,
+        stage: str,
+        *arguments: str,
+        budget: _CommandBudget,
+    ) -> str:
+        try:
+            return self._command(*arguments, budget=budget)
+        except Exception:
+            _LOGGER.warning("probe guard install failure: %s", stage)
+            raise
 
     def _run_verified_command(
         self,

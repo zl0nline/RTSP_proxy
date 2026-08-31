@@ -36,6 +36,7 @@ _SYSTEMD_EXIT = re.compile(
 _BROKER_FAILURE = re.compile(
     r"probe broker executor failure: (probe_execution_[a-z_]+)"
 )
+_GUARD_FAILURE = re.compile(r"probe guard install failure: (load|attach4|attach6|map)")
 
 
 def _service_property(name: str) -> str:
@@ -127,9 +128,18 @@ def _broker_failure_snapshot() -> tuple[str, ...]:
         timeout=3,
     )
     return tuple(
-        match.group(1)
+        value
         for line in observed.stdout.splitlines()
-        if (match := _BROKER_FAILURE.fullmatch(line)) is not None
+        if (
+            value := next(
+                (
+                    match.group(1)
+                    for pattern in (_BROKER_FAILURE, _GUARD_FAILURE)
+                    if (match := pattern.fullmatch(line)) is not None
+                ),
+                None,
+            )
+        )
     )
 
 
