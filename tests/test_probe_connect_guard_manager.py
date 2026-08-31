@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import inspect
 import json
 import multiprocessing
@@ -1087,6 +1088,47 @@ def test_bpftool_backend_preserves_defense_in_depth_cgroup_attachments(
         (9001, "cgroup_inet4_connect"),
         (9002, "cgroup_inet6_connect"),
     ]
+
+
+def test_kernel_cgroup_attachment_query_reads_only_exact_connect_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cgroup = tmp_path / "probe.service"
+    cgroup.mkdir()
+    observed: list[tuple[int, int, str]] = []
+
+    def query(
+        cgroup_fd: int,
+        *,
+        attach_type: int,
+        architecture: str,
+    ) -> tuple[int, ...]:
+        observed.append((cgroup_fd, attach_type, architecture))
+        return {10: (101, 9001), 11: (102,)}[attach_type]
+
+    monkeypatch.setattr(probe_connect_guard, "_query_cgroup_program_ids", query)
+
+    assert probe_connect_guard._kernel_cgroup_attachments(cgroup) == {
+        (101, "cgroup_inet4_connect"),
+        (102, "cgroup_inet6_connect"),
+        (9001, "cgroup_inet4_connect"),
+    }
+    assert [(attach_type, architecture) for _, attach_type, architecture in observed] == [
+        (10, probe_connect_guard._linux_architecture(platform.machine())),
+        (11, probe_connect_guard._linux_architecture(platform.machine())),
+    ]
+    assert all(cgroup_fd >= 0 for cgroup_fd, _, _ in observed)
+
+
+def test_kernel_bpf_query_layout_matches_linux_uapi() -> None:
+    query = probe_connect_guard._BpfProgramQuery
+
+    assert ctypes.sizeof(query) == 64
+    assert query.program_ids.offset == 16
+    assert query.program_count.offset == 24
+    assert query.program_attach_flags.offset == 32
+    assert query.revision.offset == 56
 
 
 def test_bpftool_backend_cleans_owned_pins_after_transient_cgroup_vanishes(

@@ -1630,6 +1630,15 @@ class BpftoolProbeConnectGuardBackend:
         *,
         budget: _CommandBudget,
     ) -> set[tuple[int, str]]:
+        if self._run is None and self._owner_uid == 0:
+            # bpftool enriches cgroup query results by reopening every program
+            # ID.  Linux still gates BPF_PROG_GET_FD_BY_ID on CAP_SYS_ADMIN,
+            # which this deliberately narrow broker does not have.  Query the
+            # two exact hooks directly instead; BPF_PROG_QUERY itself is the
+            # kernel attachment readback primitive and works with the broker's
+            # existing CAP_NET_ADMIN.
+            budget.remaining()
+            return _kernel_cgroup_attachments(cgroup_path)
         encoded = self._command(
             "-j",
             "cgroup",
@@ -3523,3 +3532,96 @@ def _json_bytes(raw: object, key: str) -> bytes:
         except ValueError:
             raise ProbeConnectGuardError("probe_guard_readback_invalid") from None
     return bytes(result)
+
+
+class _BpfProgramQuery(ctypes.Structure):
+    _fields_ = [
+        ("target_fd", ctypes.c_uint32),
+        ("attach_type", ctypes.c_uint32),
+        ("query_flags", ctypes.c_uint32),
+        ("attach_flags", ctypes.c_uint32),
+        ("program_ids", ctypes.c_uint64),
+        ("program_count", ctypes.c_uint32),
+        ("padding", ctypes.c_uint32),
+        ("program_attach_flags", ctypes.c_uint64),
+        ("link_ids", ctypes.c_uint64),
+        ("link_attach_flags", ctypes.c_uint64),
+        ("revision", ctypes.c_uint64),
+    ]
+
+
+_BPF_PROGRAM_QUERY_COMMAND = 16
+_MAX_CGROUP_PROGRAMS_PER_HOOK = 256
+_CGROUP_ATTACH_TYPE_IDS = {
+    "cgroup_inet4_connect": 10,
+    "cgroup_inet6_connect": 11,
+}
+_BPF_SYSCALL_NUMBERS = {"amd64": 321, "arm64": 280}
+
+
+def _kernel_cgroup_attachments(cgroup_path: Path) -> set[tuple[int, str]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(cgroup_path, flags)
+        result: set[tuple[int, str]] = set()
+        architecture = _linux_architecture(platform.machine())
+        for attach_name, attach_type in _CGROUP_ATTACH_TYPE_IDS.items():
+            for program_id in _query_cgroup_program_ids(
+                descriptor,
+                attach_type=attach_type,
+                architecture=architecture,
+            ):
+                item = (program_id, attach_name)
+                if item in result:
+                    raise ProbeConnectGuardError("probe_guard_readback_invalid")
+                result.add(item)
+        return result
+    except (OSError, ValueError, TypeError):
+        raise ProbeConnectGuardError("probe_guard_readback_invalid") from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ProbeConnectGuardError(
+                    "probe_guard_readback_invalid"
+                ) from None
+
+
+def _query_cgroup_program_ids(
+    cgroup_fd: int,
+    *,
+    attach_type: int,
+    architecture: str,
+) -> tuple[int, ...]:
+    try:
+        syscall_number = _BPF_SYSCALL_NUMBERS[architecture]
+    except KeyError:
+        raise ProbeConnectGuardError("probe_guard_readback_invalid") from None
+    program_ids = (ctypes.c_uint32 * _MAX_CGROUP_PROGRAMS_PER_HOOK)()
+    query = _BpfProgramQuery(
+        target_fd=cgroup_fd,
+        attach_type=attach_type,
+        program_ids=ctypes.addressof(program_ids),
+        program_count=_MAX_CGROUP_PROGRAMS_PER_HOOK,
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    result = syscall(
+        syscall_number,
+        _BPF_PROGRAM_QUERY_COMMAND,
+        ctypes.byref(query),
+        ctypes.sizeof(query),
+    )
+    if result != 0 or not 0 <= query.program_count <= len(program_ids):
+        raise ProbeConnectGuardError("probe_guard_readback_invalid")
+    observed = tuple(int(program_ids[index]) for index in range(query.program_count))
+    if any(program_id < 1 for program_id in observed) or len(set(observed)) != len(
+        observed
+    ):
+        raise ProbeConnectGuardError("probe_guard_readback_invalid")
+    return observed
