@@ -553,7 +553,11 @@ def receive_probe_broker_request(
         timeout_seconds=request_timeout_seconds,
         monotonic=monotonic,
     )
-    _require_peer(connection, expected_uid=expected_uid, expected_gid=expected_gid)
+    require_probe_broker_peer(
+        connection,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
     descriptors: list[int] = []
     try:
         header = _recv_exact(
@@ -736,7 +740,25 @@ def _wait_until_readable(
     return remaining_after_wait
 
 
-def _require_peer(connection: socket.socket, *, expected_uid: int, expected_gid: int) -> None:
+def require_probe_broker_peer(
+    connection: socket.socket,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    """Require one exact Linux peer without exposing its credentials."""
+
+    _require_unix_stream(connection)
+    if (
+        sys.platform != "linux"
+        or isinstance(expected_uid, bool)
+        or not isinstance(expected_uid, int)
+        or expected_uid < 0
+        or isinstance(expected_gid, bool)
+        or not isinstance(expected_gid, int)
+        or expected_gid < 0
+    ):
+        raise ProbeBrokerError("probe_broker_policy_invalid")
     try:
         raw = connection.getsockopt(
             socket.SOL_SOCKET,
