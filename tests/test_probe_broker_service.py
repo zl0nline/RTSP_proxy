@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import sys
@@ -155,6 +156,7 @@ def test_probe_broker_service_returns_only_the_normalized_execution_result() -> 
 def test_probe_broker_service_maps_execution_failure_to_inconclusive(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.WARNING, logger="rtsp_proxy.probe_broker_service")
     executor = _Executor(error=RuntimeError("secret from privileged boundary"))
     service = _service(executor)
     client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
