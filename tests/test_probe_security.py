@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
-from ipaddress import ip_network
+from dataclasses import replace
+from ipaddress import ip_address, ip_network
 from threading import Event, Thread
 from uuid import UUID
 
@@ -135,6 +136,83 @@ def test_each_readmission_creates_a_new_immutable_endpoint_generation() -> None:
 
     assert first.identity.address == second.identity.address
     assert first.identity.generation != second.identity.generation
+
+
+def test_persisted_endpoint_is_restored_without_dns_or_a_new_generation() -> None:
+    resolved: list[str] = []
+
+    def resolve(hostname: str) -> tuple[str, ...]:
+        resolved.append(hostname)
+        return ("10.40.0.11",)
+
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/24"),),
+        resolve=resolve,
+    )
+    source_url = "rtsp://camera:secret@camera.example/live"
+    admitted = admission.admit(source_url)
+    restored = admission.restore(source_url, admitted.identity)
+
+    assert resolved == ["camera.example"]
+    assert restored.identity is admitted.identity
+    assert restored.ffconcat_payload() == admitted.ffconcat_payload()
+
+
+@pytest.mark.parametrize(
+    "source_url,identity_port",
+    (
+        ("rtsp://camera.example/other", 554),
+        ("rtsp://camera.example/live", 8554),
+    ),
+)
+def test_restore_rejects_source_port_and_literal_identity_mismatch(
+    source_url: str,
+    identity_port: int,
+) -> None:
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/24"),),
+        resolve=lambda _hostname: ("10.40.0.11",),
+    )
+    admitted = admission.admit("rtsp://camera.example/live")
+    identity = replace(admitted.identity, port=identity_port)
+
+    with pytest.raises(ProbeEndpointRejected, match="probe_endpoint_identity_invalid"):
+        admission.restore(source_url, identity)
+
+
+def test_restore_rejects_literal_address_mismatch() -> None:
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/24"),),
+        resolve=lambda _hostname: (),
+    )
+    source_url = "rtsp://10.40.0.12/live"
+    admitted = admission.admit(source_url)
+    changed_address = replace(admitted.identity, address=ip_address("10.40.0.11"))
+
+    with pytest.raises(ProbeEndpointRejected, match="probe_endpoint_identity_invalid"):
+        admission.restore(source_url, changed_address)
+
+
+def test_restore_rejects_stale_site_policy_without_resolving_again() -> None:
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/24"),),
+        resolve=lambda _hostname: ("10.40.0.11",),
+    )
+    admitted = admission.admit("rtsp://camera.example/live")
+    changed_policy = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/25"),),
+        resolve=lambda _hostname: (_ for _ in ()).throw(
+            AssertionError("restore must not resolve")
+        ),
+    )
+
+    with pytest.raises(ProbeEndpointRejected, match="probe_endpoint_identity_invalid"):
+        changed_policy.restore("rtsp://camera.example/live", admitted.identity)
 
 
 def test_endpoint_diagnostics_never_expose_path_or_query_credentials() -> None:
