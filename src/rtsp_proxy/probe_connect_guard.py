@@ -593,6 +593,7 @@ class BpftoolProbeConnectGuardBackend:
                 *_hex_bytes(key),
                 budget=budget,
             )
+            stage = "map_value"
             if _json_bytes(lookup, "key") != key or _json_bytes(
                 lookup, "value"
             ) != scope.target.map_value():
