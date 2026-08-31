@@ -224,6 +224,7 @@ def _run_client(
     port: int,
     *,
     drop_privileges: bool = True,
+    deadline_after_ms: int = 20_000,
 ) -> subprocess.Popen[bytes]:
     raw_client = os.environ.get(_BROKER_CLIENT_ENV, "")
     client_path = Path(raw_client)
@@ -242,6 +243,7 @@ def _run_client(
         str(endpoint_generation),
         address,
         str(port),
+        str(deadline_after_ms),
     ]
     if drop_privileges:
         setpriv = shutil.which("setpriv")
@@ -261,6 +263,22 @@ def _run_client(
         stderr=subprocess.PIPE,
         env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
     )
+
+
+def _serve_stalled_source(
+    listener: socket.socket,
+    *,
+    connected: threading.Event,
+    release: threading.Event,
+    errors: list[BaseException],
+) -> None:
+    try:
+        connection, _address = listener.accept()
+        connected.set()
+        with connection:
+            assert release.wait(timeout=30)
+    except BaseException as error:
+        errors.append(error)
 
 
 def _wait_until(predicate: object, *, failure: str, timeout: float = 10) -> None:
@@ -550,3 +568,56 @@ def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit
         assert _unit_is_collected(unit_name)
         assert not (_PIN_ROOT / request_id.hex).exists()
         assert not (_OWNERSHIP_ROOT / f"{request_id.hex}.json").exists()
+
+
+def test_installed_broker_deadline_collects_stalled_probe_and_remains_available() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    request_id = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    connected = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_stalled_source,
+        args=(listener,),
+        kwargs={"connected": connected, "release": release, "errors": errors},
+        daemon=True,
+    )
+    server.start()
+    client = _run_client(
+        request_id,
+        uuid4(),
+        "127.0.0.1",
+        listener.getsockname()[1],
+        deadline_after_ms=1_500,
+    )
+    try:
+        _wait_for_source_or_client(connected, client, timeout=10)
+        assert connected.is_set(), _service_snapshot()
+        stdout, stderr = client.communicate(timeout=12)
+    finally:
+        release.set()
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        listener.close()
+
+    assert errors == []
+    assert server.is_alive() is False
+    assert client.returncode == 1
+    assert stdout == b""
+    assert stderr == b"probe_broker_client_failed\n"
+    _wait_until(lambda: _unit_is_collected(unit_name), failure="timed-out probe remained")
+    _wait_until(lambda: not scope.exists(), failure="timed-out BPF scope remained")
+    assert not receipt.exists()
+    assert _service_property("ActiveState") == "active"
+    assert _service_property("SubState") == "running"

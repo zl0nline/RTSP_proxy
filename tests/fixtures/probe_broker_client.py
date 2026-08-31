@@ -27,12 +27,15 @@ def main() -> int:
     descriptor = -1
     connection: socket.socket | None = None
     try:
-        if len(sys.argv) != 5:
+        if len(sys.argv) != 6:
             raise ValueError
         request_id = UUID(sys.argv[1])
         endpoint_generation = UUID(sys.argv[2])
         address = ip_address(sys.argv[3])
         port = int(sys.argv[4])
+        deadline_after_ms = int(sys.argv[5])
+        if not 10 <= deadline_after_ms <= 60_000:
+            raise ValueError
         target = ProbeConnectGuardTarget(address=address, port=port)
         payload = serialize_probe_input(
             address=address,
@@ -47,7 +50,7 @@ def main() -> int:
             request_id=request_id,
             endpoint_generation=endpoint_generation,
             target=target,
-            deadline_unix_ms=int(time.time() * 1_000) + 20_000,
+            deadline_unix_ms=int(time.time() * 1_000) + deadline_after_ms,
         )
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.settimeout(2)
