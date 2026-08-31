@@ -832,13 +832,35 @@ class _FakeBpftool:
         assert 0 < timeout_seconds <= 3.0
         self.commands.append(arguments)
         command = arguments[1:]
+        if command[:2] == ("map", "create"):
+            assert command[3:] == (
+                "type",
+                "array",
+                "key",
+                "4",
+                "value",
+                "32",
+                "entries",
+                "1",
+                "name",
+                "allowed_target",
+            )
+            target_map = Path(command[2])
+            target_map.touch()
+            target_map.chmod(0o600)
+            return ""
         if command[:2] == ("prog", "loadall"):
             program_root = Path(command[3])
-            map_root = Path(command[5])
+            assert command[4:] == (
+                "map",
+                "name",
+                "allowed_target",
+                "pinned",
+                str(program_root.parent / "maps" / "allowed_target"),
+            )
             for pin in (
                 program_root / "rtsp_probe_guard_ipv4",
                 program_root / "rtsp_probe_guard_ipv6",
-                map_root / "allowed_target",
             ):
                 pin.touch()
                 pin.chmod(0o600)

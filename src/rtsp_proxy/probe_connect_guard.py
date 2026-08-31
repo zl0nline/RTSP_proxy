@@ -483,14 +483,40 @@ class BpftoolProbeConnectGuardBackend:
             except Exception:
                 _LOGGER.warning("probe guard backend failure: pins")
                 raise
+            # Create the map without a BTF association before loading either
+            # program.  bpftool's JSON lookup otherwise tries
+            # BPF_BTF_GET_FD_BY_ID, which requires CAP_SYS_ADMIN even though
+            # raw map lookup is permitted by the broker's narrower CAP_BPF
+            # boundary.  Reusing this exact pinned map keeps readback byte
+            # canonical without widening the service capabilities.
+            self._install_command(
+                "map_create",
+                "map",
+                "create",
+                str(paths.target_map),
+                "type",
+                "array",
+                "key",
+                "4",
+                "value",
+                "32",
+                "entries",
+                "1",
+                "name",
+                self._MAP_PIN,
+                budget=budget,
+            )
             self._install_command(
                 "load",
                 "prog",
                 "loadall",
                 str(self._object),
                 str(paths.programs),
-                "pinmaps",
-                str(paths.maps),
+                "map",
+                "name",
+                self._MAP_PIN,
+                "pinned",
+                str(paths.target_map),
                 budget=budget,
             )
             self._install_command(

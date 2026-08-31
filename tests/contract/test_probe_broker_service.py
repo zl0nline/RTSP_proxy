@@ -36,7 +36,9 @@ _SYSTEMD_EXIT = re.compile(
 _BROKER_FAILURE = re.compile(
     r"probe broker executor failure: (probe_execution_[a-z_]+)"
 )
-_GUARD_FAILURE = re.compile(r"probe guard install failure: (load|attach4|attach6|map)")
+_GUARD_FAILURE = re.compile(
+    r"probe guard install failure: (map_create|load|attach4|attach6|map)"
+)
 _GUARD_BACKEND_FAILURE = re.compile(
     r"probe guard backend failure: (artifact|coordinator|ownership|pins)"
 )
