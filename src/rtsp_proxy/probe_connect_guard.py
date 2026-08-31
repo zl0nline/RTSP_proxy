@@ -545,67 +545,80 @@ class BpftoolProbeConnectGuardBackend:
         *,
         timeout_seconds: float,
     ) -> None:
-        self._require_artifact_identity()
-        paths = self._paths(scope)
-        budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
-        self._require_receipt(scope, paths.receipt, require_current=True)
-        self._require_exact_pin_inventory(paths)
-        map_inventory = self._json_command(
-            "-j",
-            "map",
-            "show",
-            "pinned",
-            str(paths.target_map),
-            budget=budget,
-        )
-        map_id = _map_inventory_id(map_inventory)
-        if map_id is None:
-            raise ProbeConnectGuardError("probe_guard_readback_invalid")
-        ipv4_id = self._program_id(
-            paths.ipv4,
-            expected_tag=self._identity.ipv4_program_tag,
-            expected_map_id=map_id,
-            budget=budget,
-        )
-        ipv6_id = self._program_id(
-            paths.ipv6,
-            expected_tag=self._identity.ipv6_program_tag,
-            expected_map_id=map_id,
-            budget=budget,
-        )
-        key = (0).to_bytes(4, "little")
-        lookup = self._json_command(
-            "-j",
-            "map",
-            "lookup",
-            "pinned",
-            str(paths.target_map),
-            "key",
-            "hex",
-            *_hex_bytes(key),
-            budget=budget,
-        )
-        if _json_bytes(lookup, "key") != key or _json_bytes(
-            lookup, "value"
-        ) != scope.target.map_value():
-            raise ProbeConnectGuardError("probe_guard_readback_invalid")
-        attachments = (
-            self._attachments(scope.cgroup_path, budget=budget)
-            if scope.cgroup_path.exists()
-            else set()
-        )
-        expected = {
-            (ipv4_id, self._IPV4_ATTACH),
-            (ipv6_id, self._IPV6_ATTACH),
-        }
-        owned_program_ids = {ipv4_id, ipv6_id}
-        owned_attachments = {
-            attachment
-            for attachment in attachments
-            if attachment[0] in owned_program_ids
-        }
-        if owned_attachments != expected:
-            raise ProbeConnectGuardError("probe_guard_readback_invalid")
+        stage = "artifact"
+        try:
+            self._require_artifact_identity()
+            paths = self._paths(scope)
+            budget = _CommandBudget.start(timeout_seconds, monotonic=self._monotonic)
+            stage = "receipt"
+            self._require_receipt(scope, paths.receipt, require_current=True)
+            stage = "pins"
+            self._require_exact_pin_inventory(paths)
+            stage = "map_show"
+            map_inventory = self._json_command(
+                "-j",
+                "map",
+                "show",
+                "pinned",
+                str(paths.target_map),
+                budget=budget,
+            )
+            map_id = _map_inventory_id(map_inventory)
+            if map_id is None:
+                raise ProbeConnectGuardError("probe_guard_readback_invalid")
+            stage = "program4"
+            ipv4_id = self._program_id(
+                paths.ipv4,
+                expected_tag=self._identity.ipv4_program_tag,
+                expected_map_id=map_id,
+                budget=budget,
+            )
+            stage = "program6"
+            ipv6_id = self._program_id(
+                paths.ipv6,
+                expected_tag=self._identity.ipv6_program_tag,
+                expected_map_id=map_id,
+                budget=budget,
+            )
+            key = (0).to_bytes(4, "little")
+            stage = "map_lookup"
+            lookup = self._json_command(
+                "-j",
+                "map",
+                "lookup",
+                "pinned",
+                str(paths.target_map),
+                "key",
+                "hex",
+                *_hex_bytes(key),
+                budget=budget,
+            )
+            if _json_bytes(lookup, "key") != key or _json_bytes(
+                lookup, "value"
+            ) != scope.target.map_value():
+                raise ProbeConnectGuardError("probe_guard_readback_invalid")
+            stage = "attachments"
+            attachments = (
+                self._attachments(scope.cgroup_path, budget=budget)
+                if scope.cgroup_path.exists()
+                else set()
+            )
+            expected = {
+                (ipv4_id, self._IPV4_ATTACH),
+                (ipv6_id, self._IPV6_ATTACH),
+            }
+            owned_program_ids = {ipv4_id, ipv6_id}
+            owned_attachments = {
+                attachment
+                for attachment in attachments
+                if attachment[0] in owned_program_ids
+            }
+            stage = "attachment_match"
+            if owned_attachments != expected:
+                raise ProbeConnectGuardError("probe_guard_readback_invalid")
+        except Exception:
+            _LOGGER.warning("probe guard verify failure: %s", stage)
+            raise
 
     def remove(
         self,

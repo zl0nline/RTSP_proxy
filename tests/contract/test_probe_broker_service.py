@@ -41,6 +41,10 @@ _GUARD_BACKEND_FAILURE = re.compile(
     r"probe guard backend failure: (artifact|coordinator|ownership|pins)"
 )
 _GUARD_MANAGER_FAILURE = re.compile(r"probe guard manager failure: (install|verify)")
+_GUARD_VERIFY_FAILURE = re.compile(
+    r"probe guard verify failure: "
+    r"(artifact|receipt|pins|map_show|program4|program6|map_lookup|attachments|attachment_match)"
+)
 
 
 def _service_property(name: str) -> str:
@@ -143,6 +147,7 @@ def _broker_failure_snapshot() -> tuple[str, ...]:
                         _GUARD_FAILURE,
                         _GUARD_BACKEND_FAILURE,
                         _GUARD_MANAGER_FAILURE,
+                        _GUARD_VERIFY_FAILURE,
                     )
                     if (match := pattern.fullmatch(line)) is not None
                 ),
