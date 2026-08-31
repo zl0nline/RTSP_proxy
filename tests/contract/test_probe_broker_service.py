@@ -28,6 +28,7 @@ _BROKER_CLIENT_ENV = "RTSP_PROXY_PROBE_BROKER_CLIENT"
 _PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
 _OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
 _SECRET_CANARY = "probe-broker-secret-canary"
+_SAFE_JOURNAL_FIELDS = ("EXIT_CODE", "EXIT_STATUS", "JOB_RESULT", "UNIT_RESULT")
 
 
 def _service_property(name: str) -> str:
@@ -52,6 +53,44 @@ def _service_snapshot() -> dict[str, str]:
             "ExecMainStatus",
             "NRestarts",
         )
+    }
+
+
+def _unit_exit_snapshot(unit_name: str) -> dict[str, tuple[str, ...]]:
+    observed = subprocess.run(
+        [
+            "journalctl",
+            "--unit",
+            unit_name,
+            "--no-pager",
+            "--output=json",
+            "--since=-2 minutes",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    values: dict[str, set[str]] = {field: set() for field in _SAFE_JOURNAL_FIELDS}
+    for line in observed.stdout.splitlines()[:128]:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        for field in _SAFE_JOURNAL_FIELDS:
+            value = entry.get(field)
+            if (
+                isinstance(value, str)
+                and 1 <= len(value) <= 64
+                and all(character.isalnum() or character in "_.:-" for character in value)
+            ):
+                values[field].add(value)
+    return {
+        field: tuple(sorted(field_values))
+        for field, field_values in values.items()
+        if field_values
     }
 
 
@@ -317,7 +356,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
                 "broker did not reach source or return a bounded result: "
                 f"service={_service_snapshot()}, "
                 f"cgroup={cgroup.exists()}, scope={scope.exists()}, "
-                f"receipt={receipt.exists()}"
+                f"receipt={receipt.exists()}, unit_exit={_unit_exit_snapshot(unit_name)}"
             )
         if not connected.is_set():
             stdout, stderr = client.communicate(timeout=2)
@@ -328,7 +367,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
                 f"stderr_generic={stderr == b'probe_broker_client_failed\n'}, "
                 f"service={_service_snapshot()}, "
                 f"cgroup={cgroup.exists()}, scope={scope.exists()}, "
-                f"receipt={receipt.exists()}"
+                f"receipt={receipt.exists()}, unit_exit={_unit_exit_snapshot(unit_name)}"
             )
         assert errors == []
         _wait_until(cgroup.is_dir, failure="probe cgroup was not created")
