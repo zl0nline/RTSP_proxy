@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shutil
 import socket
@@ -332,6 +333,48 @@ def _guard_attach_types(bpftool: str, cgroup: Path) -> set[str]:
     }
 
 
+def _assert_probe_secret_isolated_from_proc(unit_name: str) -> None:
+    raw_pid = subprocess.run(
+        ["systemctl", "show", unit_name, "--property=MainPID", "--value"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    ).stdout.strip()
+    assert raw_pid.isdecimal()
+    pid = int(raw_pid)
+    assert pid > 1
+    visible_metadata = (
+        Path(f"/proc/{pid}/cmdline").read_bytes()
+        + Path(f"/proc/{pid}/environ").read_bytes()
+    )
+    assert _SECRET_CANARY.encode() not in visible_metadata
+    setpriv = shutil.which("setpriv")
+    if setpriv is None:
+        pytest.fail("setpriv is required for the probe credential boundary")
+    identities = (
+        pwd.getpwnam("rtsp-proxy"),
+        pwd.getpwnam("nobody"),
+    )
+    for identity in identities:
+        observed = subprocess.run(
+            [
+                setpriv,
+                f"--reuid={identity.pw_uid}",
+                f"--regid={identity.pw_gid}",
+                "--clear-groups",
+                "/usr/bin/head",
+                "--bytes=16384",
+                f"/proc/{pid}/fd/2",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=2,
+        )
+        assert observed.returncode != 0
+        assert observed.stdout == b""
+
+
 def _serve_h264(
     listener: socket.socket,
     *,
@@ -507,6 +550,7 @@ def test_installed_broker_attaches_guard_before_ffprobe_and_leaves_no_residue() 
             "cgroup_inet_egress",
             "cgroup_inet_ingress",
         }
+        _assert_probe_secret_isolated_from_proc(unit_name)
         allow_responses.set()
         stdout, stderr = client.communicate(timeout=15)
     finally:
