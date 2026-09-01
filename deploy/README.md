@@ -1,5 +1,11 @@
 # Direct Linux deployment
 
+For the executable first-server workflow, including immutable staging,
+application update, schema-compatible rollback and the real-camera pilot gate,
+see [PILOT_INSTALL.md](PILOT_INSTALL.md). The commands there automate release
+and host-asset installation without creating secrets, migrating a live database
+implicitly or restarting media nodes.
+
 Docker/container runtime не входит в deployment contract. Target —
 systemd-based Linux host с Python 3.12 и несколькими bounded MediaMTX nodes.
 Linux amd64/arm64 имеют одинаковые functional/security/release gates; capacity

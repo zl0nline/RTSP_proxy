@@ -382,6 +382,9 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
     ) in workflow
     assert "Verify installed root broker transaction" in workflow
     assert "tests/contract/test_probe_broker_service.py" in workflow
+    assert "Publish verified pilot release bundle (${{ matrix.arch }})" in workflow
+    assert "name: rtsp-proxy-release-${{ matrix.arch }}" in workflow
+    assert "path: .artifacts/release" in workflow
 
 
 def test_release_and_runtime_connect_guard_catalogs_are_exactly_aligned() -> None:
@@ -606,6 +609,27 @@ def test_load_fixture_builder_has_valid_bash_syntax() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_pilot_bootstrap_is_bounded_and_does_not_activate_services() -> None:
+    script = Path("tools/bootstrap_rtsp_proxy_host.sh")
+    result = subprocess.run(
+        ["bash", "-n", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    content = script.read_text(encoding="utf-8")
+
+    assert result.returncode == 0, result.stderr
+    assert "24.04|26.04" in content
+    assert "Acquire::Retries=10" in content
+    assert "UV_PYTHON_INSTALL_DIR" in content
+    assert '"$deploy_uv" python install 3.12' in content
+    assert "systemctl enable" not in content
+    assert "systemctl start" not in content
+    assert "mount " not in content
+    assert "curl |" not in content
 
 
 def test_browser_e2e_cleanup_preserves_an_early_failure(tmp_path: Path) -> None:

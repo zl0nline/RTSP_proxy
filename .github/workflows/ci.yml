@@ -507,6 +507,14 @@ jobs:
           .artifacts/release-venv/bin/rtsp-proxy-verify-release \
             --manifest .artifacts/release/release-manifest.json
 
+      - name: Publish verified pilot release bundle (${{ matrix.arch }})
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rtsp-proxy-release-${{ matrix.arch }}
+          path: .artifacts/release
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Verify installed root broker transaction
         run: |
           broker_release=/opt/rtsp-proxy/releases/probe-contract

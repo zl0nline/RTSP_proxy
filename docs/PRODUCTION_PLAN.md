@@ -659,6 +659,24 @@ contention, create returns `201` with that `PROVISIONING` node and its
 `Location`; the operator continues through the node's start endpoint instead of
 retrying create and reserving another port.
 
+The source tree now ships a pilot deployment interface and direct wrappers for
+the first server trial. It stages an architecture-specific CI bundle into a
+private directory, derives the runtime environment from the exact clean
+manifest commit and lock, runs the packaged release verifier, removes
+group/other write access and atomically publishes the immutable release. Static
+systemd/sysusers/tmpfiles assets are installed separately from configuration
+and secrets. Fresh `install` never changes `current` or starts services.
+
+`update` validates the live PostgreSQL revision against the candidate rolling
+window, atomically switches `current`, restarts only previously active
+control-plane units and restores the prior compatible release when HTTPS
+readiness fails. It never enumerates or restarts media-node instances. Database
+migration remains an explicit post-bridge step; `rollback` refuses a target
+whose manifest does not include the exact live revision and never runs Alembic
+downgrade. CI publishes the verified amd64/arm64 pilot bundles, while the
+operator runbook and real-server exercise remain required evidence rather than
+a Production GO claim.
+
 ## 20. Operations
 
 Required runbooks:
@@ -675,6 +693,14 @@ Required runbooks:
 - SMTP outage/dedupe;
 - resource/FD/NIC saturation;
 - release upgrade/rollback.
+
+The executable pilot sequence is maintained in
+`deploy/PILOT_INSTALL.md`: host prerequisite check, immutable install, explicit
+first migration/activation, update health rollback, schema-compatible explicit
+rollback and a small real-camera trial gate. The bootstrap accepts Ubuntu 24.04
+and 26.04 for pilot testing, installs only reviewed OS prerequisites plus a
+dedicated Python 3.12 through an operator-provided trusted `uv`, and never
+enables services or mutates PostgreSQL/firewall state.
 
 Control-plane update must not restart media nodes. MediaMTX update proceeds one
 drained node at a time. Restore regenerates configs and validates current host

@@ -4,6 +4,12 @@
 на независимые bounded nodes: каждая node — отдельный MediaMTX process/systemd
 instance, один внешний RTSP port и не более 100 зарегистрированных камер.
 
+Для первого direct-Linux развёртывания используйте
+[`deploy/PILOT_INSTALL.md`](deploy/PILOT_INSTALL.md): там описаны проверяемая
+immutable installation, update с health rollback, schema-compatible rollback и
+пошаговый gate перед подключением реальных камер. Общий детальный deployment и
+security runbook остаётся в [`deploy/README.md`](deploy/README.md).
+
 > **Статус на 29 августа 2026**
 >
 > - Bounded-node architecture: **согласована**, issues #1–#14 обновлены.
