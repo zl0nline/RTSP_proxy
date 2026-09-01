@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import socket
 import time
-from urllib.parse import urlsplit
+from ipaddress import ip_address
+from urllib.parse import parse_qs, urlsplit
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -28,6 +30,17 @@ def main() -> int:
     if b"/probe-systemd-overflow" in payload:
         _write_all(1, b"x" * 65_537)
         return 0
+    if b"/probe-systemd-core-limit" in payload:
+        _write_all(
+            1,
+            json.dumps(
+                {"core_limit": list(resource.getrlimit(resource.RLIMIT_CORE))},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            + b"\n",
+        )
+        os.abort()
     if b"/probe-systemd-cancel" in payload:
         time.sleep(60)
         return 0
@@ -40,16 +53,40 @@ def main() -> int:
             target = urlsplit(file_line[6:-1])
             if target.hostname is None or target.port is None:
                 return 23
-            results: dict[str, bool] = {}
-            for label, port in (
-                ("allowed", target.port),
-                ("denied", target.port + 1),
+            address = ip_address(target.hostname)
+            wrong_address_values = parse_qs(
+                target.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            ).get("wrong_address", [])
+            if len(wrong_address_values) != 1:
+                return 23
+            wrong_address_value = ip_address(wrong_address_values[0])
+            if (
+                wrong_address_value.version != address.version
+                or wrong_address_value == address
             ):
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                return 23
+            family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+            alternate_family = (
+                socket.AF_INET6 if family == socket.AF_INET else socket.AF_INET
+            )
+            alternate_host = "::1" if alternate_family == socket.AF_INET6 else "127.0.0.1"
+            results: dict[str, bool] = {}
+            for label, connect_family, host, port in (
+                ("allowed", family, target.hostname, target.port),
+                ("wrong_port", family, target.hostname, target.port + 1),
+                ("wrong_address", family, str(wrong_address_value), target.port),
+                (
+                    "wrong_family",
+                    alternate_family,
+                    alternate_host,
+                    target.port,
+                ),
+            ):
+                with socket.socket(connect_family, socket.SOCK_STREAM) as connection:
                     connection.settimeout(1.0)
-                    results[label] = connection.connect_ex(
-                        (target.hostname, port)
-                    ) == 0
+                    results[label] = connection.connect_ex((host, port)) == 0
         except (OSError, StopIteration, UnicodeError, ValueError):
             return 24
         _write_all(

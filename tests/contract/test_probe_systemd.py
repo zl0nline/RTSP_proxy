@@ -57,6 +57,7 @@ def _unit_properties(unit_name: str) -> dict[str, str]:
             "--property=Type",
             "--property=CollectMode",
             "--property=DynamicUser",
+            "--property=LimitCORE",
             "--property=NoNewPrivileges",
             "--property=ProtectSystem",
         ],
@@ -102,7 +103,11 @@ def _wait_until_collected(unit_name: str) -> None:
 
 
 @contextmanager
-def _running_fixture(path: str) -> Iterator[_RunningFixture]:
+def _running_fixture(
+    path: str,
+    *,
+    password: str = "not-logged",
+) -> Iterator[_RunningFixture]:
     if os.geteuid() != 0:
         pytest.fail("probe systemd contract requires a root test process")
     request_id = uuid4()
@@ -112,7 +117,7 @@ def _running_fixture(path: str) -> Iterator[_RunningFixture]:
         port=target.port,
         path_and_query=path,
         username="contract",
-        password="not-logged",
+        password=password,
         io_timeout_microseconds=1_000_000,
     )
     sealed_input_fd = create_sealed_probe_input(payload)
@@ -233,6 +238,7 @@ def test_system_manager_enforces_policy_gate_and_sealed_input_flow() -> None:
             "Type": "exec",
             "CollectMode": "inactive-or-failed",
             "DynamicUser": "yes",
+            "LimitCORE": "0",
             "NoNewPrivileges": "yes",
             "ProtectSystem": "strict",
         }
@@ -260,6 +266,38 @@ def test_system_manager_stops_output_overflow_and_collects_the_unit() -> None:
             )
 
 
+def test_system_manager_disables_core_dump_before_reading_the_secret() -> None:
+    secret = "probe-core-secret-canary"
+    with _running_fixture(
+        "/probe-systemd-core-limit",
+        password=secret,
+    ) as fixture:
+        properties = _wait_for_properties(fixture.unit_name)
+        assert properties["LimitCORE"] == "0"
+        _release(fixture)
+
+        assert fixture.manager.read_output(
+            fixture.lease,
+            output_fd=fixture.output_read_fd,
+            timeout_seconds=5.0,
+        ) == b'{"core_limit":[0,0]}\n'
+        journal = subprocess.run(
+            [
+                "journalctl",
+                "--unit",
+                fixture.unit_name,
+                "--no-pager",
+                "--output=cat",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+
+        assert secret not in journal.stdout + journal.stderr
+
+
 def test_system_manager_cancels_and_collects_a_running_unit() -> None:
     with _running_fixture("/probe-systemd-cancel") as fixture:
         _wait_for_properties(fixture.unit_name)
@@ -269,3 +307,12 @@ def test_system_manager_cancels_and_collects_a_running_unit() -> None:
         fixture.manager.cancel(fixture.lease)
 
         assert time.monotonic() - started_at < 6
+
+
+def test_system_manager_reconciles_a_unit_left_by_a_previous_manager() -> None:
+    with _running_fixture("/probe-systemd-reconcile") as fixture:
+        _wait_for_properties(fixture.unit_name)
+        restarted = DbusNextSystemdTransport()
+
+        assert restarted.reconcile_owned(timeout_seconds=5.0) == 0
+        _wait_until_collected(fixture.unit_name)

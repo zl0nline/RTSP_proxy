@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RTSP Proxy Maintainers <noreply@rtsp-proxy.invalid>
+Date: Sun, 30 Aug 2026 00:00:00 +0300
+Subject: [PATCH] avformat/rtsp: add an opt-in no-redirect flag
+
+Deep probes admit one literal IP and port into a cgroup connect guard. Following
+an RTSP 3xx response would make the demuxer attempt a different destination
+that was not admitted by the broker. Add a demuxer-only flag that refuses the
+redirect before applying the Location URL to the demuxer or emitting FFmpeg's
+default redirect log. Response parsing still occurs before this decision.
+
+The default remains unchanged for ordinary FFmpeg users.
+---
+ libavformat/rtsp.c | 7 +++++++
+ libavformat/rtsp.h | 1 +
+ 2 files changed, 8 insertions(+)
+
+diff --git a/libavformat/rtsp.c b/libavformat/rtsp.c
+index 45b62c4188..f53df48940 100644
+--- a/libavformat/rtsp.c
++++ b/libavformat/rtsp.c
+@@ -97,6 +97,7 @@ const AVOption ff_rtsp_options[] = {
+     { "listen", "wait for incoming connections", 0, AV_OPT_TYPE_CONST, {.i64 = RTSP_FLAG_LISTEN}, 0, 0, DEC, .unit = "rtsp_flags" },
+     { "prefer_tcp", "try RTP via TCP first, if available", 0, AV_OPT_TYPE_CONST, {.i64 = RTSP_FLAG_PREFER_TCP}, 0, 0, DEC|ENC, .unit = "rtsp_flags" },
+     { "satip_raw", "export raw MPEG-TS stream instead of demuxing", 0, AV_OPT_TYPE_CONST, {.i64 = RTSP_FLAG_SATIP_RAW}, 0, 0, DEC, .unit = "rtsp_flags" },
++    { "no_redirect", "refuse RTSP redirect responses", 0, AV_OPT_TYPE_CONST, {.i64 = RTSP_FLAG_NO_REDIRECT}, 0, 0, DEC, .unit = "rtsp_flags" },
+     RTSP_MEDIATYPE_OPTS("allowed_media_types", "set media types to accept from the server"),
+     { "min_port", "set minimum local UDP port", OFFSET(rtp_port_min), AV_OPT_TYPE_INT, {.i64 = RTSP_RTP_PORT_MIN}, 0, 65535, DEC|ENC },
+     { "max_port", "set maximum local UDP port", OFFSET(rtp_port_max), AV_OPT_TYPE_INT, {.i64 = RTSP_RTP_PORT_MAX}, 0, 65535, DEC|ENC },
+@@ -2181,6 +2182,12 @@ redirect:
+     ff_rtsp_close_streams(s);
+     ff_rtsp_close_connections(s);
+     if (reply->status_code >=300 && reply->status_code < 400 && s->iformat) {
++        if (rt->rtsp_flags & RTSP_FLAG_NO_REDIRECT) {
++            av_log(s, AV_LOG_ERROR, "Status %d: RTSP redirect refused\n",
++                   reply->status_code);
++            err = AVERROR(EACCES);
++            goto fail2;
++        }
+         int ret = ff_format_check_set_url(s, reply->location);
+         if (ret < 0) {
+             err = ret;
+diff --git a/libavformat/rtsp.h b/libavformat/rtsp.h
+index 3c9c2c842d..4539e0263f 100644
+--- a/libavformat/rtsp.h
++++ b/libavformat/rtsp.h
+@@ -463,6 +463,7 @@ typedef struct RTSPState {
+                                           address of received packets. */
+ #define RTSP_FLAG_PREFER_TCP  0x10   /**< Try RTP via TCP first if possible. */
+ #define RTSP_FLAG_SATIP_RAW   0x20   /**< Export SAT>IP stream as raw MPEG-TS */
++#define RTSP_FLAG_NO_REDIRECT 0x40   /**< Refuse server-directed URL changes. */
+ 
+ typedef struct RTSPSource {
+     char addr[128]; /**< Source-specific multicast include source IP address (from SDP content) */
+-- 
+2.51.0

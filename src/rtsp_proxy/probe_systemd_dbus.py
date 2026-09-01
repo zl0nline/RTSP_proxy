@@ -40,6 +40,10 @@ _DISCONNECT_RESERVE_SECONDS = 2.0
 _NO_SUCH_UNIT = "org.freedesktop.systemd1.NoSuchUnit"
 _UNIT_EXISTS = "org.freedesktop.systemd1.UnitExists"
 _PROBE_UNIT_PATTERN = re.compile(r"rtsp-probe-[0-9a-f]{32}\.service")
+_PROBE_UNIT_GLOB = "rtsp-probe-*.service"
+_UNIT_INVENTORY_SIGNATURE = "a(ssssssouso)"
+_RECONCILE_MAX_UNITS = 8
+_RECONCILE_MAX_INVENTORY = 128
 
 
 class DbusNextSystemdTransport(ProbeSystemdTransport):
@@ -61,6 +65,11 @@ class DbusNextSystemdTransport(ProbeSystemdTransport):
             raise RuntimeError("probe systemd unit name invalid")
         asyncio.run(self._recover(unit_name, timeout_seconds=timeout_seconds))
 
+    def reconcile_owned(self, *, timeout_seconds: float) -> int:
+        """Collect one bounded batch from the broker-reserved unit namespace."""
+
+        return asyncio.run(self._reconcile_owned(timeout_seconds=timeout_seconds))
+
     async def _start(
         self,
         request: ProbeSystemdCall,
@@ -81,24 +90,31 @@ class DbusNextSystemdTransport(ProbeSystemdTransport):
         deadline = loop.time() + timeout_seconds
 
         async def operation(bus: _AsyncMessageBus) -> None:
-            stop_reply = await _await_until(
-                bus.call(_manager_message("StopUnit", "ss", [unit_name, "replace"])),
-                deadline=deadline,
-            )
-            if _is_no_such_unit(stop_reply):
-                return
-            _object_path_reply(stop_reply)
-            while True:
-                get_reply = await _await_until(
-                    bus.call(_manager_message("GetUnit", "s", [unit_name])),
-                    deadline=deadline,
-                )
-                if _is_no_such_unit(get_reply):
-                    return
-                _object_path_reply(get_reply)
-                await _sleep_until_next_readback(deadline=deadline)
+            await _recover_unit(bus, unit_name=unit_name, deadline=deadline)
 
         await self._with_bus(operation, deadline=deadline)
+
+    async def _reconcile_owned(self, *, timeout_seconds: float) -> int:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+
+        async def operation(bus: _AsyncMessageBus) -> int:
+            inventory_reply = await _await_until(
+                bus.call(
+                    _manager_message(
+                        "ListUnitsByPatterns",
+                        "asas",
+                        [[], [_PROBE_UNIT_GLOB]],
+                    )
+                ),
+                deadline=deadline,
+            )
+            unit_names = _unit_names_from_inventory(inventory_reply)
+            for unit_name in unit_names[:_RECONCILE_MAX_UNITS]:
+                await _recover_unit(bus, unit_name=unit_name, deadline=deadline)
+            return max(0, len(unit_names) - _RECONCILE_MAX_UNITS)
+
+        return await self._with_bus(operation, deadline=deadline)
 
     async def _with_bus[T](
         self,
@@ -185,6 +201,30 @@ async def _disconnect(bus: _AsyncMessageBus) -> None:
         raise disconnect_error from None
 
 
+async def _recover_unit(
+    bus: _AsyncMessageBus,
+    *,
+    unit_name: str,
+    deadline: float,
+) -> None:
+    stop_reply = await _await_until(
+        bus.call(_manager_message("StopUnit", "ss", [unit_name, "replace"])),
+        deadline=deadline,
+    )
+    if _is_no_such_unit(stop_reply):
+        return
+    _object_path_reply(stop_reply)
+    while True:
+        get_reply = await _await_until(
+            bus.call(_manager_message("GetUnit", "s", [unit_name])),
+            deadline=deadline,
+        )
+        if _is_no_such_unit(get_reply):
+            return
+        _object_path_reply(get_reply)
+        await _sleep_until_next_readback(deadline=deadline)
+
+
 async def _await_until[T](awaitable: Awaitable[T], *, deadline: float) -> T:
     remaining = deadline - asyncio.get_running_loop().time()
     if remaining <= 0:
@@ -238,6 +278,37 @@ def _object_path_reply(reply: Message | None) -> str:
     ):
         raise RuntimeError("probe systemd response invalid")
     return reply.body[0]
+
+
+def _unit_names_from_inventory(reply: Message | None) -> tuple[str, ...]:
+    if (
+        reply is None
+        or reply.message_type is not MessageType.METHOD_RETURN
+        or reply.signature != _UNIT_INVENTORY_SIGNATURE
+        or len(reply.body) != 1
+        or not isinstance(reply.body[0], list)
+        or len(reply.body[0]) > _RECONCILE_MAX_INVENTORY
+    ):
+        raise RuntimeError("probe systemd inventory invalid")
+    unit_names: list[str] = []
+    for row in reply.body[0]:
+        if (
+            not isinstance(row, list)
+            or len(row) != 10
+            or not all(isinstance(value, str) for value in row[:6])
+            or not isinstance(row[6], str)
+            or isinstance(row[7], bool)
+            or not isinstance(row[7], int)
+            or row[7] < 0
+            or not isinstance(row[8], str)
+            or not isinstance(row[9], str)
+            or _PROBE_UNIT_PATTERN.fullmatch(row[0]) is None
+        ):
+            raise RuntimeError("probe systemd inventory invalid")
+        unit_names.append(row[0])
+    if len(set(unit_names)) != len(unit_names):
+        raise RuntimeError("probe systemd inventory invalid")
+    return tuple(sorted(unit_names))
 
 
 async def _sleep_until_next_readback(*, deadline: float) -> None:

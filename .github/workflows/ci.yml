@@ -34,9 +34,36 @@ jobs:
 
       - name: Install native PostgreSQL test server
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            clang libbpf-dev linux-tools-generic postgresql
+          sudo rm -f /etc/apt/sources.list
+          sudo find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
+            -type f -delete
+          sudo tee /etc/apt/sources.list.d/rtsp-proxy-snapshot.sources \
+            >/dev/null <<'EOF'
+          Types: deb
+          URIs: https://snapshot.ubuntu.com/ubuntu/20260829T120000Z/
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --allow-downgrades --no-install-recommends \
+            clang-18=1:18.1.3-1ubuntu1 \
+            libbpf-dev=1:1.3.0-2build2 \
+            libelf-dev=0.190-1.1ubuntu0.1 \
+            linux-libc-dev=6.8.0-138.138 \
+            linux-tools-generic=6.8.0-138.138 \
+            postgresql
+          test "$(dpkg-query --show --showformat='${Version}' clang-18)" = \
+            '1:18.1.3-1ubuntu1'
+          test "$(dpkg-query --show --showformat='${Version}' libbpf-dev)" = \
+            '1:1.3.0-2build2'
+          test "$(dpkg-query --show --showformat='${Version}' libelf-dev)" = \
+            '0.190-1.1ubuntu0.1'
+          test "$(dpkg-query --show --showformat='${Version}' linux-libc-dev)" = \
+            '6.8.0-138.138'
+          test "$(dpkg-query --show --showformat='${Version}' linux-tools-generic)" = \
+            '6.8.0-138.138'
           echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
 
       - name: Install locked dependencies
@@ -73,6 +100,33 @@ jobs:
           uv pip sync --python .artifacts/clean-venv/bin/python .artifacts/runtime-requirements.txt
           uv pip install --python .artifacts/clean-venv/bin/python --no-deps dist/rtsp_proxy-0.1.0-py3-none-any.whl
           RTSP_PROXY_ROLE=web .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.runtime import create_app_from_environment; assert create_app_from_environment().title == "RTSP Proxy Control Plane"'
+          .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.probe_connect_guard import _load_packaged_artifact_catalog; catalog = _load_packaged_artifact_catalog(); assert catalog.current_release_id == "0.1.0"'
+          .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_ffprobe_identity; amd64 = trusted_probe_ffprobe_identity("amd64"); arm64 = trusted_probe_ffprobe_identity("arm64"); assert amd64[0] == arm64[0] == "9b6c896-rtsp-proxy.1"; assert amd64[1] != arm64[1]'
+          .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_connect_guard_identity; amd64 = trusted_probe_connect_guard_identity("amd64"); arm64 = trusted_probe_connect_guard_identity("arm64"); assert amd64[0] == arm64[0] == "0.1.0"; assert amd64[1] == arm64[1]'
+          launcher_stdout=$(mktemp)
+          launcher_stderr=$(mktemp)
+          if .artifacts/clean-venv/bin/rtsp-proxy-probe-launcher \
+              </dev/null >"$launcher_stdout" 2>"$launcher_stderr"; then
+            echo "probe launcher unexpectedly accepted EOF input" >&2
+            exit 1
+          else
+            launcher_status=$?
+          fi
+          test "$launcher_status" -eq 70
+          test ! -s "$launcher_stdout"
+          test ! -s "$launcher_stderr"
+          broker_stdout=$(mktemp)
+          broker_stderr=$(mktemp)
+          if .artifacts/clean-venv/bin/rtsp-proxy-probe-broker \
+              </dev/null >"$broker_stdout" 2>"$broker_stderr"; then
+            echo "probe broker unexpectedly started without root" >&2
+            exit 1
+          else
+            broker_status=$?
+          fi
+          test "$broker_status" -eq 1
+          test ! -s "$broker_stdout"
+          test "$(cat "$broker_stderr")" = "probe_broker_linux_root_required"
 
       - name: Verify packaged migrations against native PostgreSQL
         run: |
@@ -102,6 +156,8 @@ jobs:
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-nft-reconcile
           sudo install -m 0755 tests/fixtures/probe_systemd_launcher.py \
             /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-launcher
+          sudo install -m 0755 /usr/bin/true \
+            /opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-broker
           sudo install -m 0755 /usr/bin/true /opt/rtsp-proxy/releases/ci/bin/mediamtx
           sudo ln -s releases/ci /opt/rtsp-proxy/current
           sudo touch /etc/rtsp-proxy/control-plane/rtsp-proxy.env
@@ -127,7 +183,8 @@ jobs:
 
       - name: Validate owned nftables policy
         run: |
-          sudo apt-get install --yes --no-install-recommends nftables
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --no-install-recommends nftables
           sudo nft --check --file deploy/nftables/rtsp-proxy.nft
           sudo install -d -m 0700 /run/rtsp-proxy-nftables
           sudo install -d -m 0755 /etc/rtsp-proxy
@@ -162,16 +219,12 @@ jobs:
             fi
           }
           trap cleanup_bpffs EXIT
-          mapfile -t bpftool_candidates < <(
-            find /usr/lib -mindepth 2 -maxdepth 2 -type f \
-              -path '/usr/lib/linux-tools-*/bpftool' -print | sort --version-sort
-          )
-          test "${#bpftool_candidates[@]}" -gt 0
-          bpftool_path="${bpftool_candidates[-1]}"
+          bpftool_path=/usr/lib/linux-tools-6.8.0-138/bpftool
           test -x "$bpftool_path"
           "$bpftool_path" version
           mkdir -p .artifacts/probe
-          tools/probe/build_connect_guard.sh \
+          RTSP_PROXY_PROBE_CLANG=/usr/bin/clang-18 \
+            tools/probe/build_connect_guard.sh \
             "$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o"
           sha256sum \
             "$bpftool_path" \
@@ -184,6 +237,95 @@ jobs:
             RTSP_PROXY_PROBE_GUARD_BPF_OBJECT="$PWD/.artifacts/probe/rtsp_probe_connect_guard.bpf.o" \
             "$PWD/.venv/bin/python" -m pytest -q -s -p no:cacheprovider \
             tests/contract/test_probe_connect_guard.py
+
+      - name: Upload verified probe connect-guard object
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: probe-connect-guard-${{ matrix.arch }}
+          path: .artifacts/probe/rtsp_probe_connect_guard.bpf.o
+          if-no-files-found: error
+
+  probe-ffprobe-contract:
+    name: probe-ffprobe-contract (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Install pinned probe ffprobe build environment
+        run: |
+          snapshot=$(jq --raw-output \
+            '.probe_ffprobe.build_environment.ubuntu_snapshot' \
+            deploy/artifact-catalog.json)
+          sudo rm -f /etc/apt/sources.list
+          sudo find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
+            -type f -delete
+          sudo tee /etc/apt/sources.list.d/rtsp-proxy-snapshot.sources \
+            >/dev/null <<EOF
+          Types: deb
+          URIs: ${snapshot}
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          mapfile -t pinned_packages < <(
+            jq --raw-output \
+              '.probe_ffprobe.build_environment.packages | to_entries[] | .key + "=" + .value' \
+              deploy/artifact-catalog.json
+          )
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --allow-downgrades --no-install-recommends \
+            "${pinned_packages[@]}"
+
+      - name: Build controlled no-redirect ffprobe (${{ matrix.arch }})
+        run: |
+          test "$(gcc -dumpfullversion | awk -F. '{print $1}')" = \
+            "$(jq --raw-output '.probe_ffprobe.compiler_major' deploy/artifact-catalog.json)"
+          mkdir -p .artifacts/probe-ffprobe
+          tools/build_probe_ffprobe.sh \
+            "${{ matrix.arch }}" \
+            .artifacts/probe-ffprobe/ffprobe
+          tools/build_probe_ffprobe.sh \
+            "${{ matrix.arch }}" \
+            .artifacts/probe-ffprobe/ffprobe.repeat
+          cmp --silent \
+            .artifacts/probe-ffprobe/ffprobe \
+            .artifacts/probe-ffprobe/ffprobe.repeat
+          rm -- .artifacts/probe-ffprobe/ffprobe.repeat
+
+      - name: Verify controlled RTSP redirect refusal
+        env:
+          PROBE_FFPROBE_BINARY: .artifacts/probe-ffprobe/ffprobe
+        run: uv run pytest -q tests/contract/test_probe_ffprobe.py
+
+      - name: Upload controlled probe ffprobe candidate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: probe-ffprobe-${{ matrix.arch }}
+          path: .artifacts/probe-ffprobe/ffprobe*
+          if-no-files-found: error
 
   browser-e2e:
     # This is an external Chromium-client gate. agent-browser does not publish
@@ -230,6 +372,7 @@ jobs:
 
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})
+    needs: [test, probe-ffprobe-contract]
     strategy:
       fail-fast: false
       matrix:
@@ -239,7 +382,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -254,11 +397,44 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
+      - name: Install pinned probe-broker host tool
+        run: |
+          sudo rm -f /etc/apt/sources.list
+          sudo find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
+            -type f -delete
+          sudo tee /etc/apt/sources.list.d/rtsp-proxy-snapshot.sources \
+            >/dev/null <<'EOF'
+          Types: deb
+          URIs: https://snapshot.ubuntu.com/ubuntu/20260829T120000Z/
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --allow-downgrades --no-install-recommends \
+            linux-tools-generic=6.8.0-138.138
+          test "$(dpkg-query --show --showformat='${Version}' linux-tools-generic)" = \
+            '6.8.0-138.138'
+          test -x /usr/lib/linux-tools-6.8.0-138/bpftool
+
       - name: Install pinned Go toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version: "1.26.5"
           cache: false
+
+      - name: Download controlled probe ffprobe (${{ matrix.arch }})
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: probe-ffprobe-${{ matrix.arch }}
+          path: .artifacts/probe-ffprobe
+
+      - name: Download verified probe connect guard (${{ matrix.arch }})
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: probe-connect-guard-${{ matrix.arch }}
+          path: .artifacts/probe-connect-guard
 
       - name: Build pinned patched MediaMTX (${{ matrix.arch }})
         run: |
@@ -287,10 +463,19 @@ jobs:
       - name: Verify native release manifest end to end
         run: |
           uv build
-          mkdir -p .artifacts/release/bin .artifacts/release/dist
+          mkdir -p \
+            .artifacts/release/bin \
+            .artifacts/release/dist \
+            .artifacts/release/libexec/rtsp-proxy-probe
           install -m 0755 .artifacts/mediamtx/mediamtx .artifacts/release/bin/mediamtx
           install -m 0755 .artifacts/ffmpeg/bin/ffmpeg .artifacts/release/bin/ffmpeg
           install -m 0755 .artifacts/ffmpeg/bin/ffprobe .artifacts/release/bin/ffprobe
+          install -m 0755 \
+            .artifacts/probe-ffprobe/ffprobe \
+            .artifacts/release/libexec/rtsp-proxy-probe/ffprobe
+          install -m 0644 \
+            .artifacts/probe-connect-guard/rtsp_probe_connect_guard.bpf.o \
+            .artifacts/release/libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o
           install -m 0644 uv.lock .artifacts/release/uv.lock
           install -m 0644 dist/rtsp_proxy-0.1.0-py3-none-any.whl .artifacts/release/dist/
           lock_sha256=$(sha256sum .artifacts/release/uv.lock | awk '{print $1}')
@@ -305,7 +490,114 @@ jobs:
              | .git_commit = $git_commit' \
             "deploy/release-manifest.${{ matrix.arch }}.example.json" \
             > .artifacts/release/release-manifest.json
-          uv run rtsp-proxy-verify-release --manifest .artifacts/release/release-manifest.json
+          uv export \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file .artifacts/release-requirements.txt
+          uv venv --python 3.12 .artifacts/release-venv
+          uv pip sync \
+            --python .artifacts/release-venv/bin/python \
+            .artifacts/release-requirements.txt
+          uv pip install \
+            --python .artifacts/release-venv/bin/python \
+            --no-deps \
+            dist/rtsp_proxy-0.1.0-py3-none-any.whl
+          .artifacts/release-venv/bin/rtsp-proxy-verify-release \
+            --manifest .artifacts/release/release-manifest.json
+
+      - name: Publish verified pilot release bundle (${{ matrix.arch }})
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rtsp-proxy-release-${{ matrix.arch }}
+          path: .artifacts/release
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify installed root broker transaction
+        run: |
+          broker_release=/opt/rtsp-proxy/releases/probe-contract
+          broker_uv=$(command -v uv)
+          broker_python=$(uv python find 3.12)
+          broker_bpftool=/usr/lib/linux-tools-6.8.0-138/bpftool
+          mounted_bpffs=0
+          cleanup_broker() {
+            sudo systemctl stop rtsp-proxy-probe-broker.socket \
+              rtsp-proxy-probe-broker.service || true
+            sudo rm -f \
+              /run/systemd/system/rtsp-proxy-probe-broker.socket \
+              /run/systemd/system/rtsp-proxy-probe-broker.service \
+              /etc/rtsp-proxy/probe-broker.env \
+              /opt/rtsp-proxy/current
+            sudo rm -rf \
+              /run/rtsp-proxy-probe-contract \
+              /opt/rtsp-proxy/releases/probe-contract \
+              /opt/rtsp-proxy/releases/probe-malformed-result \
+              /opt/rtsp-proxy/releases/probe-output-flood \
+              /sys/fs/bpf/rtsp-proxy-probe-broker
+            sudo systemctl daemon-reload
+            if [[ "$mounted_bpffs" == 1 ]]; then
+              sudo umount /sys/fs/bpf
+            fi
+          }
+          trap cleanup_broker EXIT
+          if ! mountpoint --quiet /sys/fs/bpf; then
+            sudo mount --type bpf bpffs /sys/fs/bpf
+            mounted_bpffs=1
+          fi
+          if ! getent group rtsp-proxy >/dev/null; then
+            sudo groupadd --system rtsp-proxy
+          fi
+          if ! getent passwd rtsp-proxy >/dev/null; then
+            sudo useradd --system --gid rtsp-proxy --no-create-home \
+              --shell /usr/sbin/nologin rtsp-proxy
+          fi
+          sudo install -d -o root -g root -m 0755 \
+            /opt/rtsp-proxy/releases "$broker_release"
+          sudo cp -a .artifacts/release/. "$broker_release/"
+          sudo "$broker_uv" venv --python "$broker_python" "$broker_release/.venv"
+          sudo "$broker_uv" pip sync \
+            --python "$broker_release/.venv/bin/python" \
+            .artifacts/release-requirements.txt
+          sudo "$broker_uv" pip install \
+            --python "$broker_release/.venv/bin/python" \
+            --no-deps "$broker_release/dist/rtsp_proxy-0.1.0-py3-none-any.whl"
+          sudo chown -R root:root "$broker_release"
+          sudo chmod -R go-w "$broker_release"
+          sudo ln -s releases/probe-contract /opt/rtsp-proxy/current
+          sudo install -d -o root -g root -m 0755 /etc/rtsp-proxy
+          sudo install -d -o root -g root -m 0755 \
+            /run/rtsp-proxy-probe-contract
+          sudo install -o root -g root -m 0755 \
+            tests/fixtures/probe_broker_client.py \
+            /run/rtsp-proxy-probe-contract/client.py
+          sudo install -o root -g root -m 0600 \
+            tests/fixtures/probe-broker.env /etc/rtsp-proxy/probe-broker.env
+          sudo install -d -o root -g root -m 0700 \
+            /sys/fs/bpf/rtsp-proxy-probe-broker
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/rtsp-proxy-probe-broker.socket \
+            /run/systemd/system/rtsp-proxy-probe-broker.socket
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/rtsp-proxy-probe-broker.service \
+            /run/systemd/system/rtsp-proxy-probe-broker.service
+          sudo systemctl daemon-reload
+          sudo systemd-analyze verify \
+            /run/systemd/system/rtsp-proxy-probe-broker.socket \
+            /run/systemd/system/rtsp-proxy-probe-broker.service
+          sudo systemctl start rtsp-proxy-probe-broker.socket
+          sudo env \
+            RTSP_PROXY_RUN_PROBE_BROKER_CONTRACT=1 \
+            RTSP_PROXY_BPFTOOL="$broker_bpftool" \
+            RTSP_PROXY_PROBE_BROKER_CLIENT=/run/rtsp-proxy-probe-contract/client.py \
+            "$PWD/.venv/bin/python" -m pytest -q -p no:cacheprovider \
+            tests/contract/test_probe_broker_service.py
+          sudo systemctl is-active --quiet rtsp-proxy-probe-broker.service
+          test -z "$(sudo find /sys/fs/bpf/rtsp-proxy-probe-broker \
+            -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -z "$(sudo find /run/rtsp-proxy-probe-broker/guard-ownership \
+            -mindepth 1 -maxdepth 1 -name '*.json' -print -quit)"
 
       - name: Verify effective listener contract
         env:
@@ -348,8 +640,9 @@ jobs:
 
       - name: Install native GStreamer build and runtime packages
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 \
+            install --yes --no-install-recommends \
             iproute2 \
             libgstrtspserver-1.0-dev \
             gstreamer1.0-tools \

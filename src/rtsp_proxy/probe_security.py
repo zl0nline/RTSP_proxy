@@ -195,32 +195,9 @@ class ProbeEndpointAdmission:
         return self._policy_sha256
 
     def admit(self, source_url: str) -> AdmittedProbeEndpoint:
-        if (
-            not isinstance(source_url, str)
-            or not 1 <= len(source_url.encode("utf-8")) <= 8_192
-            or any(character in source_url for character in "\r\n\x00")
-        ):
-            raise ProbeEndpointRejected("probe_endpoint_invalid")
-        try:
-            parsed = urlsplit(source_url)
-            hostname = parsed.hostname
-            port = 554 if parsed.port is None else parsed.port
-        except (UnicodeError, ValueError):
-            raise ProbeEndpointRejected("probe_endpoint_invalid") from None
-        if (
-            parsed.scheme.lower() != "rtsp"
-            or hostname is None
-            or parsed.fragment
-            or not 1 <= port <= 65_535
-        ):
-            raise ProbeEndpointRejected("probe_endpoint_invalid")
-        credential = _parse_credential(parsed.username, parsed.password)
-        path_and_query = parsed.path or "/"
-        if parsed.query:
-            path_and_query += f"?{parsed.query}"
-        if any(character in path_and_query for character in "'\\\r\n\x00"):
-            raise ProbeEndpointRejected("probe_endpoint_invalid")
-
+        hostname, port, path_and_query, credential, source_sha256 = _parse_source_url(
+            source_url
+        )
         literal = _literal_address(hostname)
         if literal is None:
             canonical_hostname = _canonical_hostname(hostname)
@@ -255,8 +232,40 @@ class ProbeEndpointAdmission:
                 port=port,
                 site_key=self._site_key,
                 policy_sha256=self._policy_sha256,
-                source_url_sha256=hashlib.sha256(source_url.encode()).hexdigest(),
+                source_url_sha256=source_sha256,
             ),
+            _path_and_query=path_and_query,
+            _credential=credential,
+        )
+
+    def restore(
+        self,
+        source_url: str,
+        identity: ProbeEndpointIdentity,
+    ) -> AdmittedProbeEndpoint:
+        """Rehydrate one persisted admission without DNS or a new generation."""
+
+        if not isinstance(identity, ProbeEndpointIdentity):
+            raise ProbeEndpointRejected("probe_endpoint_identity_invalid")
+        hostname, port, path_and_query, credential, source_sha256 = _parse_source_url(
+            source_url
+        )
+        literal = _literal_address(hostname)
+        if (
+            identity.site_key != self._site_key
+            or identity.policy_sha256 != self._policy_sha256
+            or identity.source_url_sha256 != source_sha256
+            or identity.port != port
+            or _address_forbidden(identity.address)
+            or not self._allowed(identity.address)
+            or (
+                literal is not None
+                and _normalize_address(literal) != identity.address
+            )
+        ):
+            raise ProbeEndpointRejected("probe_endpoint_identity_invalid")
+        return AdmittedProbeEndpoint(
+            identity=identity,
             _path_and_query=path_and_query,
             _credential=credential,
         )
@@ -270,6 +279,43 @@ class ProbeEndpointAdmission:
 
 def _sha256_valid(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _parse_source_url(
+    source_url: str,
+) -> tuple[str, int, str, _ProbeCredential | None, str]:
+    if not isinstance(source_url, str) or any(
+        character in source_url for character in "\r\n\x00"
+    ):
+        raise ProbeEndpointRejected("probe_endpoint_invalid")
+    try:
+        encoded = source_url.encode("utf-8")
+        parsed = urlsplit(source_url)
+        hostname = parsed.hostname
+        port = 554 if parsed.port is None else parsed.port
+    except (UnicodeError, ValueError):
+        raise ProbeEndpointRejected("probe_endpoint_invalid") from None
+    if (
+        not 1 <= len(encoded) <= 8_192
+        or parsed.scheme.lower() != "rtsp"
+        or hostname is None
+        or parsed.fragment
+        or not 1 <= port <= 65_535
+    ):
+        raise ProbeEndpointRejected("probe_endpoint_invalid")
+    credential = _parse_credential(parsed.username, parsed.password)
+    path_and_query = parsed.path or "/"
+    if parsed.query:
+        path_and_query += f"?{parsed.query}"
+    if any(character in path_and_query for character in "'\\\r\n\x00"):
+        raise ProbeEndpointRejected("probe_endpoint_invalid")
+    return (
+        hostname,
+        port,
+        path_and_query,
+        credential,
+        hashlib.sha256(encoded).hexdigest(),
+    )
 
 
 def _parse_credential(username: str | None, password: str | None) -> _ProbeCredential | None:

@@ -1,5 +1,11 @@
 # Direct Linux deployment
 
+For the executable first-server workflow, including immutable staging,
+application update, schema-compatible rollback and the real-camera pilot gate,
+see [PILOT_INSTALL.md](PILOT_INSTALL.md). The commands there automate release
+and host-asset installation without creating secrets, migrating a live database
+implicitly or restarting media nodes.
+
 Docker/container runtime не входит в deployment contract. Target —
 systemd-based Linux host с Python 3.12 и несколькими bounded MediaMTX nodes.
 Linux amd64/arm64 имеют одинаковые functional/security/release gates; capacity
@@ -13,6 +19,7 @@ Linux amd64/arm64 имеют одинаковые functional/security/release ga
 │   └── <release-id>/
 │       ├── .venv/
 │       ├── bin/{mediamtx,ffmpeg,ffprobe}
+│       ├── libexec/rtsp-proxy-probe/ffprobe
 │       ├── dist/rtsp_proxy-<version>-py3-none-any.whl
 │       ├── release-manifest.json
 │       └── uv.lock
@@ -457,7 +464,13 @@ process; a third fails with retryable `node_disruption_busy` before mutation.
 
 ## Artifact catalog and activation
 
-`artifact-catalog.json` pins FFmpeg/ffprobe URLs and digests. MediaMTX is built
+`artifact-catalog.json` pins the general FFmpeg/ffprobe URLs and digests. The
+controlled source-probe ffprobe is a separate release artifact under
+`libexec/rtsp-proxy-probe/ffprobe`: its exact FFmpeg source, local no-redirect
+patch, Ubuntu snapshot/toolchain and reproducible amd64/arm64 digests are bound
+by both the deployment catalog and the packaged verifier trust catalog. It is
+not interchangeable with `bin/ffprobe`, and release verification does not yet
+enable the Phase G executor. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
 two SHA-256-bound production patches, one deterministic race-regression patch,
 and Go `1.26.5`; resulting amd64/arm64 binary

@@ -154,6 +154,31 @@ def _unit_exists() -> Message:
     )
 
 
+def _unit_inventory(*unit_names: str) -> Message:
+    return Message(
+        message_type=MessageType.METHOD_RETURN,
+        reply_serial=1,
+        signature="a(ssssssouso)",
+        body=[
+            [
+                [
+                    unit_name,
+                    "probe",
+                    "loaded",
+                    "active",
+                    "running",
+                    "",
+                    f"/org/freedesktop/systemd1/unit/{index}",
+                    0,
+                    "",
+                    "/",
+                ]
+                for index, unit_name in enumerate(unit_names)
+            ]
+        ],
+    )
+
+
 def test_dbus_transport_sends_the_exact_message_and_unix_descriptors(
     descriptors: ProbeTransientDescriptors,
 ) -> None:
@@ -295,6 +320,48 @@ def test_dbus_transport_stops_and_reads_back_the_exact_unit_during_recovery() ->
     assert bus.messages[1].body == [
         "rtsp-probe-447a1c4e4c794c508e5142c4dfa5fb19.service"
     ]
+    assert bus.disconnected
+    assert bus.disconnect_waited
+
+
+def test_dbus_transport_reconciles_only_reserved_probe_units_in_one_batch() -> None:
+    unit_names = tuple(
+        f"rtsp-probe-{index:032x}.service"
+        for index in range(9)
+    )
+    replies: list[Message | BaseException] = [_unit_inventory(*unit_names)]
+    for _ in range(8):
+        replies.extend((_method_return(), _no_such_unit()))
+    bus = _SequencedReplyBus(*replies)
+    transport = DbusNextSystemdTransport(
+        bus_factory=lambda deadline: _factory(bus, deadline)
+    )
+
+    assert transport.reconcile_owned(timeout_seconds=1.0) == 1
+
+    assert bus.messages[0].member == "ListUnitsByPatterns"
+    assert bus.messages[0].signature == "asas"
+    assert bus.messages[0].body == [[], ["rtsp-probe-*.service"]]
+    assert [message.member for message in bus.messages[1:]] == [
+        member
+        for _ in range(8)
+        for member in ("StopUnit", "GetUnit")
+    ]
+    assert [message.body[0] for message in bus.messages[1::2]] == list(unit_names[:8])
+    assert bus.disconnected
+    assert bus.disconnect_waited
+
+
+def test_dbus_transport_rejects_malformed_reserved_unit_inventory() -> None:
+    bus = _FakeBus(reply=_unit_inventory("postgresql.service"))
+    transport = DbusNextSystemdTransport(
+        bus_factory=lambda deadline: _factory(bus, deadline)
+    )
+
+    with pytest.raises(RuntimeError, match="probe systemd inventory invalid"):
+        transport.reconcile_owned(timeout_seconds=1.0)
+
+    assert [message.member for message in bus.messages] == ["ListUnitsByPatterns"]
     assert bus.disconnected
     assert bus.disconnect_waited
 

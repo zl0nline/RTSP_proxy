@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from ipaddress import ip_address
 from typing import cast
 from uuid import UUID
@@ -18,11 +19,15 @@ import rtsp_proxy.probe_broker as broker_module
 from rtsp_proxy.probe_broker import (
     ProbeBrokerError,
     ProbeBrokerRequest,
+    ProbeBrokerResponse,
     ReceivedProbeInput,
     receive_probe_broker_request,
+    receive_probe_broker_response,
     send_probe_broker_request,
+    send_probe_broker_response,
 )
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget, create_sealed_probe_input
+from rtsp_proxy.probes import ProbeExecutionResult, ProbeFailureClass, ProbeOutcome
 
 _REQUEST_ID = UUID("447a1c4e-4c79-4c50-8e51-42c4dfa5fb19")
 _GENERATION = UUID("d7cbf9ca-5328-4ed2-a5eb-b9e1b0ca9914")
@@ -31,6 +36,7 @@ _FFCONCAT = (
     b"ffconcat version 1.0\n"
     b"file 'rtsp://camera:secret@192.0.2.10:8554/live'\n"
     b"option rtsp_transport tcp\n"
+    b"option rtsp_flags no_redirect\n"
     b"option rw_timeout 5000000\n"
 )
 
@@ -49,6 +55,18 @@ def _fixed_wall_clock(value: int) -> Callable[[], int]:
         return value
 
     return read
+
+
+def _healthy_response() -> ProbeBrokerResponse:
+    return ProbeBrokerResponse(
+        request_id=_REQUEST_ID,
+        endpoint_generation=_GENERATION,
+        result=ProbeExecutionResult(
+            outcome=ProbeOutcome.HEALTHY,
+            completed_at=datetime(2027, 1, 15, 8, 0, tzinfo=UTC),
+            video_codec="h264",
+        ),
+    )
 
 
 def _unix_socket_without_peer() -> socket.socket:
@@ -72,6 +90,119 @@ def test_broker_request_codec_is_deterministic_bounded_and_secret_free() -> None
     assert b"camera" not in encoded
     assert b"secret" not in encoded
     assert ProbeBrokerRequest.decode(encoded) == request
+
+
+def test_broker_response_codec_is_deterministic_bounded_and_secret_free() -> None:
+    response = _healthy_response()
+
+    encoded = response.encode()
+
+    assert len(encoded) < 512
+    assert encoded == (
+        b'{"audio_codec":null,"completed_at_unix_us":1800000000000000,'
+        b'"endpoint_generation":"d7cbf9ca-5328-4ed2-a5eb-b9e1b0ca9914",'
+        b'"failure_class":null,"outcome":"healthy",'
+        b'"request_id":"447a1c4e-4c79-4c50-8e51-42c4dfa5fb19",'
+        b'"schema_version":1,"video_codec":"h264"}'
+    )
+    assert b"camera" not in encoded
+    assert b"secret" not in encoded
+    assert ProbeBrokerResponse.decode(encoded) == response
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        _healthy_response().encode().replace(
+            b'"schema_version":1', b'"schema_version":true'
+        ),
+        _healthy_response().encode().replace(
+            b'"completed_at_unix_us":1800000000000000',
+            b'"completed_at_unix_us":true',
+        ),
+        _healthy_response().encode().replace(b'"outcome":"healthy"', b'"outcome":"ok"'),
+        _healthy_response().encode().replace(b'"video_codec":"h264"', b'"video_codec":"H264"'),
+        _healthy_response().encode() + b" ",
+    ],
+)
+def test_broker_response_codec_rejects_noncanonical_payload(payload: bytes) -> None:
+    with pytest.raises(ProbeBrokerError, match="probe_broker_response_invalid"):
+        ProbeBrokerResponse.decode(payload)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+def test_broker_response_transport_round_trips_one_bound_result() -> None:
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    response = _healthy_response()
+    try:
+        send_probe_broker_response(sender, response, timeout_seconds=1)
+        assert receive_probe_broker_response(
+            receiver,
+            expected_request=_request(),
+            timeout_seconds=1,
+        ) == response.result
+    finally:
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+def test_broker_response_transport_rejects_result_for_another_request() -> None:
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    response = _healthy_response()
+    other = ProbeBrokerRequest(
+        request_id=UUID("86269d5a-fdb2-4afe-a0dc-c41a978b65d4"),
+        endpoint_generation=_GENERATION,
+        target=_request().target,
+        deadline_unix_ms=_request().deadline_unix_ms,
+    )
+    try:
+        send_probe_broker_response(sender, response, timeout_seconds=1)
+        with pytest.raises(ProbeBrokerError, match="probe_broker_response_mismatch"):
+            receive_probe_broker_response(
+                receiver,
+                expected_request=other,
+                timeout_seconds=1,
+            )
+    finally:
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+def test_broker_response_transport_rejects_oversized_or_truncated_frame() -> None:
+    for frame, reason in (
+        (struct.pack("!I", 513), "probe_broker_response_invalid"),
+        (struct.pack("!I", 8) + b"{}", "probe_broker_response_truncated"),
+    ):
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sender.sendall(frame)
+            sender.shutdown(socket.SHUT_WR)
+            with pytest.raises(ProbeBrokerError, match=reason):
+                receive_probe_broker_response(
+                    receiver,
+                    expected_request=_request(),
+                    timeout_seconds=1,
+                )
+        finally:
+            sender.close()
+            receiver.close()
+
+
+def test_broker_response_supports_only_normalized_scheduler_failures() -> None:
+    response = ProbeBrokerResponse(
+        request_id=_REQUEST_ID,
+        endpoint_generation=_GENERATION,
+        result=ProbeExecutionResult(
+            outcome=ProbeOutcome.INCONCLUSIVE,
+            completed_at=datetime(2027, 1, 15, 8, 0, tzinfo=UTC),
+            failure_class=ProbeFailureClass.EXECUTOR,
+        ),
+    )
+
+    assert ProbeBrokerResponse.decode(response.encode()) == response
 
 
 @pytest.mark.parametrize(

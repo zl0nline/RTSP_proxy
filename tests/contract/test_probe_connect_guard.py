@@ -18,6 +18,7 @@ from typing import IO
 
 import pytest
 
+from rtsp_proxy import probe_connect_guard
 from rtsp_proxy.probe_broker import ProbeBrokerRequest
 from rtsp_proxy.probe_connect_guard import (
     BpftoolProbeConnectGuardBackend,
@@ -40,6 +41,9 @@ from rtsp_proxy.probe_systemd_dbus import DbusNextSystemdTransport
 
 pytestmark = [pytest.mark.contract]
 
+_WRONG_IPV4_ADDRESS = "127.0.0.2"
+_WRONG_IPV6_ADDRESS = "::ffff:127.0.0.3"
+
 _CHILD = """
 import json
 import socket
@@ -47,6 +51,8 @@ import sys
 
 allowed_port = int(sys.argv[1])
 denied_port = int(sys.argv[2])
+wrong_ipv4_address = sys.argv[3]
+wrong_ipv6_address = sys.argv[4]
 sys.stdin.buffer.read(1)
 
 def connected(family, host, port):
@@ -57,10 +63,39 @@ def connected(family, host, port):
 print(json.dumps({
     "allowed_ipv4": connected(socket.AF_INET, "127.0.0.1", allowed_port),
     "denied_ipv4": connected(socket.AF_INET, "127.0.0.1", denied_port),
+    "wrong_ipv4": connected(socket.AF_INET, wrong_ipv4_address, allowed_port),
     "allowed_ipv6": connected(socket.AF_INET6, "::1", allowed_port),
     "denied_ipv6": connected(socket.AF_INET6, "::1", denied_port),
+    "wrong_ipv6": connected(socket.AF_INET6, wrong_ipv6_address, allowed_port),
 }, sort_keys=True), flush=True)
 """
+
+
+def _trusted_artifact_identity(
+    bpftool_path: Path,
+    object_path: Path,
+    *,
+    ipv4_program_tag: str,
+    ipv6_program_tag: str,
+) -> ProbeConnectGuardArtifactIdentity:
+    catalog = probe_connect_guard._load_packaged_artifact_catalog()
+    architecture = probe_connect_guard._linux_architecture(os.uname().machine)
+    release = catalog.cleanup_release(
+        catalog.current_release_id,
+        architecture=architecture,
+    )
+    bpftool_sha256 = _sha256_path(bpftool_path)
+    assert release.activation_compatible
+    assert bpftool_sha256 in release.bpftool_sha256
+    assert _sha256_path(object_path) == release.object_sha256
+    assert ipv4_program_tag == release.ipv4_program_tag
+    assert ipv6_program_tag == release.ipv6_program_tag
+    return ProbeConnectGuardArtifactIdentity(
+        bpftool_sha256=bpftool_sha256,
+        object_sha256=release.object_sha256,
+        ipv4_program_tag=release.ipv4_program_tag,
+        ipv6_program_tag=release.ipv6_program_tag,
+    )
 
 
 class _OwnedResources:
@@ -191,7 +226,7 @@ def test_command_failure_exposes_native_diagnostic() -> None:
 def _listener(family: socket.AddressFamily, host: str, port: int) -> socket.socket:
     listener = socket.socket(family, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if family is socket.AF_INET6:
+    if family is socket.AF_INET6 and not host.startswith("::ffff:"):
         listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     listener.bind((host, port))
     listener.listen(16)
@@ -265,7 +300,15 @@ def _start_child(
     write_cgroup: Callable[[Path, int], None] | None = None,
 ) -> subprocess.Popen[str]:
     child = subprocess.Popen(
-        [sys.executable, "-c", _CHILD, str(allowed_port), str(denied_port)],
+        [
+            sys.executable,
+            "-c",
+            _CHILD,
+            str(allowed_port),
+            str(denied_port),
+            _WRONG_IPV4_ADDRESS,
+            _WRONG_IPV6_ADDRESS,
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -494,7 +537,9 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
     with _managed_resources() as resources:
         for family, host in (
             (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET, _WRONG_IPV4_ADDRESS),
             (socket.AF_INET6, "::1"),
+            (socket.AF_INET6, _WRONG_IPV6_ADDRESS),
         ):
             for port in (allowed_port, denied_port):
                 listener = _listener(family, host, port)
@@ -515,6 +560,20 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
         resources.own("listener stop signal", stopping.set)
 
         _mkdir_owned(cgroup, resources)
+        unrestricted = _start_child(
+            cgroup,
+            allowed_port,
+            denied_port,
+            resources,
+        )
+        assert _release(unrestricted) == {
+            "allowed_ipv4": True,
+            "denied_ipv4": True,
+            "wrong_ipv4": True,
+            "allowed_ipv6": True,
+            "denied_ipv6": True,
+            "wrong_ipv6": True,
+        }
         _mkdir_owned(pin_root, resources)
         _mkdir_owned(program_pins, resources)
         _mkdir_owned(map_pins, resources)
@@ -575,8 +634,10 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
         assert _release(ipv4) == {
             "allowed_ipv4": True,
             "denied_ipv4": False,
+            "wrong_ipv4": False,
             "allowed_ipv6": False,
             "denied_ipv6": False,
+            "wrong_ipv6": False,
         }
 
         _map_update(
@@ -588,8 +649,10 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
         assert _release(ipv6) == {
             "allowed_ipv4": False,
             "denied_ipv4": False,
+            "wrong_ipv4": False,
             "allowed_ipv6": True,
             "denied_ipv6": False,
+            "wrong_ipv6": False,
         }
 
     assert not cgroup.exists()
@@ -609,21 +672,25 @@ def test_connect_guard_allows_only_one_literal_family_address_and_port() -> None
     [
         (
             "127.0.0.1",
-            {
-                "allowed_ipv4": True,
-                "denied_ipv4": False,
-                "allowed_ipv6": False,
-                "denied_ipv6": False,
-            },
+                {
+                    "allowed_ipv4": True,
+                    "denied_ipv4": False,
+                    "wrong_ipv4": False,
+                    "allowed_ipv6": False,
+                    "denied_ipv6": False,
+                    "wrong_ipv6": False,
+                },
         ),
         (
             "::1",
-            {
-                "allowed_ipv4": False,
-                "denied_ipv4": False,
-                "allowed_ipv6": True,
-                "denied_ipv6": False,
-            },
+                {
+                    "allowed_ipv4": False,
+                    "denied_ipv4": False,
+                    "wrong_ipv4": False,
+                    "allowed_ipv6": True,
+                    "denied_ipv6": False,
+                    "wrong_ipv6": False,
+                },
         ),
     ],
 )
@@ -658,7 +725,9 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
     with _managed_resources() as resources:
         for family, host in (
             (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET, _WRONG_IPV4_ADDRESS),
             (socket.AF_INET6, "::1"),
+            (socket.AF_INET6, _WRONG_IPV6_ADDRESS),
         ):
             for port in (allowed_port, denied_port):
                 listener = _listener(family, host, port)
@@ -699,13 +768,17 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
                 object_path=secure_object,
                 pin_root=pin_root,
                 ownership_root=ownership_root,
-                artifact_identity=ProbeConnectGuardArtifactIdentity(
-                    bpftool_sha256=_sha256_path(bpftool_path),
-                    object_sha256=_sha256_path(secure_object),
+                artifact_identity=_trusted_artifact_identity(
+                    bpftool_path,
+                    secure_object,
                     ipv4_program_tag=ipv4_tag,
                     ipv6_program_tag=ipv6_tag,
                 ),
             )
+        )
+        resources.own(
+            "probe guard coordinator",
+            (ownership_root / ".probe-connect-guard.lock").unlink,
         )
         lease: ProbeConnectGuardLease | None = None
 
@@ -737,7 +810,18 @@ def test_production_guard_manager_installs_reads_back_and_cleans_exact_tuple(
     os.environ.get("RTSP_PROXY_RUN_PROBE_BPF_CONTRACT") != "1",
     reason="privileged probe BPF contract is opt-in",
 )
+@pytest.mark.parametrize(
+    ("target_family", "target_host", "alternate_family", "alternate_host"),
+    [
+        (socket.AF_INET, "127.0.0.1", socket.AF_INET6, "::1"),
+        (socket.AF_INET6, "::1", socket.AF_INET, "127.0.0.1"),
+    ],
+)
 def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collection(
+    target_family: socket.AddressFamily,
+    target_host: str,
+    alternate_family: socket.AddressFamily,
+    alternate_host: str,
 ) -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.fail("probe BPF contract requires a root Linux test process")
@@ -755,11 +839,18 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     request_id = uuid.uuid4()
     unit_name = f"rtsp-probe-{request_id.hex}.service"
     allowed_port, denied_port = _free_adjacent_ports()
-    target = ProbeConnectGuardTarget(ip_address("127.0.0.1"), allowed_port)
+    target = ProbeConnectGuardTarget(ip_address(target_host), allowed_port)
+    wrong_address = (
+        _WRONG_IPV4_ADDRESS
+        if target_family == socket.AF_INET
+        else _WRONG_IPV6_ADDRESS
+    )
     payload = serialize_probe_input(
         address=target.address,
         port=target.port,
-        path_and_query="/probe-connect-guard-systemd",
+        path_and_query=(
+            f"/probe-connect-guard-systemd?wrong_address={wrong_address}"
+        ),
         username="contract",
         password="not-logged",
         io_timeout_microseconds=1_000_000,
@@ -772,8 +863,10 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
     with _managed_resources() as resources:
         stopping = threading.Event()
         listeners = [
-            _listener(socket.AF_INET, "127.0.0.1", allowed_port),
-            _listener(socket.AF_INET, "127.0.0.1", denied_port),
+            _listener(target_family, target_host, allowed_port),
+            _listener(target_family, target_host, denied_port),
+            _listener(target_family, wrong_address, allowed_port),
+            _listener(alternate_family, alternate_host, allowed_port),
         ]
         threads: list[threading.Thread] = []
         for listener in listeners:
@@ -859,13 +952,17 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
                 object_path=secure_object,
                 pin_root=pin_root,
                 ownership_root=ownership_root,
-                artifact_identity=ProbeConnectGuardArtifactIdentity(
-                    bpftool_sha256=_sha256_path(bpftool_path),
-                    object_sha256=_sha256_path(secure_object),
+                artifact_identity=_trusted_artifact_identity(
+                    bpftool_path,
+                    secure_object,
                     ipv4_program_tag=ipv4_tag,
                     ipv6_program_tag=ipv6_tag,
                 ),
             )
+        )
+        resources.own(
+            "probe guard coordinator",
+            (ownership_root / ".probe-connect-guard.lock").unlink,
         )
         guard_lease: ProbeConnectGuardLease | None = None
 
@@ -893,7 +990,12 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
             )
         )
         transient_lease = None
-        assert observed == {"allowed": True, "denied": False}
+        assert observed == {
+            "allowed": True,
+            "wrong_address": False,
+            "wrong_family": False,
+            "wrong_port": False,
+        }
         _wait_for_transient_collection(unit_name)
         assert not cgroup.exists()
         release_guard()

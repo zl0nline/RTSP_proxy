@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "current_release_id": "0.1.0",
+  "releases": {
+    "0.1.0": {
+      "activation_compatible": true,
+      "cleanup_compatible": true,
+      "architectures": {
+        "amd64": {
+          "bpftool_sha256": [
+            "92eaf7a8341f2bbb1a61323e2d3882adb74057338c43a8f67c3f7d14a6fe8a93"
+          ],
+          "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece",
+          "ipv4_program_tag": "63abbb99bcda9919",
+          "ipv6_program_tag": "9fa3ee2d14abef2a"
+        },
+        "arm64": {
+          "bpftool_sha256": [
+            "b7f52227fcb546f62d30351ab69f9e651712e37fae09daea9c38f90638265243"
+          ],
+          "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece",
+          "ipv4_program_tag": "63abbb99bcda9919",
+          "ipv6_program_tag": "9fa3ee2d14abef2a"
+        }
+      }
+    }
+  }
+}

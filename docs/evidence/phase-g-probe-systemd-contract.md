@@ -1,6 +1,7 @@
 # Phase G direct systemd probe contract
 
 - Date: 2026-08-30
+- Last reviewed: 2026-08-31
 - Status: implementation, direct-Linux amd64 contract, independent Spec/
   Standards review and privileged native amd64/arm64 CI green
 - Commit: `e1481f3d97a9d687db769ff7d3b80025ae556d56`
@@ -23,8 +24,9 @@ ffprobe.
 - The transient service runs in `rtsp-probe.slice` as a `DynamicUser` with no
   capabilities, `NoNewPrivileges`, strict filesystem/kernel/cgroup protection,
   a narrow address-family set, no socket bind and address-level network deny.
-  Exact destination enforcement remains the separate cgroup connect guard.
-- stdin is a broker-held release gate, fd 2 is read-only sealed input and stdout
+  `LimitCORE=0` is applied before the launcher can read fd 2. Exact destination
+  enforcement remains the separate cgroup connect guard.
+- stdin is a broker-held release gate, fd 2 is immutable sealed input and stdout
   is a bounded result pipe. The quiet launcher never writes diagnostics to fd 2.
   This fixed ABI uses transient properties available in systemd 255 while also
   passing on systemd 259.
@@ -52,12 +54,22 @@ The application coverage, lint, type, packaging, migration, release,
 pull/load and external-browser jobs all passed; there were seven successful
 jobs in total.
 
+The follow-up launcher/result hardening in
+[CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101)
+passed all nine jobs at commit `92cec7405f5789f1cb305807f641e7fa247c096d`.
+Both privileged application jobs proved effective soft/hard core limits `[0,0]`
+before the fixture read its source-secret canary, then aborted and left the
+canary absent from the unit journal. The same jobs exercised the installed
+clean-wheel launcher and passed the independent 90% coverage gate at 90.08%.
+
 ## Deliberately excluded
 
-There is still no installed root-owned broker socket/service and no production
-probe executor. The broker must authenticate the AF_UNIX peer, revalidate the
-site/CIDR policy, attach and read back both cgroup BPF hooks before releasing
-the gate, hand the sealed input to a controlled no-redirect ffprobe build,
-parse only an allowlisted bounded result and prove end-to-end cancellation,
-restart and residue cleanup. ADR 0004 therefore remains Proposed, Phase G stays
-IN PROGRESS and Production remains NO-GO.
+An installed root-owned socket/service and production-shaped executor now exist
+as an unpromoted integrated candidate. CI run 33432355260 proves on amd64 and
+arm64 that the broker authenticates its AF_UNIX peer, revalidates site/CIDR
+policy, attaches and reads back both cgroup BPF hooks before releasing the gate,
+returns decoded video/audio/mixed results, bounds timeout/output/result failure,
+recovers broker crashes and repeated failures, and collects unit/cgroup/pin/
+receipt residue. Explicit caller/shutdown cancellation and the remaining
+integrated policy cases are still pending. ADR 0004 therefore remains Proposed,
+Phase G stays IN PROGRESS and Production remains NO-GO.

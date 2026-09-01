@@ -1,8 +1,10 @@
 # Phase G sealed probe-input contract
 
 - Date: 2026-08-30
-- Status: implementation, direct-Linux amd64 contract, independent
-  Spec/Standards review and native amd64/arm64 CI green
+- Last reviewed: 2026-08-31
+- Status: five-line no-redirect sealed input, independent review and native
+  amd64/arm64 controlled-artifact plus integrated success/failure matrix green;
+  explicit cancellation/policy cases pending
 - Production decision: NO-GO
 
 ## Scope
@@ -11,9 +13,10 @@ This slice implements the anonymous input primitive required by the isolated
 probe boundary:
 
 - one typed serializer/parser is shared with endpoint admission; only its
-  canonical four-line ffconcat form is accepted: one literal IPv4 or bracketed
-  IPv6 `rtsp://` authority with an explicit port, interleaved TCP and a bounded
-  canonical-decimal microsecond read/write timeout;
+  canonical five-line ffconcat form is accepted: one literal IPv4 or bracketed
+  IPv6 `rtsp://` authority with an explicit port, interleaved TCP, the
+  controlled demuxer's `rtsp_flags=no_redirect` and a bounded canonical-decimal
+  microsecond read/write timeout;
 - the payload is capped at 16 KiB and rejects NUL, CR, extra directives,
   alternate transport and an out-of-policy timeout before any descriptor is
   created;
@@ -38,10 +41,15 @@ at commit `3f7f400`.
 
 ## Deliberately excluded
 
-This primitive does not run ffprobe. A separately documented transport
-primitive now covers authenticated `SO_PEERCRED` plus exactly one `SCM_RIGHTS`
-descriptor, but it is not a deployed root service. The broker service,
-system-manager unit, BPF attach/readback/run gate, no-redirect ffprobe, bounded
-output and complete cancellation/residue matrix remain required. Consequently
-ADR 0004 stays Proposed, the production executor stays disabled and Phase G
-remains IN PROGRESS / Production NO-GO.
+This primitive does not itself run ffprobe. The exact-source controlled binary,
+redirect contract, architecture digests and release admission are now complete.
+A separately documented transport covers authenticated `SO_PEERCRED` plus one
+`SCM_RIGHTS` descriptor, and a socket-activated root service/system-manager/BPF
+executor now exists as an unpromoted integrated candidate. CI run 33432355260
+proves its sealed-descriptor handoff, attach/readback-before-release, decoded
+video/audio/mixed results, policy denial, deadline cancellation, bounded output/
+result failure, crash recovery, repeated failure and zero residue on amd64 and
+arm64. Explicit caller/shutdown cancellation and the remaining integrated
+network-policy cases stay pending. Consequently ADR 0004 stays Proposed,
+production scheduling stays disabled and Phase G remains IN PROGRESS /
+Production NO-GO.

@@ -370,7 +370,36 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
     assert "Verify native release manifest end to end" in workflow
-    assert "uv run rtsp-proxy-verify-release --manifest" in workflow
+    assert ".artifacts/release-venv/bin/rtsp-proxy-verify-release" in workflow
+    assert "trusted_probe_ffprobe_identity" in workflow
+    assert "trusted_probe_connect_guard_identity" in workflow
+    assert "Download controlled probe ffprobe" in workflow
+    assert "Download verified probe connect guard" in workflow
+    assert ".artifacts/release/libexec/rtsp-proxy-probe/ffprobe" in workflow
+    assert (
+        ".artifacts/release/libexec/rtsp-proxy-probe/"
+        "rtsp_probe_connect_guard.bpf.o"
+    ) in workflow
+    assert "Verify installed root broker transaction" in workflow
+    assert "tests/contract/test_probe_broker_service.py" in workflow
+    assert "Publish verified pilot release bundle (${{ matrix.arch }})" in workflow
+    assert "name: rtsp-proxy-release-${{ matrix.arch }}" in workflow
+    assert "path: .artifacts/release" in workflow
+
+
+def test_release_and_runtime_connect_guard_catalogs_are_exactly_aligned() -> None:
+    deployment = json.loads(
+        Path("deploy/artifact-catalog.json").read_text(encoding="utf-8")
+    )["probe_connect_guard"]
+    runtime = json.loads(
+        Path("src/rtsp_proxy/artifacts/probe_connect_guard.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    release = runtime["releases"][runtime["current_release_id"]]
+
+    assert deployment["release_id"] == runtime["current_release_id"]
+    assert deployment["architectures"] == release["architectures"]
 
 
 def test_native_ci_enforces_coverage_with_an_independent_exit_gate() -> None:
@@ -392,6 +421,36 @@ def test_packaged_migration_ci_asserts_the_current_application_schema() -> None:
     )[1].split("- name: Validate systemd units", 1)[0]
 
     assert f'= "{APPLICATION_SCHEMA}"' in migration_step
+
+
+def test_systemd_validation_stages_probe_broker_entrypoint() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    validation_step = workflow.split("- name: Validate systemd units", 1)[1].split(
+        "- name: Validate owned nftables policy",
+        1,
+    )[0]
+
+    assert (
+        "/opt/rtsp-proxy/releases/ci/.venv/bin/rtsp-proxy-probe-broker"
+        in validation_step
+    )
+    assert validation_step.index("rtsp-proxy-probe-broker") < validation_step.index(
+        "systemd-analyze verify"
+    )
+
+
+def test_native_broker_ci_stages_client_outside_the_release() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    transaction_step = workflow.split(
+        "- name: Verify installed root broker transaction",
+        1,
+    )[1].split("- name: Verify effective listener contract", 1)[0]
+
+    client_path = "/run/rtsp-proxy-probe-contract/client.py"
+    assert client_path in transaction_step
+    assert "tests/fixtures/probe_broker_client.py" in transaction_step
+    assert f"RTSP_PROXY_PROBE_BROKER_CLIENT={client_path}" in transaction_step
+    assert "/opt/rtsp-proxy/releases/probe-contract/client.py" not in transaction_step
 
 
 def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> None:
@@ -466,6 +525,81 @@ def test_mediamtx_source_builder_has_valid_shell_syntax() -> None:
     assert "go test -race ./internal/auth ./internal/core ./internal/servers/rtsp" in builder
 
 
+def test_probe_ffprobe_native_candidate_has_immutable_build_provenance() -> None:
+    catalog = json.loads(Path("deploy/artifact-catalog.json").read_text(encoding="utf-8"))
+    probe = catalog["probe_ffprobe"]
+    trusted_probe = json.loads(
+        Path("src/rtsp_proxy/artifacts/probe_ffprobe.json").read_text(encoding="utf-8")
+    )
+    patch = Path(probe["patch"])
+
+    assert probe["status"] == "digest-pinned-native-candidate"
+    assert probe["source_repository"] == "https://github.com/FFmpeg/FFmpeg"
+    assert probe["source_commit"] == "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b"
+    assert probe["source_date_epoch"] == 1_785_458_830
+    assert probe["version"] == "9b6c896-rtsp-proxy.1"
+    assert hashlib.sha256(patch.read_bytes()).hexdigest() == probe["patch_sha256"]
+    assert probe["build_environment"] == {
+        "ubuntu_snapshot": "https://snapshot.ubuntu.com/ubuntu/20260829T120000Z/",
+        "packages": {
+            "binutils": "2.42-4ubuntu2.10",
+            "gcc": "4:13.2.0-7ubuntu1",
+            "gcc-13": "13.3.0-6ubuntu2~24.04.1",
+            "libc6-dev": "2.39-0ubuntu8.8",
+            "make": "4.3-4.1build2",
+        },
+    }
+    assert probe["cflags"] == ["-O2", "-fno-ident"]
+    assert probe["source_prefix_map"] == "/usr/src/ffmpeg"
+    assert probe["architectures"] == {
+        "amd64": {
+            "binary_sha256": (
+                "f4daff8216f93062965b4947982cafe50cf97363c4e7b01c66f455e7a37463f3"
+            )
+        },
+        "arm64": {
+            "binary_sha256": (
+                "cfebf1bf05e18d6d5dd680d890ec8bd0a6ae1e7db303bdc1ca131f51ae7ce557"
+            )
+        },
+    }
+    assert trusted_probe == {
+        "schema_version": 1,
+        "version": probe["version"],
+        "architectures": probe["architectures"],
+    }
+
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    retry_options = "-o Acquire::Retries=10 -o Acquire::https::Timeout=30"
+    assert workflow.count("sudo apt-get") == 9
+    assert workflow.count(f"sudo apt-get {retry_options}") == 9
+    assert workflow.count(probe["build_environment"]["ubuntu_snapshot"]) == 2
+    assert "'.probe_ffprobe.build_environment.ubuntu_snapshot'" in workflow
+
+    result = subprocess.run(
+        ["sh", "-n", "tools/build_probe_ffprobe.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    builder = Path("tools/build_probe_ffprobe.sh").read_text(encoding="utf-8")
+    assert "git -C \"$source_root\" apply --check" in builder
+    assert "dpkg-query" in builder
+    assert (
+        'export CFLAGS="$cflags -ffile-prefix-map=$source_root=$source_prefix_map"'
+        in builder
+    )
+    flags = probe["configure_flags"]
+    assert "--disable-autodetect" in flags
+    assert "--disable-ffmpeg" in flags
+    assert "--disable-x86asm" in flags
+    assert "--enable-protocol=file,pipe,tcp" in flags
+    assert "--enable-demuxer=concat,rtsp,sdp,rtp" in flags
+    assert "--extra-version=rtsp-proxy.1" in flags
+
+
 def test_load_fixture_builder_has_valid_bash_syntax() -> None:
     result = subprocess.run(
         ["bash", "-n", "tools/load/prepare_fixture.sh"],
@@ -475,6 +609,27 @@ def test_load_fixture_builder_has_valid_bash_syntax() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_pilot_bootstrap_is_bounded_and_does_not_activate_services() -> None:
+    script = Path("tools/bootstrap_rtsp_proxy_host.sh")
+    result = subprocess.run(
+        ["bash", "-n", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    content = script.read_text(encoding="utf-8")
+
+    assert result.returncode == 0, result.stderr
+    assert "24.04|26.04" in content
+    assert "Acquire::Retries=10" in content
+    assert "UV_PYTHON_INSTALL_DIR" in content
+    assert '"$deploy_uv" python install 3.12' in content
+    assert "systemctl enable" not in content
+    assert "systemctl start" not in content
+    assert "mount " not in content
+    assert "curl |" not in content
 
 
 def test_browser_e2e_cleanup_preserves_an_early_failure(tmp_path: Path) -> None:

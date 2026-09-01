@@ -4,6 +4,12 @@
 на независимые bounded nodes: каждая node — отдельный MediaMTX process/systemd
 instance, один внешний RTSP port и не более 100 зарегистрированных камер.
 
+Для первого direct-Linux развёртывания используйте
+[`deploy/PILOT_INSTALL.md`](deploy/PILOT_INSTALL.md): там описаны проверяемая
+immutable installation, update с health rollback, schema-compatible rollback и
+пошаговый gate перед подключением реальных камер. Общий детальный deployment и
+security runbook остаётся в [`deploy/README.md`](deploy/README.md).
+
 > **Статус на 29 августа 2026**
 >
 > - Bounded-node architecture: **согласована**, issues #1–#14 обновлены.
@@ -99,30 +105,47 @@ instance, один внешний RTSP port и не более 100 зареги�
 >   This is not a
 >   production source-probe runner. ADR 0004 remains Proposed: the reviewed
 >   direct system-manager transient-unit primitive is now green on systemd 255
->   and 259 and in privileged amd64/arm64 CI, but a narrow root broker still
->   needs to integrate it with the already green exact cgroup `IP:port` guard
->   and its attach/readback/run canaries;
->   no-redirect ffprobe build and privileged amd64/arm64 evidence are still
->   mandatory. Foundation evidence is
+>   and 259 and in privileged amd64/arm64 CI. A narrow root-broker candidate now
+>   integrates it with the already green exact cgroup `IP:port` guard and its
+>   attach/readback/run canaries. Its installed success, policy denial,
+>   deadline-driven cancellation, crash recovery, bounded-output/result failure,
+>   video/audio/mixed, exact IPv6, redirect-refusal and zero-residue matrix is
+>   native amd64/arm64 CI green through the installed production client with
+>   mutual `SO_PEERCRED`; explicit caller/shutdown cancellation and production
+>   scheduling remain open;
+>   the exact-source no-redirect ffprobe is now reproducible, digest-pinned and
+>   release-admitted on amd64/arm64. Its fixed quiet launcher and strict
+>   decoded-frame result contract are independently reviewed and native
+>   amd64/arm64 CI green. Foundation evidence is
 >   [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381); see
 >   [`docs/evidence/phase-g-probe-foundation.md`](docs/evidence/phase-g-probe-foundation.md)
 >   and the [exact connect-guard contract](docs/evidence/phase-g-connect-guard-contract.md),
->   whose native matrix passed in
->   [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424).
+>   whose native matrix and final interruption/PID/FD ownership hardening are
+>   green in all seven jobs of
+>   [CI run 33314959484](https://github.com/zl0nline/RTSP_proxy/actions/runs/33314959484).
 >   The canonical sealed-memfd input primitive is also reviewed and native
 >   amd64/arm64 green in
 >   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877).
 >   The separate AF_UNIX/`SCM_RIGHTS` transport primitive is direct-Linux amd64,
 >   independent-review and native amd64/arm64 CI green in
 >   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
->   the root broker service and probe execution remain disabled. See the
->   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md)
->   and [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md).
+>   the root broker/executor remains an unpromoted integrated candidate, but its
+>   installed eleven-case success/failure matrix is native amd64/arm64 green in
+>   [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327).
+>   Production scheduling remains disabled. See the
+>   [sealed-input contract](docs/evidence/phase-g-sealed-probe-input-contract.md),
+>   [transport contract](docs/evidence/phase-g-probe-broker-transport-contract.md)
+>   and [integrated broker contract](docs/evidence/phase-g-integrated-probe-broker-contract.md).
 >   The direct transient-unit contract is independently reviewed and green in
 >   all seven jobs of
 >   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254),
 >   including its privileged amd64 and arm64 tests; see the
 >   [systemd contract](docs/evidence/phase-g-probe-systemd-contract.md).
+>   The controlled artifact, launcher/result and release path are green in all
+>   nine jobs of
+>   [CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101);
+>   launcher scope and remaining gates are recorded in the
+>   [controlled-ffprobe contract](docs/evidence/phase-g-controlled-ffprobe-contract.md).
 > - Production: **NO-GO** до всех evidence gates.
 
 Нормативная спецификация: [Production plan](docs/PRODUCTION_PLAN.md).

@@ -659,6 +659,24 @@ contention, create returns `201` with that `PROVISIONING` node and its
 `Location`; the operator continues through the node's start endpoint instead of
 retrying create and reserving another port.
 
+The source tree now ships a pilot deployment interface and direct wrappers for
+the first server trial. It stages an architecture-specific CI bundle into a
+private directory, derives the runtime environment from the exact clean
+manifest commit and lock, runs the packaged release verifier, removes
+group/other write access and atomically publishes the immutable release. Static
+systemd/sysusers/tmpfiles assets are installed separately from configuration
+and secrets. Fresh `install` never changes `current` or starts services.
+
+`update` validates the live PostgreSQL revision against the candidate rolling
+window, atomically switches `current`, restarts only previously active
+control-plane units and restores the prior compatible release when HTTPS
+readiness fails. It never enumerates or restarts media-node instances. Database
+migration remains an explicit post-bridge step; `rollback` refuses a target
+whose manifest does not include the exact live revision and never runs Alembic
+downgrade. CI publishes the verified amd64/arm64 pilot bundles, while the
+operator runbook and real-server exercise remain required evidence rather than
+a Production GO claim.
+
 ## 20. Operations
 
 Required runbooks:
@@ -675,6 +693,14 @@ Required runbooks:
 - SMTP outage/dedupe;
 - resource/FD/NIC saturation;
 - release upgrade/rollback.
+
+The executable pilot sequence is maintained in
+`deploy/PILOT_INSTALL.md`: host prerequisite check, immutable install, explicit
+first migration/activation, update health rollback, schema-compatible explicit
+rollback and a small real-camera trial gate. The bootstrap accepts Ubuntu 24.04
+and 26.04 for pilot testing, installs only reviewed OS prerequisites plus a
+dedicated Python 3.12 through an operator-provided trusted `uv`, and never
+enables services or mutates PostgreSQL/firewall state.
 
 Control-plane update must not restart media nodes. MediaMTX update proceeds one
 drained node at a time. Restore regenerates configs and validates current host
@@ -1250,8 +1276,8 @@ generation. The default empty CIDR set is deny-all. A policy change invalidates
 prior admissions until explicit source re-registration.
 Probe work carries that generation and never resolves a hostname. Admission hides credentials plus
 path/query material from diagnostics, pins one literal
-`rtsp://` destination and generates the pinned TCP/microsecond-timeout ffconcat
-input without persisting source URL or credentials.
+`rtsp://` destination and generates the pinned TCP/no-redirect/
+microsecond-timeout ffconcat input without persisting source URL or credentials.
 
 Re-registration is executable through the ordinary camera update seam: when
 the endpoint row is missing or its policy digest differs, resubmitting the same
@@ -1280,14 +1306,44 @@ impact is measured.
   (compatibility mechanism only);
 - [x] versioned exact-tuple cgroup `connect4`/`connect6` map ABI and privileged
   attach-before-release/ownership-safe cleanup contract (direct-Linux amd64,
-  independent review and privileged amd64/arm64
-  [CI run 33280195424](https://github.com/zl0nline/RTSP_proxy/actions/runs/33280195424)
-  green; executor still disabled);
+  independent review and privileged amd64/arm64; final signal/PID/FD ownership
+  hardening is green in all seven jobs of
+  [CI run 33314959484](https://github.com/zl0nline/RTSP_proxy/actions/runs/33314959484);
+  executor still disabled);
 - [x] anonymous canonical ffconcat input primitive with a 16 KiB cap,
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
   independent review and native amd64/arm64
   [CI run 33281241877](https://github.com/zl0nline/RTSP_proxy/actions/runs/33281241877)
-  green; broker service and executor still disabled);
+  green; the installed integrated broker success/failure matrix is native
+  amd64/arm64 green in
+  [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327));
+- [x] promote the exact-source `9b6c896-rtsp-proxy.1` no-redirect ffprobe as a
+  distinct reproducible amd64/arm64 release artifact with immutable digests,
+  ordinary RTSP/TCP plus redirect-refusal behavior and clean-wheel release
+  admission (all nine jobs green in
+  [CI run 33323810984](https://github.com/zl0nline/RTSP_proxy/actions/runs/33323810984));
+- [x] fixed quiet gate-before-input launcher, strict bounded decoded-frame
+  result, SDP-only/corrupt-media rejection, clean-wheel entrypoint and
+  `LimitCORE=0` transient policy (independent Spec/Standards review PASS; all
+  nine amd64/arm64 jobs green in
+  [CI run 33325835101](https://github.com/zl0nline/RTSP_proxy/actions/runs/33325835101));
+- [x] privileged amd64/arm64 installed root-broker success/denial transaction:
+  exact peer and target policy, sealed descriptor handoff, nested systemd
+  cgroup resolution, exact BPF tuple readback before gate release, decoded H264
+  result and zero unit/cgroup/pin/receipt residue (all nine jobs green in
+  [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327));
+- [x] integrated deadline-driven cancellation, output-flood, malformed-result,
+  broker-crash recovery, repeated no-media failure, video/audio/mixed decoded
+  media, exact IPv6 target, redirect-secret refusal, control-plane/unrelated-UID
+  `/proc` isolation and zero-residue matrix through the installed production
+  client on native amd64/arm64 (eleven installed broker contracts and all nine
+  jobs green in
+  [CI run 33439334327](https://github.com/zl0nline/RTSP_proxy/actions/runs/33439334327));
+- [x] production unprivileged AF_UNIX client with root `SO_PEERCRED`, sealed-fd
+  request handoff and normalized infrastructure failure, plus DNS-free exact
+  persisted endpoint restoration under the current site/policy/source digest;
+- [ ] define and prove explicit caller/shutdown cancellation plus the remaining
+  integrated special-range/alternate-protocol cases before broker promotion;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
@@ -1295,17 +1351,23 @@ impact is measured.
   Standards review green; all seven jobs, including the amd64/arm64 full-suite
   transport tests, green in
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
-  broker service and executor still disabled);
+  the socket-activated broker/executor candidate's installed success/failure
+  matrix is native amd64/arm64 green in CI run 33439334327, but explicit
+  cancellation and remaining network-policy cases still block promotion);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
   immutable input plus release gate, 64 KiB output cap and exact collection
   (direct Linux systemd 259 and independently reviewed; privileged systemd 255
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
-  root broker, BPF transaction and real ffprobe execution still disabled);
+  the root-broker wiring remains unpromoted; its integrated success/failure
+  matrix is native amd64/arm64 green in CI run 33439334327 and explicit
+  caller/shutdown cancellation is still pending);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
-- [ ] implement the broker/executor, periodic risk-based producer and durable
-  health-state orchestration;
+- [ ] promote the reviewed broker/executor after integrated native evidence,
+  then implement encrypted source-secret references, the authoritative camera
+  probe profile, periodic risk-based producer and durable health-state
+  orchestration;
 - per-node 100-camera matrix;
 - multi-node server ladder and 24h soak;
 - chaos/failure/email/restore game days;

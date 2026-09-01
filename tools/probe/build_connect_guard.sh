@@ -8,6 +8,12 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 output="$1"
+compiler="${RTSP_PROXY_PROBE_CLANG:-clang}"
+if [[ "$compiler" == */* ]]; then
+  [[ "$compiler" == /* && -x "$compiler" ]]
+else
+  command -v "$compiler" >/dev/null
+fi
 case "$(uname -m)" in
   x86_64)
     target_arch=x86
@@ -24,7 +30,7 @@ case "$(uname -m)" in
 esac
 
 mkdir -p "$(dirname -- "$output")"
-clang -O2 -g -Wall -Werror -target bpf -D"__TARGET_ARCH_${target_arch}" \
+"$compiler" -O2 -g -Wall -Werror -target bpf -D"__TARGET_ARCH_${target_arch}" \
   -ffile-prefix-map="$script_dir=/usr/src/rtsp-proxy/probe" \
   -fdebug-prefix-map="$script_dir=/usr/src/rtsp-proxy/probe" \
   -I"/usr/include/${multiarch}" -I"$script_dir" \

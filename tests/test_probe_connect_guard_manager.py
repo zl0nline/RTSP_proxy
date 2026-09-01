@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import ctypes
+import inspect
 import json
+import multiprocessing
 import os
+import platform
 import selectors
 import shutil
-import subprocess
+import signal
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
+from multiprocessing.connection import Connection
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any, Never, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,10 +30,47 @@ from rtsp_proxy.probe_connect_guard import (
     ProbeConnectGuardArtifactIdentity,
     ProbeConnectGuardBackend,
     ProbeConnectGuardError,
+    ProbeConnectGuardLease,
     ProbeConnectGuardManager,
     ProbeConnectGuardScope,
 )
 from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
+
+
+class _GuardLedger:
+    def __init__(
+        self,
+        *,
+        publish_interrupt: str | None = None,
+        release_interrupt: str | None = None,
+        owns_interrupt: bool = False,
+    ) -> None:
+        self.value: ProbeConnectGuardLease | None = None
+        self.publish_interrupt = publish_interrupt
+        self.release_interrupt = release_interrupt
+        self.owns_interrupt = owns_interrupt
+
+    def publish(self, value: ProbeConnectGuardLease) -> None:
+        if self.publish_interrupt == "before_publish":
+            raise KeyboardInterrupt("guard publish interrupted before ownership")
+        self.value = value
+        if self.publish_interrupt == "after_publish":
+            raise KeyboardInterrupt("guard publish interrupted after ownership")
+
+    def owns(self, value: ProbeConnectGuardLease) -> bool:
+        if self.owns_interrupt:
+            self.owns_interrupt = False
+            raise KeyboardInterrupt("guard ownership inspection interrupted")
+        return self.value is value
+
+    def release(self, value: ProbeConnectGuardLease) -> None:
+        if self.value is not value:
+            raise RuntimeError("guard ownership mismatch")
+        if self.release_interrupt == "before_release":
+            raise KeyboardInterrupt("guard release interrupted before ownership")
+        self.value = None
+        if self.release_interrupt == "after_release":
+            raise KeyboardInterrupt("guard release interrupted after ownership")
 
 
 @dataclass(slots=True)
@@ -68,6 +115,52 @@ def _unit_name(request_id: UUID) -> str:
     return f"rtsp-probe-{request_id.hex}.service"
 
 
+def _receipt_entries(ownership_root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in ownership_root.iterdir()
+        if path.name != ".probe-connect-guard.lock"
+    )
+
+
+def _legacy_v2_receipt_bytes(
+    backend: BpftoolProbeConnectGuardBackend,
+    scope: ProbeConnectGuardScope,
+    *,
+    phase: int,
+    scope_device: int,
+    scope_inode: int,
+) -> bytes:
+    return (
+        json.dumps(
+            {
+                "address": str(scope.target.address),
+                "artifact_release_id": backend._artifact_release.release_id,
+                "cgroup_path": str(scope.cgroup_path),
+                "object_sha256": backend._artifact_release.object_sha256,
+                "phase": phase,
+                "port": scope.target.port,
+                "request_id": str(scope.request_id),
+                "scope_device": f"{scope_device:020d}",
+                "scope_inode": f"{scope_inode:020d}",
+                "unit_name": scope.unit_name,
+                "version": 2,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _simulate_backend_process_exit(
+    backend: BpftoolProbeConnectGuardBackend,
+    *scopes: ProbeConnectGuardScope,
+) -> None:
+    for scope in scopes:
+        backend._forget_scope_coordinator(scope)
+
+
 def test_guard_manager_installs_verifies_and_releases_one_exact_scope(
     tmp_path: Path,
 ) -> None:
@@ -104,6 +197,369 @@ def test_guard_manager_installs_verifies_and_releases_one_exact_scope(
     assert backend.removed == backend.installed
     with pytest.raises(ProbeConnectGuardError, match="probe_guard_lease_invalid"):
         manager.release(lease, timeout_seconds=3.0)
+
+
+@pytest.mark.parametrize(
+    ("interruption", "owns_lease", "remove_count"),
+    [
+        ("before_publish", False, 1),
+        ("after_publish", True, 0),
+    ],
+)
+def test_guard_manager_transfers_or_recovers_install_ownership_atomically(
+    tmp_path: Path,
+    interruption: str,
+    owns_lease: bool,
+    remove_count: int,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger(publish_interrupt=interruption)
+
+    with pytest.raises(KeyboardInterrupt, match="guard publish interrupted"):
+        manager.install_owned(
+            request_id=scope.request_id,
+            unit_name=scope.unit_name,
+            cgroup_path=scope.cgroup_path,
+            target=scope.target,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+
+    assert (ledger.value is not None) is owns_lease
+    assert len(backend.removed) == remove_count
+    if ledger.value is not None:
+        manager.ensure_released(
+            ledger.value,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+        assert ledger.value is None
+        assert len(backend.removed) == 1
+
+
+@pytest.mark.parametrize(
+    ("release_interruption", "ledger_retains_lease"),
+    [
+        ("before_release", True),
+        ("after_release", False),
+    ],
+)
+def test_guard_manager_makes_released_handoff_retryable(
+    tmp_path: Path,
+    release_interruption: str,
+    ledger_retains_lease: bool,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger(release_interrupt=release_interruption)
+    manager.install_owned(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+
+    with pytest.raises(KeyboardInterrupt, match="guard release interrupted"):
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert (ledger.value is lease) is ledger_retains_lease
+    assert backend.removed == [scope]
+
+    if ledger.value is lease:
+        ledger.release_interrupt = None
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+        assert ledger.value is None
+        assert backend.removed == [scope]
+
+    replacement = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    manager.release(replacement, timeout_seconds=3.0)
+
+
+def test_guard_manager_releases_operation_when_ownership_check_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger(
+        publish_interrupt="after_publish",
+        owns_interrupt=True,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as interrupted:
+        manager.install_owned(
+            request_id=scope.request_id,
+            unit_name=scope.unit_name,
+            cgroup_path=scope.cgroup_path,
+            target=scope.target,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert any(
+        isinstance(error, KeyboardInterrupt)
+        for error in interrupted.value.exceptions
+    )
+    lease = ledger.value
+    assert lease is not None
+
+    manager.ensure_released(
+        lease,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    assert ledger.value is None
+    assert backend.removed == [scope]
+
+
+def test_guard_manager_preserves_lease_when_interrupted_after_publication(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    source_lines, first_line = inspect.getsourcelines(ProbeConnectGuardManager._install)
+    target_line = first_line + next(
+        index
+        for index, source_line in enumerate(source_lines)
+        if source_line.strip() == "published_owned = True"
+    )
+    def interrupt_after_publication(frame: Any, event: str, arg: Any) -> Any:
+        del arg
+        if (
+            frame.f_code is ProbeConnectGuardManager._install.__code__
+            and event == "line"
+            and frame.f_lineno == target_line
+        ):
+            sys.settrace(None)
+            raise KeyboardInterrupt("guard interrupted after publication")
+        return interrupt_after_publication
+
+    interruptions: list[BaseException] = []
+
+    def install() -> None:
+        sys.settrace(interrupt_after_publication)
+        try:
+            manager.install_owned(
+                request_id=scope.request_id,
+                unit_name=scope.unit_name,
+                cgroup_path=scope.cgroup_path,
+                target=scope.target,
+                timeout_seconds=3.0,
+                ownership=ledger,
+            )
+        except BaseException as error:
+            interruptions.append(error)
+        finally:
+            sys.settrace(None)
+
+    thread = Thread(target=install)
+    thread.start()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert len(interruptions) == 1
+    assert isinstance(interruptions[0], KeyboardInterrupt)
+    assert str(interruptions[0]) == "guard interrupted after publication"
+
+    lease = ledger.value
+    assert lease is not None
+    assert backend.removed == []
+    manager.ensure_released(
+        lease,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    assert ledger.value is None
+    assert backend.removed == [scope]
+
+
+def test_guard_manager_recovers_lease_when_interrupted_before_publication(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    source_lines, first_line = inspect.getsourcelines(ProbeConnectGuardManager._install)
+    target_line = first_line + next(
+        index
+        for index, source_line in enumerate(source_lines)
+        if source_line.strip() == "ownership.publish(lease)"
+    )
+    def interrupt_before_publication(frame: Any, event: str, arg: Any) -> Any:
+        del arg
+        if (
+            frame.f_code is ProbeConnectGuardManager._install.__code__
+            and event == "line"
+            and frame.f_lineno == target_line
+        ):
+            sys.settrace(None)
+            raise KeyboardInterrupt("guard interrupted before publication")
+        return interrupt_before_publication
+
+    interruptions: list[BaseException] = []
+
+    def install() -> None:
+        sys.settrace(interrupt_before_publication)
+        try:
+            manager.install_owned(
+                request_id=scope.request_id,
+                unit_name=scope.unit_name,
+                cgroup_path=scope.cgroup_path,
+                target=scope.target,
+                timeout_seconds=3.0,
+                ownership=ledger,
+            )
+        except BaseException as error:
+            interruptions.append(error)
+        finally:
+            sys.settrace(None)
+
+    thread = Thread(target=install)
+    thread.start()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert len(interruptions) == 1
+    assert isinstance(interruptions[0], KeyboardInterrupt)
+    assert str(interruptions[0]) == "guard interrupted before publication"
+
+    assert ledger.value is None
+    assert backend.removed == [scope]
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 0
+    assert backend.removed == [scope]
+    replacement = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    manager.release(replacement, timeout_seconds=3.0)
+
+
+def test_guard_owned_cleanup_retries_only_through_the_exact_ledger(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    manager.install_owned(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+    backend.remove_errors = [RuntimeError("first cleanup failed")]
+
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_cleanup_pending"):
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert ledger.value is lease
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 1
+    assert backend.removed == [scope]
+
+    manager.ensure_released(
+        lease,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    assert ledger.value is None
+    assert backend.removed == [scope, scope]
+
+
+def test_guard_sweep_finalizes_a_released_terminal_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    ledger = _GuardLedger()
+    manager.install_owned(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+        ownership=ledger,
+    )
+    lease = ledger.value
+    assert lease is not None
+    original_remove = manager._remove_active_record
+
+    def interrupt_remove(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise KeyboardInterrupt("guard terminal removal interrupted")
+
+    monkeypatch.setattr(manager, "_remove_active_record", interrupt_remove)
+    with pytest.raises(KeyboardInterrupt, match="guard terminal removal interrupted"):
+        manager.ensure_released(
+            lease,
+            timeout_seconds=3.0,
+            ownership=ledger,
+        )
+    assert ledger.value is None
+    assert backend.removed == [scope]
+
+    monkeypatch.setattr(manager, "_remove_active_record", original_remove)
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 0
+    replacement = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    manager.release(replacement, timeout_seconds=3.0)
+
+
+def test_guard_manager_reconciles_zero_residue_before_first_install(
+    tmp_path: Path,
+) -> None:
+    class _ReconcileCountingBackend(_RecordingBackend):
+        reconcile_calls = 0
+
+        def reconcile_owned(self, *, timeout_seconds: float) -> int:
+            self.reconcile_calls += 1
+            return super().reconcile_owned(timeout_seconds=timeout_seconds)
+
+    backend = _ReconcileCountingBackend(installed=[], verified=[], removed=[])
+    manager = ProbeConnectGuardManager(backend=backend)
+    scope = _guard_scope(tmp_path)
+
+    lease = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+
+    assert backend.reconcile_calls == 1
+    manager.release(lease, timeout_seconds=3.0)
 
 
 @pytest.mark.parametrize(
@@ -163,7 +619,7 @@ def test_guard_manager_collects_an_ambiguous_install_before_reporting_failure(
 
 def test_guard_manager_uses_one_install_and_readback_deadline(tmp_path: Path) -> None:
     backend = _RecordingBackend(installed=[], verified=[], removed=[])
-    observed_times = iter([0.0, 0.0, 4.0])
+    observed_times = iter([0.0, 0.0, 0.0, 4.0])
     manager = ProbeConnectGuardManager(
         backend=backend,
         monotonic=lambda: next(observed_times),
@@ -306,45 +762,12 @@ def test_guard_manager_cleans_a_failed_or_interrupted_receipt_write(
     manager = ProbeConnectGuardManager(backend=backend)
     scope = _guard_scope(tmp_path)
 
-    class _FailingReceiptOutput:
-        def __init__(self, descriptor: int) -> None:
-            self.descriptor = descriptor
+    def failing_write(_descriptor: int, _payload: bytes) -> int:
+        if failure == "interrupt":
+            raise KeyboardInterrupt("receipt interrupted")
+        return 0
 
-        def __enter__(self) -> _FailingReceiptOutput:
-            return self
-
-        def __exit__(
-            self,
-            _error_type: object,
-            _error: object,
-            _traceback: object,
-        ) -> None:
-            os.close(self.descriptor)
-
-        def write(self, _payload: bytes) -> int:
-            if failure == "interrupt":
-                raise KeyboardInterrupt("receipt interrupted")
-            return 0
-
-        def fileno(self) -> int:
-            return self.descriptor
-
-    def failing_open(
-        path: str | Path,
-        _mode: str,
-        *,
-        buffering: int,
-        opener: object,
-    ) -> _FailingReceiptOutput:
-        assert buffering == 0
-        assert callable(opener)
-        descriptor = opener(
-            os.fspath(path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        )
-        return _FailingReceiptOutput(descriptor)
-
-    monkeypatch.setattr("builtins.open", failing_open)
+    monkeypatch.setattr(os, "write", failing_write)
     if failure == "interrupt":
         expected_error: type[BaseException] = KeyboardInterrupt
         expected_message = "receipt interrupted"
@@ -363,7 +786,7 @@ def test_guard_manager_cleans_a_failed_or_interrupted_receipt_write(
 
     assert fake.commands == []
     assert list((tmp_path / "pins").iterdir()) == []
-    assert list((tmp_path / "ownership").iterdir()) == []
+    assert _receipt_entries(tmp_path / "ownership") == []
 
 
 def test_guard_manager_retries_only_one_bounded_cleanup_batch(tmp_path: Path) -> None:
@@ -410,18 +833,41 @@ class _FakeBpftool:
         assert 0 < timeout_seconds <= 3.0
         self.commands.append(arguments)
         command = arguments[1:]
+        if command[:2] == ("map", "create"):
+            assert command[3:] == (
+                "type",
+                "array",
+                "key",
+                "4",
+                "value",
+                "32",
+                "entries",
+                "1",
+                "name",
+                "allowed_target",
+            )
+            target_map = Path(command[2])
+            target_map.touch()
+            target_map.chmod(0o600)
+            return ""
         if command[:2] == ("prog", "loadall"):
             program_root = Path(command[3])
-            map_root = Path(command[5])
+            assert command[4:] == (
+                "map",
+                "name",
+                "allowed_target",
+                "pinned",
+                str(program_root.parent / "maps" / "allowed_target"),
+            )
             for pin in (
                 program_root / "rtsp_probe_guard_ipv4",
                 program_root / "rtsp_probe_guard_ipv6",
-                map_root / "allowed_target",
             ):
                 pin.touch()
                 pin.chmod(0o600)
             return ""
         if command[:2] == ("cgroup", "attach"):
+            assert command[-1] == "multi"
             self.attachments[str(command[3])] = (
                 101 if command[3] == "cgroup_inet4_connect" else 102
             )
@@ -566,6 +1012,23 @@ def _guard_scope(tmp_path: Path) -> ProbeConnectGuardScope:
     )
 
 
+def _spawned_reconcile_result(root: str, sender: Connection) -> None:
+    backend = _bpftool_backend(
+        Path(root),
+        run=_FakeBpftool(),
+        create_roots=False,
+    )
+    manager = ProbeConnectGuardManager(backend=backend)
+    try:
+        manager.reconcile_startup(timeout_seconds=0.2)
+    except ProbeConnectGuardError as error:
+        sender.send(("error", str(error)))
+    else:
+        sender.send(("success", ""))
+    finally:
+        sender.close()
+
+
 def test_bpftool_backend_installs_reads_back_and_removes_exact_owned_state(
     tmp_path: Path,
 ) -> None:
@@ -627,6 +1090,172 @@ def test_bpftool_backend_preserves_defense_in_depth_cgroup_attachments(
     ]
 
 
+def test_kernel_cgroup_attachment_query_reads_only_exact_connect_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cgroup = tmp_path / "probe.service"
+    cgroup.mkdir()
+    observed: list[tuple[int, int, str]] = []
+
+    def query(
+        cgroup_fd: int,
+        *,
+        attach_type: int,
+        architecture: str,
+    ) -> tuple[int, ...]:
+        observed.append((cgroup_fd, attach_type, architecture))
+        return {10: (101, 9001), 11: (102,)}[attach_type]
+
+    monkeypatch.setattr(probe_connect_guard, "_query_cgroup_program_ids", query)
+
+    assert probe_connect_guard._kernel_cgroup_attachments(cgroup) == {
+        (101, "cgroup_inet4_connect"),
+        (102, "cgroup_inet6_connect"),
+        (9001, "cgroup_inet4_connect"),
+    }
+    assert [(attach_type, architecture) for _, attach_type, architecture in observed] == [
+        (10, probe_connect_guard._linux_architecture(platform.machine())),
+        (11, probe_connect_guard._linux_architecture(platform.machine())),
+    ]
+    assert all(cgroup_fd >= 0 for cgroup_fd, _, _ in observed)
+
+
+def test_kernel_bpf_query_layout_matches_linux_uapi() -> None:
+    query = probe_connect_guard._BpfProgramQuery
+
+    assert ctypes.sizeof(query) == 64
+    assert query.program_ids.offset == 16
+    assert query.program_count.offset == 24
+    assert query.program_attach_flags.offset == 32
+    assert query.revision.offset == 56
+
+
+class _FakeBpfSyscall:
+    def __init__(
+        self,
+        *,
+        result: int = 0,
+        program_ids: tuple[int, ...] = (101, 102),
+        reported_count: int | None = None,
+    ) -> None:
+        self.restype: object = None
+        self.result = result
+        self.program_ids = program_ids
+        self.reported_count = reported_count
+        self.calls: list[tuple[int, int, int, int]] = []
+
+    def __call__(
+        self,
+        syscall_number: int,
+        command: int,
+        raw_query: Any,
+        size: int,
+    ) -> int:
+        query_pointer = ctypes.cast(
+            raw_query,
+            ctypes.POINTER(probe_connect_guard._BpfProgramQuery),
+        )
+        query = query_pointer.contents
+        self.calls.append((syscall_number, command, query.attach_type, size))
+        ids = ctypes.cast(query.program_ids, ctypes.POINTER(ctypes.c_uint32))
+        for index, program_id in enumerate(self.program_ids):
+            ids[index] = program_id
+        query.program_count = (
+            len(self.program_ids)
+            if self.reported_count is None
+            else self.reported_count
+        )
+        return self.result
+
+
+def test_kernel_bpf_query_returns_exact_program_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    syscall = _FakeBpfSyscall(program_ids=(101, 9001))
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: type("FakeLibc", (), {"syscall": syscall})(),
+    )
+
+    assert probe_connect_guard._query_cgroup_program_ids(
+        17,
+        attach_type=10,
+        architecture="amd64",
+    ) == (101, 9001)
+    assert syscall.calls == [(321, 16, 10, 64)]
+    assert syscall.restype is ctypes.c_long
+
+
+@pytest.mark.parametrize(
+    ("architecture", "syscall", "message"),
+    [
+        ("unknown", _FakeBpfSyscall(), "probe_guard_readback_invalid"),
+        ("arm64", _FakeBpfSyscall(result=-1), "probe_guard_readback_invalid"),
+        (
+            "arm64",
+            _FakeBpfSyscall(reported_count=257),
+            "probe_guard_readback_invalid",
+        ),
+        (
+            "arm64",
+            _FakeBpfSyscall(program_ids=(0,)),
+            "probe_guard_readback_invalid",
+        ),
+        (
+            "arm64",
+            _FakeBpfSyscall(program_ids=(101, 101)),
+            "probe_guard_readback_invalid",
+        ),
+    ],
+)
+def test_kernel_bpf_query_rejects_untrusted_results(
+    architecture: str,
+    syscall: _FakeBpfSyscall,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: type("FakeLibc", (), {"syscall": syscall})(),
+    )
+
+    with pytest.raises(ProbeConnectGuardError, match=message):
+        probe_connect_guard._query_cgroup_program_ids(
+            17,
+            attach_type=11,
+            architecture=architecture,
+        )
+
+
+def test_kernel_cgroup_attachment_query_rejects_duplicate_and_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cgroup = tmp_path / "probe.service"
+    cgroup.mkdir()
+    alias = tmp_path / "alias.service"
+    alias.symlink_to(cgroup, target_is_directory=True)
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_query_cgroup_program_ids",
+        lambda *_args, **_kwargs: (101,),
+    )
+
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_readback_invalid"):
+        probe_connect_guard._kernel_cgroup_attachments(alias)
+
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_query_cgroup_program_ids",
+        lambda *_args, **_kwargs: (101, 101),
+    )
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_readback_invalid"):
+        probe_connect_guard._kernel_cgroup_attachments(cgroup)
+
+
 def test_bpftool_backend_cleans_owned_pins_after_transient_cgroup_vanishes(
     tmp_path: Path,
 ) -> None:
@@ -648,6 +1277,37 @@ def test_bpftool_backend_cleans_owned_pins_after_transient_cgroup_vanishes(
     assert not (tmp_path / "pins" / scope.request_id.hex).exists()
 
 
+def test_bpftool_backend_refuses_an_unreceipted_pin_scope(tmp_path: Path) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    scope_root = tmp_path / "pins" / scope.request_id.hex
+    scope_root.mkdir(mode=0o700)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend.remove(scope, timeout_seconds=3.0)
+
+    assert scope_root.is_dir()
+
+
+def test_bpftool_backend_collects_receipt_after_owned_scope_disappears(
+    tmp_path: Path,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    scope_root = tmp_path / "pins" / scope.request_id.hex
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    shutil.rmtree(scope_root)
+
+    backend.remove(scope, timeout_seconds=3.0)
+
+    assert not scope_root.exists()
+    assert not receipt.exists()
+
+
 def test_bpftool_backend_handles_cgroup_disappearance_during_detach(
     tmp_path: Path,
 ) -> None:
@@ -667,6 +1327,29 @@ def test_bpftool_backend_handles_cgroup_disappearance_during_detach(
     manager.release(lease, timeout_seconds=3.0)
 
     assert not (tmp_path / "pins" / scope.request_id.hex).exists()
+
+
+def test_bpftool_backend_keeps_owned_state_when_detach_fails(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeBpftool()
+    override = _OverrideBpftool(
+        fake,
+        prefix=("cgroup", "detach"),
+        response=RuntimeError("detach failed"),
+    )
+    backend = _bpftool_backend(tmp_path, run=override)
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    override.enabled = True
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        backend.remove(scope, timeout_seconds=3.0)
+
+    assert (tmp_path / "pins" / scope.request_id.hex).is_dir()
 
 
 def test_bpftool_backend_retries_when_owned_attachment_survives_detach(
@@ -725,14 +1408,19 @@ def test_bpftool_backend_does_not_remove_scope_won_after_receipt_reservation(
     scope = _guard_scope(tmp_path)
     foreign_scope = tmp_path / "pins" / scope.request_id.hex
     original_mkdir = os.mkdir
+    original_rename = probe_connect_guard._rename_directory_no_replace
 
-    def lose_scope_race(path: str | Path, mode: int = 0o777) -> None:
-        if Path(path) == foreign_scope:
-            original_mkdir(path, mode)
-            raise FileExistsError(os.fspath(path))
-        original_mkdir(path, mode)
+    def lose_scope_race(source: Path, destination: Path) -> None:
+        if destination == foreign_scope:
+            original_mkdir(destination, 0o700)
+            raise FileExistsError(os.fspath(destination))
+        original_rename(source, destination)
 
-    monkeypatch.setattr("rtsp_proxy.probe_connect_guard.os.mkdir", lose_scope_race)
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_rename_directory_no_replace",
+        lose_scope_race,
+    )
 
     with pytest.raises(ProbeConnectGuardError, match="probe_guard_already_active"):
         manager.install(
@@ -745,12 +1433,48 @@ def test_bpftool_backend_does_not_remove_scope_won_after_receipt_reservation(
 
     assert foreign_scope.is_dir()
     assert list(foreign_scope.iterdir()) == []
-    assert list((tmp_path / "ownership").iterdir()) == []
+    assert _receipt_entries(tmp_path / "ownership") == []
 
 
+def test_reconcile_collects_owned_reservation_after_scope_collision_crash(
+    tmp_path: Path,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    reservation_nonce = backend._create_receipt(scope, receipt)
+    reservation_scope = backend._reservation_scope_path(scope, reservation_nonce)
+    reservation_scope.mkdir(mode=0o700)
+    backend._promote_receipt(scope, receipt, reservation_scope)
+    foreign_scope = tmp_path / "pins" / scope.request_id.hex
+    foreign_scope.mkdir(mode=0o700)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 0
+
+    assert foreign_scope.is_dir()
+    assert list(foreign_scope.iterdir()) == []
+    assert not reservation_scope.exists()
+    assert not receipt.exists()
+
+
+def test_bpffs_reservation_name_is_visible_and_request_bound(tmp_path: Path) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    nonce = "a" * 32
+
+    reservation = backend._reservation_scope_path(scope, nonce)
+
+    assert reservation.parent == tmp_path / "pins"
+    assert reservation.name == (
+        f"rtsp_probe_reservation_{scope.request_id.hex}_{nonce}"
+    )
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
 def test_collision_receipt_cleanup_failure_never_owns_the_foreign_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    interrupted: bool,
 ) -> None:
     fake = _FakeBpftool()
     backend = _bpftool_backend(tmp_path, run=fake)
@@ -759,27 +1483,44 @@ def test_collision_receipt_cleanup_failure_never_owns_the_foreign_scope(
     foreign_scope = tmp_path / "pins" / scope.request_id.hex
     receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
     original_mkdir = os.mkdir
+    original_rename = probe_connect_guard._rename_directory_no_replace
     original_unlink = Path.unlink
-    fail_unlink = True
+    remaining_unlink_failures = 2
 
-    def lose_scope_race(path: str | Path, mode: int = 0o777) -> None:
-        if Path(path) == foreign_scope:
-            original_mkdir(path, mode)
-            raise FileExistsError(os.fspath(path))
-        original_mkdir(path, mode)
+    def lose_scope_race(source: Path, destination: Path) -> None:
+        if destination == foreign_scope:
+            original_mkdir(destination, 0o700)
+            raise FileExistsError(os.fspath(destination))
+        original_rename(source, destination)
 
     def reject_receipt_unlink(
         path: Path,
         missing_ok: bool = False,
     ) -> None:
-        if path == receipt and fail_unlink:
+        nonlocal remaining_unlink_failures
+        if path == receipt and remaining_unlink_failures:
+            remaining_unlink_failures -= 1
+            if interrupted:
+                raise KeyboardInterrupt("receipt cleanup interrupted")
             raise OSError("ambiguous receipt cleanup")
         original_unlink(path, missing_ok=missing_ok)
 
-    monkeypatch.setattr("rtsp_proxy.probe_connect_guard.os.mkdir", lose_scope_race)
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_rename_directory_no_replace",
+        lose_scope_race,
+    )
     monkeypatch.setattr(Path, "unlink", reject_receipt_unlink)
 
-    with pytest.raises(ProbeConnectGuardError, match="probe_guard_already_active"):
+    expected_error: type[BaseException] = (
+        KeyboardInterrupt if interrupted else ProbeConnectGuardError
+    )
+    expected_message = (
+        "receipt cleanup interrupted"
+        if interrupted
+        else "probe_guard_reconcile_required"
+    )
+    with pytest.raises(expected_error, match=expected_message):
         manager.install(
             request_id=scope.request_id,
             unit_name=scope.unit_name,
@@ -791,11 +1532,15 @@ def test_collision_receipt_cleanup_failure_never_owns_the_foreign_scope(
     assert foreign_scope.is_dir()
     assert receipt.is_file()
 
-    fail_unlink = False
-    restarted = ProbeConnectGuardManager(
-        backend=_bpftool_backend(tmp_path, run=fake, create_roots=False)
-    )
-    assert restarted.reconcile_startup(timeout_seconds=3.0) == 0
+    remaining_unlink_failures = 0
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_already_active"):
+        manager.install(
+            request_id=scope.request_id,
+            unit_name=scope.unit_name,
+            cgroup_path=scope.cgroup_path,
+            target=scope.target,
+            timeout_seconds=3.0,
+        )
     assert foreign_scope.is_dir()
     assert not receipt.exists()
 
@@ -816,6 +1561,7 @@ def test_guard_manager_reconciles_receipt_proven_state_after_broker_restart(
     )
     receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
     assert receipt.is_file()
+    _simulate_backend_process_exit(first_backend, scope)
 
     restarted_manager = ProbeConnectGuardManager(
         backend=_bpftool_backend(tmp_path, run=fake, create_roots=False)
@@ -823,6 +1569,530 @@ def test_guard_manager_reconciles_receipt_proven_state_after_broker_restart(
     assert restarted_manager.reconcile_startup(timeout_seconds=3.0) == 0
 
     assert fake.attachments == {}
+    assert not receipt.exists()
+    assert not (tmp_path / "pins" / scope.request_id.hex).exists()
+
+
+def test_reconcile_cleans_a_legacy_v2_active_receipt(tmp_path: Path) -> None:
+    fake = _FakeBpftool()
+    backend = _bpftool_backend(tmp_path, run=fake)
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    scope_root = tmp_path / "pins" / scope.request_id.hex
+    metadata = scope_root.stat()
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    receipt.write_bytes(
+        _legacy_v2_receipt_bytes(
+            backend,
+            scope,
+            phase=1,
+            scope_device=metadata.st_dev,
+            scope_inode=metadata.st_ino,
+        )
+    )
+    receipt.chmod(0o600)
+    _simulate_backend_process_exit(backend, scope)
+
+    restarted = _bpftool_backend(tmp_path, run=fake, create_roots=False)
+    assert restarted.reconcile_owned(timeout_seconds=3.0) == 0
+
+    assert not receipt.exists()
+    assert not scope_root.exists()
+    assert fake.attachments == {}
+
+
+def test_reconcile_cleans_a_legacy_v2_uncommitted_receipt(tmp_path: Path) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    receipt.write_bytes(
+        _legacy_v2_receipt_bytes(
+            backend,
+            scope,
+            phase=0,
+            scope_device=0,
+            scope_inode=0,
+        )
+    )
+    receipt.chmod(0o600)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 0
+    assert not receipt.exists()
+
+
+def test_reconcile_rejects_ambiguous_legacy_v2_uncommitted_scope(
+    tmp_path: Path,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    receipt.write_bytes(
+        _legacy_v2_receipt_bytes(
+            backend,
+            scope,
+            phase=0,
+            scope_device=0,
+            scope_inode=0,
+        )
+    )
+    receipt.chmod(0o600)
+    foreign_scope = tmp_path / "pins" / scope.request_id.hex
+    foreign_scope.mkdir(mode=0o700)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 1
+    assert receipt.is_file()
+    assert foreign_scope.is_dir()
+
+
+def test_guard_manager_serializes_reconcile_against_another_broker_process(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeBpftool()
+    backend = _bpftool_backend(tmp_path, run=fake)
+    manager = ProbeConnectGuardManager(backend=backend)
+    scope = _guard_scope(tmp_path)
+    lease = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_spawned_reconcile_result,
+        args=(os.fspath(tmp_path), sender),
+    )
+    process.start()
+    sender.close()
+    assert receiver.poll(3.0)
+    assert receiver.recv() == ("error", "probe_guard_timeout")
+    process.join(timeout=3.0)
+    assert process.exitcode == 0
+    receiver.close()
+
+    manager.release(lease, timeout_seconds=3.0)
+
+
+def test_bpftool_backend_stops_reconciliation_at_aggregate_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    _simulate_backend_process_exit(backend, scope)
+    observed = iter([0.0, 4.0])
+    backend._monotonic = lambda: next(observed)
+
+    def fail_remove(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise ProbeConnectGuardError("cleanup failed")
+
+    monkeypatch.setattr(backend, "_remove_owned", fail_remove)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 1
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_bpftool_backend_collects_a_failed_receipt_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted: bool,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+
+    def fail_promotion(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        if interrupted:
+            raise KeyboardInterrupt("promotion interrupted")
+        raise RuntimeError("promotion failed")
+
+    monkeypatch.setattr(backend, "_promote_receipt", fail_promotion)
+    expected_error: type[BaseException] = (
+        probe_connect_guard.ProbeConnectGuardInstallRejectedInterruption
+        if interrupted
+        else probe_connect_guard.ProbeConnectGuardInstallRejected
+    )
+
+    with pytest.raises(expected_error):
+        backend.install(scope, timeout_seconds=3.0)
+
+    assert list((tmp_path / "pins").iterdir()) == []
+    assert _receipt_entries(tmp_path / "ownership") == []
+
+
+def test_bpftool_backend_preserves_receipt_promotion_and_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    original_rmdir = Path.rmdir
+
+    def fail_promotion(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("promotion failed")
+
+    def fail_scope_cleanup(path: Path) -> None:
+        if path.name.startswith("rtsp_probe_reservation_"):
+            raise KeyboardInterrupt("scope cleanup interrupted")
+        original_rmdir(path)
+
+    monkeypatch.setattr(backend, "_promote_receipt", fail_promotion)
+    monkeypatch.setattr(Path, "rmdir", fail_scope_cleanup)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        backend.install(scope, timeout_seconds=3.0)
+
+    assert any(isinstance(error, RuntimeError) for error in raised.value.exceptions)
+    assert any(isinstance(error, KeyboardInterrupt) for error in raised.value.exceptions)
+    assert any(
+        path.name.startswith("rtsp_probe_reservation_")
+        for path in (tmp_path / "pins").iterdir()
+    )
+
+
+def test_bpftool_backend_refuses_an_existing_receipt_reservation(
+    tmp_path: Path,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    receipt.write_bytes(b"foreign")
+
+    with pytest.raises(
+        probe_connect_guard.ProbeConnectGuardInstallRejected,
+        match="probe_guard_already_active",
+    ):
+        backend._create_receipt(scope, receipt)
+
+    assert receipt.read_bytes() == b"foreign"
+
+
+def test_bpftool_backend_preserves_receipt_write_and_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+
+    def fail_fsync(descriptor: int) -> None:
+        del descriptor
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        backend._create_receipt(scope, receipt)
+
+    assert len(raised.value.exceptions) == 2
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("scope_state", ["missing", "wrong_mode"])
+def test_bpftool_backend_refuses_unprovable_receipt_promotion(
+    tmp_path: Path,
+    scope_state: str,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    scope_root = tmp_path / "pins" / scope.request_id.hex
+    backend._create_receipt(scope, receipt)
+    if scope_state == "wrong_mode":
+        scope_root.mkdir(mode=0o700)
+        scope_root.chmod(0o770)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._promote_receipt(scope, receipt, scope_root)
+
+
+@pytest.mark.parametrize("tamper", ["mode", "content", "temp_write_stall"])
+def test_bpftool_backend_refuses_tampered_receipt_during_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    reservation_nonce = backend._create_receipt(scope, receipt)
+    scope_root = backend._reservation_scope_path(scope, reservation_nonce)
+    scope_root.mkdir(mode=0o700)
+    if tamper == "mode":
+        receipt.chmod(0o644)
+    elif tamper == "content":
+        payload = bytearray(receipt.read_bytes())
+        payload[0] = ord("[")
+        receipt.write_bytes(payload)
+    else:
+        monkeypatch.setattr(os, "write", lambda *args: 0)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._promote_receipt(scope, receipt, scope_root)
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_bpftool_backend_collects_an_uncommitted_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted: bool,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    original_fsync = os.fsync
+    first_fsync = True
+
+    def fail_initial_fsync(descriptor: int) -> None:
+        nonlocal first_fsync
+        if first_fsync:
+            first_fsync = False
+            if interrupted:
+                raise KeyboardInterrupt("receipt fsync interrupted")
+            raise OSError("receipt fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_initial_fsync)
+    expected_error: type[BaseException] = (
+        probe_connect_guard.ProbeConnectGuardInstallRejectedInterruption
+        if interrupted
+        else probe_connect_guard.ProbeConnectGuardInstallRejected
+    )
+
+    with pytest.raises(expected_error):
+        backend.install(scope, timeout_seconds=3.0)
+
+    assert list((tmp_path / "pins").iterdir()) == []
+    assert _receipt_entries(tmp_path / "ownership") == []
+
+
+def test_bpftool_backend_reconciles_reserved_receipt_and_empty_scope(
+    tmp_path: Path,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    reservation_nonce = backend._create_receipt(scope, receipt)
+    scope_root = backend._reservation_scope_path(scope, reservation_nonce)
+    scope_root.mkdir(mode=0o700)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 0
+
+    assert not receipt.exists()
+    assert not scope_root.exists()
+
+
+def test_bpftool_receipt_promotion_never_rewrites_committed_receipt_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    scope_root = tmp_path / "pins" / scope.request_id.hex
+    backend._create_receipt(scope, receipt)
+    scope_root.mkdir(mode=0o700)
+
+    def reject_in_place_write(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise AssertionError("receipt must be replaced atomically")
+
+    monkeypatch.setattr(os, "pwrite", reject_in_place_write)
+
+    backend._promote_receipt(scope, receipt, scope_root)
+    assert json.loads(receipt.read_bytes())["phase"] == 1
+
+
+def test_bpftool_backend_reconciles_a_torn_atomic_promotion_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    reservation_nonce = backend._create_receipt(scope, receipt)
+    reservation_scope = backend._reservation_scope_path(
+        scope,
+        reservation_nonce,
+    )
+    reservation_scope.mkdir(mode=0o700)
+    original_write = os.write
+    calls = 0
+
+    def torn_write(descriptor: int, payload: bytes) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(descriptor, payload[:1])
+        raise KeyboardInterrupt("promotion write interrupted")
+
+    monkeypatch.setattr(os, "write", torn_write)
+    with pytest.raises(KeyboardInterrupt, match="promotion write interrupted"):
+        backend._promote_receipt(scope, receipt, reservation_scope)
+    monkeypatch.setattr(os, "write", original_write)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 0
+    assert _receipt_entries(tmp_path / "ownership") == []
+    assert list((tmp_path / "pins").iterdir()) == []
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_bpftool_backend_reconciles_a_crashed_initial_receipt_publish(
+    tmp_path: Path,
+    linked: bool,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    nonce = "a" * 32
+    temporary = backend._reservation_receipt_path(scope, nonce)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    if linked:
+        payload = probe_connect_guard._receipt_bytes(
+            scope,
+            object_sha256=backend._identity.object_sha256,
+            artifact_release_id=backend._artifact_release.release_id,
+            phase=0,
+            scope_device=0,
+            scope_inode=0,
+            reservation_nonce=nonce,
+        )
+        temporary.write_bytes(payload)
+        temporary.chmod(0o600)
+        os.link(temporary, receipt)
+    else:
+        temporary.write_bytes(b"{")
+        temporary.chmod(0o600)
+
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 0
+    assert _receipt_entries(tmp_path / "ownership") == []
+
+
+def test_bpftool_backend_reconciles_replace_then_directory_fsync_ambiguity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    reservation_nonce = backend._create_receipt(scope, receipt)
+    reservation_scope = backend._reservation_scope_path(
+        scope,
+        reservation_nonce,
+    )
+    reservation_scope.mkdir(mode=0o700)
+    original_fsync_directory = probe_connect_guard._fsync_directory
+    fail_once = True
+
+    def fail_after_replace(path: Path) -> None:
+        nonlocal fail_once
+        if fail_once and path == tmp_path / "ownership":
+            fail_once = False
+            raise OSError("directory fsync interrupted")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_fsync_directory",
+        fail_after_replace,
+    )
+    with pytest.raises(ProbeConnectGuardError, match="ownership_invalid"):
+        backend._promote_receipt(scope, receipt, reservation_scope)
+
+    assert json.loads(receipt.read_bytes())["phase"] == 1
+    assert backend.reconcile_owned(timeout_seconds=3.0) == 0
+    assert _receipt_entries(tmp_path / "ownership") == []
+    assert list((tmp_path / "pins").iterdir()) == []
+
+
+def test_guard_manager_reconciles_a_catalogued_previous_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeBpftool()
+    previous_object_sha = "a" * 64
+    current_identity = ProbeConnectGuardArtifactIdentity(
+        bpftool_sha256=sha256(b"fixture").hexdigest(),
+        object_sha256=sha256(b"fixture").hexdigest(),
+        ipv4_program_tag="1" * 16,
+        ipv6_program_tag="2" * 16,
+    )
+    releases: dict[str, object] = {}
+    for release_id, object_sha, ipv4_tag, ipv6_tag, activation in (
+        ("0.0.1", previous_object_sha, "3" * 16, "4" * 16, False),
+        (
+            "0.1.0",
+            current_identity.object_sha256,
+            current_identity.ipv4_program_tag,
+            current_identity.ipv6_program_tag,
+            True,
+        ),
+    ):
+        architectures = {
+            architecture: {
+                "bpftool_sha256": [current_identity.bpftool_sha256],
+                "object_sha256": object_sha,
+                "ipv4_program_tag": ipv4_tag,
+                "ipv6_program_tag": ipv6_tag,
+            }
+            for architecture in ("amd64", "arm64")
+        }
+        releases[release_id] = {
+            "activation_compatible": activation,
+            "cleanup_compatible": True,
+            "architectures": architectures,
+        }
+    catalog = probe_connect_guard._parse_artifact_catalog(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "current_release_id": "0.1.0",
+                "releases": releases,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_test_artifact_catalog",
+        lambda identity, architecture: catalog,
+    )
+    backend = _bpftool_backend(tmp_path, run=fake)
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    decoded = json.loads(receipt.read_bytes())
+    decoded["artifact_release_id"] = "0.0.1"
+    decoded["object_sha256"] = previous_object_sha
+    receipt.write_bytes(
+        json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode()
+        + b"\n"
+    )
+    fake.ipv4_tag = "3" * 16
+    fake.ipv6_tag = "4" * 16
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend.verify(scope, timeout_seconds=3.0)
+
+    _simulate_backend_process_exit(backend, scope)
+
+    restarted = ProbeConnectGuardManager(
+        backend=_bpftool_backend(tmp_path, run=fake, create_roots=False)
+    )
+    assert restarted.reconcile_startup(timeout_seconds=3.0) == 0
     assert not receipt.exists()
     assert not (tmp_path / "pins" / scope.request_id.hex).exists()
 
@@ -847,6 +2117,175 @@ def test_bpftool_backend_receipt_does_not_own_a_replaced_scope_inode(
     assert displaced_scope.is_dir()
 
 
+def test_bpftool_backend_refuses_receipt_when_owned_scope_cannot_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    owned_scope = tmp_path / "pins" / scope.request_id.hex
+    original_lstat = Path.lstat
+
+    def fail_scope_lstat(path: Path) -> os.stat_result:
+        if path == owned_scope:
+            raise OSError("scope unavailable")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_scope_lstat)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend.verify(scope, timeout_seconds=3.0)
+
+
+def test_bpftool_backend_rejects_unknown_ownership_inventory(tmp_path: Path) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    foreign = tmp_path / "ownership" / "foreign"
+    foreign.write_bytes(b"")
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._receipt_inventory()
+
+
+def test_bpftool_backend_fails_closed_when_ownership_inventory_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    ownership_root = tmp_path / "ownership"
+    original_iterdir = Path.iterdir
+
+    def fail_inventory(path: Path) -> Iterator[Path]:
+        if path == ownership_root:
+            raise OSError("inventory unavailable")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_inventory)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._receipt_inventory()
+
+
+@pytest.mark.parametrize("fault", ["short_read", "close"])
+def test_bpftool_backend_fails_closed_on_receipt_io_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    if fault == "short_read":
+        original_read = os.read
+
+        def short_read(descriptor: int, size: int) -> bytes:
+            return original_read(descriptor, max(0, size - 1))[:-1]
+
+        monkeypatch.setattr(os, "read", short_read)
+    else:
+        original_close = os.close
+        failed = False
+
+        def fail_close(descriptor: int) -> None:
+            nonlocal failed
+            original_close(descriptor)
+            if not failed:
+                failed = True
+                raise OSError("close failed")
+
+        monkeypatch.setattr(os, "close", fail_close)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._ownership_from_receipt(receipt)
+
+
+def test_bpftool_backend_rejects_noncanonical_receipt_fields(tmp_path: Path) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+    decoded = json.loads(receipt.read_bytes())
+    decoded["phase"] = True
+    receipt.write_bytes(
+        json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._ownership_from_receipt(receipt)
+
+
+def test_bpftool_backend_refuses_to_collect_an_owned_receipt_as_reserved(
+    tmp_path: Path,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend._remove_reserved_receipt(receipt)
+
+    assert receipt.is_file()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["scope_mode", "root_entry", "program_mode", "pin_mode", "inventory_error"],
+)
+def test_bpftool_backend_rejects_ambiguous_partial_pin_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    scope = _guard_scope(tmp_path)
+    backend.install(scope, timeout_seconds=3.0)
+    scope_root = tmp_path / "pins" / scope.request_id.hex
+    programs = scope_root / "programs"
+    if tamper == "scope_mode":
+        scope_root.chmod(0o770)
+    elif tamper == "root_entry":
+        (scope_root / "foreign").write_bytes(b"")
+    elif tamper == "program_mode":
+        programs.chmod(0o770)
+    elif tamper == "pin_mode":
+        (programs / "rtsp_probe_guard_ipv4").chmod(0o660)
+    else:
+        original_iterdir = Path.iterdir
+
+        def fail_inventory(path: Path) -> Iterator[Path]:
+            if path == scope_root:
+                raise OSError("inventory unavailable")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fail_inventory)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        backend.verify(scope, timeout_seconds=3.0)
+
+
 def test_guard_manager_retries_cleanup_after_receipt_unlink_fsync_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -867,7 +2306,11 @@ def test_guard_manager_retries_cleanup_after_receipt_unlink_fsync_failure(
     reject_final_fsync = True
 
     def ambiguous_fsync(path: Path) -> None:
-        if reject_final_fsync and path == ownership_root and not any(path.iterdir()):
+        if (
+            reject_final_fsync
+            and path == ownership_root
+            and not _receipt_entries(path)
+        ):
             raise OSError("directory fsync failed after unlink")
         original_fsync_directory(path)
 
@@ -877,7 +2320,7 @@ def test_guard_manager_retries_cleanup_after_receipt_unlink_fsync_failure(
         manager.release(lease, timeout_seconds=3.0)
 
     assert list((tmp_path / "pins").iterdir()) == []
-    assert list(ownership_root.iterdir()) == []
+    assert _receipt_entries(ownership_root) == []
     reject_final_fsync = False
     assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 0
 
@@ -898,6 +2341,7 @@ def test_guard_manager_reconcile_refuses_a_tampered_ownership_receipt(
     )
     receipt = tmp_path / "ownership" / f"{scope.request_id.hex}.json"
     receipt.write_text("{}\n", encoding="utf-8")
+    _simulate_backend_process_exit(backend, scope)
 
     restarted_manager = ProbeConnectGuardManager(
         backend=_bpftool_backend(tmp_path, run=fake, create_roots=False)
@@ -928,6 +2372,8 @@ def test_guard_manager_reconcile_rejects_noncanonical_receipt_storage(
         replacement.write_bytes(receipt.read_bytes())
         receipt.unlink()
         receipt.symlink_to(replacement)
+
+    _simulate_backend_process_exit(backend, scope)
 
     restarted_manager = ProbeConnectGuardManager(
         backend=_bpftool_backend(tmp_path, run=fake, create_roots=False)
@@ -975,9 +2421,13 @@ def test_guard_manager_reconciles_only_one_bounded_crash_batch(
 ) -> None:
     fake = _FakeBpftool()
     backend = _bpftool_backend(tmp_path, run=fake)
+    scopes: list[ProbeConnectGuardScope] = []
     for _index in range(10):
         scope = _guard_scope(tmp_path)
         backend.install(scope, timeout_seconds=3.0)
+        scopes.append(scope)
+
+    _simulate_backend_process_exit(backend, *scopes)
 
     restarted_manager = ProbeConnectGuardManager(
         backend=_bpftool_backend(tmp_path, run=fake, create_roots=False)
@@ -1191,6 +2641,7 @@ def test_bpftool_backend_requires_the_complete_exact_pin_inventory(
         backend.verify(scope, timeout_seconds=3.0)
 
     missing_pin.touch()
+    missing_pin.chmod(0o600)
     backend.remove(scope, timeout_seconds=3.0)
 
 
@@ -1238,7 +2689,191 @@ def test_bpftool_backend_rejects_artifact_replacement_before_kernel_mutation(
 
     assert fake.commands == []
     assert list((tmp_path / "pins").iterdir()) == []
-    assert list((tmp_path / "ownership").iterdir()) == []
+    assert _receipt_entries(tmp_path / "ownership") == []
+
+
+def test_packaged_guard_catalog_rejects_a_substituted_current_artifact() -> None:
+    catalog = probe_connect_guard._load_packaged_artifact_catalog()
+    for architecture in ("amd64", "arm64"):
+        release = catalog.cleanup_release("0.1.0", architecture=architecture)
+        trusted_tool = min(release.bpftool_sha256)
+        identity = ProbeConnectGuardArtifactIdentity(
+            bpftool_sha256=trusted_tool,
+            object_sha256=release.object_sha256,
+            ipv4_program_tag=release.ipv4_program_tag,
+            ipv6_program_tag=release.ipv6_program_tag,
+        )
+
+        assert catalog.activation_release(
+            identity,
+            architecture=architecture,
+        ) == release
+        with pytest.raises(
+            ProbeConnectGuardError,
+            match="probe_guard_artifact_identity_invalid",
+        ):
+            catalog.activation_release(
+                ProbeConnectGuardArtifactIdentity(
+                    bpftool_sha256=trusted_tool,
+                    object_sha256="0" * 64,
+                    ipv4_program_tag=release.ipv4_program_tag,
+                    ipv6_program_tag=release.ipv6_program_tag,
+                ),
+                architecture=architecture,
+            )
+
+
+def test_guard_catalog_rejects_unknown_cleanup_release() -> None:
+    catalog = probe_connect_guard._load_packaged_artifact_catalog()
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_ownership_invalid",
+    ):
+        catalog.cleanup_release("unknown", architecture="amd64")
+
+
+def test_guard_catalog_requires_both_architectures_for_every_cleanup_release() -> None:
+    decoded = json.loads(
+        Path("src/rtsp_proxy/artifacts/probe_connect_guard.json").read_bytes()
+    )
+    current = decoded["releases"][decoded["current_release_id"]]
+    previous = json.loads(json.dumps(current))
+    del previous["architectures"]["arm64"]
+    previous["activation_compatible"] = False
+    previous["cleanup_compatible"] = True
+    decoded["releases"]["previous"] = previous
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_artifact_identity_invalid",
+    ):
+        probe_connect_guard._parse_artifact_catalog(json.dumps(decoded).encode())
+
+
+def test_packaged_guard_catalog_fails_closed_when_resource_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnreadableResource:
+        def joinpath(self, *parts: str) -> _UnreadableResource:
+            del parts
+            return self
+
+        def read_bytes(self) -> bytes:
+            raise OSError("catalog unavailable")
+
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "files",
+        lambda package: _UnreadableResource(),
+    )
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_artifact_identity_invalid",
+    ):
+        probe_connect_guard._load_packaged_artifact_catalog()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "json",
+        "schema",
+        "current",
+        "releases",
+        "release_id",
+        "release_shape",
+        "activation",
+        "cleanup",
+        "architectures",
+        "architecture",
+        "identity_shape",
+        "tools_empty",
+        "tools_duplicate",
+        "tool_digest",
+        "object_digest",
+        "ipv4_tag",
+        "ipv6_tag",
+        "current_not_activation_compatible",
+    ],
+)
+def test_guard_artifact_catalog_rejects_noncanonical_content(case: str) -> None:
+    if case == "json":
+        payload = b"{"
+    else:
+        decoded = json.loads(
+            Path("src/rtsp_proxy/artifacts/probe_connect_guard.json").read_bytes()
+        )
+        releases = decoded["releases"]
+        current = releases[decoded["current_release_id"]]
+        arm64 = current["architectures"]["arm64"]
+        if case == "schema":
+            decoded["schema_version"] = 2
+        elif case == "current":
+            decoded["current_release_id"] = "invalid release"
+        elif case == "releases":
+            decoded["releases"] = {}
+        elif case == "release_id":
+            releases["invalid release"] = releases.pop("0.1.0")
+            decoded["current_release_id"] = "invalid release"
+        elif case == "release_shape":
+            current["unexpected"] = True
+        elif case == "activation":
+            current["activation_compatible"] = 1
+        elif case == "cleanup":
+            current["cleanup_compatible"] = 1
+        elif case == "architectures":
+            current["architectures"] = []
+        elif case == "architecture":
+            current["architectures"]["riscv64"] = current["architectures"].pop(
+                "arm64"
+            )
+        elif case == "identity_shape":
+            arm64["unexpected"] = True
+        elif case == "tools_empty":
+            arm64["bpftool_sha256"] = []
+        elif case == "tools_duplicate":
+            arm64["bpftool_sha256"] *= 2
+        elif case == "tool_digest":
+            arm64["bpftool_sha256"] = ["invalid"]
+        elif case == "object_digest":
+            arm64["object_sha256"] = "invalid"
+        elif case == "ipv4_tag":
+            arm64["ipv4_program_tag"] = "invalid"
+        elif case == "ipv6_tag":
+            arm64["ipv6_program_tag"] = "invalid"
+        else:
+            current["activation_compatible"] = False
+        payload = json.dumps(decoded).encode()
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_artifact_identity_invalid",
+    ):
+        probe_connect_guard._parse_artifact_catalog(payload)
+
+
+@pytest.mark.parametrize(
+    ("machine", "expected"),
+    [
+        ("x86_64", "amd64"),
+        ("AMD64", "amd64"),
+        ("aarch64", "arm64"),
+        ("ARM64", "arm64"),
+    ],
+)
+def test_guard_artifact_catalog_normalizes_linux_architecture(
+    machine: str,
+    expected: str,
+) -> None:
+    assert probe_connect_guard._linux_architecture(machine) == expected
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_artifact_identity_invalid",
+    ):
+        probe_connect_guard._linux_architecture("riscv64")
 
 
 @pytest.mark.skipif(
@@ -1278,14 +2913,15 @@ def test_bpftool_backend_executes_the_verified_inode_not_a_replaced_path(
         artifact_identity=identity,
         trusted_owner_uid=os.getuid(),
     )
-    original_popen = subprocess.Popen
+    original_spawn = probe_connect_guard._spawn_owned_process
     swapped = False
     executed_paths: list[str] = []
 
     def swap_during_process_start(
+        owner: probe_connect_guard._ProcessOwner,
         arguments: tuple[str, ...],
-        **keywords: object,
-    ) -> object:
+        **keywords: Any,
+    ) -> None:
         nonlocal swapped
         executed_paths.append(arguments[0])
         if not swapped:
@@ -1294,20 +2930,99 @@ def test_bpftool_backend_executes_the_verified_inode_not_a_replaced_path(
             bpftool.rename(backup)
             malicious.rename(bpftool)
             try:
-                return original_popen(arguments, **keywords)  # type: ignore[call-overload]
+                original_spawn(
+                    owner,
+                    arguments,
+                    **keywords,
+                )
             finally:
                 bpftool.rename(malicious)
                 backup.rename(bpftool)
-        return original_popen(arguments, **keywords)  # type: ignore[call-overload]
+            return
+        original_spawn(
+            owner,
+            arguments,
+            **keywords,
+        )
 
     monkeypatch.setattr(
-        "rtsp_proxy.probe_connect_guard.subprocess.Popen",
+        "rtsp_proxy.probe_connect_guard._spawn_owned_process",
         swap_during_process_start,
     )
 
     backend.install(_guard_scope(tmp_path), timeout_seconds=3.0)
 
     assert all(path != str(bpftool) for path in executed_paths)
+
+
+def test_verified_command_passes_bound_root_descriptors_to_bpftool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+    observed_pass_fds: tuple[int, ...] = ()
+
+    def capture_command(
+        arguments: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        pass_fds: tuple[int, ...] = (),
+    ) -> str:
+        nonlocal observed_pass_fds
+        del arguments, timeout_seconds
+        observed_pass_fds = pass_fds
+        return ""
+
+    monkeypatch.setattr(probe_connect_guard, "_run_command", capture_command)
+
+    backend._run_verified_command(("version",), timeout_seconds=3.0)
+
+    assert set(backend._root_descriptors).issubset(observed_pass_fds)
+    assert len(observed_pass_fds) == len(backend._root_descriptors) + 2
+
+
+@pytest.mark.parametrize(
+    ("command_error", "cleanup_error", "expected"),
+    [
+        (
+            RuntimeError("command failed"),
+            RuntimeError("close failed"),
+            ProbeConnectGuardError,
+        ),
+        (
+            KeyboardInterrupt("command interrupted"),
+            RuntimeError("close failed"),
+            BaseExceptionGroup,
+        ),
+        (None, RuntimeError("close failed"), ProbeConnectGuardError),
+        (None, KeyboardInterrupt("close interrupted"), BaseExceptionGroup),
+    ],
+)
+def test_bpftool_backend_preserves_verified_command_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command_error: BaseException | None,
+    cleanup_error: BaseException,
+    expected: type[BaseException],
+) -> None:
+    backend = _bpftool_backend(tmp_path, run=_FakeBpftool())
+
+    def run_command(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        if command_error is not None:
+            raise command_error
+        return ""
+
+    def close_with_error(descriptors: list[int]) -> list[BaseException]:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        return [cleanup_error]
+
+    monkeypatch.setattr(probe_connect_guard, "_run_command", run_command)
+    monkeypatch.setattr(probe_connect_guard, "_close_descriptors", close_with_error)
+
+    with pytest.raises(expected):
+        backend._run_verified_command(("version",), timeout_seconds=3.0)
 
 
 @pytest.mark.parametrize("drift", ["tag", "map"])
@@ -1350,10 +3065,13 @@ def test_bpftool_backend_bounds_kernel_command_stdout_and_stderr(
     bpftool.chmod(0o700)
     bpf_object = tmp_path / "guard.bpf.o"
     bpf_object.write_bytes(b"fixture")
+    bpf_object.chmod(0o600)
     pin_root = tmp_path / "pins"
     pin_root.mkdir()
+    pin_root.chmod(0o700)
     ownership_root = tmp_path / "ownership"
     ownership_root.mkdir()
+    ownership_root.chmod(0o700)
     backend = BpftoolProbeConnectGuardBackend(
         bpftool_path=bpftool,
         object_path=bpf_object,
@@ -1381,7 +3099,7 @@ def test_bpftool_backend_bounds_kernel_command_stdout_and_stderr(
 
     assert str(raised.value) == "probe_guard_install_failed"
     assert list(pin_root.iterdir()) == []
-    assert list(ownership_root.iterdir()) == []
+    assert _receipt_entries(ownership_root) == []
 
 
 def test_bpftool_command_owns_process_before_selector_setup(
@@ -1412,9 +3130,17 @@ def test_bpftool_command_owns_process_before_selector_setup(
             self.reaped = True
             return 0
 
+    def spawn_fake_process(
+        owner: object,
+        *arguments: object,
+        **keywords: object,
+    ) -> None:
+        del arguments, keywords
+        owner.process = _Process()  # type: ignore[attr-defined]
+
     monkeypatch.setattr(
-        "rtsp_proxy.probe_connect_guard.subprocess.Popen",
-        lambda *arguments, **keywords: _Process(),
+        "rtsp_proxy.probe_connect_guard._spawn_owned_process",
+        spawn_fake_process,
     )
     original_selector = selectors.DefaultSelector
     selector_calls = 0
@@ -1435,10 +3161,13 @@ def test_bpftool_command_owns_process_before_selector_setup(
     bpftool.chmod(0o700)
     bpf_object = tmp_path / "guard.bpf.o"
     bpf_object.write_bytes(b"fixture")
+    bpf_object.chmod(0o600)
     pin_root = tmp_path / "pins"
     pin_root.mkdir()
+    pin_root.chmod(0o700)
     ownership_root = tmp_path / "ownership"
     ownership_root.mkdir()
+    ownership_root.chmod(0o700)
     manager = ProbeConnectGuardManager(
         backend=BpftoolProbeConnectGuardBackend(
             bpftool_path=bpftool,
@@ -1478,6 +3207,463 @@ def test_bpftool_command_owns_process_before_selector_setup(
     assert process.stderr.closed
 
 
+def test_bpftool_command_owns_pid_before_unblocking_process_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = os.posix_spawn
+    spawned: list[int] = []
+
+    def queue_interrupt_after_spawn(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        pid = original_spawn(
+            path,
+            arguments,
+            environment,
+            **keywords,
+        )
+        spawned.append(pid)
+        os.kill(os.getpid(), signal.SIGINT)
+        return pid
+
+    monkeypatch.setattr(os, "posix_spawn", queue_interrupt_after_spawn)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "import time; time.sleep(30)"),
+                timeout_seconds=1.0,
+            )
+
+        assert len(spawned) == 1
+        with pytest.raises(ChildProcessError):
+            os.waitpid(spawned[0], os.WNOHANG)
+    finally:
+        for pid in spawned:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+
+def test_bpftool_command_restores_signal_mask_when_blocking_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_sigmask = signal.pthread_sigmask
+    original_mask = original_sigmask(signal.SIG_BLOCK, set())
+    interrupted = False
+
+    def interrupt_after_block(
+        operation: int,
+        mask: set[int | signal.Signals],
+    ) -> set[int | signal.Signals]:
+        nonlocal interrupted
+        previous = original_sigmask(operation, mask)
+        if operation == signal.SIG_BLOCK and mask and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("signal mask mutation interrupted")
+        return previous
+
+    monkeypatch.setattr(signal, "pthread_sigmask", interrupt_after_block)
+    try:
+        with pytest.raises(
+            KeyboardInterrupt,
+            match="signal mask mutation interrupted",
+        ):
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "raise SystemExit(0)"),
+                timeout_seconds=1.0,
+            )
+        observed_mask = original_sigmask(signal.SIG_BLOCK, set())
+    finally:
+        original_sigmask(signal.SIG_SETMASK, original_mask)
+
+    assert observed_mask == original_mask
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="spawn ownership is a Linux production boundary",
+)
+def test_bpftool_command_recovers_pid_when_spawn_return_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = os.posix_spawn
+    original_pread = os.pread
+    spawned: list[int] = []
+    inventory_reads = 0
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_SPAWN_WRAPPER",
+        "import time; time.sleep(30)\n" + probe_connect_guard._SPAWN_WRAPPER,
+    )
+
+    def interrupt_after_spawn(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        pid = original_spawn(path, arguments, environment, **keywords)
+        spawned.append(pid)
+        raise KeyboardInterrupt("spawn return interrupted")
+
+    def fail_first_post_spawn_inventory_read(
+        descriptor: int,
+        length: int,
+        offset: int,
+    ) -> bytes:
+        nonlocal inventory_reads
+        inventory_reads += 1
+        if inventory_reads == 2:
+            raise OSError("injected owned inventory read failure")
+        return original_pread(descriptor, length, offset)
+
+    monkeypatch.setattr(os, "posix_spawn", interrupt_after_spawn)
+    monkeypatch.setattr(os, "pread", fail_first_post_spawn_inventory_read)
+    try:
+        with pytest.raises(BaseException) as raised:
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "import time; time.sleep(30)"),
+                timeout_seconds=1.0,
+            )
+
+        assert isinstance(raised.value, KeyboardInterrupt) or (
+            isinstance(raised.value, BaseExceptionGroup)
+            and any(
+                isinstance(error, KeyboardInterrupt)
+                for error in raised.value.exceptions
+            )
+        )
+        assert len(spawned) == 1
+        with pytest.raises(ChildProcessError):
+            os.waitpid(spawned[0], os.WNOHANG)
+    finally:
+        for pid in spawned:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/thread-self/children").is_file(),
+    reason="direct-child recovery is a Linux production boundary",
+)
+def test_bpftool_command_recovers_zombie_before_pid_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = os.posix_spawn
+    original_pread = os.pread
+    spawned: list[int] = []
+    inventory_reads = 0
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_SPAWN_WRAPPER",
+        "import time; time.sleep(30)\n" + probe_connect_guard._SPAWN_WRAPPER,
+    )
+
+    def interrupt_after_child_becomes_zombie(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        pid = original_spawn(path, arguments, environment, **keywords)
+        spawned.append(pid)
+        os.kill(pid, signal.SIGKILL)
+        linux_os = cast(Any, os)
+        while linux_os.waitid(
+            linux_os.P_PID,
+            pid,
+            linux_os.WEXITED | os.WNOHANG | linux_os.WNOWAIT,
+        ) is None:
+            time.sleep(0.001)
+        raise KeyboardInterrupt("spawn return interrupted after child exit")
+
+    def fail_first_post_spawn_inventory_read(
+        descriptor: int,
+        length: int,
+        offset: int,
+    ) -> bytes:
+        nonlocal inventory_reads
+        inventory_reads += 1
+        if inventory_reads == 2:
+            raise OSError("injected owned inventory read failure")
+        return original_pread(descriptor, length, offset)
+
+    monkeypatch.setattr(os, "posix_spawn", interrupt_after_child_becomes_zombie)
+    monkeypatch.setattr(os, "pread", fail_first_post_spawn_inventory_read)
+    try:
+        with pytest.raises(BaseException) as raised:
+            probe_connect_guard._run_command(
+                (sys.executable, "-c", "raise SystemExit(0)"),
+                timeout_seconds=1.0,
+            )
+
+        assert isinstance(raised.value, KeyboardInterrupt) or (
+            isinstance(raised.value, BaseExceptionGroup)
+            and any(
+                isinstance(error, KeyboardInterrupt)
+                for error in raised.value.exceptions
+            )
+        )
+        assert len(spawned) == 1
+        with pytest.raises(ChildProcessError):
+            os.waitpid(spawned[0], os.WNOHANG)
+    finally:
+        for pid in spawned:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+
+def test_bpftool_command_requires_owned_child_inventory_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawn_called = False
+
+    def fail_child_inventory(_inventory: Any) -> None:
+        raise ProbeConnectGuardError("probe_guard_kernel_operation_failed")
+
+    def unexpected_spawn(*args: Any, **kwargs: Any) -> int:
+        nonlocal spawn_called
+        spawn_called = True
+        raise AssertionError("spawn must not run without child inventory")
+
+    monkeypatch.setattr(
+        probe_connect_guard._OwnedThreadChildInventory,
+        "acquire",
+        fail_child_inventory,
+    )
+    monkeypatch.setattr(os, "posix_spawn", unexpected_spawn)
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=1.0,
+        )
+
+    assert spawn_called is False
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/exe").exists(),
+    reason="verified current executable is a Linux production boundary",
+)
+def test_bpftool_command_executes_wrapper_from_current_inode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "rtsp_proxy.probe_connect_guard.sys.executable",
+        "/missing/python",
+    )
+
+    assert (
+        probe_connect_guard._run_command(
+            ("/bin/true",),
+            timeout_seconds=1.0,
+        )
+        == ""
+    )
+
+
+def test_bpftool_command_includes_spawn_handshake_in_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        probe_connect_guard,
+        "_SPAWN_WRAPPER",
+        "import time; time.sleep(0.2)\n" + probe_connect_guard._SPAWN_WRAPPER,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=0.05,
+        )
+
+    assert time.monotonic() - started < 0.75
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor ownership is a Linux production boundary",
+)
+def test_bpftool_command_closes_descriptors_when_pipe_acquisition_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_acquire = probe_connect_guard._OwnedSpawnPipe.acquire
+    calls = 0
+    allocated: list[int] = []
+
+    def fail_second_pipe(pipe: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected pipe failure")
+        original_acquire(pipe)
+        allocated.extend((pipe.read_descriptor, pipe.write_descriptor))
+
+    before = set(Path("/proc/self/fd").iterdir())
+    monkeypatch.setattr(
+        probe_connect_guard._OwnedSpawnPipe,
+        "acquire",
+        fail_second_pipe,
+    )
+
+    with pytest.raises(
+        ProbeConnectGuardError,
+        match="probe_guard_kernel_operation_failed",
+    ):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=1.0,
+        )
+
+    assert not set(Path("/proc/self/fd").iterdir()).difference(before)
+    for descriptor in allocated:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor ownership is a Linux production boundary",
+)
+def test_bpftool_command_closes_pipe_when_allocation_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_acquire = probe_connect_guard._OwnedSpawnPipe.acquire
+    calls = 0
+    allocated: list[int] = []
+
+    def interrupt_after_allocation(pipe: Any) -> None:
+        nonlocal calls
+        calls += 1
+        original_acquire(pipe)
+        allocated.extend((pipe.read_descriptor, pipe.write_descriptor))
+        if calls == 1:
+            raise KeyboardInterrupt("pipe allocation interrupted")
+
+    before = set(Path("/proc/self/fd").iterdir())
+    monkeypatch.setattr(
+        probe_connect_guard._OwnedSpawnPipe,
+        "acquire",
+        interrupt_after_allocation,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="pipe allocation interrupted"):
+        probe_connect_guard._run_command(
+            (sys.executable, "-c", "raise SystemExit(0)"),
+            timeout_seconds=1.0,
+        )
+
+    assert not set(Path("/proc/self/fd").iterdir()).difference(before)
+    for descriptor in allocated:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_spawn_pipe_second_close_cannot_close_reused_descriptor(
+) -> None:
+    pipe = probe_connect_guard._OwnedSpawnPipe()
+    pipe.acquire()
+    descriptor = pipe.read_descriptor
+    replacement = os.open(os.devnull, os.O_RDONLY)
+    try:
+        pipe.close_read()
+        os.dup2(replacement, descriptor)
+
+        assert pipe.close() == []
+        os.fstat(descriptor)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+        os.close(replacement)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor inheritance is a Linux production boundary",
+)
+def test_bpftool_command_closes_unrelated_inheritable_descriptors() -> None:
+    unrelated_read, unrelated_write = os.pipe()
+    try:
+        os.set_inheritable(unrelated_read, True)
+        observed = probe_connect_guard._run_command(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; fd=int(sys.argv[1]); "
+                    "\ntry: os.fstat(fd)"
+                    "\nexcept OSError: print('closed')"
+                    "\nelse: print('visible')"
+                ),
+                str(unrelated_read),
+            ),
+            timeout_seconds=1.0,
+        )
+    finally:
+        os.close(unrelated_read)
+        os.close(unrelated_write)
+
+    assert observed == "closed\n"
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="descriptor inheritance is a Linux production boundary",
+)
+def test_bpftool_command_closes_descriptor_made_inheritable_during_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unrelated_read, unrelated_write = os.pipe()
+    original_spawn = os.posix_spawn
+
+    def expose_descriptor_during_spawn(
+        path: str,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        **keywords: Any,
+    ) -> int:
+        os.set_inheritable(unrelated_read, True)
+        return original_spawn(path, arguments, environment, **keywords)
+
+    monkeypatch.setattr(os, "posix_spawn", expose_descriptor_during_spawn)
+    try:
+        observed = probe_connect_guard._run_command(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; fd=int(sys.argv[1]); "
+                    "\ntry: os.fstat(fd)"
+                    "\nexcept OSError: print('closed')"
+                    "\nelse: print('visible')"
+                ),
+                str(unrelated_read),
+            ),
+            timeout_seconds=1.0,
+        )
+    finally:
+        os.close(unrelated_read)
+        os.close(unrelated_write)
+
+    assert observed == "closed\n"
+
+
 @pytest.mark.parametrize("failure", ["nonzero", "invalid_utf8", "timeout"])
 def test_bpftool_backend_bounds_command_exit_encoding_and_deadline(
     tmp_path: Path,
@@ -1501,10 +3687,13 @@ def test_bpftool_backend_bounds_command_exit_encoding_and_deadline(
     bpftool.chmod(0o700)
     bpf_object = tmp_path / "guard.bpf.o"
     bpf_object.write_bytes(b"fixture")
+    bpf_object.chmod(0o600)
     pin_root = tmp_path / "pins"
     pin_root.mkdir()
+    pin_root.chmod(0o700)
     ownership_root = tmp_path / "ownership"
     ownership_root.mkdir()
+    ownership_root.chmod(0o700)
     backend = BpftoolProbeConnectGuardBackend(
         bpftool_path=bpftool,
         object_path=bpf_object,
@@ -1531,7 +3720,7 @@ def test_bpftool_backend_bounds_command_exit_encoding_and_deadline(
         )
 
     assert list(pin_root.iterdir()) == []
-    assert list(ownership_root.iterdir()) == []
+    assert _receipt_entries(ownership_root) == []
 
 
 def test_bpftool_backend_rejects_untrusted_paths_before_mutation(
@@ -1572,7 +3761,6 @@ def test_bpftool_backend_rejects_untrusted_paths_before_mutation(
             artifact_identity=object(),  # type: ignore[arg-type]
             trusted_owner_uid=os.getuid(),
         )
-
     with pytest.raises(ProbeConnectGuardError, match="probe_guard_tool_invalid"):
         BpftoolProbeConnectGuardBackend(
             bpftool_path=Path("relative-bpftool"),
@@ -1610,6 +3798,16 @@ def test_bpftool_backend_rejects_untrusted_paths_before_mutation(
             artifact_identity=identity,
             trusted_owner_uid=os.getuid(),
         )
+
+
+def test_descriptor_execution_path_fails_closed_without_procfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda path: False)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_tool_invalid"):
+        probe_connect_guard._descriptor_path(7, fallback=Path("/tmp/mutable"))
 
 
 def test_guard_manager_release_failure_is_retryable_and_one_shot(
@@ -1675,3 +3873,122 @@ def test_guard_manager_rejects_invalid_lease_and_timeout(tmp_path: Path) -> None
         manager.retry_pending_cleanup(timeout_seconds=True)
 
     assert backend.removed == []
+
+
+def test_guard_manager_rejects_release_while_scope_operation_is_busy(
+    tmp_path: Path,
+) -> None:
+    manager, _backend = _manager()
+    scope = _guard_scope(tmp_path)
+    lease = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    record = manager._active[scope.unit_name]
+    record.operation_lock.acquire()
+    try:
+        with pytest.raises(
+            ProbeConnectGuardError,
+            match="probe_guard_cleanup_in_progress",
+        ):
+            manager.release(lease, timeout_seconds=3.0)
+    finally:
+        record.operation_lock.release()
+
+    manager.release(lease, timeout_seconds=3.0)
+
+
+def test_guard_manager_bounds_pending_cleanup_by_aggregate_deadline(
+    tmp_path: Path,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    lease = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    backend.remove_errors = [RuntimeError("cleanup failed")]
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_cleanup_pending"):
+        manager.release(lease, timeout_seconds=3.0)
+    observed = iter([0.0, 4.0])
+    manager._monotonic = lambda: next(observed)
+
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 1
+
+
+def test_guard_manager_skips_busy_pending_cleanup_scope(tmp_path: Path) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    lease = manager.install(
+        request_id=scope.request_id,
+        unit_name=scope.unit_name,
+        cgroup_path=scope.cgroup_path,
+        target=scope.target,
+        timeout_seconds=3.0,
+    )
+    backend.remove_errors = [RuntimeError("cleanup failed")]
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_cleanup_pending"):
+        manager.release(lease, timeout_seconds=3.0)
+    record = manager._active[scope.unit_name]
+    record.operation_lock.acquire()
+    try:
+        assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 1
+    finally:
+        record.operation_lock.release()
+
+    assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 0
+
+
+def test_guard_manager_serializes_cleanup_retry_callers() -> None:
+    manager, _backend = _manager()
+    manager._cleanup_retry_lock.acquire()
+    try:
+        assert manager.retry_pending_cleanup(timeout_seconds=3.0) == 0
+    finally:
+        manager._cleanup_retry_lock.release()
+
+
+def test_guard_command_budget_rejects_invalid_or_expired_deadline() -> None:
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_timeout_invalid"):
+        probe_connect_guard._CommandBudget.start(0, monotonic=lambda: 0.0)
+
+    observed = iter([0.0, 2.0])
+    budget = probe_connect_guard._CommandBudget.start(
+        1.0,
+        monotonic=lambda: next(observed),
+    )
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_timeout"):
+        budget.remaining()
+
+
+def test_guard_manager_fails_closed_when_cgroup_metadata_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, backend = _manager()
+    scope = _guard_scope(tmp_path)
+    original_is_dir = Path.is_dir
+
+    def fail_cgroup_read(path: Path) -> bool:
+        if path == scope.cgroup_path:
+            raise OSError("cgroup unavailable")
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", fail_cgroup_read)
+
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_scope_invalid"):
+        manager.install(
+            request_id=scope.request_id,
+            unit_name=scope.unit_name,
+            cgroup_path=scope.cgroup_path,
+            target=scope.target,
+            timeout_seconds=3.0,
+        )
+
+    assert backend.installed == []

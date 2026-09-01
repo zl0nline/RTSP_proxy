@@ -253,6 +253,7 @@ The fixed conceptual input is:
 ffconcat version 1.0
 file 'rtsp://<percent-encoded-user>:<percent-encoded-password>@<literal>:<port>/<canonical-path>'
 option rtsp_transport tcp
+option rtsp_flags no_redirect
 option rw_timeout <bounded-microseconds>
 ```
 
@@ -311,6 +312,14 @@ project needs one of these reviewed solutions:
 
 Option 1 matches the current ADR. The existing third-party ffprobe artifact is
 therefore adequate for compatibility work, not production source probes.
+
+Follow-up on 2026-08-30: the project added an exact-source opt-in
+`rtsp_flags=no_redirect` patch that refuses a 3xx before applying its parsed
+`Location` value or emitting FFmpeg's default redirect log. The mandatory quiet
+launcher also suppresses response-level diagnostics. The ordinary demuxer default remains unchanged. The source
+candidate and five-line input contract do not become production evidence until
+both architecture digests, native behavioral tests and release admission are
+retained.
 
 ## Proposed fail-closed boundary
 
