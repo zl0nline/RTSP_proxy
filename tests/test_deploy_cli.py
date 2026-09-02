@@ -263,7 +263,12 @@ def test_linux_host_stages_exact_clean_checkout_into_immutable_release(
 set -eu
 case "$1" in
   export) for out do :; done; : >"$out" ;;
-  venv) for target do :; done; mkdir -p "$target/bin"; : >"$target/bin/python" ;;
+  venv)
+    [ "$2" = --relocatable ] || exit 42
+    for target do :; done
+    mkdir -p "$target/bin"
+    : >"$target/bin/python"
+    ;;
   pip)
     if [ "$2" = install ]; then
       while [ "$1" != --python ]; do shift; done

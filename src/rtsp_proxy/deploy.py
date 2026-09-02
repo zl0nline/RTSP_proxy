@@ -124,7 +124,14 @@ class LinuxDeploymentHost:
                 "--output-file",
                 str(requirements),
             )
-            self._run(self._uv, "venv", "--python", "3.12", str(staging / ".venv"))
+            self._run(
+                self._uv,
+                "venv",
+                "--relocatable",
+                "--python",
+                "3.12",
+                str(staging / ".venv"),
+            )
             python = staging / ".venv/bin/python"
             self._run(self._uv, "pip", "sync", "--python", str(python), str(requirements))
             wheel = _artifact_path(staging, manifest, "python", "wheel")
