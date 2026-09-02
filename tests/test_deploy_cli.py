@@ -320,6 +320,22 @@ def test_linux_host_preserves_bundle_executable_mode(tmp_path: Path) -> None:
     assert (staging / "bin/mediamtx").stat().st_mode & 0o777 == 0o755
 
 
+def test_linux_host_immutability_does_not_follow_venv_symlinks(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    binary_directory = release / ".venv/bin"
+    binary_directory.mkdir(parents=True)
+    shared_python = tmp_path / "shared-python"
+    shared_python.write_bytes(b"fixture")
+    shared_python.chmod(0o777)
+    (binary_directory / "python3.12").symlink_to(shared_python)
+    host = LinuxDeploymentHost(DeploymentPaths.under(tmp_path / "host"))
+
+    host._make_immutable(release)
+
+    assert shared_python.stat().st_mode & 0o777 == 0o777
+    assert (binary_directory.stat().st_mode & 0o022) == 0
+
+
 def test_linux_host_reports_command_exit_and_captured_stderr(tmp_path: Path) -> None:
     host = LinuxDeploymentHost(DeploymentPaths.under(tmp_path / "host"))
 

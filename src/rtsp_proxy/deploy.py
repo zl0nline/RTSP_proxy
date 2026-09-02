@@ -316,8 +316,10 @@ class LinuxDeploymentHost:
     @staticmethod
     def _make_immutable(root: Path) -> None:
         for path in [root, *root.rglob("*")]:
-            mode = path.stat().st_mode
-            path.chmod(mode & ~(stat.S_IWGRP | stat.S_IWOTH))
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                continue
+            path.chmod(stat.S_IMODE(mode) & ~(stat.S_IWGRP | stat.S_IWOTH))
 
     @staticmethod
     def _require_tool(path: Path, label: str) -> None:
