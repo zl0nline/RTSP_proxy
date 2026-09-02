@@ -148,7 +148,12 @@ class LinuxDeploymentHost:
 
     def verify(self, release: Path) -> None:
         verifier = release / ".venv/bin/rtsp-proxy-verify-release"
-        self._run(verifier, "--manifest", str(release / "release-manifest.json"))
+        self._run(
+            verifier,
+            "--manifest",
+            str(release / "release-manifest.json"),
+            capture=True,
+        )
 
     def install_assets(self, source_root: Path, release: Path) -> None:
         self.verify(release)
@@ -262,9 +267,21 @@ class LinuxDeploymentHost:
         expected = manifest.get("git_commit")
         if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}", expected):
             raise DeploymentError("invalid_manifest_git_commit")
-        head = self._run(Path("/usr/bin/git"), "-C", str(root), "rev-parse", "HEAD", capture=True)
+        safe_directory = f"safe.directory={root}"
+        head = self._run(
+            Path("/usr/bin/git"),
+            "-c",
+            safe_directory,
+            "-C",
+            str(root),
+            "rev-parse",
+            "HEAD",
+            capture=True,
+        )
         status = self._run(
             Path("/usr/bin/git"),
+            "-c",
+            safe_directory,
             "-C",
             str(root),
             "status",
@@ -292,7 +309,9 @@ class LinuxDeploymentHost:
                 destination.mkdir(exist_ok=True)
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                source_mode = stat.S_IMODE(source.stat(follow_symlinks=False).st_mode)
                 shutil.copyfile(source, destination)
+                destination.chmod(source_mode & 0o777)
 
     @staticmethod
     def _make_immutable(root: Path) -> None:
@@ -313,6 +332,7 @@ class LinuxDeploymentHost:
 
     @staticmethod
     def _run(*command: Path | str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+        command_label = Path(str(command[0])).name if command else "unknown"
         try:
             return subprocess.run(
                 [str(value) for value in command],
@@ -327,8 +347,23 @@ class LinuxDeploymentHost:
                     "UV_PYTHON_INSTALL_DIR": "/opt/rtsp-proxy/python",
                 },
             )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            raise DeploymentError("host_command_failed") from error
+        except subprocess.CalledProcessError as error:
+            message = (
+                f"host_command_failed command={command_label} exit_code={error.returncode}"
+            )
+            detail = _safe_command_detail(error.stderr)
+            if detail:
+                message = f"{message} stderr={detail}"
+            raise DeploymentError(message) from error
+        except subprocess.TimeoutExpired as error:
+            raise DeploymentError(
+                f"host_command_failed command={command_label} timeout_seconds=180"
+            ) from error
+        except OSError as error:
+            suffix = f" errno={error.errno}" if error.errno is not None else ""
+            raise DeploymentError(
+                f"host_command_failed command={command_label}{suffix}"
+            ) from error
 
 
 def main(
@@ -550,6 +585,25 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _safe_command_detail(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    printable = "".join(character if character.isprintable() else " " for character in text)
+    collapsed = " ".join(printable.split())
+    collapsed = re.sub(
+        r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@",
+        r"\1<redacted>@",
+        collapsed,
+    )
+    collapsed = re.sub(
+        r"(?i)\b(password|token|secret|authorization)=\S+",
+        r"\1=<redacted>",
+        collapsed,
+    )
+    return collapsed[:1024]
 
 
 def _install_file(source: Path, target: Path, mode: int) -> None:

@@ -82,6 +82,13 @@ test -z "$(git status --porcelain=v1 --untracked-files=all)"
 uv sync --locked --all-groups
 ```
 
+Checkout может принадлежать обычному оператору, который затем запускает
+installer через `sudo`. Installer передаёт Git одноразовый локальный параметр
+`safe.directory` только для чтения `HEAD` и статуса этого точного каталога. Он
+не изменяет глобальную конфигурацию Git, поэтому выполнять
+`git config --global --add safe.directory ...` или менять владельца всего
+checkout не требуется.
+
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
 `/srv/rtsp-proxy-bundles/0.12.0-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
@@ -120,6 +127,10 @@ sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
 7. устанавливает systemd/sysusers/tmpfiles assets и примеры env-файлов;
 8. запускает `systemd-sysusers`, `systemd-tmpfiles` и
    `systemctl daemon-reload`.
+
+При копировании bundle сохраняются обычные POSIX permission bits, включая
+executable bit у `mediamtx`, `ffmpeg`, `ffprobe` и служебных binaries. Перед
+установкой каждый исполняемый артефакт запускается verifier из нового venv.
 
 Команда **не** создаёт секреты, не редактирует активные env-файлы, не мигрирует
 PostgreSQL, не переключает `/opt/rtsp-proxy/current`, не включает units и не
@@ -273,3 +284,34 @@ identity из catalog, а также node drain/confirmation workflow. Deploy to
 Только после стабильной работы малого pilot-контура переходите к проверке
 лимита 100 камер на ноду или нескольких нод. Ёмкость сервера определяется
 измерениями и не должна выводиться из настроенного значения `max_nodes`.
+
+## 9. Если установка остановилась
+
+Installer завершает операцию без частично активированного релиза и печатает
+диагностический код. Для ошибки внешней команды сообщение содержит безопасное
+имя команды, exit code и ограниченный stderr, если он был захвачен, например:
+
+```text
+deployment failed: host_command_failed command=git exit_code=128 stderr=...
+```
+
+Наиболее частые проверки:
+
+| Сообщение | Что проверить |
+|---|---|
+| `source_checkout_not_exact_release_commit` | `git rev-parse HEAD`, отсутствие modified/untracked файлов и commit из manifest |
+| `source_lock_mismatch` | файл `uv.lock` взят из того же точного commit |
+| `uv_unavailable` | `RTSP_PROXY_DEPLOY_UV` указывает на существующий executable |
+| `uv_untrusted` | файл `uv` принадлежит root и недоступен для записи группе/остальным |
+| `release_bundle_contains_unexpected_entry` | bundle распакован без переименования или добавления файлов |
+| `version_probe_failed:<artifact>` | выбран bundle нужной архитектуры и его binaries не повреждены |
+| `database_schema_incompatible_with_release` | live schema входит в compatibility window выбранного manifest |
+
+После исправления причины безопасно повторите ту же команду: незавершённый
+приватный staging-каталог удаляется автоматически, а уже установленный релиз
+принимается повторно только при точном совпадении manifest.
+
+Не исправляйте установку ручным переключением `current`, отключением verifier,
+изменением `alembic_version` или выдачей `0777`. Если причина всё ещё неясна,
+сохраните полный текст команды и её вывода, предварительно убедившись, что в нём
+нет локальных путей или иной информации, которую нельзя публиковать.

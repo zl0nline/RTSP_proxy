@@ -305,6 +305,118 @@ def test_linux_host_rejects_unexpected_bundle_entry(
         host._copy_bundle(bundle, staging)
 
 
+def test_linux_host_preserves_bundle_executable_mode(tmp_path: Path) -> None:
+    host = LinuxDeploymentHost(DeploymentPaths.under(tmp_path / "host"))
+    bundle = tmp_path / "bundle"
+    binary = bundle / "bin/mediamtx"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"fixture")
+    binary.chmod(0o755)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    host._copy_bundle(bundle, staging)
+
+    assert (staging / "bin/mediamtx").stat().st_mode & 0o777 == 0o755
+
+
+def test_linux_host_reports_command_exit_and_captured_stderr(tmp_path: Path) -> None:
+    host = LinuxDeploymentHost(DeploymentPaths.under(tmp_path / "host"))
+
+    with pytest.raises(DeploymentError) as captured:
+        host._run(
+            Path("/bin/sh"),
+            "-c",
+            "printf 'fatal: fixture detail\\n' >&2; exit 23",
+            capture=True,
+        )
+
+    assert str(captured.value) == (
+        "host_command_failed command=sh exit_code=23 stderr=fatal: fixture detail"
+    )
+
+
+def test_command_diagnostic_is_bounded_and_redacts_common_credentials() -> None:
+    detail = deploy_module._safe_command_detail(
+        "https://operator:camera-password@example.invalid/path "
+        "token=private-value\n" + "x" * 2048
+    )
+
+    assert "camera-password" not in detail
+    assert "private-value" not in detail
+    assert "https://<redacted>@example.invalid/path" in detail
+    assert "token=<redacted>" in detail
+    assert len(detail) == 1024
+
+
+def test_linux_host_captures_release_verifier_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = LinuxDeploymentHost(DeploymentPaths.under(tmp_path / "host"))
+    release = tmp_path / "release"
+    calls: list[tuple[tuple[Path | str, ...], bool]] = []
+
+    def record(
+        *command: Path | str,
+        capture: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((command, capture))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(host, "_run", record)
+
+    host.verify(release)
+
+    assert calls == [
+        (
+            (
+                release / ".venv/bin/rtsp-proxy-verify-release",
+                "--manifest",
+                str(release / "release-manifest.json"),
+            ),
+            True,
+        )
+    ]
+
+
+def test_source_checkout_uses_scoped_git_safe_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "operator-owned-source"
+    source.mkdir()
+    lock = source / "uv.lock"
+    lock.write_bytes(b"lock")
+    commit = "a" * 40
+    manifest: dict[str, object] = {
+        "git_commit": commit,
+        "python": {
+            "lock": "uv.lock",
+            "lock_sha256": __import__("hashlib").sha256(b"lock").hexdigest(),
+        },
+    }
+
+    def git_with_different_owner(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        expected_option = f"safe.directory={source}"
+        if command[1:3] != ["-c", expected_option]:
+            raise subprocess.CalledProcessError(
+                128,
+                command,
+                stderr="fatal: detected dubious ownership in repository",
+            )
+        stdout = f"{commit}\n" if "rev-parse" in command else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", git_with_different_owner)
+    host = LinuxDeploymentHost(DeploymentPaths.under(tmp_path / "host"))
+
+    host._require_source_checkout(source, manifest)
+
+
 def test_linux_host_reads_schema_and_manages_only_active_units(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
