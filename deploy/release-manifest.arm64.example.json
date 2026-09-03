@@ -1,6 +1,6 @@
 {
   "schema_version": 4,
-  "release_id": "0.12.0",
+  "release_id": "0.13.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",
@@ -37,7 +37,7 @@
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",
-    "maximum": "0020_probe_observations"
+    "maximum": "0021_local_operator_login"
   },
   "config_schema_version": 1
 }

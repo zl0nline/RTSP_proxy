@@ -44,7 +44,9 @@ arbitrary path, unit name or command.
 ## Services
 
 - `rtsp-proxy-web.service` — management HTTPS/control application boundary.
-- `rtsp-proxy@reconciler|probe.service` — mutable background roles.
+- `rtsp-proxy@reconciler.service` — background reconciliation. The generic
+  template deliberately skips every other instance: the standalone `probe`
+  role is not implemented in this release and must not be enabled.
 - `rtsp-proxy-collector.service` — dedicated read-only fleet collector.
 - `rtsp-proxy-notifier.service` — dedicated SMTP incident dispatcher.
 - `rtsp-proxy-media@<node-id>.service` — one MediaMTX process per media node.
@@ -728,18 +730,60 @@ After revision 0020 commits, rollback to application 0.11.0 (maximum schema
 0019) is **NO-GO**. Fix forward with verified 0.12.0 artifacts or restore the
 pre-0020 PostgreSQL backup with the control plane stopped.
 
-The five WEB authentication files are delivered by installing
+Application release `0.13.0` adds schema revision
+`0021_local_operator_login`. The migration is additive: existing OIDC and
+break-glass accounts and sessions remain valid, while ordinary local operator
+credentials are stored in a separate table. Roll every process to the 0.13.0
+bridge-compatible application before applying 0021. After 0021, application
+0.12.0 (maximum schema 0020) is no longer a rollback target; use fix-forward or
+restore the pre-migration backup with the control plane stopped.
+
+### Operator authentication modes
+
+There are two independent normal login paths, and they may be enabled at the
+same time:
+
+- built-in local username/password authentication, handled entirely by RTSP
+  Proxy and PostgreSQL;
+- OIDC against an operator-controlled IdP inside the trusted local contour.
+
+No external or cloud IdP is required or contacted by the built-in path. OIDC is
+an optional integration, not a prerequisite. Break-glass remains a third,
+emergency-only identity with separate audit and alert semantics.
+
+For a first installation, apply migration 0021 and run:
+
+```sh
+sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
+  --release-id 0.13.0 \
+  --username admin \
+  --display-name 'Administrator' \
+  --with-totp
+```
+
+The password is read twice from the terminal and is never accepted in argv or
+an environment variable. The script creates a root-owned mode-0600 encryption
+key, provisions the account before activation, enables
+`RTSP_PROXY_LOCAL_AUTH_ENABLED=true`, installs
+`/etc/systemd/system/rtsp-proxy-web.service.d/local-auth.conf`, and reloads
+systemd. `--with-totp` prints a one-time enrollment URI. It is optional for
+normal password login, but a verified TOTP is required to establish recent MFA
+for sensitive actions. After WEB starts, use `/auth/local/login` and test both
+accepted and rejected credentials.
+
+The OIDC WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
 `/etc/systemd/system/rtsp-proxy-web.service.d/auth.conf`, running
 `systemctl daemon-reload`, and restarting WEB. The drop-in uses
 `LoadCredential=`; the environment file contains
-only IdP endpoints/client ID and the exact accepted ACR/AMR policy. Before
-enabling those variables, provision exactly one enabled `break_glass` account,
-verify that readiness can decrypt its TOTP material, and verify SMTP delivery
-of both an accepted and a rejected drill. Every attempt is admitted through a
-bounded concurrency gate plus durable per-IP and per-account progressive
-lockout, and creates both a sanitized audit/outbox event and a dedicated
-durable email alert.
+only local-IdP endpoints/client ID and the exact accepted ACR/AMR policy. Enable
+it only when that IdP is reachable inside the trusted contour. OIDC failure
+must not disable local login. Before relying on emergency recovery, provision
+exactly one enabled `break_glass` account, verify that readiness can decrypt its
+TOTP material, and verify SMTP delivery of both an accepted and a rejected
+drill. Every break-glass attempt is admitted through a bounded concurrency gate
+plus durable per-IP and per-account progressive lockout, and creates both a
+sanitized audit/outbox event and a dedicated durable email alert.
 
 WEB readiness polls the configured IdP discovery document through verified TLS
 with a bounded response. It requires the exact issuer/endpoints, Code+PKCE S256,
@@ -807,10 +851,11 @@ old/invalid login and require its rejected security email; make one login with
 the new password/TOTP and require its accepted email, then log out. Do not
 declare the drill complete if either message is missing/duplicated, the old
 session remains usable, or readiness is red.
-Exactly one WEB health monitor performs the external discovery/token and local
-store probes at startup and every 30 seconds. HTTP `/health/ready` only reads
-its immutable synchronized result; requests cannot fan out IdP/DB work or race
-the durable failure/recovery transition recorder.
+Exactly one WEB health monitor performs configured local-IdP discovery/token
+and local-store probes at startup and every 30 seconds. If OIDC is disabled,
+there is no IdP network probe. HTTP `/health/ready` only reads its immutable
+synchronized result; requests cannot fan out IdP/DB work or race the durable
+failure/recovery transition recorder.
 
 Existing canonical `oidc:<sha256(issuer NUL sub)>` accounts remain unchanged.
 Any noncanonical legacy OIDC row blocks new account provisioning with

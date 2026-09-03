@@ -23,6 +23,22 @@ contains only an opaque identifier; authorization comes from the current
 operator account, role, scope and `authz_version`. A stale or unavailable
 authoritative record fails closed and does not affect established media.
 
+## Local operator account
+
+Штатная учётная запись control plane, которая аутентифицируется самим RTSP
+Proxy по локальным username/password credentials без обращения к IdP. В
+PostgreSQL хранится только memory-hard password verifier; при настроенном TOTP
+его secret хранится зашифрованным. Local operator и OIDC operator получают
+одинаковые server-side sessions, RBAC, rate limits и audit. Local operator не
+является `break-glass` account.
+
+## Local IdP
+
+Необязательный OIDC provider, развёрнутый в доверенном локальном контуре. Он
+может использоваться одновременно с local operator login, но его отсутствие
+или авария не блокируют штатный локальный вход. Облачный IdP не является
+требованием или частью pilot installation.
+
 ## Media node
 
 Один независимо управляемый MediaMTX process/systemd instance с собственными

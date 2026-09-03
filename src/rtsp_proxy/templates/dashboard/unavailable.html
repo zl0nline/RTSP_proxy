@@ -7,7 +7,7 @@
     <h1>{{ unavailable.title }}</h1>
     <p>{{ unavailable.message }}</p>
     {% if unavailable.login_href %}
-    <a class="button-link" href="{{ unavailable.login_href }}">Войти через OIDC</a>
+    <a class="button-link" href="{{ unavailable.login_href }}">{% if unavailable.login_href == "/auth/local/login" %}Войти локально{% else %}Войти через OIDC{% endif %}</a>
     {% endif %}
   </section>
 </main>

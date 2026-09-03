@@ -61,9 +61,11 @@ from rtsp_proxy.operator_identity import (
     BreakGlassControl,
     HttpsOidcDiscoveryEndpoint,
     HttpsOidcTokenEndpoint,
+    LocalOperatorLoginControl,
     OidcLoginControl,
     OidcProvider,
     PostgresBreakGlassStore,
+    PostgresLocalOperatorStore,
     PostgresOidcAccountResolver,
     PostgresOidcFlowStore,
     Rs256OidcClaimsVerifier,
@@ -103,6 +105,8 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_SMTP_TIMEOUT_SECONDS": "smtp_timeout_seconds",
     "RTSP_PROXY_NOTIFICATION_MAX_ATTEMPTS": "notification_max_attempts",
     "RTSP_PROXY_NOTIFICATION_RETRY_SECONDS": "notification_retry_seconds",
+    "RTSP_PROXY_LOCAL_AUTH_ENABLED": "local_auth_enabled",
+    "RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE": "local_auth_encryption_key_file",
     "RTSP_PROXY_MAX_NODES": "max_nodes",
     "RTSP_PROXY_NODE_PORT_RANGE_START": "node_port_range_start",
     "RTSP_PROXY_NODE_PORT_RANGE_END": "node_port_range_end",
@@ -157,24 +161,30 @@ class ConfigurationError(ValueError):
 @dataclass(frozen=True, slots=True)
 class _OperatorSecurityRuntime:
     sessions: OperatorSessionControl
-    login: OidcLoginControl
-    break_glass: BreakGlassControl
+    local_login: LocalOperatorLoginControl | None
+    login: OidcLoginControl | None
+    break_glass: BreakGlassControl | None
     session_store: PostgresOperatorSessionStore
-    flow_store: PostgresOidcFlowStore
-    account_resolver: PostgresOidcAccountResolver
-    break_glass_store: PostgresBreakGlassStore
-    token_endpoint: HttpsOidcTokenEndpoint
-    discovery_endpoint: HttpsOidcDiscoveryEndpoint
-    claims_verifier: Rs256OidcClaimsVerifier
+    local_store: PostgresLocalOperatorStore | None
+    flow_store: PostgresOidcFlowStore | None
+    account_resolver: PostgresOidcAccountResolver | None
+    break_glass_store: PostgresBreakGlassStore | None
+    token_endpoint: HttpsOidcTokenEndpoint | None
+    discovery_endpoint: HttpsOidcDiscoveryEndpoint | None
+    claims_verifier: Rs256OidcClaimsVerifier | None
 
     def assert_ready(self) -> None:
+        optional_checks = (
+            ("local_store", self.local_store),
+            ("flow_store", self.flow_store),
+            ("break_glass_store", self.break_glass_store),
+            ("claims_verifier", self.claims_verifier),
+            ("discovery_endpoint", self.discovery_endpoint),
+            ("token_endpoint", self.token_endpoint),
+        )
         checks: tuple[tuple[str, Callable[[], None]], ...] = (
             ("session_store", self.session_store.assert_ready),
-            ("flow_store", self.flow_store.assert_ready),
-            ("break_glass_store", self.break_glass_store.assert_ready),
-            ("claims_verifier", self.claims_verifier.assert_ready),
-            ("discovery_endpoint", self.discovery_endpoint.assert_ready),
-            ("token_endpoint", self.token_endpoint.assert_ready),
+            *( (name, component.assert_ready) for name, component in optional_checks if component ),
         )
         failures: dict[str, Exception] = {}
         with ThreadPoolExecutor(
@@ -189,7 +199,11 @@ class _OperatorSecurityRuntime:
                     failures[name] = error
         discovery_healthy = "discovery_endpoint" not in failures
         claim_health_error: Exception | None = None
-        if "break_glass_store" not in failures:
+        if (
+            self.discovery_endpoint is not None
+            and self.break_glass_store is not None
+            and "break_glass_store" not in failures
+        ):
             try:
                 self.break_glass_store.record_claim_contract_health(healthy=discovery_healthy)
             except Exception as error:
@@ -201,9 +215,14 @@ class _OperatorSecurityRuntime:
             raise claim_health_error
 
     def close(self) -> None:
-        self.break_glass_store.close()
-        self.account_resolver.close()
-        self.flow_store.close()
+        if self.break_glass_store is not None:
+            self.break_glass_store.close()
+        if self.account_resolver is not None:
+            self.account_resolver.close()
+        if self.flow_store is not None:
+            self.flow_store.close()
+        if self.local_store is not None:
+            self.local_store.close()
         self.session_store.close()
 
 
@@ -485,6 +504,9 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         probe_observations=probe_observations,
         fleet_snapshot_max_age_seconds=settings.collector_interval_seconds * 3,
         operator_sessions=(None if operator_security is None else operator_security.sessions),
+        local_operator_login=(
+            None if operator_security is None else operator_security.local_login
+        ),
         operator_login=None if operator_security is None else operator_security.login,
         break_glass=(None if operator_security is None else operator_security.break_glass),
         startup=start_runtime,
@@ -499,49 +521,28 @@ def _open_operator_security(
 ) -> _OperatorSecurityRuntime:
     if not settings.operator_auth_enabled or settings.database_url is None:
         raise ConfigurationError("operator_auth_configuration_incomplete")
-    assert settings.oidc_issuer is not None
-    assert settings.oidc_client_id is not None
-    assert settings.oidc_authorization_endpoint is not None
-    assert settings.oidc_token_endpoint is not None
-    assert settings.oidc_jwks_file is not None
-    assert settings.oidc_redirect_uri is not None
-    assert settings.oidc_client_secret_file is not None
-    assert settings.oidc_derivation_key_file is not None
-    assert settings.oidc_group_roles_file is not None
-    assert settings.break_glass_encryption_key_file is not None
     credential_owner_uid = os.geteuid() if trusted_owner_uid is None else trusted_owner_uid
     try:
-        client_secret = _decode_single_line(
-            read_operator_secret_file(
-                settings.oidc_client_secret_file,
-                trusted_owner_uid=credential_owner_uid,
-                maximum_bytes=4096,
+        local_encryption_key = (
+            None
+            if settings.local_auth_encryption_key_file is None
+            else _decode_operator_key(
+                read_operator_secret_file(
+                    settings.local_auth_encryption_key_file,
+                    trusted_owner_uid=credential_owner_uid,
+                    maximum_bytes=256,
+                )
             )
         )
-        derivation_key = _decode_operator_key(
-            read_operator_secret_file(
-                settings.oidc_derivation_key_file,
-                trusted_owner_uid=credential_owner_uid,
-                maximum_bytes=256,
-            )
-        )
-        encryption_key = _decode_operator_key(
-            read_operator_secret_file(
-                settings.break_glass_encryption_key_file,
-                trusted_owner_uid=credential_owner_uid,
-                maximum_bytes=256,
-            )
-        )
-        jwks = _decode_json_object(
-            read_operator_secret_file(
-                settings.oidc_jwks_file,
-                trusted_owner_uid=credential_owner_uid,
-            )
-        )
-        group_roles = _decode_group_roles(
-            read_operator_secret_file(
-                settings.oidc_group_roles_file,
-                trusted_owner_uid=credential_owner_uid,
+        break_glass_encryption_key = (
+            None
+            if settings.break_glass_encryption_key_file is None
+            else _decode_operator_key(
+                read_operator_secret_file(
+                    settings.break_glass_encryption_key_file,
+                    trusted_owner_uid=credential_owner_uid,
+                    maximum_bytes=256,
+                )
             )
         )
     except (UnicodeError, ValueError, json.JSONDecodeError):
@@ -555,66 +556,126 @@ def _open_operator_security(
     flow_store: PostgresOidcFlowStore | None = None
     account_resolver: PostgresOidcAccountResolver | None = None
     break_glass_store: PostgresBreakGlassStore | None = None
+    local_store: PostgresLocalOperatorStore | None = None
     try:
-        flow_store = PostgresOidcFlowStore(
-            settings.database_url,
-            statement_timeout_ms=timeout_ms,
-        )
-        account_resolver = PostgresOidcAccountResolver(
-            settings.database_url,
-            issuer=settings.oidc_issuer,
-            statement_timeout_ms=timeout_ms,
-        )
-        break_glass_store = PostgresBreakGlassStore(
-            settings.database_url,
-            encryption_key=encryption_key,
-            statement_timeout_ms=timeout_ms,
-        )
         sessions = OperatorSessionControl(
             store=session_store,
             token_factory=lambda: secrets.token_urlsafe(32),
         )
-        provider = OidcProvider(
-            issuer=settings.oidc_issuer,
-            client_id=settings.oidc_client_id,
-            authorization_endpoint=settings.oidc_authorization_endpoint,
-            token_endpoint=settings.oidc_token_endpoint,
-            redirect_uri=settings.oidc_redirect_uri,
-        )
-        token_endpoint = HttpsOidcTokenEndpoint(
-            token_endpoint=settings.oidc_token_endpoint,
-            client_id=settings.oidc_client_id,
-            client_secret=client_secret,
-            redirect_uri=settings.oidc_redirect_uri,
-        )
-        discovery_endpoint = HttpsOidcDiscoveryEndpoint(
-            issuer=settings.oidc_issuer,
-            authorization_endpoint=settings.oidc_authorization_endpoint,
-            token_endpoint=settings.oidc_token_endpoint,
-        )
-        claims_verifier = Rs256OidcClaimsVerifier(
-            issuer=settings.oidc_issuer,
-            client_id=settings.oidc_client_id,
-            jwks=jwks,
-            group_roles=group_roles,
-            accepted_mfa_acr=frozenset(settings.oidc_mfa_acr),
-            required_mfa_amr=frozenset(settings.oidc_mfa_amr),
-        )
-        login = OidcLoginControl(
-            provider=provider,
-            flows=flow_store,
-            derivation_key=derivation_key,
-            state_factory=lambda: secrets.token_urlsafe(32),
-            token_endpoint=token_endpoint,
-            claims_verifier=claims_verifier,
-            account_resolver=account_resolver.resolve,
-            sessions=sessions,
-        )
+        local_login: LocalOperatorLoginControl | None = None
+        if settings.local_auth_enabled:
+            assert local_encryption_key is not None
+            local_store = PostgresLocalOperatorStore(
+                settings.database_url,
+                encryption_key=local_encryption_key,
+                statement_timeout_ms=timeout_ms,
+            )
+            local_login = LocalOperatorLoginControl(store=local_store, sessions=sessions)
+
+        login: OidcLoginControl | None = None
+        token_endpoint: HttpsOidcTokenEndpoint | None = None
+        discovery_endpoint: HttpsOidcDiscoveryEndpoint | None = None
+        claims_verifier: Rs256OidcClaimsVerifier | None = None
+        if settings.oidc_issuer is not None:
+            assert settings.oidc_client_id is not None
+            assert settings.oidc_authorization_endpoint is not None
+            assert settings.oidc_token_endpoint is not None
+            assert settings.oidc_jwks_file is not None
+            assert settings.oidc_redirect_uri is not None
+            assert settings.oidc_client_secret_file is not None
+            assert settings.oidc_derivation_key_file is not None
+            assert settings.oidc_group_roles_file is not None
+            try:
+                client_secret = _decode_single_line(
+                    read_operator_secret_file(
+                        settings.oidc_client_secret_file,
+                        trusted_owner_uid=credential_owner_uid,
+                        maximum_bytes=4096,
+                    )
+                )
+                derivation_key = _decode_operator_key(
+                    read_operator_secret_file(
+                        settings.oidc_derivation_key_file,
+                        trusted_owner_uid=credential_owner_uid,
+                        maximum_bytes=256,
+                    )
+                )
+                jwks = _decode_json_object(
+                    read_operator_secret_file(
+                        settings.oidc_jwks_file,
+                        trusted_owner_uid=credential_owner_uid,
+                    )
+                )
+                group_roles = _decode_group_roles(
+                    read_operator_secret_file(
+                        settings.oidc_group_roles_file,
+                        trusted_owner_uid=credential_owner_uid,
+                    )
+                )
+            except (UnicodeError, ValueError, json.JSONDecodeError):
+                raise ConfigurationError("operator_auth_file_invalid") from None
+            flow_store = PostgresOidcFlowStore(
+                settings.database_url,
+                statement_timeout_ms=timeout_ms,
+            )
+            account_resolver = PostgresOidcAccountResolver(
+                settings.database_url,
+                issuer=settings.oidc_issuer,
+                statement_timeout_ms=timeout_ms,
+            )
+            provider = OidcProvider(
+                issuer=settings.oidc_issuer,
+                client_id=settings.oidc_client_id,
+                authorization_endpoint=settings.oidc_authorization_endpoint,
+                token_endpoint=settings.oidc_token_endpoint,
+                redirect_uri=settings.oidc_redirect_uri,
+            )
+            token_endpoint = HttpsOidcTokenEndpoint(
+                token_endpoint=settings.oidc_token_endpoint,
+                client_id=settings.oidc_client_id,
+                client_secret=client_secret,
+                redirect_uri=settings.oidc_redirect_uri,
+            )
+            discovery_endpoint = HttpsOidcDiscoveryEndpoint(
+                issuer=settings.oidc_issuer,
+                authorization_endpoint=settings.oidc_authorization_endpoint,
+                token_endpoint=settings.oidc_token_endpoint,
+            )
+            claims_verifier = Rs256OidcClaimsVerifier(
+                issuer=settings.oidc_issuer,
+                client_id=settings.oidc_client_id,
+                jwks=jwks,
+                group_roles=group_roles,
+                accepted_mfa_acr=frozenset(settings.oidc_mfa_acr),
+                required_mfa_amr=frozenset(settings.oidc_mfa_amr),
+            )
+            login = OidcLoginControl(
+                provider=provider,
+                flows=flow_store,
+                derivation_key=derivation_key,
+                state_factory=lambda: secrets.token_urlsafe(32),
+                token_endpoint=token_endpoint,
+                claims_verifier=claims_verifier,
+                account_resolver=account_resolver.resolve,
+                sessions=sessions,
+            )
+        if break_glass_encryption_key is not None:
+            break_glass_store = PostgresBreakGlassStore(
+                settings.database_url,
+                encryption_key=break_glass_encryption_key,
+                statement_timeout_ms=timeout_ms,
+            )
         return _OperatorSecurityRuntime(
             sessions=sessions,
+            local_login=local_login,
             login=login,
-            break_glass=BreakGlassControl(store=break_glass_store, sessions=sessions),
+            break_glass=(
+                None
+                if break_glass_store is None
+                else BreakGlassControl(store=break_glass_store, sessions=sessions)
+            ),
             session_store=session_store,
+            local_store=local_store,
             flow_store=flow_store,
             account_resolver=account_resolver,
             break_glass_store=break_glass_store,
@@ -623,6 +684,8 @@ def _open_operator_security(
             claims_verifier=claims_verifier,
         )
     except Exception:
+        if local_store is not None:
+            local_store.close()
         if break_glass_store is not None:
             break_glass_store.close()
         if account_resolver is not None:

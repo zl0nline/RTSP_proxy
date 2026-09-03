@@ -90,7 +90,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.12.0-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.13.0-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -112,7 +112,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.12.0-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.13.0-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -141,19 +141,46 @@ PostgreSQL, не переключает `/opt/rtsp-proxy/current`, не вклю
 
 Перед активацией:
 
-1. скопируйте каждый необходимый пример в документированный active path и
-   замените все placeholder endpoints, release IDs, architecture digests и
-   диапазоны портов;
+1. скопируйте необходимые примеры в active paths; минимальный набор для WEB и
+   reconciler показан ниже. Не запускайте сами файлы через `source` — это
+   systemd environment files;
 2. установите management TLS как один принадлежащий root combined PEM и
    атомарный symlink;
 3. создайте PostgreSQL-роли с минимально необходимыми правами с помощью SQL
    artifacts из точного checkout;
-4. установите access peppers и SMTP/OIDC/break-glass credentials через
-   `LoadCredential`; никогда не размещайте секреты в env-файлах или аргументах
-   командной строки;
+4. установите access peppers и, если используются, SMTP/OIDC/break-glass
+   credentials через `LoadCredential`; никогда не размещайте секреты в
+   env-файлах или аргументах командной строки;
 5. установите принадлежащую приложению nftables policy с фактическим диапазоном
    портов нод, затем включите её reconciliation unit;
-6. перед включением проверьте каждый unit:
+6. перед включением проверьте каждый unit.
+
+Создайте минимальные active environment files:
+
+```sh
+sudo install -d -o root -g rtsp-proxy-access -m 0750 \
+  /etc/rtsp-proxy/control-plane
+sudo install -o root -g rtsp-proxy-access -m 0640 \
+  /etc/rtsp-proxy/examples/rtsp-proxy.env.example \
+  /etc/rtsp-proxy/control-plane/rtsp-proxy.env
+sudo install -o root -g rtsp-proxy-access -m 0640 \
+  /etc/rtsp-proxy/examples/rtsp-proxy-role.env.example \
+  /etc/rtsp-proxy/control-plane/rtsp-proxy-reconciler.env
+```
+
+Откройте оба файла редактором и обязательно замените
+`RTSP_PROXY_DATABASE_URL`, `RTSP_PROXY_CONFIRMATION_SECRET`, release identity,
+SHA-256 MediaMTX и диапазоны портов. Не добавляйте пустую строку
+`RTSP_PROXY_NODE_PORT_RESERVED=`: если резервируемых портов нет, параметр должен
+отсутствовать. Остальные роли копируйте только при их фактическом включении:
+`collector.env.example` → `/etc/rtsp-proxy/collector.env`,
+`notifier.env.example` → `/etc/rtsp-proxy/notifier.env`,
+`node-runtime.env.example` → `/etc/rtsp-proxy/node-runtime.env`,
+`probe-broker.env.example` → `/etc/rtsp-proxy/probe-broker.env` и
+`rtsp-proxy-auth.env.example` →
+`/etc/rtsp-proxy/control-plane/rtsp-proxy-auth.env`.
+
+Проверьте unit-файлы:
 
 ```sh
 sudo systemd-analyze verify \
@@ -168,19 +195,48 @@ source venv:
 sudo systemd-run --quiet --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.12.0/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.13.0/.venv/bin/rtsp-proxy-migrate
 ```
 
 Перед каждым последующим изменением schema создавайте backup PostgreSQL.
 Alembic downgrade на работающей системе не поддерживается.
 
-## 5. Первая активация
+## 5. Создание первого локального администратора
+
+Внешний IdP для работы RTSP Proxy не требуется. После migration выполните одну
+интерактивную команду; пароль дважды читается с терминала и не попадает ни в
+argv, ни в environment file, ни в журнал команд:
+
+```sh
+cd /srv/rtsp-proxy-source
+sudo ./tools/configure_local_auth.sh \
+  --release-id 0.13.0 \
+  --username admin \
+  --display-name 'Administrator' \
+  --with-totp
+```
+
+Скрипт создаёт защищённый локальный encryption key, сначала записывает
+администратора в PostgreSQL, затем включает local login в WEB environment,
+устанавливает systemd `LoadCredential` drop-in и выполняет `daemon-reload`.
+При ошибке создания аккаунта local login не активируется. Сохраните показанный
+`otpauth://` URI в локальном authenticator: он выводится один раз. Параметр
+`--with-totp` можно опустить — вход по имени и паролю останется полноценным, но
+операции, требующие недавнего MFA, будут закрыты.
+
+OIDC — необязательный второй способ входа для собственного IdP внутри закрытого
+контура. Его можно включить позже по разделу authentication в
+[полном deployment runbook](README.md), не отключая локальные аккаунты. RTSP
+Proxy не устанавливает, не вызывает и не требует облачный IdP. Аварийный
+`break-glass` настраивается отдельно и не используется как обычный аккаунт.
+
+## 6. Первая активация
 
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.12.0/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.12.0 \
+sudo /opt/rtsp-proxy/releases/0.13.0/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.13.0 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -189,7 +245,10 @@ sudo /opt/rtsp-proxy/releases/0.12.0/.venv/bin/rtsp-proxy-deploy activate \
 При первой активации активных units ещё нет, поэтому команда только переключит
 symlink, не запуская их. Явно включите sockets/services в документированном
 порядке зависимостей, затем потребуйте успешную readiness-проверку и выполнение
-native probe-broker contract. Пока не включайте production probe scheduling.
+native probe-broker contract. Из шаблонного unit включайте только
+`rtsp-proxy@reconciler.service`: отдельная роль `rtsp-proxy@probe.service` в
+этом релизе не реализована, а unit намеренно пропустит её запуск без restart
+loop. Пока не включайте production probe scheduling.
 
 Полезные команды для проверки:
 
@@ -203,7 +262,12 @@ sudo journalctl -u 'rtsp-proxy*' --since '-10 min' --no-pager
 Не содержащий секретов deployment receipt хранится в
 `/var/lib/rtsp-proxy/deployment.json`, принадлежит root и имеет mode `0600`.
 
-## 6. Обновление приложения
+После запуска WEB откройте
+`https://<management-address>:8000/auth/local/login` и проверьте успешный вход,
+неверный пароль и выход. Если OIDC настроен, страница локального входа также
+покажет отдельную ссылку на локальный IdP.
+
+## 7. Обновление приложения
 
 Никогда не обновляйте систему из dirty checkout или непроверенного произвольного
 каталога. Скачайте новый architecture-specific artifact, переключитесь на его
@@ -242,7 +306,7 @@ Deploy tool не объединяет шаги 1 и 3, потому что migra
 сделать предыдущее приложение несовместимым. После migration rollback разрешён,
 только если manifest целевого релиза всё ещё содержит точную live revision.
 
-## 7. Откат и fix-forward
+## 8. Откат и fix-forward
 
 Чтобы откатить код приложения на установленный совместимый релиз:
 
@@ -264,14 +328,15 @@ control plane и восстановите backup PostgreSQL, сделанный 
 identity из catalog, а также node drain/confirmation workflow. Deploy tool
 намеренно не умеет массово перезапускать media nodes.
 
-## 8. Gate первого испытания с реальными камерами
+## 9. Gate первого испытания с реальными камерами
 
 Начните с одной ноды и нескольких камер. Перед увеличением их количества
 зафиксируйте:
 
 - точный release manifest и deployment receipt;
 - результат проверки backup/restore базы данных;
-- accepted/rejected drills для HTTPS, OIDC/break-glass и SMTP;
+- accepted/rejected drills для HTTPS и local login; OIDC только если он включён;
+- отдельные accepted/rejected drills для break-glass и SMTP;
 - create/start/stop ноды, add/update/move/delete камеры и `453` при занятом
   потоке;
 - обычное FFmpeg-воспроизведение через interleaved TCP для каждого профиля
@@ -285,7 +350,7 @@ identity из catalog, а также node drain/confirmation workflow. Deploy to
 лимита 100 камер на ноду или нескольких нод. Ёмкость сервера определяется
 измерениями и не должна выводиться из настроенного значения `max_nodes`.
 
-## 9. Если установка остановилась
+## 10. Если установка остановилась
 
 Installer завершает операцию без частично активированного релиза и печатает
 диагностический код. Для ошибки внешней команды сообщение содержит безопасное
@@ -306,6 +371,10 @@ deployment failed: host_command_failed command=git exit_code=128 stderr=...
 | `release_bundle_contains_unexpected_entry` | bundle распакован без переименования или добавления файлов |
 | `version_probe_failed:<artifact>` | выбран bundle нужной архитектуры и его binaries не повреждены |
 | `database_schema_incompatible_with_release` | live schema входит в compatibility window выбранного manifest |
+| `local operator CLI missing` | `--release-id` совпадает с установленным release directory |
+| `RTSP_PROXY_DATABASE_URL is missing` | активный WEB env содержит непустой URL PostgreSQL |
+| `local_operator_store_unavailable` | migration 0021 применена и PostgreSQL доступен локально |
+| `local_operator_password_confirmation_failed` | пароль не короче 12 символов и оба ввода совпадают |
 
 После исправления причины безопасно повторите ту же команду: незавершённый
 приватный staging-каталог удаляется автоматически, а уже установленный релиз

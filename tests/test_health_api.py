@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 from rtsp_proxy.app import create_app
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.health import DependencyResult, ReadinessProvider, RoleReadinessProvider
+from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.operator_access import (
     OperatorAccount,
     OperatorIdentitySource,
@@ -840,6 +841,60 @@ def test_smtp_configuration_requires_complete_verified_starttls_paths(tmp_path: 
 
     settings = Settings(**configured, smtp_ca_file=tmp_path / "ca.pem")  # type: ignore[arg-type]
     assert settings.smtp_starttls
+
+
+def test_local_operator_auth_is_independent_from_optional_oidc(tmp_path: Path) -> None:
+    key = tmp_path / "local-auth-key"
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+        local_auth_enabled=True,
+        local_auth_encryption_key_file=key,
+    )
+
+    assert settings.operator_auth_enabled
+    assert settings.oidc_issuer is None
+
+    with pytest.raises(ValidationError, match="local_auth_key_file_required"):
+        Settings(
+            role=RuntimeRole.WEB,
+            database_url="postgresql+psycopg://db.invalid/rtsp_proxy",
+            local_auth_enabled=True,
+        )
+    with pytest.raises(ValidationError, match="local_auth_web_database_required"):
+        Settings(
+            role=RuntimeRole.WEB,
+            local_auth_enabled=True,
+            local_auth_encryption_key_file=key,
+        )
+
+
+def test_web_runtime_exposes_local_login_without_oidc(
+    postgres_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upgrade_database(postgres_database_url)
+    key = tmp_path / "local-auth-key"
+    key.write_bytes(base64.urlsafe_b64encode(b"L" * 32).rstrip(b"=") + b"\n")
+    key.chmod(0o600)
+    environment = {
+        "RTSP_PROXY_ROLE": "web",
+        "RTSP_PROXY_DATABASE_URL": postgres_database_url,
+        "RTSP_PROXY_LOCAL_AUTH_ENABLED": "true",
+        "RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE": str(key),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    app = create_app_from_environment()
+    with TestClient(app, base_url="https://management.example.test") as client:
+        response = client.get("/auth/local/login")
+        readiness = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert "/auth/oidc/login" not in response.text
+    assert readiness.status_code == 200
 
 
 def test_enabling_the_privileged_node_runtime_requires_pinned_release_identity() -> None:

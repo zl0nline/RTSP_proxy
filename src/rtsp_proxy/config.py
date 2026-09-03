@@ -113,6 +113,8 @@ class Settings(BaseSettings):
     smtp_timeout_seconds: float = Field(default=10, gt=0, le=30)
     notification_max_attempts: int = Field(default=3, ge=1, le=10)
     notification_retry_seconds: int = Field(default=60, ge=1, le=3600)
+    local_auth_enabled: bool = False
+    local_auth_encryption_key_file: Path | None = None
     oidc_issuer: str | None = Field(default=None, max_length=2048)
     oidc_client_id: str | None = Field(default=None, min_length=1, max_length=256)
     oidc_authorization_endpoint: str | None = Field(default=None, max_length=2048)
@@ -128,7 +130,7 @@ class Settings(BaseSettings):
 
     @property
     def operator_auth_enabled(self) -> bool:
-        return self.oidc_issuer is not None
+        return self.local_auth_enabled or self.oidc_issuer is not None
 
     @field_validator("node_port_reserved", mode="before")
     @classmethod
@@ -288,6 +290,16 @@ class Settings(BaseSettings):
             self.oidc_group_roles_file,
             self.break_glass_encryption_key_file,
         )
+        if self.local_auth_enabled:
+            if self.role is not RuntimeRole.WEB or self.database_url is None:
+                raise ValueError("local_auth_web_database_required")
+            if (
+                self.local_auth_encryption_key_file is None
+                or not self.local_auth_encryption_key_file.is_absolute()
+            ):
+                raise ValueError("local_auth_key_file_required")
+        elif self.local_auth_encryption_key_file is not None:
+            raise ValueError("local_auth_configuration_incomplete")
         if (
             any(value is not None for value in operator_auth_values)
             or self.oidc_mfa_acr

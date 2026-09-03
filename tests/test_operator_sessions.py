@@ -602,9 +602,12 @@ def test_operator_session_public_contract_rejects_invalid_boundary_states() -> N
             idle_timeout=timedelta(hours=2),
             absolute_timeout=timedelta(hours=1),
         )
-    no_mfa = OperatorSessionControl(store=store, token_factory=lambda: "t" * 43)
-    with pytest.raises(OperatorAuthenticationRequired, match="operator_mfa_required"):
-        no_mfa.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+    no_mfa = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=lambda: "t" * 43,
+    )
+    password_only = no_mfa.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+    assert password_only.session.mfa_verified_at is None
     bad_token = OperatorSessionControl(store=store, token_factory=lambda: "short")
     with pytest.raises(ValueError, match="operator_session_token_invalid"):
         bad_token.issue(account_id=ACCOUNT_ID, mfa_verified=True)

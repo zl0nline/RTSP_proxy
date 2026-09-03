@@ -28,3 +28,4 @@ Current records:
 | [0005](0005-bounded-media-nodes.md) | Accepted | Up to 100 cameras per MediaMTX node on one Linux server |
 | [0006](0006-patched-mediamtx-admission-fence.md) | Accepted | Non-disruptive reader fence and exact RTSP 453 |
 | [0007](0007-operator-identity-sessions-and-rbac.md) | Accepted | OIDC/break-glass identities, revocable sessions and scoped RBAC |
+| [0008](0008-dual-local-operator-authentication.md) | Accepted | Built-in local login alongside optional local-contour OIDC |

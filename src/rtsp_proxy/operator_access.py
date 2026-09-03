@@ -30,6 +30,7 @@ class OperatorRole(StrEnum):
 
 class OperatorIdentitySource(StrEnum):
     OIDC = "oidc"
+    LOCAL = "local"
     BREAK_GLASS = "break_glass"
 
 
@@ -337,7 +338,10 @@ class OperatorAccount:
                 and self.roles != frozenset({OperatorRole.BREAK_GLASS})
             )
             or (
-                self.identity_source is OperatorIdentitySource.OIDC
+                self.identity_source in {
+                    OperatorIdentitySource.OIDC,
+                    OperatorIdentitySource.LOCAL,
+                }
                 and OperatorRole.BREAK_GLASS in self.roles
             )
         ):
@@ -897,7 +901,11 @@ class PostgresOperatorSessionStore:
                 )
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
-        return revisions in ((PREVIOUS_APPLICATION_SCHEMA,), (APPLICATION_SCHEMA,))
+        return revisions in (
+            ("0019_dashboard_rate_limits",),
+            (PREVIOUS_APPLICATION_SCHEMA,),
+            (APPLICATION_SCHEMA,),
+        )
 
     def claim_operator_action(
         self,
@@ -1485,8 +1493,6 @@ class OperatorSessionControl:
         expected_authz_version: int | None = None,
         audit_context: OperatorRequestAuditContext | None = None,
     ) -> IssuedOperatorSession:
-        if not mfa_verified:
-            raise OperatorAuthenticationRequired("operator_mfa_required")
         session_token = self._token()
         csrf_token = self._token()
         session = self._store.issue_session(

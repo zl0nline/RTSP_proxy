@@ -121,6 +121,417 @@ class BreakGlassAuthentication:
             raise ValueError("break_glass_authentication_invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class LocalOperatorCredentials:
+    password_scrypt: bytes
+    totp_secret: bytes | None = None
+    last_totp_step: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.password_scrypt) != 80
+            or (self.totp_secret is not None and len(self.totp_secret) < 20)
+            or (self.totp_secret is None and self.last_totp_step is not None)
+            or (self.last_totp_step is not None and self.last_totp_step < 0)
+        ):
+            raise ValueError("local_operator_credentials_invalid")
+
+    @classmethod
+    def hash_password(cls, password: str, *, salt: bytes | None = None) -> bytes:
+        if not 12 <= len(password) <= 1024:
+            raise ValueError("local_operator_password_invalid")
+        actual_salt = secrets.token_bytes(16) if salt is None else salt
+        if len(actual_salt) != 16:
+            raise ValueError("local_operator_password_invalid")
+        digest = Scrypt(salt=actual_salt, length=64, n=2**15, r=8, p=1).derive(
+            password.encode("utf-8")
+        )
+        return actual_salt + digest
+
+    def verifies_password(self, password: str) -> bool:
+        if len(password) > 1024:
+            return False
+        salt, digest = self.password_scrypt[:16], self.password_scrypt[16:]
+        try:
+            Scrypt(salt=salt, length=64, n=2**15, r=8, p=1).verify(
+                password.encode("utf-8"),
+                digest,
+            )
+        except InvalidKey:
+            return False
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class LocalOperatorAuthentication:
+    account_id: UUID
+    authz_version: int
+    mfa_verified: bool
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.authz_version < (1 << 63):
+            raise ValueError("local_operator_authentication_invalid")
+
+
+class InMemoryLocalOperatorStore:
+    def __init__(
+        self,
+        *,
+        account: OperatorAccount,
+        credentials: LocalOperatorCredentials,
+    ) -> None:
+        if account.identity_source.value != "local":
+            raise ValueError("local_operator_account_invalid")
+        self._account = account
+        self._credentials = credentials
+        self._lock = RLock()
+
+    def authenticate(
+        self,
+        *,
+        username: str,
+        password: str,
+        totp: str,
+        source_ip: str,
+        now: datetime,
+    ) -> LocalOperatorAuthentication:
+        del source_ip
+        with self._lock:
+            expected_username = self._account.subject.removeprefix("local:")
+            rejected = (
+                not self._account.enabled
+                or not hmac.compare_digest(username, expected_username)
+                or not self._credentials.verifies_password(password)
+            )
+            mfa_verified = False
+            secret = self._credentials.totp_secret
+            if not rejected and totp:
+                step = int(now.timestamp()) // 30
+                try:
+                    if (
+                        secret is None
+                        or (
+                            self._credentials.last_totp_step is not None
+                            and step <= self._credentials.last_totp_step
+                        )
+                    ):
+                        raise ValueError
+                    TOTP(secret, 6, hashes.SHA1(), 30).verify(
+                        totp.encode("ascii"),
+                        int(now.timestamp()),
+                    )
+                except Exception:
+                    rejected = True
+                else:
+                    mfa_verified = True
+                    self._credentials = replace(self._credentials, last_totp_step=step)
+            if rejected:
+                raise OidcLoginInvalid("local_operator_login_failed")
+            return LocalOperatorAuthentication(
+                account_id=self._account.id,
+                authz_version=self._account.authz_version,
+                mfa_verified=mfa_verified,
+            )
+
+
+class PostgresLocalOperatorStore:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        encryption_key: bytes,
+        statement_timeout_ms: int = 1000,
+    ) -> None:
+        if len(encryption_key) != 32 or not 100 <= statement_timeout_ms <= 5000:
+            raise ValueError("local_operator_store_configuration_invalid")
+        self._key = encryption_key
+        self._admission = BoundedSemaphore(8)
+        self._dummy_password = LocalOperatorCredentials.hash_password(
+            "local-login-dummy-password",
+            salt=b"\0" * 16,
+        )
+        self._engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            hide_parameters=True,
+            pool_size=2,
+            max_overflow=0,
+            pool_timeout=statement_timeout_ms / 1000,
+            connect_args={
+                "connect_timeout": max(1, math.ceil(statement_timeout_ms / 1000)),
+                "options": f"-c statement_timeout={statement_timeout_ms}",
+            },
+        )
+
+    def close(self) -> None:
+        self._engine.dispose()
+
+    def assert_ready(self) -> None:
+        try:
+            with self._engine.connect() as connection:
+                connection.execute(
+                    text("SELECT account_id FROM operator_local_credentials LIMIT 0")
+                )
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+
+    def provision(
+        self,
+        *,
+        account: OperatorAccount,
+        credentials: LocalOperatorCredentials,
+        context: OperatorMutationContext,
+    ) -> int:
+        username = account.subject.removeprefix("local:")
+        if (
+            account.identity_source.value != "local"
+            or not account.subject.startswith("local:")
+            or not 1 <= len(username) <= 256
+            or any(character.isspace() for character in username)
+            or account.authz_version != 1
+            or not account.enabled
+        ):
+            raise ValueError("local_operator_provision_invalid")
+        encrypted_totp: bytes | None = None
+        if credentials.totp_secret is not None:
+            nonce = secrets.token_bytes(12)
+            encrypted_totp = nonce + AESGCM(self._key).encrypt(
+                nonce,
+                credentials.totp_secret,
+                account.id.bytes,
+            )
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                connection.execute(
+                    text(
+                        "INSERT INTO operator_accounts "
+                        "(id, identity_source, subject, display_name, roles, scopes, "
+                        "authz_version, enabled) VALUES "
+                        "(:id, 'local', :subject, :display_name, :roles, :scopes, 1, true)"
+                    ),
+                    {
+                        "id": account.id,
+                        "subject": account.subject,
+                        "display_name": account.display_name,
+                        "roles": sorted(role.value for role in account.roles),
+                        "scopes": sorted(account.scopes),
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO operator_local_credentials "
+                        "(account_id, username, password_scrypt, totp_secret) VALUES "
+                        "(:account_id, :username, :password_scrypt, :totp_secret)"
+                    ),
+                    {
+                        "account_id": account.id,
+                        "username": username,
+                        "password_scrypt": credentials.password_scrypt,
+                        "totp_secret": encrypted_totp,
+                    },
+                )
+                _record_local_account_event(
+                    connection,
+                    account=account,
+                    username=username,
+                    context=context,
+                )
+            return 1
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+
+    def authenticate(
+        self,
+        *,
+        username: str,
+        password: str,
+        totp: str,
+        source_ip: str,
+        now: datetime,
+    ) -> LocalOperatorAuthentication:
+        if (
+            not 1 <= len(username) <= 256
+            or any(character.isspace() for character in username)
+            or not 1 <= len(password) <= 1024
+            or (totp and (len(totp) != 6 or not totp.isascii() or not totp.isdigit()))
+            or not source_ip
+            or now.tzinfo is None
+        ):
+            raise OidcLoginInvalid("local_operator_login_failed")
+        if not self._admission.acquire(blocking=False):
+            raise OidcLoginRateLimited()
+        try:
+            rejected = True
+            rate_limited = False
+            account_id: UUID | None = None
+            authz_version = 0
+            mfa_verified = False
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                rate_limited = _local_attempt_is_locked(
+                    connection,
+                    source_ip=source_ip,
+                    username=username,
+                )
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT a.id, a.enabled, a.authz_version, c.password_scrypt, "
+                            "c.totp_secret, c.last_totp_step FROM operator_local_credentials c "
+                            "JOIN operator_accounts a ON a.id=c.account_id "
+                            "WHERE c.username=:username AND a.identity_source='local' "
+                            "FOR UPDATE OF c"
+                        ),
+                        {"username": username},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                password_credentials = LocalOperatorCredentials(
+                    password_scrypt=(
+                        self._dummy_password if row is None else bytes(row["password_scrypt"])
+                    )
+                )
+                password_valid = password_credentials.verifies_password(password)
+                if row is not None:
+                    account_id = UUID(str(row["id"]))
+                    authz_version = int(row["authz_version"])
+                rejected = (
+                    rate_limited
+                    or row is None
+                    or not bool(row["enabled"])
+                    or not password_valid
+                )
+                if not rejected and totp:
+                    assert row is not None
+                    assert account_id is not None
+                    encrypted = row["totp_secret"]
+                    try:
+                        if encrypted is None:
+                            raise ValueError
+                        encrypted_bytes = bytes(encrypted)
+                        secret = AESGCM(self._key).decrypt(
+                            encrypted_bytes[:12],
+                            encrypted_bytes[12:],
+                            account_id.bytes,
+                        )
+                        step = int(now.timestamp()) // 30
+                        last_step = row["last_totp_step"]
+                        if last_step is not None and step <= int(last_step):
+                            raise ValueError
+                        TOTP(secret, 6, hashes.SHA1(), 30).verify(
+                            totp.encode("ascii"),
+                            int(now.timestamp()),
+                        )
+                    except Exception:
+                        rejected = True
+                    else:
+                        mfa_verified = True
+                        connection.execute(
+                            text(
+                                "UPDATE operator_local_credentials SET last_totp_step=:step, "
+                                "updated_at=clock_timestamp() WHERE account_id=:account_id"
+                            ),
+                            {"account_id": account_id, "step": step},
+                        )
+                if rejected and not rate_limited:
+                    rate_limited = _record_local_failure(
+                        connection,
+                        source_ip=source_ip,
+                        username=username,
+                    )
+                elif not rejected:
+                    _clear_local_attempts(
+                        connection,
+                        source_ip=source_ip,
+                        username=username,
+                    )
+                _record_local_login_attempt(
+                    connection,
+                    source_ip=source_ip,
+                    outcome="rejected" if rejected else "accepted",
+                    reason_code=(
+                        "rate_limited"
+                        if rate_limited
+                        else "operator_login_failed"
+                        if rejected
+                        else "authenticated"
+                    ),
+                )
+            if rate_limited:
+                raise OidcLoginRateLimited()
+            if rejected or account_id is None:
+                raise OidcLoginInvalid("local_operator_login_failed")
+            return LocalOperatorAuthentication(
+                account_id=account_id,
+                authz_version=authz_version,
+                mfa_verified=mfa_verified,
+            )
+        except (OidcLoginInvalid, OidcLoginRateLimited):
+            raise
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+        except Exception:
+            raise OidcLoginInvalid("local_operator_login_failed") from None
+        finally:
+            self._admission.release()
+
+
+class LocalOperatorAuthenticator(Protocol):
+    def authenticate(
+        self,
+        *,
+        username: str,
+        password: str,
+        totp: str,
+        source_ip: str,
+        now: datetime,
+    ) -> LocalOperatorAuthentication: ...
+
+
+class LocalOperatorLoginControl:
+    def __init__(
+        self,
+        *,
+        store: LocalOperatorAuthenticator,
+        sessions: OperatorSessionControl,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._store = store
+        self._sessions = sessions
+        self._clock = clock
+
+    def login(
+        self,
+        *,
+        username: str,
+        password: str,
+        totp: str = "",
+        source_ip: str,
+        audit_context: OperatorRequestAuditContext | None = None,
+    ) -> IssuedOperatorSession:
+        now = self._clock()
+        if now.tzinfo is None:
+            raise OidcLoginInvalid("local_operator_login_failed")
+        authentication = self._store.authenticate(
+            username=username,
+            password=password,
+            totp=totp,
+            source_ip=source_ip,
+            now=now,
+        )
+        try:
+            return self._sessions.issue(
+                account_id=authentication.account_id,
+                mfa_verified=authentication.mfa_verified,
+                expected_authz_version=authentication.authz_version,
+                audit_context=audit_context,
+            )
+        except OperatorAuthenticationRequired:
+            raise OidcLoginInvalid("local_operator_login_failed") from None
+
+
 class InMemoryBreakGlassStore:
     def __init__(
         self,
@@ -2160,6 +2571,132 @@ def _attempt_digest(*, source_ip: str, username: str) -> str:
     if not source_ip or len(source_ip) > 128 or not username or len(username) > 256:
         raise OidcLoginInvalid("break_glass_login_failed")
     return hashlib.sha256((source_ip + "\0" + username.casefold()).encode()).hexdigest()
+
+
+def _local_attempt_keys(*, source_ip: str, username: str) -> tuple[str, str]:
+    if not source_ip or len(source_ip) > 128 or not username or len(username) > 256:
+        raise OidcLoginInvalid("local_operator_login_failed")
+    return (
+        hashlib.sha256(("local-ip\0" + source_ip).encode()).hexdigest(),
+        hashlib.sha256(
+            ("local-pair\0" + source_ip + "\0" + username).encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def _local_attempt_is_locked(
+    connection: Connection,
+    *,
+    source_ip: str,
+    username: str,
+) -> bool:
+    keys = _local_attempt_keys(source_ip=source_ip, username=username)
+    _lock_attempt_keys(connection, keys)
+    connection.execute(
+        text(
+            "DELETE FROM operator_login_attempts "
+            "WHERE last_attempt_at < clock_timestamp() - interval '24 hours'"
+        )
+    )
+    return bool(
+        connection.scalar(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM operator_login_attempts "
+                "WHERE key_sha256 = ANY(:keys) AND locked_until > clock_timestamp())"
+            ),
+            {"keys": list(keys)},
+        )
+    )
+
+
+def _record_local_failure(
+    connection: Connection,
+    *,
+    source_ip: str,
+    username: str,
+) -> bool:
+    rate_limited = False
+    for key_sha256 in _local_attempt_keys(source_ip=source_ip, username=username):
+        row = _record_progressive_failure(connection, key_sha256=key_sha256)
+        rate_limited = rate_limited or bool(
+            row["locked_until"] is not None and row["failure_count"] >= 5
+        )
+    return rate_limited
+
+
+def _clear_local_attempts(
+    connection: Connection,
+    *,
+    source_ip: str,
+    username: str,
+) -> None:
+    connection.execute(
+        text("DELETE FROM operator_login_attempts WHERE key_sha256 = ANY(:keys)"),
+        {"keys": list(_local_attempt_keys(source_ip=source_ip, username=username))},
+    )
+
+
+def _record_local_login_attempt(
+    connection: Connection,
+    *,
+    source_ip: str,
+    outcome: str,
+    reason_code: str,
+) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO operator_login_audit "
+            "(id, auth_method, outcome, reason_code, source_ip_sha256) VALUES "
+            "(:id, 'local_password', :outcome, :reason_code, :source_ip_sha256)"
+        ),
+        {
+            "id": uuid4(),
+            "outcome": outcome,
+            "reason_code": reason_code,
+            "source_ip_sha256": hashlib.sha256(source_ip.encode("utf-8")).hexdigest(),
+        },
+    )
+
+
+def _record_local_account_event(
+    connection: Connection,
+    *,
+    account: OperatorAccount,
+    username: str,
+    context: OperatorMutationContext,
+) -> None:
+    payload = json.dumps(
+        {
+            "account_id": str(account.id),
+            "action": "operator.local_account_provision",
+            "actor": context.actor,
+            "display_name": account.display_name,
+            "identity_source": "local",
+            "outcome": "completed",
+            "reason": context.reason,
+            "roles": sorted(role.value for role in account.roles),
+            "scopes": sorted(account.scopes),
+            "username_sha256": hashlib.sha256(username.encode("utf-8")).hexdigest(),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account.id,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, "
+                "'operator.local_account_provisioned', 1, CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
 
 
 def _attempt_keys(*, source_ip: str, username: str) -> tuple[str, str]:

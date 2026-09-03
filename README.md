@@ -26,7 +26,8 @@
 - перенос камер между нодами с проверкой активного reader и blast radius;
 - один downstream-клиент на камеру; второй получает RTSP `453`;
 - отдельные CIDR allowlist для internet и local access;
-- HTTPS dashboard, RBAC, OIDC и аварийный break-glass вход;
+- HTTPS dashboard, RBAC, встроенный локальный вход, необязательный OIDC для
+  локального IdP и аварийный break-glass вход;
 - агрегированную статистику по серверу, нодам и камерам;
 - email при аварии и одно подтверждение после восстановления;
 - immutable releases, проверяемые обновления и автоматический health rollback.
@@ -69,7 +70,7 @@ restart прерывает только потоки выбранной ноды
 | Изоляция MediaMTX-процессов и портов | Реализовано, native amd64/arm64 CI |
 | Camera CRUD, move, drain и one-reader `453` | Реализовано |
 | Двухуровневые ACL и camera grants | Реализовано |
-| Dashboard, RBAC, OIDC, audit и email | Реализовано |
+| Dashboard, RBAC, local login, optional local OIDC, audit и email | Реализовано |
 | HTTPS management boundary | Реализовано |
 | Immutable install, update и rollback tooling | Реализовано |
 | Глубокие source/path probes | Кандидат проверен; production scheduling выключен |
@@ -107,15 +108,30 @@ mechanism testing с отдельно установленными Python 3.12 �
    ```
 
 5. Настроить PostgreSQL, management TLS, secrets, nftables и environment files
-   по [`deploy/README.md`](deploy/README.md).
-6. Выполнить migration, активировать release и включить сервисы в указанном в
-   runbook порядке.
-7. Проверить backup/restore, update rollback и только затем подключить несколько
+   по [`deploy/PILOT_INSTALL.md`](deploy/PILOT_INSTALL.md).
+6. Выполнить migration и одной интерактивной командой создать первого
+   локального администратора. Для этого не нужен IdP.
+7. Активировать release и включить сервисы в указанном в runbook порядке.
+8. Проверить backup/restore, update rollback и только затем подключить несколько
    тестовых камер.
 
 Installer намеренно не создаёт secrets, не меняет активные env-файлы, не
 мигрирует БД, не переключает `current` и не запускает сервисы. Это отдельные
 явные операторские шаги.
+
+## Вход операторов без облака
+
+RTSP Proxy не требует внешнего сервера авторизации и не передаёт учётные данные
+в облако. После первой migration установщик локальной авторизации создаёт
+обычного администратора в PostgreSQL; вход выполняется по локальному имени и
+паролю на `/auth/local/login`. TOTP можно добавить сразу, но он необязателен для
+обычного входа и нужен для действий, требующих недавнего MFA.
+
+Если в закрытом контуре уже есть собственный IdP, OIDC можно включить как второй
+способ входа. Локальные аккаунты при этом продолжают работать. `break-glass` —
+отдельная аварийная учётная запись, а не повседневный локальный логин. Точный
+порядок первичной настройки описан в
+[pilot-runbook](deploy/PILOT_INSTALL.md#5-создание-первого-локального-администратора).
 
 ## Обновление и rollback
 
@@ -147,7 +163,7 @@ downgrade в работающей системе не поддерживаетс
 
 - exact release manifest и deployment receipt;
 - успешный PostgreSQL backup/restore drill;
-- HTTPS, OIDC/break-glass и SMTP accepted/rejected drills;
+- HTTPS, local login, при включении OIDC, break-glass и SMTP accepted/rejected drills;
 - create/start/stop/restart ноды и полный camera CRUD/move;
 - сохранение работающего потока при изменении другой камеры;
 - `453` для второго reader;

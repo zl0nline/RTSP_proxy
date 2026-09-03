@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Literal
+from urllib.parse import parse_qs
 from uuid import UUID, uuid4
 
 import anyio
@@ -36,6 +37,7 @@ from rtsp_proxy.dashboard import (
     DashboardUnavailable,
     FleetSnapshotFailureReason,
     FleetSnapshotReadFailure,
+    render_local_login,
     render_logout,
     render_node_detail,
     render_overview,
@@ -103,6 +105,7 @@ from rtsp_proxy.operator_access import (
 )
 from rtsp_proxy.operator_identity import (
     BreakGlassControl,
+    LocalOperatorLoginControl,
     OidcLoginControl,
     OidcLoginInvalid,
     OidcLoginRateLimited,
@@ -321,6 +324,12 @@ class BreakGlassLoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=256)
     password: str = Field(min_length=1, max_length=1024)
     totp: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class LocalLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=256, pattern=r"^\S+$")
+    password: str = Field(min_length=1, max_length=1024)
+    totp: str = Field(default="", pattern=r"^(?:[0-9]{6})?$")
 
 
 class CameraCreateRequest(BaseModel):
@@ -665,6 +674,7 @@ def create_app(
     probe_observations: ProbeObservationReader | None = None,
     camera_live_updates: CameraLiveUpdateSource | None = None,
     operator_sessions: OperatorSessionControl | None = None,
+    local_operator_login: LocalOperatorLoginControl | None = None,
     operator_login: OidcLoginControl | None = None,
     break_glass: BreakGlassControl | None = None,
     fleet_snapshot_max_age_seconds: float = 30,
@@ -713,6 +723,48 @@ def create_app(
 
     app = FastAPI(title="RTSP Proxy Control Plane", lifespan=lifespan)
     readiness_provider = readiness or MissingReadinessProvider()
+
+    if local_operator_login is not None:
+
+        @app.get("/auth/local/login", include_in_schema=False)
+        def local_login_page() -> HTMLResponse:
+            return _dashboard_html_response(
+                render_local_login(oidc_enabled=operator_login is not None)
+            )
+
+        @app.post("/auth/local/login", include_in_schema=False)
+        async def local_login(request: Request) -> Response:
+            try:
+                payload = await _read_local_login_form(request)
+                issued = await anyio.to_thread.run_sync(
+                    lambda: local_operator_login.login(
+                        username=payload.username,
+                        password=payload.password,
+                        totp=payload.totp,
+                        source_ip=_request_source_ip(request),
+                        audit_context=_operator_login_request_audit_context(request),
+                    ),
+                    abandon_on_cancel=True,
+                )
+            except OidcLoginRateLimited as error:
+                return _operator_rate_limited(error.retry_after_seconds)
+            except (OidcLoginInvalid, ValueError):
+                return _dashboard_html_response(
+                    render_local_login(
+                        oidc_enabled=operator_login is not None,
+                        error=True,
+                    ),
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                )
+            except OidcLoginUnavailable:
+                return _operator_login_unavailable()
+            response = RedirectResponse(
+                "/",
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Cache-Control": "no-store"},
+            )
+            _set_operator_session_cookies(response, issued)
+            return response
 
     if operator_login is not None:
 
@@ -889,6 +941,7 @@ def create_app(
                 return audited_response(
                     _operator_authentication_required_response(
                         request,
+                        local_enabled=local_operator_login is not None,
                         oidc_enabled=operator_login is not None,
                     )
                 )
@@ -896,6 +949,7 @@ def create_app(
                 return audited_response(
                     _operator_authentication_required_response(
                         request,
+                        local_enabled=local_operator_login is not None,
                         oidc_enabled=operator_login is not None,
                     )
                 )
@@ -3468,9 +3522,31 @@ def _operator_error_response(status_code: int, code: str) -> JSONResponse:
     )
 
 
+async def _read_local_login_form(request: Request) -> LocalLoginRequest:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        raise ValueError("local_login_form_invalid")
+    body = await request.body()
+    if len(body) > 4096:
+        raise ValueError("local_login_form_invalid")
+    try:
+        decoded = body.decode("utf-8")
+        values = parse_qs(decoded, keep_blank_values=True, strict_parsing=True)
+    except (UnicodeError, ValueError):
+        raise ValueError("local_login_form_invalid") from None
+    if set(values) - {"username", "password", "totp"} or any(
+        len(items) != 1 for items in values.values()
+    ):
+        raise ValueError("local_login_form_invalid")
+    return LocalLoginRequest.model_validate(
+        {name: items[0] for name, items in values.items()}
+    )
+
+
 def _operator_authentication_required_response(
     request: Request,
     *,
+    local_enabled: bool,
     oidc_enabled: bool,
 ) -> Response:
     if request.url.path.startswith("/dashboard"):
@@ -3478,7 +3554,13 @@ def _operator_authentication_required_response(
             DashboardUnavailable(
                 title="Требуется вход оператора",
                 message="Откройте защищённую сессию, чтобы увидеть состояние сервера.",
-                login_href="/auth/oidc/login" if oidc_enabled else None,
+                login_href=(
+                    "/auth/local/login"
+                    if local_enabled
+                    else "/auth/oidc/login"
+                    if oidc_enabled
+                    else None
+                ),
             ),
             status_code=status.HTTP_401_UNAUTHORIZED,
         )

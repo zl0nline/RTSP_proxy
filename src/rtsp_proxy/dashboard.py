@@ -42,6 +42,14 @@ class DashboardUnavailable:
     login_href: str | None = None
 
 
+def render_local_login(*, oidc_enabled: bool, error: bool = False) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/login.html")
+        .render(oidc_enabled=oidc_enabled, error=error, principal=None)
+    )
+
+
 class FleetSnapshotFailureReason(StrEnum):
     UNAVAILABLE = "fleet_snapshot_unavailable"
     PENDING = "fleet_snapshot_pending"

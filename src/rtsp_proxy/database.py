@@ -688,6 +688,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            ("0019_dashboard_rate_limits",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -716,6 +717,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            ("0019_dashboard_rate_limits",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -743,6 +745,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            ("0019_dashboard_rate_limits",),
             (PREVIOUS_APPLICATION_SCHEMA,),
         ):
             return False
@@ -763,6 +766,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            ("0019_dashboard_rate_limits",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         )
@@ -2616,6 +2620,7 @@ class PostgresNodeStore:
             ("0016_node_registration_keys",),
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
+            ("0019_dashboard_rate_limits",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -4308,6 +4313,7 @@ def _require_access_grant_idempotency_schema(connection: Connection) -> None:
     if revisions not in (
         ("0017_access_grant_keys",),
         ("0018_camera_registration_keys",),
+        ("0019_dashboard_rate_limits",),
         (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):
@@ -4318,6 +4324,7 @@ def _require_camera_registration_idempotency_schema(connection: Connection) -> N
     revisions = tuple(connection.scalars(text("SELECT version_num FROM alembic_version")))
     if revisions not in (
         ("0018_camera_registration_keys",),
+        ("0019_dashboard_rate_limits",),
         (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):

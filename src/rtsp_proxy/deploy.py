@@ -145,6 +145,7 @@ class LinuxDeploymentHost:
                 str(wheel),
             )
             self.verify(staging)
+            staging.chmod(0o755)
             self._make_immutable(staging)
             os.replace(staging, target)
             _fsync_directory(target.parent)
@@ -199,6 +200,10 @@ class LinuxDeploymentHost:
             (
                 source_root / "deploy/systemd/rtsp-proxy-web-auth.conf.example",
                 "rtsp-proxy-web-auth.conf.example",
+            ),
+            (
+                source_root / "deploy/systemd/rtsp-proxy-web-local-auth.conf.example",
+                "rtsp-proxy-web-local-auth.conf.example",
             ),
             (source_root / "deploy/nftables/rtsp-proxy.nft", "rtsp-proxy.nft.example"),
         ):

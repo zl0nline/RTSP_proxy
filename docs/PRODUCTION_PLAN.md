@@ -510,6 +510,15 @@ Forwarded headers are ignored. Unknown path, denied IP, unknown username and
 wrong password use a stable no-oracle response shape allowed by the pinned RTSP
 contract. Metrics classify reasons internally without exposing them to client.
 
+Operator authentication has two concurrent normal modes: built-in local
+username/password authentication and optional OIDC through an IdP deployed
+inside the trusted local contour. Built-in login performs no IdP or cloud
+request. Local TOTP is optional for login and supplies recent MFA for sensitive
+operations when present. Both identity sources share the same PostgreSQL
+sessions, RBAC scopes, `authz_version` fencing, CSRF, rate limits and audit.
+Break-glass remains a separate emergency identity and is never used as the
+ordinary local account. ADR-0008 defines this boundary.
+
 Plain RTSP is unencrypted. Internet use without trusted/private L3 or an
 explicit accepted risk is production NO-GO.
 
@@ -964,9 +973,12 @@ Status: **IN PROGRESS**. The bounded collector, generation-bound per-path
 metrics, persisted fleet snapshot API, incident state machine, durable SMTP
 dispatcher, digest-only PostgreSQL operator sessions, authoritative
 `authz_version` fencing, CSRF/RBAC HTTP boundary, browser-bound OIDC Code+PKCE
-with exact MFA claims, and durable break-glass TOTP audit/email admission are
-implemented locally. Live OIDC discovery/claims compatibility is polled through
-bounded readiness and emits one durable failure/recovery alert per transition.
+with exact MFA claims, built-in password login with optional local TOTP, and
+durable break-glass TOTP audit/email admission are implemented locally. OIDC is
+optional and targets only an IdP inside the trusted contour; when configured,
+live discovery/claims compatibility is polled through bounded readiness and
+emits one durable failure/recovery alert per transition. Local login has no IdP
+availability dependency.
 The management HTTPS slice is implemented, independently reviewed and green on
 direct Linux plus native amd64/arm64 CI. WEB rejects wildcard, IPv4
 limited-broadcast and
@@ -1201,9 +1213,10 @@ No Phase-F completion claim is made yet.
   UI CI-green; node registration and bounded lifecycle actions CI-green;
   disruptive port-change/reconfigure/restart implementation, review and native
   publication CI complete);
-- [x] RBAC/CSRF/OIDC/break-glass foundation, revision-fenced rotation/drill and
-  shared-boundary authentication/authorization-denial/logout classes with
-  representative semantic targets;
+- [x] RBAC/CSRF, built-in local login, optional local-contour OIDC and
+  break-glass foundation, with shared-boundary
+  authentication/authorization-denial/logout classes and representative
+  semantic targets;
 - [x] recursively generated route-method negative matrix (the 75-route live
   surface is independently reviewed and green in direct-Linux plus all seven
   native/external CI jobs);

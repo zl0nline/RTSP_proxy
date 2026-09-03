@@ -44,9 +44,12 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
         "management-tls.pem"
     )
     auth_drop_in = read_unit("rtsp-proxy-web-auth.conf.example")["Service"]
+    local_auth_drop_in = read_unit("rtsp-proxy-web-local-auth.conf.example")["Service"]
     assert "%d/oidc-client-secret" in auth_drop_in["Environment"]
     assert "oidc-client-secret:" in auth_drop_in["LoadCredential"]
     assert "break-glass-key:" in auth_drop_in["LoadCredential"]
+    assert "%d/local-auth-key" in local_auth_drop_in["Environment"]
+    assert "local-auth-key:" in local_auth_drop_in["LoadCredential"]
     assert media["Service"]["ExecStart"].endswith(" /etc/rtsp-proxy/mediamtx/mediamtx.yml")
 
     users = Path("deploy/sysusers.d/rtsp-proxy.conf").read_text(encoding="utf-8")
@@ -75,11 +78,26 @@ def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
 def test_background_roles_use_a_separate_systemd_template() -> None:
     service = read_unit("rtsp-proxy@.service")["Service"]
 
+    assert service["ExecCondition"] == "/usr/bin/test %i = reconciler"
     assert service["Environment"] == "RTSP_PROXY_ROLE=%i"
     assert service["ExecStart"] == (
         "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i"
     )
     assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env")
+
+
+def test_background_role_example_contains_required_startup_identity() -> None:
+    environment = Path("deploy/rtsp-proxy-role.env.example").read_text(encoding="utf-8")
+
+    assert "RTSP_PROXY_DATABASE_URL=postgresql+psycopg://rtsp_proxy@" in environment
+    assert "RTSP_PROXY_NODE_RELEASE_ID=0.2.1" in environment
+    assert "RTSP_PROXY_NODE_MEDIAMTX_BINARY_SHA256=replace-with-64-lowercase-hex" in environment
+
+
+def test_shipped_environment_examples_do_not_assign_empty_reserved_ports() -> None:
+    for name in ("rtsp-proxy.env.example", "collector.env.example"):
+        environment = Path("deploy", name).read_text(encoding="utf-8")
+        assert "RTSP_PROXY_NODE_PORT_RESERVED=" not in environment
 
 
 def test_collector_has_a_dedicated_read_only_helper_boundary() -> None:
@@ -364,6 +382,9 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             control[f"RTSP_PROXY_{control_name}"]
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
+    assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
+        "/opt/rtsp-proxy/releases/0.13.0/bin/mediamtx"
+    )
 
 
 def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> None:
@@ -698,3 +719,19 @@ def test_browser_e2e_evidence_verifier_requires_exact_nonempty_artifacts(
     )
     assert unexpected.returncode != 0
     assert "browser_evidence_file_set_invalid" in unexpected.stderr
+
+
+def test_local_auth_bootstrap_has_valid_shell_syntax_and_no_password_argument() -> None:
+    result = subprocess.run(
+        ["sh", "-n", "tools/configure_local_auth.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    script = Path("tools/configure_local_auth.sh").read_text(encoding="utf-8")
+
+    assert result.returncode == 0
+    assert "--password" not in script
+    assert "RTSP_PROXY_LOCAL_AUTH_ENABLED=true" in script
+    assert "dropin_directory=/etc/systemd/system/rtsp-proxy-web.service.d" in script
+    assert "dropin_file=$dropin_directory/local-auth.conf" in script

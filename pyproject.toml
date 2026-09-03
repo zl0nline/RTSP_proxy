@@ -36,6 +36,7 @@ rtsp-proxy-probe-launcher = "rtsp_proxy.probe_launcher:main"
 rtsp-proxy-probe-broker = "rtsp_proxy.probe_broker_runtime:run_probe_broker"
 rtsp-proxy-phase-d-transition = "rtsp_proxy.phase_d_transition:main"
 rtsp-proxy-break-glass = "rtsp_proxy.break_glass_cli:main"
+rtsp-proxy-local-operator = "rtsp_proxy.local_operator_cli:main"
 rtsp-proxy-deploy = "rtsp_proxy.deploy:cli"
 rtsp-proxy-schema-revision = "rtsp_proxy.schema_cli:main"
 

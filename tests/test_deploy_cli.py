@@ -290,7 +290,7 @@ esac
     release = paths.releases / "0.12.0"
     assert release_id == "0.12.0"
     assert (release / ".venv/bin/rtsp-proxy-verify-release").is_file()
-    assert (release.stat().st_mode & 0o022) == 0
+    assert release.stat().st_mode & 0o777 == 0o755
     assert not any(path.name.startswith(".0.12.0.staging-") for path in paths.releases.iterdir())
 
 
@@ -503,6 +503,7 @@ def test_linux_host_installs_only_static_assets_and_examples(
         "deploy/tmpfiles.d/rtsp-proxy-probe-broker.conf",
         "deploy/rtsp-proxy.env.example",
         "deploy/systemd/rtsp-proxy-web-auth.conf.example",
+        "deploy/systemd/rtsp-proxy-web-local-auth.conf.example",
         "deploy/nftables/rtsp-proxy.nft",
     ):
         path = source / relative
@@ -534,6 +535,9 @@ def test_linux_host_installs_only_static_assets_and_examples(
     assert (paths.root / "etc/rtsp-proxy/examples/rtsp-proxy.nft.example").is_file()
     assert (
         paths.root / "etc/rtsp-proxy/examples/rtsp-proxy-web-auth.conf.example"
+    ).is_file()
+    assert (
+        paths.root / "etc/rtsp-proxy/examples/rtsp-proxy-web-local-auth.conf.example"
     ).is_file()
     assert commands[-1] == ("/usr/bin/systemctl", "daemon-reload")
 

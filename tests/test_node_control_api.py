@@ -1232,7 +1232,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'probe_observations', 'camera_probe_endpoints')"
             )
         )
-    assert revision == "0020_probe_observations"
+        assert revision == "0021_local_operator_login"
     assert table_count == 12
 
 
@@ -1470,7 +1470,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0020_probe_observations"
+            "0021_local_operator_login"
         )
 
 
@@ -1503,7 +1503,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0020_probe_observations"
+            "0021_local_operator_login"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})

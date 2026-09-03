@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from io import BytesIO
+from pathlib import Path
 from threading import Event
 from types import TracebackType
 from typing import Any
@@ -30,6 +31,7 @@ from sqlalchemy import create_engine, text
 from rtsp_proxy.app import create_app
 from rtsp_proxy.break_glass_cli import main as break_glass_cli_main
 from rtsp_proxy.config import RuntimeRole, Settings
+from rtsp_proxy.local_operator_cli import main as local_operator_cli_main
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.observability import (
     NotificationStatus,
@@ -53,7 +55,10 @@ from rtsp_proxy.operator_identity import (
     HttpsOidcDiscoveryEndpoint,
     HttpsOidcTokenEndpoint,
     InMemoryBreakGlassStore,
+    InMemoryLocalOperatorStore,
     InMemoryOidcFlowStore,
+    LocalOperatorCredentials,
+    LocalOperatorLoginControl,
     OidcFlow,
     OidcIdentity,
     OidcLoginControl,
@@ -62,6 +67,7 @@ from rtsp_proxy.operator_identity import (
     OidcLoginUnavailable,
     OidcProvider,
     PostgresBreakGlassStore,
+    PostgresLocalOperatorStore,
     PostgresOidcAccountResolver,
     PostgresOidcFlowStore,
     Rs256OidcClaimsVerifier,
@@ -73,6 +79,236 @@ TEST_MUTATION_CONTEXT = OperatorMutationContext(
     actor="system:test-bootstrap",
     reason="test fixture provisioning",
 )
+
+
+def test_local_operator_password_login_works_without_idp_and_totp_is_optional() -> None:
+    totp_secret = b"L" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    credentials = LocalOperatorCredentials(
+        password_scrypt=LocalOperatorCredentials.hash_password(
+            "correct horse battery staple",
+            salt=b"L" * 16,
+        ),
+        totp_secret=totp_secret,
+    )
+    store = InMemoryLocalOperatorStore(account=account, credentials=credentials)
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("P" * 43, "C" * 43, "M" * 43, "D" * 43)).__next__,
+    )
+    login = LocalOperatorLoginControl(store=store, sessions=sessions, clock=lambda: NOW)
+
+    password_only = login.login(
+        username="admin",
+        password="correct horse battery staple",
+        source_ip="192.0.2.10",
+    )
+    assert password_only.session.mfa_verified_at is None
+
+    code = TOTP(totp_secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
+    with_mfa = login.login(
+        username="admin",
+        password="correct horse battery staple",
+        totp=code,
+        source_ip="192.0.2.10",
+    )
+    assert with_mfa.session.mfa_verified_at == NOW
+
+    with pytest.raises(OidcLoginInvalid, match="local_operator_login_failed"):
+        login.login(
+            username="admin",
+            password="wrong password",
+            source_ip="192.0.2.10",
+        )
+
+
+def test_local_operator_has_a_browser_login_form_without_oidc() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    local_store = InMemoryLocalOperatorStore(
+        account=account,
+        credentials=LocalOperatorCredentials(
+            password_scrypt=LocalOperatorCredentials.hash_password(
+                "correct horse battery staple",
+                salt=b"B" * 16,
+            )
+        ),
+    )
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("S" * 43, "C" * 43)).__next__,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            operator_sessions=sessions,
+            local_operator_login=LocalOperatorLoginControl(
+                store=local_store,
+                sessions=sessions,
+                clock=lambda: NOW,
+            ),
+        ),
+        base_url="https://management.example.test",
+    )
+
+    denied = client.get("/dashboard")
+    login_page = client.get("/auth/local/login")
+    rejected = client.post(
+        "/auth/local/login",
+        data={"username": "admin", "password": "wrong password", "totp": ""},
+    )
+    accepted = client.post(
+        "/auth/local/login",
+        data={
+            "username": "admin",
+            "password": "correct horse battery staple",
+            "totp": "",
+        },
+        follow_redirects=False,
+    )
+
+    assert denied.status_code == 401
+    assert 'href="/auth/local/login">Войти локально</a>' in denied.text
+    assert login_page.status_code == 200
+    assert 'action="/auth/local/login"' in login_page.text
+    assert "локальные учётные данные" in login_page.text
+    assert rejected.status_code == 401
+    assert "Неверный логин" in rejected.text
+    assert accepted.status_code == 303
+    assert accepted.headers["location"] == "/"
+    assert accepted.cookies["__Host-rtsp_proxy_session"] == "S" * 43
+
+
+def test_postgres_local_operator_provision_and_login_keep_secrets_out_of_rows(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    key = b"K" * 32
+    totp_secret = b"T" * 20
+    password = "correct horse battery staple"
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresLocalOperatorStore(postgres_database_url, encryption_key=key)
+    try:
+        assert store.provision(
+            account=account,
+            credentials=LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(
+                    password,
+                    salt=b"P" * 16,
+                ),
+                totp_secret=totp_secret,
+            ),
+            context=TEST_MUTATION_CONTEXT,
+        ) == 1
+        password_only = store.authenticate(
+            username="admin",
+            password=password,
+            totp="",
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+        code = TOTP(totp_secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode(
+            "ascii"
+        )
+        with_mfa = store.authenticate(
+            username="admin",
+            password=password,
+            totp=code,
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+        assert password_only.mfa_verified is False
+        assert with_mfa.mfa_verified is True
+    finally:
+        store.close()
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT password_scrypt, totp_secret FROM operator_local_credentials "
+                "WHERE account_id=:account_id"
+            ),
+            {"account_id": ACCOUNT_ID},
+        ).one()
+        events = connection.execute(
+            text(
+                "SELECT event_type, payload::text FROM audit_events "
+                "WHERE aggregate_id=:account_id"
+            ),
+            {"account_id": ACCOUNT_ID},
+        ).all()
+    engine.dispose()
+    assert password.encode() not in bytes(row.password_scrypt)
+    assert totp_secret not in bytes(row.totp_secret)
+    assert any(event.event_type == "operator.local_account_provisioned" for event in events)
+    assert all(password not in event.payload and "T" * 20 not in event.payload for event in events)
+
+
+def test_local_operator_cli_bootstraps_first_admin_without_password_in_arguments(
+    postgres_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upgrade_database(postgres_database_url)
+    key = tmp_path / "local-auth-key"
+    key.write_bytes(base64.urlsafe_b64encode(b"K" * 32).rstrip(b"=") + b"\n")
+    key.chmod(0o600)
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", postgres_database_url)
+    monkeypatch.setenv("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", str(key))
+    password = "correct horse battery staple"
+    answers = iter((password, password))
+
+    result = local_operator_cli_main(
+        ["--username", "pilot-admin", "--display-name", "Pilot administrator"],
+        password_reader=lambda _prompt: next(answers),
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "provisioned local operator" in captured.out
+    assert password not in captured.out
+    assert captured.err == ""
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT a.identity_source, a.roles, c.username "
+                "FROM operator_accounts a JOIN operator_local_credentials c "
+                "ON c.account_id=a.id"
+            )
+        ).one()
+    engine.dispose()
+    assert row.identity_source == "local"
+    assert row.roles == ["admin"]
+    assert row.username == "pilot-admin"
 
 
 def test_operator_login_migration_preserves_existing_oidc_accounts(
