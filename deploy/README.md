@@ -747,6 +747,9 @@ Release 0.13.5 additionally creates each private runtime socket directory with
 the helper client's group. In 0.13.4 the socket itself had the correct group,
 but the root-owned parent directory could prevent reconciler and collector from
 reaching it.
+Release 0.13.6 runs its root-side checkout verification with Git optional
+locks disabled. The verification remains read-only and cannot replace the
+operator-owned `.git/index` with a root-owned file that blocks later updates.
 
 ### Operator authentication modes
 
@@ -765,7 +768,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.5 \
+  --release-id 0.13.6 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

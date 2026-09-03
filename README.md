@@ -89,12 +89,15 @@ mechanism testing с отдельно установленными Python 3.12 �
 
 Полная пошаговая инструкция: **[Pilot installation, update and rollback](deploy/PILOT_INSTALL.md)**.
 
-Для новой установки используйте release `0.13.5` или новее. Release `0.13.1`
+Для новой установки используйте release `0.13.6` или новее. Release `0.13.1`
 исправляет загрузку local-auth credentials, а `0.13.2` также убирает скрытую
 зависимость installer-а от development venv в source checkout. Release `0.13.3`
 нормализует release tree, `0.13.4` — и root-managed Python независимо от
 пользовательского `umask`, а `0.13.5` создаёт закрытые runtime socket
 directories с группами, которым разрешено обращаться к helper-процессам. Release
+`0.13.6` также не изменяет владельца `.git/index` при проверке checkout из-под
+`sudo`, поэтому последующие обновления остаются доступны обычному оператору.
+Release
 `0.13.0` несовместим с фактическим mode системных credentials и после
 активации уходит в restart loop. Dashboard привязывается к конкретному IP
 management LAN; доступ с другого компьютера требует маршрута и разрешённого

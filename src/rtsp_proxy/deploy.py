@@ -286,6 +286,7 @@ class LinuxDeploymentHost:
         safe_directory = f"safe.directory={root}"
         head = self._run(
             Path("/usr/bin/git"),
+            "--no-optional-locks",
             "-c",
             safe_directory,
             "-C",
@@ -296,6 +297,7 @@ class LinuxDeploymentHost:
         )
         status = self._run(
             Path("/usr/bin/git"),
+            "--no-optional-locks",
             "-c",
             safe_directory,
             "-C",

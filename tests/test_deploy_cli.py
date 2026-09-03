@@ -432,7 +432,7 @@ def test_source_checkout_uses_scoped_git_safe_directory(
         **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         expected_option = f"safe.directory={source}"
-        if command[1:3] != ["-c", expected_option]:
+        if command[1:4] != ["--no-optional-locks", "-c", expected_option]:
             raise subprocess.CalledProcessError(
                 128,
                 command,
