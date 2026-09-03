@@ -28,6 +28,7 @@ from joserfc import jwt
 from joserfc.jwk import RSAKey
 from sqlalchemy import create_engine, text
 
+from rtsp_proxy import local_operator_cli
 from rtsp_proxy.app import create_app
 from rtsp_proxy.break_glass_cli import main as break_glass_cli_main
 from rtsp_proxy.config import RuntimeRole, Settings
@@ -57,6 +58,7 @@ from rtsp_proxy.operator_identity import (
     InMemoryBreakGlassStore,
     InMemoryLocalOperatorStore,
     InMemoryOidcFlowStore,
+    LocalOperatorAuthentication,
     LocalOperatorCredentials,
     LocalOperatorLoginControl,
     OidcFlow,
@@ -127,6 +129,154 @@ def test_local_operator_password_login_works_without_idp_and_totp_is_optional() 
         login.login(
             username="admin",
             password="wrong password",
+            source_ip="192.0.2.10",
+        )
+
+
+def test_local_operator_credentials_reject_invalid_material() -> None:
+    with pytest.raises(ValueError, match="local_operator_credentials_invalid"):
+        LocalOperatorCredentials(password_scrypt=b"short")
+    with pytest.raises(ValueError, match="local_operator_password_invalid"):
+        LocalOperatorCredentials.hash_password("too short")
+    with pytest.raises(ValueError, match="local_operator_password_invalid"):
+        LocalOperatorCredentials.hash_password("valid password", salt=b"short")
+    credentials = LocalOperatorCredentials(
+        password_scrypt=LocalOperatorCredentials.hash_password(
+            "correct horse battery staple",
+            salt=b"V" * 16,
+        )
+    )
+    assert credentials.verifies_password("x" * 1025) is False
+    with pytest.raises(ValueError, match="local_operator_authentication_invalid"):
+        LocalOperatorAuthentication(
+            account_id=ACCOUNT_ID,
+            authz_version=0,
+            mfa_verified=False,
+        )
+
+
+def test_local_operator_rejects_totp_when_account_has_no_totp() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = InMemoryLocalOperatorStore(
+        account=account,
+        credentials=LocalOperatorCredentials(
+            password_scrypt=LocalOperatorCredentials.hash_password(
+                "correct horse battery staple",
+                salt=b"N" * 16,
+            )
+        ),
+    )
+
+    with pytest.raises(OidcLoginInvalid, match="local_operator_login_failed"):
+        store.authenticate(
+            username="admin",
+            password="correct horse battery staple",
+            totp="123456",
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+
+
+def test_local_operator_store_rejects_invalid_configuration() -> None:
+    with pytest.raises(ValueError, match="local_operator_store_configuration_invalid"):
+        PostgresLocalOperatorStore("postgresql+psycopg://invalid", encryption_key=b"short")
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:test",
+        display_name="Test",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    credentials = LocalOperatorCredentials(
+        password_scrypt=LocalOperatorCredentials.hash_password(
+            "correct horse battery staple",
+            salt=b"I" * 16,
+        )
+    )
+    with pytest.raises(ValueError, match="local_operator_account_invalid"):
+        InMemoryLocalOperatorStore(account=account, credentials=credentials)
+
+
+def test_local_operator_cli_reports_failure_and_one_time_totp(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert local_operator_cli_main([], password_reader=lambda _prompt: "unused") == 1
+    assert "local operator provisioning failed" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        local_operator_cli,
+        "provision_from_environment",
+        lambda **_kwargs: (ACCOUNT_ID, b"T" * 20),
+    )
+    assert local_operator_cli.main(["--username", "pilot-admin", "--with-totp"]) == 0
+    output = capsys.readouterr().out
+    assert str(ACCOUNT_ID) in output
+    assert "otpauth://totp/RTSP%20Proxy%3Apilot-admin" in output
+
+
+def test_local_operator_cli_rejects_password_mismatch_and_invalid_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", "postgresql+psycopg://unused")
+    invalid_key = tmp_path / "invalid-key"
+    invalid_key.write_text("not-base64")
+    invalid_key.chmod(0o600)
+    monkeypatch.setenv("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", str(invalid_key))
+    answers = iter(("correct horse battery staple", "different password"))
+
+    with pytest.raises(
+        local_operator_cli.LocalOperatorProvisionError,
+        match="local_operator_password_confirmation_failed",
+    ):
+        local_operator_cli.provision_from_environment(
+            account_id=ACCOUNT_ID,
+            username="admin",
+            display_name="Administrator",
+            roles=frozenset({OperatorRole.ADMIN}),
+            scopes=frozenset({"server:*"}),
+            with_totp=False,
+            actor="system:test",
+            reason="test",
+            password_reader=lambda _prompt: next(answers),
+        )
+
+    with pytest.raises(
+        local_operator_cli.LocalOperatorProvisionError,
+        match="local_operator_key_invalid",
+    ):
+        local_operator_cli._read_key(invalid_key)
+    with pytest.raises(
+        local_operator_cli.LocalOperatorProvisionError,
+        match="local_operator_key_file_unsafe",
+    ):
+        local_operator_cli._read_key(tmp_path / "missing-key")
+
+
+def test_local_operator_login_rejects_naive_clock_before_credentials() -> None:
+    login = LocalOperatorLoginControl(
+        store=Any,  # type: ignore[arg-type]
+        sessions=Any,  # type: ignore[arg-type]
+        clock=lambda: datetime(2026, 9, 3),
+    )
+
+    with pytest.raises(OidcLoginInvalid, match="local_operator_login_failed"):
+        login.login(
+            username="admin",
+            password="correct horse battery staple",
             source_ip="192.0.2.10",
         )
 
