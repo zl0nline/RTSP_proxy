@@ -730,13 +730,15 @@ After revision 0020 commits, rollback to application 0.11.0 (maximum schema
 0019) is **NO-GO**. Fix forward with verified 0.12.0 artifacts or restore the
 pre-0020 PostgreSQL backup with the control plane stopped.
 
-Application release `0.13.0` adds schema revision
+Application release `0.13.1` includes schema revision
 `0021_local_operator_login`. The migration is additive: existing OIDC and
 break-glass accounts and sessions remain valid, while ordinary local operator
-credentials are stored in a separate table. Roll every process to the 0.13.0
+credentials are stored in a separate table. Roll every process to the 0.13.1
 bridge-compatible application before applying 0021. After 0021, application
 0.12.0 (maximum schema 0020) is no longer a rollback target; use fix-forward or
 restore the pre-migration backup with the control plane stopped.
+Release 0.13.1 also accepts the root-owned mode `0440` files produced by
+systemd's `LoadCredential`; 0.13.0 must not be used for local-login activation.
 
 ### Operator authentication modes
 
@@ -755,7 +757,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.0 \
+  --release-id 0.13.1 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

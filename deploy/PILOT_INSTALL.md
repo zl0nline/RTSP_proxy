@@ -79,8 +79,12 @@ git clone https://github.com/zl0nline/RTSP_proxy.git /srv/rtsp-proxy-source
 cd /srv/rtsp-proxy-source
 git checkout --detach '<manifest-git-commit>'
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-uv sync --locked --all-groups
 ```
+
+Создавать source-venv командой `uv sync` на сервере не требуется: installer
+сам экспортирует только runtime-зависимости из проверенного lock-файла и
+создаёт отдельный venv внутри release directory. `uv sync --all-groups` нужен
+только разработчику, который собирается запускать тесты из checkout.
 
 Checkout может принадлежать обычному оператору, который затем запускает
 installer через `sudo`. Installer передаёт Git одноразовый локальный параметр
@@ -90,7 +94,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.13.0-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.13.1-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -112,7 +116,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.0-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.13.1-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -195,7 +199,7 @@ source venv:
 sudo systemd-run --quiet --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.13.0/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.13.1/.venv/bin/rtsp-proxy-migrate
 ```
 
 Перед каждым последующим изменением schema создавайте backup PostgreSQL.
@@ -210,7 +214,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.13.0 \
+  --release-id 0.13.1 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -235,8 +239,8 @@ Proxy не устанавливает, не вызывает и не требу�
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.13.0/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.13.0 \
+sudo /opt/rtsp-proxy/releases/0.13.1/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.13.1 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -267,12 +271,35 @@ sudo journalctl -u 'rtsp-proxy*' --since '-10 min' --no-pager
 неверный пароль и выход. Если OIDC настроен, страница локального входа также
 покажет отдельную ссылку на локальный IdP.
 
+`RTSP_PROXY_HTTP_HOST` должен содержать конкретный IP интерфейса management LAN,
+а не `127.0.0.1` и не wildcard `0.0.0.0`. Сертификат обязан содержать этот IP в
+Subject Alternative Name. Проверьте доступ сначала на сервере, а затем с
+другого компьютера той же сети:
+
+```sh
+sudo ss -ltnp | grep ':8000'
+curl --fail --cacert /path/to/management-ca.crt \
+  https://<management-address>:8000/health/ready
+
+# Следующую команду выполните уже с другого компьютера management LAN.
+curl --fail --cacert /path/to/management-ca.crt \
+  https://<management-address>:8000/auth/local/login
+```
+
+Оба запроса должны пройти без `--insecure`. Если локальный запрос успешен, а
+удалённый получает `connection refused` или `network unreachable`, проверьте
+маршрут от клиентской подсети и входной firewall/ACL до TCP 8000. Доступный
+SSH-порт через NAT или port forwarding сам по себе не означает, что внутренний
+management-IP маршрутизируется с рабочего компьютера. Не меняйте bind на
+`0.0.0.0` для обхода этой проблемы.
+
 ## 7. Обновление приложения
 
 Никогда не обновляйте систему из dirty checkout или непроверенного произвольного
 каталога. Скачайте новый architecture-specific artifact, переключитесь на его
-точный commit, выполните `uv sync --locked --all-groups` и создайте backup
-PostgreSQL.
+точный commit, проверьте чистоту checkout и создайте backup PostgreSQL. Source
+venv для update не нужен: runtime-зависимости создаются installer-ом из
+проверенного lock-файла.
 
 Перед переключением команда update проверяет, что *текущая* ревизия базы данных
 находится в rolling window manifest нового релиза:
@@ -281,7 +308,7 @@ PostgreSQL.
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.0-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.13.1-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -373,6 +400,7 @@ deployment failed: host_command_failed command=git exit_code=128 stderr=...
 | `database_schema_incompatible_with_release` | live schema входит в compatibility window выбранного manifest |
 | `local operator CLI missing` | `--release-id` совпадает с установленным release directory |
 | `RTSP_PROXY_DATABASE_URL is missing` | активный WEB env содержит непустой URL PostgreSQL |
+| `operator_auth_file_invalid` сразу после local-auth bootstrap | установлен release не ниже 0.13.1; он корректно принимает root-owned systemd credentials mode `0440` |
 | `local_operator_store_unavailable` | migration 0021 применена и PostgreSQL доступен локально |
 | `local_operator_password_confirmation_failed` | пароль не короче 12 символов и оба ввода совпадают |
 

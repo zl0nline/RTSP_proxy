@@ -89,6 +89,12 @@ mechanism testing с отдельно установленными Python 3.12 �
 
 Полная пошаговая инструкция: **[Pilot installation, update and rollback](deploy/PILOT_INSTALL.md)**.
 
+Для встроенного локального входа используйте release `0.13.1` или новее:
+`0.13.0` несовместим с фактическим mode системных credentials и после
+активации уходит в restart loop. Dashboard привязывается к конкретному IP
+management LAN; доступ с другого компьютера требует маршрута и разрешённого
+TCP 8000 до этого IP.
+
 Минимальный порядок действий:
 
 1. Скачать architecture-specific release bundle из успешного CI run.

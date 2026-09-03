@@ -383,7 +383,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.0/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.1/bin/mediamtx"
     )
 
 

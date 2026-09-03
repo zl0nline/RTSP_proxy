@@ -2861,7 +2861,7 @@ def read_operator_secret_file(
     trusted_owner_uid: int = 0,
     maximum_bytes: int = 65_536,
 ) -> bytes:
-    """Read a root-owned, non-linked regular secret/config file without following links."""
+    """Read a private or systemd-provided secret without following links."""
 
     descriptor = -1
     try:
@@ -2870,11 +2870,16 @@ def read_operator_secret_file(
             os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
         )
         file_stat = os.fstat(descriptor)
+        mode = stat.S_IMODE(file_stat.st_mode)
+        private_mode = mode in {0o400, 0o600}
+        systemd_credential_mode = (
+            mode == 0o440 and file_stat.st_uid == 0 and file_stat.st_gid == 0
+        )
         if (
             not stat.S_ISREG(file_stat.st_mode)
             or file_stat.st_uid != trusted_owner_uid
             or file_stat.st_nlink != 1
-            or stat.S_IMODE(file_stat.st_mode) not in {0o400, 0o600}
+            or not (private_mode or systemd_credential_mode)
         ):
             raise ValueError
         payload = os.read(descriptor, maximum_bytes + 1)

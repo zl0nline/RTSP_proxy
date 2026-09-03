@@ -522,6 +522,26 @@ def _open_operator_security(
     if not settings.operator_auth_enabled or settings.database_url is None:
         raise ConfigurationError("operator_auth_configuration_incomplete")
     credential_owner_uid = os.geteuid() if trusted_owner_uid is None else trusted_owner_uid
+    if trusted_owner_uid is None:
+        credentials_directory_value = os.environ.get("CREDENTIALS_DIRECTORY")
+        credential_paths = tuple(
+            path
+            for path in (
+                settings.local_auth_encryption_key_file,
+                settings.oidc_jwks_file,
+                settings.oidc_client_secret_file,
+                settings.oidc_derivation_key_file,
+                settings.oidc_group_roles_file,
+                settings.break_glass_encryption_key_file,
+            )
+            if path is not None
+        )
+        if credentials_directory_value:
+            credentials_directory = Path(credentials_directory_value)
+            if credentials_directory.is_absolute() and all(
+                path.parent == credentials_directory for path in credential_paths
+            ):
+                credential_owner_uid = 0
     try:
         local_encryption_key = (
             None

@@ -897,7 +897,13 @@ def test_web_runtime_exposes_local_login_without_oidc(
     upgrade_database(postgres_database_url)
     key = tmp_path / "local-auth-key"
     key.write_bytes(base64.urlsafe_b64encode(b"L" * 32).rstrip(b"=") + b"\n")
-    key.chmod(0o600)
+    key.chmod(0o440)
+    real_fstat = os.fstat
+    monkeypatch.setattr(
+        "rtsp_proxy.operator_identity.os.fstat",
+        lambda descriptor: _owned_by_root(real_fstat(descriptor), gid=0),
+    )
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
     environment = {
         "RTSP_PROXY_ROLE": "web",
         "RTSP_PROXY_DATABASE_URL": postgres_database_url,
