@@ -757,6 +757,10 @@ previous release.
 Release 0.13.8 adds the built-in `local` identity source to the normative node
 mutation audit context. Earlier dual-auth releases could authenticate a local
 administrator but rejected node and camera mutations before persistence.
+Release 0.13.9 gives only execute/traversal permission to unrelated users on
+the shared runtime, state and log parents. Per-node directories remain `0750`;
+this lets systemd's isolated DynamicUser enter its own directory without
+exposing sibling directory listings or contents.
 
 ### Operator authentication modes
 
@@ -775,7 +779,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.8 \
+  --release-id 0.13.9 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

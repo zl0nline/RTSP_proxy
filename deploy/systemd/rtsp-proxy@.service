@@ -22,8 +22,8 @@ RuntimeDirectory=rtsp-proxy-%i
 StateDirectory=rtsp-proxy
 LogsDirectory=rtsp-proxy
 RuntimeDirectoryMode=0750
-StateDirectoryMode=0750
-LogsDirectoryMode=0750
+StateDirectoryMode=0751
+LogsDirectoryMode=0751
 ReadWritePaths=/run/rtsp-proxy-%i /var/lib/rtsp-proxy /var/log/rtsp-proxy
 
 NoNewPrivileges=yes

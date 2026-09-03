@@ -543,7 +543,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
         "amd64",
         "arm64",
     }
-    assert {manifest.release_id for manifest in manifests} == {"0.13.8"}
+    assert {manifest.release_id for manifest in manifests} == {"0.13.9"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
     assert {manifest.probe_connect_guard.release_id for manifest in manifests} == {
         "0.1.0"

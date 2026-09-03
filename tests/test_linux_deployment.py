@@ -70,9 +70,24 @@ def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
         assert service["ProtectHome"] == "yes"
         assert service["CapabilityBoundingSet"] == ""
         assert "/opt/rtsp-proxy" not in service["ReadWritePaths"]
-        assert service["RuntimeDirectoryMode"] == "0750"
-        assert service["StateDirectoryMode"] == "0750"
-        assert service["LogsDirectoryMode"] == "0750"
+    web = read_unit("rtsp-proxy-web.service")["Service"]
+    role = read_unit("rtsp-proxy@.service")["Service"]
+    legacy_media = read_unit("mediamtx.service")["Service"]
+    assert (
+        web["RuntimeDirectoryMode"],
+        web["StateDirectoryMode"],
+        web["LogsDirectoryMode"],
+    ) == ("0751", "0751", "0751")
+    assert (
+        role["RuntimeDirectoryMode"],
+        role["StateDirectoryMode"],
+        role["LogsDirectoryMode"],
+    ) == ("0750", "0751", "0751")
+    assert (
+        legacy_media["RuntimeDirectoryMode"],
+        legacy_media["StateDirectoryMode"],
+        legacy_media["LogsDirectoryMode"],
+    ) == ("0750", "0750", "0750")
 
 
 def test_background_roles_use_a_separate_systemd_template() -> None:
@@ -230,6 +245,23 @@ def test_media_nodes_use_an_exact_isolated_systemd_instance() -> None:
     assert service["TasksMax"] == "256"
     assert "rtsp-proxy-auth.service" in unit["Unit"]["Wants"]
     assert "rtsp-proxy-auth.service" in unit["Unit"]["After"]
+
+
+def test_dynamic_media_can_traverse_shared_runtime_state_and_log_parents() -> None:
+    web = read_unit("rtsp-proxy-web.service")["Service"]
+    role = read_unit("rtsp-proxy@.service")["Service"]
+    tmpfiles = Path("deploy/tmpfiles.d/rtsp-proxy.conf").read_text(encoding="utf-8")
+
+    assert web["RuntimeDirectoryMode"] == "0751"
+    assert web["StateDirectoryMode"] == "0751"
+    assert web["LogsDirectoryMode"] == "0751"
+    assert role["RuntimeDirectoryMode"] == "0750"
+    assert role["StateDirectoryMode"] == "0751"
+    assert role["LogsDirectoryMode"] == "0751"
+    assert "d /var/lib/rtsp-proxy 0751 rtsp-proxy rtsp-proxy -" in tmpfiles
+    assert "d /var/log/rtsp-proxy 0751 rtsp-proxy rtsp-proxy -" in tmpfiles
+    assert "d /var/lib/rtsp-proxy/nodes 0751 mediamtx mediamtx -" in tmpfiles
+    assert "d /var/log/rtsp-proxy/nodes 0751 mediamtx mediamtx -" in tmpfiles
 
 
 def test_nftables_policy_is_additive_bounded_and_scoped_to_node_ports() -> None:
@@ -397,7 +429,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.8/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.9/bin/mediamtx"
     )
 
 
