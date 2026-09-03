@@ -112,11 +112,14 @@ def test_collector_has_a_dedicated_read_only_helper_boundary() -> None:
     assert metrics_socket["ListenStream"] == "/run/rtsp-proxy-node-metrics/metrics.sock"
     assert metrics_socket["SocketGroup"] == "rtsp-proxy-collector"
     assert metrics_socket["SocketMode"] == "0660"
+    assert metrics_socket["DirectoryMode"] == "0750"
     assert metrics_helper["Service"]["Environment"] == ("RTSP_PROXY_NODE_HELPER_READ_ONLY=true")
     assert metrics_helper["Service"]["ReadOnlyPaths"] == (
         "/etc/rtsp-proxy/nodes /etc/rtsp-proxy/control-plane/access-peppers.json"
     )
     assert "u rtsp-proxy-collector " in users
+    tmpfiles = Path("deploy/tmpfiles.d/rtsp-proxy.conf").read_text(encoding="utf-8")
+    assert "d /run/rtsp-proxy-node-metrics 0750 root rtsp-proxy-collector -" in tmpfiles
 
 
 def test_notifier_uses_a_dedicated_identity_and_systemd_credential() -> None:
@@ -354,6 +357,17 @@ def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> 
     assert runtime_socket["SocketUser"] == "root"
     assert runtime_socket["SocketGroup"] == "rtsp-proxy"
     assert runtime_socket["SocketMode"] == "0660"
+    assert runtime_socket["DirectoryMode"] == "0750"
+    tmpfiles = Path("deploy/tmpfiles.d/rtsp-proxy.conf").read_text(encoding="utf-8")
+    assert "d /run/rtsp-proxy-node-runtime 0750 root rtsp-proxy -" in tmpfiles
+
+
+def test_runbook_imports_role_sql_through_operator_readable_stdin() -> None:
+    runbook = Path("deploy/README.md").read_text(encoding="utf-8")
+
+    assert "--file deploy/postgresql/" not in runbook
+    assert "< deploy/postgresql/rtsp_proxy_auth.sql" in runbook
+    assert "< deploy/postgresql/rtsp_proxy_collector.sql" in runbook
 
 
 def test_control_and_helper_examples_define_one_identical_runtime_policy() -> None:
@@ -383,7 +397,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.4/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.5/bin/mediamtx"
     )
 
 

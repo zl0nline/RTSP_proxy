@@ -332,9 +332,9 @@ Create the two least-privilege PostgreSQL roles before enabling those units:
 
 ```sh
 sudo -u postgres psql --dbname rtsp_proxy --set DBNAME=rtsp_proxy \
-  --file deploy/postgresql/rtsp_proxy_collector.sql
+  < deploy/postgresql/rtsp_proxy_collector.sql
 sudo -u postgres psql --dbname rtsp_proxy --set DBNAME=rtsp_proxy \
-  --file deploy/postgresql/rtsp_proxy_notifier.sql
+  < deploy/postgresql/rtsp_proxy_notifier.sql
 ```
 
 The collector can read only the non-secret node inventory and maintain fleet
@@ -743,6 +743,10 @@ Release 0.13.4 makes immutable release and root-managed Python permissions
 independent of the invoking operator's `umask`; earlier installers can produce
 non-traversable paths under `umask 077` and must not be used for a fresh
 installation.
+Release 0.13.5 additionally creates each private runtime socket directory with
+the helper client's group. In 0.13.4 the socket itself had the correct group,
+but the root-owned parent directory could prevent reconciler and collector from
+reaching it.
 
 ### Operator authentication modes
 
@@ -761,7 +765,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.4 \
+  --release-id 0.13.5 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -1002,8 +1006,12 @@ database role only the operations required by the callback:
 
 ```sh
 sudo -u postgres psql --dbname rtsp_proxy --set DBNAME=rtsp_proxy \
-  --file deploy/postgresql/rtsp_proxy_auth.sql
+  < deploy/postgresql/rtsp_proxy_auth.sql
 ```
+
+The operator's shell opens these repository files before `psql` changes to the
+`postgres` user. This also works when the checkout itself is intentionally not
+traversable by `postgres`; do not replace stdin redirection with `--file`.
 
 The idempotent artifact creates `rtsp_proxy_auth` without broad database or
 schema privileges, grants exact callback reads plus `EXECUTE` on two constrained
