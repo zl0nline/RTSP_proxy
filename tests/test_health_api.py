@@ -35,6 +35,7 @@ from rtsp_proxy.runtime import (
     ConfigurationError,
     _dispatch_notification_fairly,
     _load_access_verifier,
+    _open_operator_security,
     create_app_from_environment,
     create_background_app,
     load_settings,
@@ -44,6 +45,25 @@ from rtsp_proxy.runtime import (
 )
 
 TRUSTED_MEDIAMTX_SHA256 = trusted_mediamtx_identity(platform.machine())[1].root
+
+
+def test_operator_security_refuses_disabled_or_invalid_local_auth(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConfigurationError, match="operator_auth_configuration_incomplete"):
+        _open_operator_security(Settings(role=RuntimeRole.WEB))
+
+    invalid_key = tmp_path / "local-auth-key"
+    invalid_key.write_text("invalid-key")
+    invalid_key.chmod(0o600)
+    settings = Settings(
+        role=RuntimeRole.WEB,
+        database_url="postgresql+psycopg://unused",
+        local_auth_enabled=True,
+        local_auth_encryption_key_file=invalid_key,
+    )
+    with pytest.raises(ConfigurationError, match="operator_auth_file_invalid"):
+        _open_operator_security(settings)
 
 
 def test_live_reports_the_running_role_without_dependency_checks() -> None:
