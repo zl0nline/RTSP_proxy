@@ -383,7 +383,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.2/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.3/bin/mediamtx"
     )
 
 
@@ -752,3 +752,9 @@ def test_deployment_wrappers_do_not_require_a_source_virtualenv() -> None:
         assert "UV_PYTHON_INSTALL_DIR=/opt/rtsp-proxy/python" in script
         assert 'python find 3.12' in script
         assert ' -I "$repo_root/src/rtsp_proxy/deploy.py"' in script
+
+
+def test_host_bootstrap_normalizes_the_application_parent_mode() -> None:
+    script = Path("tools/bootstrap_rtsp_proxy_host.sh").read_text(encoding="utf-8")
+
+    assert 'install -d -o root -g root -m 0755 /opt/rtsp-proxy "$python_root"' in script

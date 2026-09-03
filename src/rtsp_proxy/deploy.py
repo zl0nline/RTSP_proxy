@@ -106,7 +106,10 @@ class LinuxDeploymentHost:
 
         self._require_source_checkout(source_root, manifest)
         self._require_tool(self._uv, "uv")
+        self._paths.opt_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        self._paths.opt_root.chmod(0o755)
         self._paths.releases.mkdir(parents=True, exist_ok=True, mode=0o755)
+        self._paths.releases.chmod(0o755)
         staging = Path(tempfile.mkdtemp(prefix=f".{release_id}.staging-", dir=target.parent))
         try:
             self._copy_bundle(bundle, staging)
@@ -332,7 +335,14 @@ class LinuxDeploymentHost:
             mode = path.lstat().st_mode
             if stat.S_ISLNK(mode):
                 continue
-            path.chmod(stat.S_IMODE(mode) & ~(stat.S_IWGRP | stat.S_IWOTH))
+            permissions = stat.S_IMODE(mode) & ~(stat.S_IWGRP | stat.S_IWOTH)
+            if stat.S_ISDIR(mode):
+                permissions |= 0o555
+            elif stat.S_ISREG(mode):
+                permissions |= 0o444
+                if permissions & 0o111:
+                    permissions |= 0o555
+            path.chmod(permissions)
 
     @staticmethod
     def _require_tool(path: Path, label: str) -> None:

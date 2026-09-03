@@ -58,7 +58,7 @@ test "$(stat -c '%F:%u:%a' "$deploy_uv")" = 'regular file:0:755' || {
 }
 
 python_root=/opt/rtsp-proxy/python
-install -d -o root -g root -m 0755 "$python_root"
+install -d -o root -g root -m 0755 /opt/rtsp-proxy "$python_root"
 if [ "$bootstrap_mode" = --install ]; then
   UV_PYTHON_INSTALL_DIR="$python_root" "$deploy_uv" python install 3.12
 fi

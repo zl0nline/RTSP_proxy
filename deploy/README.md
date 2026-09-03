@@ -739,6 +739,9 @@ bridge-compatible application before applying 0021. After 0021, application
 restore the pre-migration backup with the control plane stopped.
 Release 0.13.1 also accepts the root-owned mode `0440` files produced by
 systemd's `LoadCredential`; 0.13.0 must not be used for local-login activation.
+Release 0.13.3 makes immutable runtime permissions independent of the invoking
+operator's `umask`; earlier installers can produce non-traversable paths under
+`umask 077` and must not be used for a fresh installation.
 
 ### Operator authentication modes
 
@@ -757,7 +760,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.2 \
+  --release-id 0.13.3 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

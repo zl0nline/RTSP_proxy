@@ -285,12 +285,21 @@ esac
     host = LinuxDeploymentHost(paths, uv=fake_uv)
     monkeypatch.setattr(host, "_require_tool", lambda path, label: None)
 
-    release_id = host.stage(bundle, paths.releases / "0.12.0", source)
+    previous_umask = os.umask(0o077)
+    try:
+        release_id = host.stage(bundle, paths.releases / "0.12.0", source)
+    finally:
+        os.umask(previous_umask)
 
     release = paths.releases / "0.12.0"
     assert release_id == "0.12.0"
     assert (release / ".venv/bin/rtsp-proxy-verify-release").is_file()
+    assert paths.opt_root.stat().st_mode & 0o777 == 0o755
+    assert paths.releases.stat().st_mode & 0o777 == 0o755
     assert release.stat().st_mode & 0o777 == 0o755
+    assert (release / ".venv").stat().st_mode & 0o777 == 0o755
+    assert (release / ".venv/bin").stat().st_mode & 0o777 == 0o755
+    assert (release / "runtime-requirements.txt").stat().st_mode & 0o777 == 0o644
     assert not any(path.name.startswith(".0.12.0.staging-") for path in paths.releases.iterdir())
 
 
