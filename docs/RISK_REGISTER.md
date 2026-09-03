@@ -4,7 +4,7 @@
 |---|---|---|---|---|
 | R1 | Per-node 100-camera capacity is unproven | Open | per-node matrix and 24h soak | technical |
 | R2 | Sustainable media-node count per server is unknown | Open | 1/5/10/25/50 node ladder; optional 100 | technical |
-| R3 | MediaMTX API/auth/restart semantics are unproven | Open | pinned external contract suite | media/security |
+| R3 | MediaMTX API/auth/restart semantics are unproven | Closed for pinned v1.20.0-rtsp-proxy.3 | [Phase 0 contract](evidence/phase0-mediamtx-v1.20.0-contract.md), [node administration contract](evidence/phase-d-node-administration-contract.md), and [0.13.10 native startup evidence](evidence/release-0.13.10-node-startup-contract.md); reopen on MediaMTX upgrade | media/security |
 | R4 | Camera move/port change changes consumer URL | Open | blast-radius confirmation and managed client config channel | migration |
 | R5 | Production network/kernel/camera drift changes capacity | Open | production-like manifest and soak | operations |
 | R6 | ACL-before-password, direct peer IP and exact RTSP 453 are unproven | Open | per-node auth/admission native tests | security |

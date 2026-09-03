@@ -35,6 +35,12 @@ nodes on one physical Linux server.
 - Every node has a unique random management credential and systemd
   `DynamicUser`; its process receives only its own config and cannot traverse
   another node's root-owned config/credential directory.
+- Shared runtime, state and log parents allow traversal only (`0751`) so the
+  isolated DynamicUser can enter its own `0750` per-node directory; this does
+  not grant directory listing or sibling-content access.
+- The root-owned lifecycle helper retains only `CAP_SYS_PTRACE` so Linux permits
+  it to verify `/proc/<pid>/exe` for a DynamicUser-owned MediaMTX process before
+  accepting that process identity.
 - Multi-server topology, gateway tier and one unified external port are not part
   of this product version.
 

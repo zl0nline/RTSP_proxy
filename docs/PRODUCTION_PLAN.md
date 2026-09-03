@@ -655,6 +655,12 @@ never receives arbitrary systemctl authority.
 
 Each media instance uses `DynamicUser`, a systemd credential copy of its own
 config and a release-specific absolute MediaMTX path stored by the root helper.
+Shared runtime/state/log parents are `0751` for traversal without listing;
+each node directory remains `0750`. The lifecycle helper has only
+`CAP_SYS_PTRACE`, required by the Linux `/proc/<pid>/exe` access check when it
+verifies a process owned by a different DynamicUser. MediaMTX config smoke
+compares its canonical API representation, including the explicit empty
+`path` returned for API and metrics permissions.
 Per-node random Basic credentials protect loopback API/metrics; the process
 never receives another node's credential file. Helper requests have a bounded
 deadline and all lifecycle commands for one UUID are serialized by a
