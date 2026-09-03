@@ -754,6 +754,9 @@ Release 0.13.7 polls management readiness for up to 30 seconds after restarting
 active units. A normal multi-process startup no longer causes an immediate
 false rollback, while a persistent failure still restores the compatible
 previous release.
+Release 0.13.8 adds the built-in `local` identity source to the normative node
+mutation audit context. Earlier dual-auth releases could authenticate a local
+administrator but rejected node and camera mutations before persistence.
 
 ### Operator authentication modes
 
@@ -772,7 +775,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.7 \
+  --release-id 0.13.8 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

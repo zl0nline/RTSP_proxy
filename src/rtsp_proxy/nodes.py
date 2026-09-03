@@ -143,7 +143,7 @@ class NodeMutationContext:
     def __post_init__(self) -> None:
         digests = (self.source_ip_sha256, self.user_agent_sha256)
         if (
-            self.identity_source not in {"oidc", "break_glass"}
+            self.identity_source not in {"oidc", "local", "break_glass"}
             or not 1 <= len(self.actor_subject) <= 512
             or self.roles != tuple(sorted(set(self.roles)))
             or not self.roles

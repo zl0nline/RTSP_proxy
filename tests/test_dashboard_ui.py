@@ -1038,6 +1038,7 @@ def _authenticated_dashboard(
     node_control: object | None = None,
     settings: Settings | None = None,
     role: OperatorRole = OperatorRole.VIEWER,
+    identity_source: OperatorIdentitySource = OperatorIdentitySource.OIDC,
     scopes: frozenset[str] = frozenset({"server:*"}),
     authenticated_at: datetime = NOW,
     session_store: InMemoryOperatorSessionStore | PostgresOperatorSessionStore | None = None,
@@ -1049,9 +1050,9 @@ def _authenticated_dashboard(
     live_updates: CameraLiveUpdateSource | None = None,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
-        identity_source=OperatorIdentitySource.OIDC,
+        identity_source=identity_source,
         id=ACCOUNT_ID,
-        subject="oidc:viewer@example.test",
+        subject=f"{identity_source.value}:viewer@example.test",
         display_name="Дежурный <script>alert(1)</script>",
         roles=frozenset({role}),
         scopes=scopes,
@@ -1491,6 +1492,37 @@ def test_dashboard_node_create_supports_random_and_manual_port_with_csrf() -> No
     assert second["external_port"] == 10544
     assert 'href="/dashboard/nodes/new"' not in viewer_overview.text
     assert viewer_create.status_code == 403
+
+
+def test_local_operator_can_create_node() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    control = RecordingNodeDashboardControl()
+    client, headers = _authenticated_dashboard(
+        observations=observations,
+        node_control=control,
+        role=OperatorRole.ADMIN,
+        identity_source=OperatorIdentitySource.LOCAL,
+    )
+
+    response = client.post(
+        "/dashboard/nodes",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "local operator node",
+            "external_port": "10544",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    context = cast(
+        NodeMutationContext,
+        cast(dict[str, object], control.calls[0][1])["mutation_context"],
+    )
+    assert context.identity_source == OperatorIdentitySource.LOCAL.value
 
 
 def test_dashboard_node_create_is_fail_closed_and_reports_port_exhaustion() -> None:
