@@ -750,6 +750,10 @@ reaching it.
 Release 0.13.6 runs its root-side checkout verification with Git optional
 locks disabled. The verification remains read-only and cannot replace the
 operator-owned `.git/index` with a root-owned file that blocks later updates.
+Release 0.13.7 polls management readiness for up to 30 seconds after restarting
+active units. A normal multi-process startup no longer causes an immediate
+false rollback, while a persistent failure still restores the compatible
+previous release.
 
 ### Operator authentication modes
 
@@ -768,7 +772,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.6 \
+  --release-id 0.13.7 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

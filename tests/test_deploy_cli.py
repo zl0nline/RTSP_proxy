@@ -117,6 +117,58 @@ def test_update_switches_atomically_and_records_rollback_target(tmp_path: Path) 
     assert host.restarted == [("rtsp-proxy-web.service",)]
 
 
+def test_update_waits_for_transient_startup_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = DeploymentPaths.under(tmp_path / "host")
+    old = paths.releases / "0.11.0"
+    old.mkdir(parents=True)
+    (old / "release-manifest.json").write_text(
+        json.dumps(
+            {
+                "release_id": "0.11.0",
+                "schema_compatibility": {
+                    "minimum": "0012_operator_sessions",
+                    "maximum": "0020_probe_observations",
+                },
+            }
+        )
+    )
+    paths.opt_root.mkdir(parents=True, exist_ok=True)
+    paths.current.symlink_to(Path("releases/0.11.0"))
+    bundle = _bundle(
+        tmp_path,
+        "0.12.0",
+        "0012_operator_sessions",
+        "0020_probe_observations",
+    )
+    host = FakeHost()
+    results = iter((False, False, True))
+    sleeps: list[float] = []
+    monkeypatch.setattr(host, "health", lambda url, ca_file: next(results))
+    monkeypatch.setattr(deploy_module.time, "sleep", sleeps.append)
+
+    result = main(
+        [
+            "update",
+            "--bundle",
+            str(bundle),
+            "--environment-file",
+            "/etc/rtsp-proxy/control-plane/rtsp-proxy.env",
+            "--health-url",
+            "https://management.example/health/ready",
+        ],
+        host=host,
+        paths=paths,
+        source_root=tmp_path,
+    )
+
+    assert result == 0
+    assert paths.current.readlink() == Path("releases/0.12.0")
+    assert sleeps == [1.0, 1.0]
+
+
 def test_fresh_install_stages_assets_without_activating_or_starting(tmp_path: Path) -> None:
     paths = DeploymentPaths.under(tmp_path / "host")
     bundle = _bundle(tmp_path, "0.12.0", "0012_operator_sessions", "0020_probe_observations")
@@ -136,7 +188,10 @@ def test_fresh_install_stages_assets_without_activating_or_starting(tmp_path: Pa
     assert host.restarted == []
 
 
-def test_failed_update_health_restores_previous_release(tmp_path: Path) -> None:
+def test_failed_update_health_restores_previous_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     paths = DeploymentPaths.under(tmp_path / "host")
     old = paths.releases / "0.11.0"
     old.mkdir(parents=True)
@@ -156,6 +211,7 @@ def test_failed_update_health_restores_previous_release(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, "0.12.0", "0012_operator_sessions", "0020_probe_observations")
     host = FakeHost()
     host.health_ok = False
+    monkeypatch.setattr(deploy_module.time, "sleep", lambda seconds: None)
 
     try:
         main(

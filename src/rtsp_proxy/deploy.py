@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from urllib import parse, request
 
 _RELEASE_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 _REVISION = re.compile(r"^(\d{4})_[0-9a-z_]+$")
+_HEALTH_ATTEMPTS = 30
+_HEALTH_INTERVAL_SECONDS = 1.0
 _MANAGED_UNITS = (
     "rtsp-proxy-nftables.service",
     "rtsp-proxy-auth.service",
@@ -489,7 +492,7 @@ def _activate(
     _switch(paths, release_id)
     try:
         host.restart_units(units)
-        if units and not host.health(health_url, ca_file):
+        if units and not _await_health(host, health_url, ca_file):
             raise DeploymentError("activation_health_check_failed")
     except BaseException as error:
         if previous is not None:
@@ -500,6 +503,19 @@ def _activate(
                 raise DeploymentError("activation_health_check_failed_rolled_back") from error
         raise
     _write_receipt(paths, release_id, previous, revision)
+
+
+def _await_health(
+    host: DeploymentHost,
+    health_url: str,
+    ca_file: Path | None,
+) -> bool:
+    for attempt in range(_HEALTH_ATTEMPTS):
+        if host.health(health_url, ca_file):
+            return True
+        if attempt + 1 < _HEALTH_ATTEMPTS:
+            time.sleep(_HEALTH_INTERVAL_SECONDS)
+    return False
 
 
 def _switch(paths: DeploymentPaths, release_id: str) -> None:
