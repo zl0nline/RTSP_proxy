@@ -5,6 +5,7 @@ test "$(id -u)" -eq 0 || {
   printf 'bootstrap requires root\n' >&2
   exit 1
 }
+umask 022
 test -r /etc/os-release || {
   printf 'os-release unavailable\n' >&2
   exit 1
@@ -61,8 +62,23 @@ python_root=/opt/rtsp-proxy/python
 install -d -o root -g root -m 0755 /opt/rtsp-proxy "$python_root"
 if [ "$bootstrap_mode" = --install ]; then
   UV_PYTHON_INSTALL_DIR="$python_root" "$deploy_uv" python install 3.12
+  find "$python_root" -type d -exec chmod a+rx,go-w {} +
+  find "$python_root" -type f -exec chmod a+r,go-w {} +
+  find "$python_root" -type f -perm /111 -exec chmod a+x {} +
 fi
-UV_PYTHON_INSTALL_DIR="$python_root" "$deploy_uv" python find 3.12 >/dev/null
+python_executable=$(UV_PYTHON_INSTALL_DIR="$python_root" "$deploy_uv" python find 3.12)
+if find "$python_root" -type d ! -perm -0005 -print -quit | grep -q . \
+  || find "$python_root" -type f ! -perm -0004 -print -quit | grep -q . \
+  || find "$python_root" -type f -perm -0100 ! -perm -0001 -print -quit | grep -q .
+then
+  printf 'python runtime is not traversable/readable by service users: %s\n' \
+    "$python_root" >&2
+  exit 1
+fi
+test -x "$python_executable" || {
+  printf 'python runtime executable unavailable: %s\n' "$python_executable" >&2
+  exit 1
+}
 
 for command in bpftool curl git jq nft openssl psql systemctl systemd-run; do
   command -v "$command" >/dev/null || {

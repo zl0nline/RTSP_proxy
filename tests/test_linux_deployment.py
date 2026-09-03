@@ -383,7 +383,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.3/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.4/bin/mediamtx"
     )
 
 
@@ -758,3 +758,8 @@ def test_host_bootstrap_normalizes_the_application_parent_mode() -> None:
     script = Path("tools/bootstrap_rtsp_proxy_host.sh").read_text(encoding="utf-8")
 
     assert 'install -d -o root -g root -m 0755 /opt/rtsp-proxy "$python_root"' in script
+    assert "umask 022" in script
+    assert 'find "$python_root" -type d -exec chmod a+rx,go-w {} +' in script
+    assert 'find "$python_root" -type f -exec chmod a+r,go-w {} +' in script
+    assert 'find "$python_root" -type f -perm /111 -exec chmod a+x {} +' in script
+    assert 'python runtime is not traversable/readable by service users' in script

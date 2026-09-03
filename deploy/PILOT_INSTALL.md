@@ -94,7 +94,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.13.3-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.13.4-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -116,7 +116,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.3-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.13.4-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -199,7 +199,7 @@ source venv:
 sudo systemd-run --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.13.3/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.13.4/.venv/bin/rtsp-proxy-migrate
 sudo -u postgres psql --dbname rtsp_proxy --tuples-only --no-align \
   --command 'SELECT version_num FROM alembic_version;'
 ```
@@ -220,7 +220,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.13.3 \
+  --release-id 0.13.4 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -245,8 +245,8 @@ Proxy не устанавливает, не вызывает и не требу�
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.13.3/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.13.3 \
+sudo /opt/rtsp-proxy/releases/0.13.4/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.13.4 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -314,7 +314,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.3-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.13.4-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -407,7 +407,7 @@ deployment failed: host_command_failed command=git exit_code=128 stderr=...
 | `local operator CLI missing` | `--release-id` совпадает с установленным release directory |
 | `RTSP_PROXY_DATABASE_URL is missing` | активный WEB env содержит непустой URL PostgreSQL |
 | `operator_auth_file_invalid` сразу после local-auth bootstrap | установлен release не ниже 0.13.1; он корректно принимает root-owned systemd credentials mode `0440` |
-| migration завершилась с `status=203/EXEC` / `Permission denied` | установлен release не ниже 0.13.3; он нормализует traversal/read/execute modes при любом `umask` оператора |
+| migration завершилась с `status=203/EXEC`, `126` или `Permission denied` | установлен release не ниже 0.13.4; он нормализует release tree и root-managed Python при любом `umask` оператора |
 | `local_operator_store_unavailable` | migration 0021 применена и PostgreSQL доступен локально |
 | `local_operator_password_confirmation_failed` | пароль не короче 12 символов и оба ввода совпадают |
 
