@@ -94,7 +94,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.13.1-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.13.2-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -116,7 +116,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.1-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.13.2-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -199,7 +199,7 @@ source venv:
 sudo systemd-run --quiet --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.13.1/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.13.2/.venv/bin/rtsp-proxy-migrate
 ```
 
 Перед каждым последующим изменением schema создавайте backup PostgreSQL.
@@ -214,7 +214,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.13.1 \
+  --release-id 0.13.2 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -239,8 +239,8 @@ Proxy не устанавливает, не вызывает и не требу�
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.13.1/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.13.1 \
+sudo /opt/rtsp-proxy/releases/0.13.2/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.13.2 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -308,7 +308,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.1-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.13.2-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt

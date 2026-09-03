@@ -383,7 +383,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.1/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.2/bin/mediamtx"
     )
 
 
@@ -735,3 +735,20 @@ def test_local_auth_bootstrap_has_valid_shell_syntax_and_no_password_argument() 
     assert "RTSP_PROXY_LOCAL_AUTH_ENABLED=true" in script
     assert "dropin_directory=/etc/systemd/system/rtsp-proxy-web.service.d" in script
     assert "dropin_file=$dropin_directory/local-auth.conf" in script
+
+
+def test_deployment_wrappers_do_not_require_a_source_virtualenv() -> None:
+    for path in ("tools/install_rtsp_proxy.sh", "tools/update_rtsp_proxy.sh"):
+        result = subprocess.run(
+            ["bash", "-n", path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        script = Path(path).read_text(encoding="utf-8")
+
+        assert result.returncode == 0, result.stderr
+        assert ".venv/bin/python" not in script
+        assert "UV_PYTHON_INSTALL_DIR=/opt/rtsp-proxy/python" in script
+        assert 'python find 3.12' in script
+        assert ' -I "$repo_root/src/rtsp_proxy/deploy.py"' in script

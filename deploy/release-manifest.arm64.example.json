@@ -1,6 +1,6 @@
 {
   "schema_version": 4,
-  "release_id": "0.13.1",
+  "release_id": "0.13.2",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",

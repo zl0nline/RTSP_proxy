@@ -114,6 +114,7 @@ class LinuxDeploymentHost:
             self._run(
                 self._uv,
                 "export",
+                "--quiet",
                 "--locked",
                 "--no-dev",
                 "--no-emit-project",

@@ -757,7 +757,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.1 \
+  --release-id 0.13.2 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
