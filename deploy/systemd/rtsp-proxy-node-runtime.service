@@ -28,8 +28,10 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Reading /proc/<pid>/exe for a DynamicUser-owned MediaMTX process is subject
+# to the kernel ptrace access check, even though this helper runs as root.
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 ReadWritePaths=/etc/rtsp-proxy/nodes

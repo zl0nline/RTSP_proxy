@@ -380,7 +380,8 @@ def test_control_plane_reaches_systemd_only_through_the_scoped_unix_helper() -> 
     assert helper["ReadWritePaths"] == "/etc/rtsp-proxy/nodes"
     assert helper["NoNewPrivileges"] == "yes"
     assert helper["ProtectSystem"] == "strict"
-    assert helper["CapabilityBoundingSet"] == ""
+    assert helper["CapabilityBoundingSet"] == "CAP_SYS_PTRACE"
+    assert helper["AmbientCapabilities"] == "CAP_SYS_PTRACE"
     assert helper_unit["Unit"]["Requires"] == (
         "rtsp-proxy-node-runtime.socket rtsp-proxy-nftables.service"
     )
@@ -429,7 +430,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.9/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.13.10/bin/mediamtx"
     )
 
 

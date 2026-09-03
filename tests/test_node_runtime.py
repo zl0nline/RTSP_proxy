@@ -1343,7 +1343,10 @@ def test_auth_enabled_smoke_requires_management_and_probe_identities() -> None:
                 "user": management.username,
                 "pass": management.password,
                 "ips": ["127.0.0.1/32", "::1/128"],
-                "permissions": [{"action": "api"}, {"action": "metrics"}],
+                "permissions": [
+                    {"action": "api", "path": ""},
+                    {"action": "metrics", "path": ""},
+                ],
             },
             {
                 "user": reader.username,

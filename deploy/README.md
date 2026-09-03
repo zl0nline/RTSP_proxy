@@ -761,6 +761,12 @@ Release 0.13.9 gives only execute/traversal permission to unrelated users on
 the shared runtime, state and log parents. Per-node directories remain `0750`;
 this lets systemd's isolated DynamicUser enter its own directory without
 exposing sibling directory listings or contents.
+Release 0.13.10 gives the privileged node runtime helper only `CAP_SYS_PTRACE`,
+which Linux requires to resolve `/proc/<pid>/exe` for a MediaMTX process owned
+by a systemd DynamicUser. Its lifecycle smoke also accepts MediaMTX's canonical
+empty `path` on API and metrics permissions. Older releases can start MediaMTX
+but then fail closed with `node_process_identity_unavailable` or
+`node_api_config_mismatch`.
 
 ### Operator authentication modes
 
@@ -779,7 +785,7 @@ For a first installation, apply migration 0021 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.9 \
+  --release-id 0.13.10 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

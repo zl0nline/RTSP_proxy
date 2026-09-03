@@ -1076,7 +1076,12 @@ class MediaNodeSmokeProbe:
                     "user": credentials.username,
                     "pass": credentials.password,
                     "ips": ["127.0.0.1/32", "::1/128"],
-                    "permissions": [{"action": "api"}, {"action": "metrics"}],
+                    # MediaMTX canonicalizes pathless management permissions in
+                    # its config API by returning an explicit empty path.
+                    "permissions": [
+                        {"action": "api", "path": ""},
+                        {"action": "metrics", "path": ""},
+                    ],
                 },
                 {
                     "user": reader_credentials.username,
