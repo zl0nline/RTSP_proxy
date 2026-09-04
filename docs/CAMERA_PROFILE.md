@@ -34,6 +34,13 @@ complete before pilot 100.
 - additional-session preflight under existing load;
 - credential encoding cases without log leakage.
 
+Register the source as a credential-free `rtsp://host/path` URL. When the camera
+requires authentication, supply username and password through the separate
+fields; the control plane stores a camera-bound encrypted envelope and never
+returns the secret through API, dashboard or audit. Empty
+`RTSP_PROXY_PROBE_SOURCE_CIDRS` is a source-registration deny-all, distinct from
+the downstream internet/local allow-all behavior described below.
+
 Unknown GOP or session limit blocks migration unless the owner records an
 explicit risk acceptance.
 

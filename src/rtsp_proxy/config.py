@@ -87,6 +87,7 @@ class Settings(BaseSettings):
         pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
     )
     probe_source_cidrs: Annotated[tuple[IPvAnyNetwork, ...], NoDecode] = ()
+    camera_source_keys_file: Path | None = None
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
     operator_recent_mfa_seconds: int = Field(default=300, ge=30, le=900)
     node_release_id: str = Field(
@@ -334,6 +335,11 @@ class Settings(BaseSettings):
             )
             if any(path is None or not path.is_absolute() for path in paths):
                 raise ValueError("operator_auth_file_must_be_absolute")
+        if (
+            self.camera_source_keys_file is not None
+            and not self.camera_source_keys_file.is_absolute()
+        ):
+            raise ValueError("camera_source_keys_file_must_be_absolute")
         if set(self.node_port_reserved) & (api | metrics):
             raise ValueError("node_management_port_reserved")
         available = external.difference(self.node_port_reserved)

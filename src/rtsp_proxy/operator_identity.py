@@ -173,6 +173,24 @@ class LocalOperatorAuthentication:
             raise ValueError("local_operator_authentication_invalid")
 
 
+def validate_local_operator_password(password: str) -> str:
+    """Apply the local-account policy without retaining or logging the secret."""
+
+    if not 12 <= len(password) <= 1024:
+        raise ValueError("local_operator_password_policy_failed")
+    categories = sum(
+        (
+            any(character.islower() for character in password),
+            any(character.isupper() for character in password),
+            any(character.isdigit() for character in password),
+            any(not character.isalnum() for character in password),
+        )
+    )
+    if len(password) < 20 and categories < 3:
+        raise ValueError("local_operator_password_policy_failed")
+    return password
+
+
 class InMemoryLocalOperatorStore:
     def __init__(
         self,
@@ -233,6 +251,50 @@ class InMemoryLocalOperatorStore:
                 mfa_verified=mfa_verified,
             )
 
+    def change_password(
+        self,
+        *,
+        account_id: UUID,
+        current_password: str,
+        new_password: str,
+        totp: str,
+        current_session_id: UUID | None,
+        context: OperatorRequestAuditContext,
+        now: datetime,
+    ) -> int:
+        del current_session_id, context
+        validate_local_operator_password(new_password)
+        with self._lock:
+            if (
+                account_id != self._account.id
+                or not self._account.enabled
+                or not self._credentials.verifies_password(current_password)
+                or self._credentials.verifies_password(new_password)
+            ):
+                raise OidcLoginInvalid("local_operator_password_change_denied")
+            last_totp_step = self._credentials.last_totp_step
+            if self._credentials.totp_secret is not None:
+                try:
+                    step = int(now.timestamp()) // 30
+                    if not totp or (last_totp_step is not None and step <= last_totp_step):
+                        raise ValueError
+                    TOTP(self._credentials.totp_secret, 6, hashes.SHA1(), 30).verify(
+                        totp.encode("ascii"), int(now.timestamp())
+                    )
+                except Exception:
+                    raise OidcLoginInvalid("local_operator_password_change_denied") from None
+                last_totp_step = step
+            self._credentials = LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(new_password),
+                totp_secret=self._credentials.totp_secret,
+                last_totp_step=last_totp_step,
+            )
+            self._account = replace(
+                self._account,
+                authz_version=self._account.authz_version + 1,
+            )
+            return self._account.authz_version
+
 
 class PostgresLocalOperatorStore:
     def __init__(
@@ -274,6 +336,22 @@ class PostgresLocalOperatorStore:
                 )
         except SQLAlchemyError:
             raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+
+    def account_id_for_username(self, username: str) -> UUID | None:
+        if not 1 <= len(username) <= 256 or any(character.isspace() for character in username):
+            return None
+        try:
+            with self._engine.connect() as connection:
+                value = connection.scalar(
+                    text(
+                        "SELECT account_id FROM operator_local_credentials "
+                        "WHERE username=:username"
+                    ),
+                    {"username": username},
+                )
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+        return None if value is None else UUID(str(value))
 
     def provision(
         self,
@@ -476,6 +554,178 @@ class PostgresLocalOperatorStore:
             raise OidcLoginInvalid("local_operator_login_failed") from None
         finally:
             self._admission.release()
+
+    def change_password(
+        self,
+        *,
+        account_id: UUID,
+        current_password: str,
+        new_password: str,
+        totp: str,
+        current_session_id: UUID | None,
+        context: OperatorRequestAuditContext,
+        now: datetime,
+    ) -> int:
+        validate_local_operator_password(new_password)
+        if now.tzinfo is None or not 1 <= len(current_password) <= 1024:
+            raise OidcLoginInvalid("local_operator_password_change_denied")
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT a.id, a.enabled, a.authz_version, c.password_scrypt, "
+                            "c.totp_secret, c.last_totp_step "
+                            "FROM operator_local_credentials c "
+                            "JOIN operator_accounts a ON a.id=c.account_id "
+                            "WHERE a.id=:account_id AND a.identity_source='local' "
+                            "FOR UPDATE OF a, c"
+                        ),
+                        {"account_id": account_id},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                credentials = LocalOperatorCredentials(
+                    password_scrypt=(
+                        self._dummy_password if row is None else bytes(row["password_scrypt"])
+                    )
+                )
+                rejected = (
+                    row is None
+                    or not bool(row["enabled"])
+                    or not credentials.verifies_password(current_password)
+                    or credentials.verifies_password(new_password)
+                )
+                last_totp_step = None if row is None else row["last_totp_step"]
+                if not rejected and row is not None and row["totp_secret"] is not None:
+                    try:
+                        encrypted = bytes(row["totp_secret"])
+                        secret = AESGCM(self._key).decrypt(
+                            encrypted[:12], encrypted[12:], account_id.bytes
+                        )
+                        step = int(now.timestamp()) // 30
+                        if (
+                            not totp
+                            or (last_totp_step is not None and step <= int(last_totp_step))
+                        ):
+                            raise ValueError
+                        TOTP(secret, 6, hashes.SHA1(), 30).verify(
+                            totp.encode("ascii"), int(now.timestamp())
+                        )
+                    except Exception:
+                        rejected = True
+                    else:
+                        last_totp_step = step
+                if rejected:
+                    raise OidcLoginInvalid("local_operator_password_change_denied")
+                assert row is not None
+                previous_version = int(row["authz_version"])
+                if previous_version >= (1 << 63) - 1:
+                    raise OidcLoginInvalid("local_operator_password_change_denied")
+                authz_version = previous_version + 1
+                connection.execute(
+                    text(
+                        "UPDATE operator_local_credentials SET password_scrypt=:password, "
+                        "last_totp_step=:last_totp_step, updated_at=clock_timestamp() "
+                        "WHERE account_id=:account_id"
+                    ),
+                    {
+                        "account_id": account_id,
+                        "password": LocalOperatorCredentials.hash_password(new_password),
+                        "last_totp_step": last_totp_step,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE operator_accounts SET authz_version=:authz_version, "
+                        "updated_at=clock_timestamp() WHERE id=:account_id"
+                    ),
+                    {"account_id": account_id, "authz_version": authz_version},
+                )
+                revoked_sessions = len(
+                    connection.execute(
+                        text(
+                            "UPDATE operator_sessions SET revoked_at=clock_timestamp() "
+                            "WHERE account_id=:account_id AND revoked_at IS NULL "
+                            "AND (:session_id IS NULL OR id<>:session_id) RETURNING id"
+                        ),
+                        {"account_id": account_id, "session_id": current_session_id},
+                    ).all()
+                )
+                if current_session_id is not None:
+                    updated = connection.execute(
+                        text(
+                            "UPDATE operator_sessions SET authz_version=:authz_version "
+                            "WHERE id=:session_id AND account_id=:account_id "
+                            "AND revoked_at IS NULL RETURNING id"
+                        ),
+                        {
+                            "account_id": account_id,
+                            "session_id": current_session_id,
+                            "authz_version": authz_version,
+                        },
+                    ).one_or_none()
+                    if updated is None:
+                        raise OidcLoginInvalid("local_operator_password_change_denied")
+                _record_local_password_change_event(
+                    connection,
+                    account_id=account_id,
+                    authz_version=authz_version,
+                    revoked_sessions=revoked_sessions,
+                    context=context,
+                )
+                return authz_version
+        except OidcLoginInvalid:
+            raise
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+
+
+class LocalOperatorPasswordStore(Protocol):
+    def change_password(
+        self,
+        *,
+        account_id: UUID,
+        current_password: str,
+        new_password: str,
+        totp: str,
+        current_session_id: UUID | None,
+        context: OperatorRequestAuditContext,
+        now: datetime,
+    ) -> int: ...
+
+
+class LocalOperatorPasswordControl:
+    def __init__(
+        self,
+        *,
+        store: LocalOperatorPasswordStore,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._store = store
+        self._clock = clock
+
+    def change(
+        self,
+        *,
+        account_id: UUID,
+        current_session_id: UUID | None,
+        current_password: str,
+        new_password: str,
+        totp: str,
+        context: OperatorRequestAuditContext,
+    ) -> int:
+        return self._store.change_password(
+            account_id=account_id,
+            current_password=current_password,
+            new_password=new_password,
+            totp=totp,
+            current_session_id=current_session_id,
+            context=context,
+            now=self._clock(),
+        )
 
 
 class LocalOperatorAuthenticator(Protocol):
@@ -2403,6 +2653,46 @@ def _record_break_glass_event(
             "reason_code": reason_code,
         },
     )
+
+
+def _record_local_password_change_event(
+    connection: Connection,
+    *,
+    account_id: UUID,
+    authz_version: int,
+    revoked_sessions: int,
+    context: OperatorRequestAuditContext,
+) -> None:
+    payload = json.dumps(
+        {
+            "account_id": str(account_id),
+            "action": "operator.password_change",
+            "outcome": "changed",
+            "revoked_sessions": revoked_sessions,
+            "request_id": str(context.request_id),
+            "source_ip_sha256": context.source_ip_sha256,
+            "user_agent_sha256": context.user_agent_sha256,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account_id,
+        "aggregate_revision": authz_version,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, "
+                "'operator.password_changed', :aggregate_revision, CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
 
 
 def _record_break_glass_provision_event(

@@ -13,6 +13,13 @@
     </div>
   </div>
 
+  {% if not probe_source_policy_configured %}
+  <section class="form-error" role="status" aria-live="polite">
+    <strong>Источник камер не настроен</strong>
+    <p>Политика RTSP_PROXY_PROBE_SOURCE_CIDRS пуста (deny-all). Добавление камер будет отклонено до настройки разрешённых CIDR-сетей.</p>
+  </section>
+  {% endif %}
+
   <section class="summary-grid" aria-label="Сводка сервера">
     <article class="summary-card">
       <span>Ноды</span>

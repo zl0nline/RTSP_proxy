@@ -1,20 +1,27 @@
 {% extends "dashboard/base.html" %}
 {% block title %}Вход — RTSP Proxy{% endblock %}
 {% block content %}
-<main id="main-content" class="centered-state">
-  <section class="state-card">
+<main id="main-content" class="login-page">
+  <section class="state-card login-card" aria-labelledby="login-title">
     <p class="eyebrow">RTSP Proxy</p>
-    <h1>Вход оператора</h1>
-    <p>Введите локальные учётные данные. Код TOTP нужен только для операций, требующих MFA.</p>
-    {% if error %}<p role="alert">Неверный логин, пароль или код TOTP.</p>{% endif %}
-    <form method="post" action="/auth/local/login" autocomplete="on">
+    <h1 id="login-title">Вход оператора</h1>
+    <p class="login-intro">Введите локальные учётные данные этого сервера.</p>
+    {% if error %}<p id="login-error" class="form-error" role="alert" tabindex="-1" autofocus>Неверный логин, пароль или код TOTP.</p>{% endif %}
+    <form class="login-form" method="post" action="/auth/local/login" autocomplete="on" data-login-form>
       <label for="username">Логин</label>
-      <input id="username" name="username" type="text" required maxlength="256" autocomplete="username">
+      <input id="username" name="username" type="text" required maxlength="256" autocomplete="username" value="{{ username }}" placeholder="admin"{% if error %} aria-describedby="login-error"{% endif %}>
       <label for="password">Пароль</label>
-      <input id="password" name="password" type="password" required maxlength="1024" autocomplete="current-password">
-      <label for="totp">Код TOTP <span>(необязательно)</span></label>
-      <input id="totp" name="totp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
-      <button type="submit">Войти</button>
+      <div class="password-field">
+        <input id="password" name="password" type="password" required maxlength="1024" autocomplete="current-password" placeholder="Введите пароль"{% if error %} aria-describedby="login-error"{% endif %}>
+        <button type="button" class="password-toggle" data-password-toggle aria-controls="password" aria-label="Показать пароль">Показать</button>
+      </div>
+      <details class="totp-field">
+        <summary>Использовать код TOTP</summary>
+        <label for="totp">Одноразовый код</label>
+        <input id="totp" name="totp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000">
+        <small>Заполните, если для этой учётной записи включена MFA.</small>
+      </details>
+      <button class="login-submit" type="submit" data-login-submit><span data-login-label>Войти</span></button>
     </form>
     {% if oidc_enabled %}
     <p><a class="button-link" href="/auth/oidc/login">Войти через локальный IdP</a></p>

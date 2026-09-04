@@ -23,6 +23,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from rtsp_proxy.app import create_app
+from rtsp_proxy.camera_secrets import (
+    CameraSourceCredentialCipher,
+    CameraSourceCredentials,
+    CameraSourceKeyRing,
+)
 from rtsp_proxy.config import NodeRegistrationPolicy, RuntimeRole, Settings
 from rtsp_proxy.database import DatabaseSchemaMismatch, PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId, generate_public_id
@@ -723,6 +728,182 @@ def test_camera_create_fails_closed_when_bounded_endpoint_resolution_times_out()
     assert store.list_cameras() == ()
 
 
+def test_camera_create_reports_an_unconfigured_source_policy() -> None:
+    node = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000001"),
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        management_observed_at=datetime.now(UTC),
+        config_compatible=True,
+        applied_revision=1,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+        probe_endpoint_admission=ProbeEndpointAdmission(
+            site_key="site-a",
+            allowed_networks=(),
+            resolve=lambda _hostname: ("10.40.0.11",),
+        ),
+    )
+
+    response = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), camera_control=control)
+    ).post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.example/main"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"code": "probe_source_policy_not_configured"}
+    }
+    assert store.list_cameras() == ()
+
+
+def test_camera_create_accepts_credentials_separately_without_returning_them() -> None:
+    node = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000001"),
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        management_observed_at=datetime.now(UTC),
+        config_compatible=True,
+        applied_revision=1,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-4000-8000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+    )
+
+    response = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), camera_control=control)
+    ).post(
+        "/api/v1/cameras",
+        json={
+            "name": "entrance",
+            "source_url": "rtsp://camera.example/main",
+            "source_credentials": {
+                "username": "operator",
+                "password": "never-return-this-password",
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    assert store.list_cameras()[0].source_url == (
+        "rtsp://operator:never-return-this-password@camera.example/main"
+    )
+    assert "operator" not in response.text
+    assert "never-return-this-password" not in response.text
+
+
+def test_postgres_camera_source_credentials_are_encrypted_and_restored(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    cipher = CameraSourceCredentialCipher(
+        CameraSourceKeyRing(primary_key_id="2026-09", keys={"2026-09": b"k" * 32})
+    )
+    store = PostgresNodeStore(postgres_database_url, camera_source_cipher=cipher)
+    node = store.register_automatically(
+        name="media-a",
+        allowed_ports=(12000,),
+        max_nodes=1,
+        preferred_port=12000,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000001"),
+        api_ports=(13000,),
+        metrics_ports=(14000,),
+    )
+    running = store.request_desired_state(node.id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        node.id,
+        SuccessfulNodeRuntime().execute(NodeRuntimeAction.START, running),
+    )
+    password = "database-must-not-contain-this-password"
+
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-4000-8000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+    )
+    camera = control.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.example/main",
+        source_credentials=CameraSourceCredentials(
+            username="operator",
+            password=password,
+        ),
+        node_id=node.id,
+    )
+
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.connect() as connection:
+        stored = connection.execute(
+            text(
+                "SELECT c.source_url, s.key_id, s.ciphertext "
+                "FROM cameras c JOIN camera_source_credentials s ON s.camera_id=c.id "
+                "WHERE c.id=:camera_id"
+            ),
+            {"camera_id": camera.id},
+        ).one()
+    assert stored.source_url == "rtsp://camera.example/main"
+    assert stored.key_id == "2026-09"
+    assert password.encode() not in bytes(stored.ciphertext)
+    assert store.get_camera(camera.id) == camera
+
+    preserved = control.update_camera(
+        camera.id,
+        name="entrance renamed",
+        source_url="rtsp://camera.example/sub",
+        expected_revision=camera.desired_revision,
+    )
+    assert preserved.source_url == f"rtsp://operator:{password}@camera.example/sub"
+    replacement_password = "replacement-database-secret"
+    replaced = control.update_camera(
+        camera.id,
+        name="entrance renamed",
+        source_url="rtsp://camera.example/sub",
+        source_credentials=CameraSourceCredentials(
+            username="replacement",
+            password=replacement_password,
+        ),
+        expected_revision=preserved.desired_revision,
+    )
+    assert replaced.source_url == (
+        f"rtsp://replacement:{replacement_password}@camera.example/sub"
+    )
+    with engine.connect() as connection:
+        updated_row = connection.execute(
+            text(
+                "SELECT c.source_url, s.ciphertext FROM cameras c "
+                "JOIN camera_source_credentials s ON s.camera_id=c.id WHERE c.id=:camera_id"
+            ),
+            {"camera_id": camera.id},
+        ).one()
+    assert updated_row.source_url == "rtsp://camera.example/sub"
+    assert replacement_password.encode() not in bytes(updated_row.ciphertext)
+
+    store.close()
+    without_key = PostgresNodeStore(postgres_database_url)
+    with pytest.raises(InvalidCameraSource, match="camera_source_credentials_unavailable"):
+        without_key.get_camera(camera.id)
+    without_key.close()
+    engine.dispose()
+
+
 def test_automatic_placement_skips_a_manually_created_provisioning_node() -> None:
     store = InMemoryNodeStore(
         nodes=(
@@ -1229,11 +1410,12 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_access_policies', 'camera_access_grants', "
                 "'node_registration_requests', 'access_grant_issue_requests', "
                 "'operator_action_rate_limits', 'camera_registration_requests', "
-                "'probe_observations', 'camera_probe_endpoints')"
+                "'probe_observations', 'camera_probe_endpoints', "
+                "'camera_source_credentials')"
             )
         )
-        assert revision == "0021_local_operator_login"
-    assert table_count == 12
+        assert revision == "0022_camera_source_credentials"
+    assert table_count == 13
 
 
 def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(
@@ -1470,7 +1652,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0021_local_operator_login"
+            "0022_camera_source_credentials"
         )
 
 
@@ -1503,7 +1685,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0021_local_operator_login"
+            "0022_camera_source_credentials"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})

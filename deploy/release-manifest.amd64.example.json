@@ -1,6 +1,6 @@
 {
   "schema_version": 4,
-  "release_id": "0.13.10",
+  "release_id": "0.14.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",
@@ -37,7 +37,7 @@
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",
-    "maximum": "0021_local_operator_login"
+    "maximum": "0022_camera_source_credentials"
   },
   "config_schema_version": 1
 }

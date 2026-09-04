@@ -25,7 +25,7 @@ RuntimeDirectoryMode=0751
 StateDirectoryMode=0751
 LogsDirectoryMode=0751
 ReadWritePaths=/run/rtsp-proxy /var/lib/rtsp-proxy /var/log/rtsp-proxy
-ReadOnlyPaths=/etc/rtsp-proxy/control-plane/access-peppers.json
+ReadOnlyPaths=/etc/rtsp-proxy/control-plane/access-peppers.json -/etc/rtsp-proxy/control-plane/camera-source-keys.json
 
 NoNewPrivileges=yes
 ProtectSystem=strict

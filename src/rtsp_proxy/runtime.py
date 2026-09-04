@@ -27,6 +27,7 @@ from rtsp_proxy.access import (
     load_pepper_verifier,
 )
 from rtsp_proxy.app import ManagementHstsBoundary, create_app, create_media_auth_app
+from rtsp_proxy.camera_secrets import load_camera_source_cipher
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.health import RoleReadinessProvider
@@ -62,6 +63,7 @@ from rtsp_proxy.operator_identity import (
     HttpsOidcDiscoveryEndpoint,
     HttpsOidcTokenEndpoint,
     LocalOperatorLoginControl,
+    LocalOperatorPasswordControl,
     OidcLoginControl,
     OidcProvider,
     PostgresBreakGlassStore,
@@ -124,6 +126,7 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_COLLECTOR_INTERVAL_SECONDS": "collector_interval_seconds",
     "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "dashboard_poll_interval_seconds",
     "RTSP_PROXY_PROBE_SOURCE_CIDRS": "probe_source_cidrs",
+    "RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE": "camera_source_keys_file",
     "RTSP_PROXY_PROBE_SOURCE_SITE_KEY": "probe_source_site_key",
     "RTSP_PROXY_CONFIRMATION_SECRET": "confirmation_secret",
     "RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS": "operator_recent_mfa_seconds",
@@ -162,6 +165,7 @@ class ConfigurationError(ValueError):
 class _OperatorSecurityRuntime:
     sessions: OperatorSessionControl
     local_login: LocalOperatorLoginControl | None
+    local_passwords: LocalOperatorPasswordControl | None
     login: OidcLoginControl | None
     break_glass: BreakGlassControl | None
     session_store: PostgresOperatorSessionStore
@@ -507,6 +511,9 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         local_operator_login=(
             None if operator_security is None else operator_security.local_login
         ),
+        local_operator_passwords=(
+            None if operator_security is None else operator_security.local_passwords
+        ),
         operator_login=None if operator_security is None else operator_security.login,
         break_glass=(None if operator_security is None else operator_security.break_glass),
         startup=start_runtime,
@@ -583,6 +590,7 @@ def _open_operator_security(
             token_factory=lambda: secrets.token_urlsafe(32),
         )
         local_login: LocalOperatorLoginControl | None = None
+        local_passwords: LocalOperatorPasswordControl | None = None
         if settings.local_auth_enabled:
             assert local_encryption_key is not None
             local_store = PostgresLocalOperatorStore(
@@ -591,6 +599,7 @@ def _open_operator_security(
                 statement_timeout_ms=timeout_ms,
             )
             local_login = LocalOperatorLoginControl(store=local_store, sessions=sessions)
+            local_passwords = LocalOperatorPasswordControl(store=local_store)
 
         login: OidcLoginControl | None = None
         token_endpoint: HttpsOidcTokenEndpoint | None = None
@@ -688,6 +697,7 @@ def _open_operator_security(
         return _OperatorSecurityRuntime(
             sessions=sessions,
             local_login=local_login,
+            local_passwords=local_passwords,
             login=login,
             break_glass=(
                 None
@@ -1137,6 +1147,14 @@ def _background_readiness(
 def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
     if settings.database_url is None:
         return None
+    try:
+        camera_source_cipher = (
+            None
+            if settings.camera_source_keys_file is None
+            else load_camera_source_cipher(settings.camera_source_keys_file)
+        )
+    except ValueError as error:
+        raise ConfigurationError("camera_source_key_file_unsafe") from error
     store = PostgresNodeStore(
         settings.database_url,
         lifecycle_lock_pool_size=settings.node_lifecycle_lock_pool_size,
@@ -1150,6 +1168,7 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
                 else None
             )
         ),
+        camera_source_cipher=camera_source_cipher,
     )
     try:
         store.assert_schema_compatible()

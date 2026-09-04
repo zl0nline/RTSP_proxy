@@ -526,7 +526,7 @@ def _validate_manifest(manifest: PhaseDTransitionManifest) -> None:
         raise PhaseDTransitionError("transition_node_capacity_exceeded")
     for camera in manifest.cameras:
         PublicId.parse(camera.public_id)
-        validate_camera_source_url(camera.source_url)
+        validate_camera_source_url(camera.source_url, allow_credentials=True)
         if camera.state not in {CameraState.ENABLED, CameraState.DISABLED}:
             raise PhaseDTransitionError("transition_camera_state_invalid")
 

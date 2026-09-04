@@ -1,5 +1,5 @@
 {% extends "dashboard/base.html" %}
-{% block title %}Регистрация камеры — RTSP Proxy{% endblock %}
+{% block title %}{% if error_message %}Камера не добавлена{% else %}Регистрация камеры{% endif %} — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
   <nav class="breadcrumbs" aria-label="Навигация">
@@ -8,7 +8,7 @@
   <div class="page-heading">
     <div>
       <p class="eyebrow">Обычный RTSP/TCP · до 100 камер на ноду</p>
-      <h1>Зарегистрировать камеру</h1>
+      <h1>{% if error_message %}Камера не добавлена{% else %}Зарегистрировать камеру{% endif %}</h1>
     </div>
   </div>
 
@@ -19,29 +19,44 @@
         <h2 id="camera-create-title">Источник и размещение</h2>
       </div>
     </div>
+    {% if error_message %}
+    <div class="form-error" role="alert" aria-live="polite">
+      <strong>Проверьте параметры источника</strong>
+      <p>{{ error_message }}</p>
+    </div>
+    {% endif %}
     <form class="mutation-form" method="post" action="/dashboard/cameras">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
       <label>
         <span>Имя камеры</span>
-        <input type="text" name="name" required minlength="1" maxlength="128" autocomplete="off">
+        <input type="text" name="name" required minlength="1" maxlength="128" autocomplete="off" value="{{ entered_name }}">
       </label>
       <label>
         <span>Source RTSP URL</span>
         <input type="url" name="source_url" required maxlength="8192" autocomplete="off" placeholder="rtsp://camera.local/path">
-        <small>Логин и пароль в URL не принимаются. После ошибки введённый URL не возвращается в HTML.</small>
+        <small>URL указывается без логина, пароля и query. После ошибки введённый URL не возвращается в HTML.</small>
+      </label>
+      <label>
+        <span>Логин камеры <small>(необязательно)</small></span>
+        <input type="text" name="source_username" maxlength="64" autocomplete="off" spellcheck="false">
+      </label>
+      <label>
+        <span>Пароль камеры <small>(необязательно)</small></span>
+        <input type="password" name="source_password" maxlength="256" autocomplete="new-password" spellcheck="false">
+        <small>Credentials шифруются перед сохранением и никогда не возвращаются в Dashboard, API, аудит или журналы.</small>
       </label>
       <fieldset>
         <legend>Размещение</legend>
-        <label><input type="radio" name="placement_mode" value="automatic" checked> Автоматически: наименее загруженная подходящая нода</label>
-        <label><input type="radio" name="placement_mode" value="manual"> Вручную: выбранная нода</label>
+        <label><input type="radio" name="placement_mode" value="automatic"{% if placement_mode == 'automatic' %} checked{% endif %}> Автоматически: наименее загруженная подходящая нода</label>
+        <label><input type="radio" name="placement_mode" value="manual"{% if placement_mode == 'manual' %} checked{% endif %}> Вручную: выбранная нода</label>
       </fieldset>
       <label>
         <span>Нода для ручного размещения</span>
         <select name="node_id">
           <option value="">Не выбрана</option>
           {% for node in targets %}
-          <option value="{{ node.id }}">{{ node.name }} · порт {{ node.external_port }} · {{ node.registered_cameras }} / {{ node.camera_capacity }} камер · {{ node.active_sources }} active</option>
+          <option value="{{ node.id }}"{% if selected_node_id == node.id|string %} selected{% endif %}>{{ node.name }} · порт {{ node.external_port }} · {{ node.registered_cameras }} / {{ node.camera_capacity }} камер · {{ node.active_sources }} active</option>
           {% endfor %}
         </select>
         {% if not targets %}<small>Сейчас нет подходящих нод. Automatic может создать ноду только если серверная политика допускает это.</small>{% endif %}

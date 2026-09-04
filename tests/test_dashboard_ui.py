@@ -27,6 +27,7 @@ from rtsp_proxy.access import (
     IssuedAccessGrant,
 )
 from rtsp_proxy.app import create_app
+from rtsp_proxy.camera_secrets import CameraSourceCredentials
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId
@@ -54,6 +55,7 @@ from rtsp_proxy.nodes import (
     CameraState,
     EligibleNodeMissing,
     InMemoryNodeStore,
+    InvalidCameraSource,
     MaximumNodesReached,
     MediaNode,
     NodeCameraCapacityReached,
@@ -718,8 +720,19 @@ class RecordingCameraMutations:
         expected_revision: int | None = None,
         name: str | None = None,
         source_url: str | None = None,
+        source_credentials: CameraSourceCredentials | None = None,
     ) -> CameraMutationPreview:
-        self.calls.append(("preview", camera_id, operation, expected_revision, name, source_url))
+        call: tuple[object, ...] = (
+            "preview",
+            camera_id,
+            operation,
+            expected_revision,
+            name,
+            source_url,
+        )
+        if source_credentials is not None:
+            call = (*call, source_credentials)
+        self.calls.append(call)
         return CameraMutationPreview(
             camera_id=camera_id,
             operation=operation,
@@ -736,11 +749,11 @@ class RecordingCameraMutations:
         *,
         name: str,
         source_url: str,
+        source_credentials: CameraSourceCredentials | None = None,
         expected_revision: int | None = None,
         confirmation_token: str | None,
     ) -> None:
-        self.calls.append(
-            (
+        call: tuple[object, ...] = (
                 "update",
                 camera_id,
                 name,
@@ -748,7 +761,9 @@ class RecordingCameraMutations:
                 expected_revision,
                 confirmation_token,
             )
-        )
+        if source_credentials is not None:
+            call = (*call, source_credentials)
+        self.calls.append(call)
 
     def disable(
         self,
@@ -1391,6 +1406,23 @@ def test_dashboard_distinguishes_confirmed_idle_zero_from_unknown_metrics() -> N
     assert detail.status_code == 200
     assert detail.text.count("<strong>0</strong>") == 2
     assert "0 бит/с" in detail.text  # noqa: RUF001
+
+
+def test_dashboard_warns_until_camera_source_network_policy_is_configured() -> None:
+    observations = InMemoryObservabilityStore()
+    observations.save_snapshot(_snapshot())
+    denied, denied_headers = _authenticated_dashboard(observations=observations)
+    configured, configured_headers = _authenticated_dashboard(
+        observations=observations,
+        settings=Settings(role=RuntimeRole.WEB, probe_source_cidrs=("10.180.5.0/24",)),
+    )
+
+    denied_page = denied.get("/dashboard", headers=denied_headers)
+    configured_page = configured.get("/dashboard", headers=configured_headers)
+
+    assert "Источник камер не настроен" in denied_page.text
+    assert "RTSP_PROXY_PROBE_SOURCE_CIDRS" in denied_page.text
+    assert "Источник камер не настроен" not in configured_page.text
 
 
 def test_dashboard_node_detail_is_authenticated_escaped_and_snapshot_bound() -> None:
@@ -3107,7 +3139,7 @@ def test_dashboard_camera_registration_explains_placement_failures(
         ({"placement_mode": "invalid"}, "Некорректная форма"),
         (
             {"source_url": "rtsp://operator:never-render@camera.internal/main"},
-            "Некорректный source URL",
+            "Логин и пароль нельзя помещать в URL",
         ),
     ),
 )
@@ -3159,6 +3191,112 @@ def test_dashboard_camera_registration_rejects_invalid_secret_bearing_forms(
     assert expected_message in response.text
     assert "never-render" not in response.text
     assert control.list_cameras() == ()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_message"),
+    (
+        (
+            "probe_source_policy_not_configured",
+            "Источник камер не настроен",
+        ),
+        (
+            "probe_destination_not_allowed",
+            "Сеть камеры не входит в разрешённые сети источника",
+        ),
+        ("camera_source_url_invalid", "Source URL имеет некорректный формат"),
+    ),
+)
+def test_dashboard_camera_registration_preserves_safe_fields_and_explains_source_error(
+    reason: str,
+    expected_message: str,
+) -> None:
+    class RejectedCamera:
+        def creation_targets(self) -> tuple[MediaNode, ...]:
+            return ()
+
+        def create_camera(self, **_kwargs: object) -> None:
+            raise InvalidCameraSource(reason)
+
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, RejectedCamera()),
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "Северный вход",
+            "source_url": "rtsp://camera.internal/private",
+            "placement_mode": "manual",
+            "node_id": str(NODE_ID),
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Камера не добавлена" in response.text
+    assert expected_message in response.text
+    assert "Северный вход" in response.text
+    assert 'value="manual" checked' in response.text
+    assert "camera.internal/private" not in response.text
+    assert "Дашборд недоступен" not in response.text
+
+
+def test_dashboard_camera_registration_accepts_separate_source_credentials() -> None:
+    observed_at = datetime.now(UTC)
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=NODE_ID,
+                name="edge-north",
+                external_port=10543,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=observed_at,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: CAMERA_ID,
+        new_public_id=lambda: "a" * 26,
+    )
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=control,
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "Credentialed camera",
+            "source_url": "rtsp://camera.internal/main",
+            "source_username": "operator",
+            "source_password": "never-render-this-password",
+            "placement_mode": "automatic",
+            "node_id": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert store.list_cameras()[0].source_url == (
+        "rtsp://operator:never-render-this-password@camera.internal/main"
+    )
+    assert "never-render-this-password" not in response.text
 
 
 def test_postgres_dashboard_camera_registration_persists_operator_attribution(
@@ -5088,7 +5226,9 @@ def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry
     )
     detail_path = f"/dashboard/cameras/{CAMERA_ID}"
     edit_path = f"{detail_path}/edit"
-    source_url = "rtsp://new-admin:new-secret@camera.internal/private"
+    source_url = "rtsp://camera.internal/private"
+    source_username = "new-admin"
+    source_password = "new-secret"
 
     edit = client.get(edit_path, headers=headers)
     preview = client.post(
@@ -5100,6 +5240,8 @@ def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry
             "expected_revision": "3",
             "name": "Front updated",
             "source_url": source_url,
+            "source_username": source_username,
+            "source_password": source_password,
         },
     )
     applied = client.post(
@@ -5111,6 +5253,8 @@ def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry
             "expected_revision": "3",
             "name": "Front updated",
             "source_url": source_url,
+            "source_username": source_username,
+            "source_password": source_password,
             "confirmation_token": "confirmation-token",
         },
         follow_redirects=False,
@@ -5121,6 +5265,8 @@ def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry
     assert catalog.source_url not in edit.text
     assert preview.status_code == 200
     assert source_url not in preview.text
+    assert source_username not in preview.text
+    assert source_password not in preview.text
     assert "Введите новый source URL ещё раз" in preview.text
     assert applied.status_code == 303
     assert applied.headers["location"] == detail_path
@@ -5132,6 +5278,10 @@ def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry
             3,
             "Front updated",
             source_url,
+            CameraSourceCredentials(
+                username=source_username,
+                password=source_password,
+            ),
         ),
         (
             "update",
@@ -5140,6 +5290,10 @@ def test_camera_update_confirmation_never_echoes_source_url_and_requires_reentry
             source_url,
             3,
             "confirmation-token",
+            CameraSourceCredentials(
+                username=source_username,
+                password=source_password,
+            ),
         ),
     ]
 

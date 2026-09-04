@@ -94,7 +94,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.13.10-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.14.0-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -116,7 +116,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.10-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.14.0-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -211,12 +211,12 @@ source venv:
 sudo systemd-run --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.13.10/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.14.0/.venv/bin/rtsp-proxy-migrate
 sudo -u postgres psql --dbname rtsp_proxy --tuples-only --no-align \
   --command 'SELECT version_num FROM alembic_version;'
 ```
 
-Вторая команда должна вывести `0021_local_operator_login`. Отсутствие вывода
+Вторая команда должна вывести `0022_camera_source_credentials`. Отсутствие вывода
 первой команды само по себе не считается успехом; проверяйте её exit status и
 фактическую ревизию schema до создания администратора.
 
@@ -232,7 +232,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.13.10 \
+  --release-id 0.14.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -252,13 +252,38 @@ OIDC — необязательный второй способ входа дл�
 Proxy не устанавливает, не вызывает и не требует облачный IdP. Аварийный
 `break-glass` настраивается отдельно и не используется как обычный аккаунт.
 
+После первого входа откройте меню **Сменить пароль** и замените временный пароль.
+Смена сохраняет текущую сессию, завершает остальные сессии этой учётной записи
+и создаёт безопасную audit-запись. Если WEB недоступен, загрузите переменные из
+WEB environment file и запустите `rtsp-proxy-local-operator --rotate-password
+--username admin`; CLI читает секреты интерактивно и отзывает все web-сессии.
+
+### 5.1. Разрешённые сети и credentials исходных камер
+
+Без этого шага пустой `RTSP_PROXY_PROBE_SOURCE_CIDRS` означает deny-all, поэтому
+создание камеры завершится кодом `probe_source_policy_not_configured`. Укажите
+только фактические сети камер:
+
+```sh
+cd /srv/rtsp-proxy-source
+sudo ./tools/configure_camera_sources.sh \
+  --release-id 0.14.0 \
+  --source-cidrs '10.180.5.0/24'
+```
+
+Скрипт не перезаписывает существующий keyring, атомарно создаёт
+`/etc/rtsp-proxy/control-plane/camera-source-keys.json` с владельцем
+`root:rtsp-proxy-access` и mode `0640`, затем одинаково обновляет WEB и
+reconciler environment files. Source URL вводится без `login:password@`; логин
+и пароль камеры вводятся в отдельные поля и никогда не возвращаются dashboard.
+
 ## 6. Первая активация
 
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.13.10/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.13.10 \
+sudo /opt/rtsp-proxy/releases/0.14.0/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.14.0 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -326,7 +351,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.13.10-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.14.0-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -429,6 +454,10 @@ deployment failed: host_command_failed command=git exit_code=128 stderr=...
 | запуск/перезапуск ноды завершается `node_process_identity_unavailable` или `node_api_config_mismatch` | установлен release не ниже 0.13.10; runtime helper должен иметь только `CAP_SYS_PTRACE`, а smoke-проверка — учитывать канонический пустой `path` в management permissions MediaMTX API |
 | `local_operator_store_unavailable` | migration 0021 применена и PostgreSQL доступен локально |
 | `local_operator_password_confirmation_failed` | пароль не короче 12 символов и оба ввода совпадают |
+| `probe_source_policy_not_configured` | выполните `configure_camera_sources.sh` с точными непустыми CIDR и перезапустите WEB/reconciler |
+| `probe_destination_not_allowed` | адрес камеры не входит в configured camera CIDR; расширяйте policy только до нужной подсети |
+| `camera_source_credentials_unavailable` | migration 0022 применена, keyring существует с mode `0640 root:rtsp-proxy-access`, его путь одинаков в WEB/reconciler env |
+| форма камеры сообщает про userinfo | удалите `login:password@` из URL и заполните отдельные поля логина и пароля |
 
 После исправления причины безопасно повторите ту же команду: незавершённый
 приватный staging-каталог удаляется автоматически, а уже установленный релиз

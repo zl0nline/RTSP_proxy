@@ -17,6 +17,11 @@ from typing import Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from rtsp_proxy.camera_secrets import (
+    CameraSourceCredentials,
+    attach_source_credentials,
+    split_source_credentials,
+)
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.probe_security import (
     AdmittedProbeEndpoint,
@@ -1514,7 +1519,7 @@ class InMemoryNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
+        source_url = validate_camera_source_url(source_url, allow_credentials=True)
         with self._lock:
             eligible = [
                 node
@@ -1567,7 +1572,7 @@ class InMemoryNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
+        source_url = validate_camera_source_url(source_url, allow_credentials=True)
         with self._lock:
             selected = next((node for node in self._nodes if node.id == node_id), None)
             if selected is None:
@@ -1859,7 +1864,7 @@ class InMemoryNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
+        source_url = validate_camera_source_url(source_url, allow_credentials=True)
         with self._lock:
             camera = next(
                 (candidate for candidate in self._cameras if candidate.id == camera_id),
@@ -3473,11 +3478,17 @@ class CameraControl:
         *,
         name: str,
         source_url: str,
+        source_credentials: CameraSourceCredentials | None = None,
         node_id: UUID | None = None,
         mutation_context: NodeMutationContext | None = None,
     ) -> CameraPlacement:
         validated_name = validate_camera_name(name)
         validated_source_url = validate_camera_source_url(source_url)
+        if source_credentials is not None:
+            validated_source_url = attach_source_credentials(
+                validated_source_url,
+                source_credentials,
+            )
         idempotency = _camera_registration_idempotency(
             name=validated_name,
             source_url=validated_source_url,
@@ -3606,15 +3617,27 @@ class CameraControl:
         *,
         name: str,
         source_url: str,
+        source_credentials: CameraSourceCredentials | None = None,
         expected_revision: int | None = None,
     ) -> CameraPlacement:
         current = self._store.get_camera(camera_id)
+        clean_source_url, current_credentials = split_source_credentials(
+            current.source_url if current is not None else source_url
+        )
+        del clean_source_url
+        validated_source_url = validate_camera_source_url(source_url)
+        effective_credentials = source_credentials or current_credentials
+        if effective_credentials is not None:
+            validated_source_url = attach_source_credentials(
+                validated_source_url,
+                effective_credentials,
+            )
         probe_endpoint = (
-            self._admit_probe_endpoint(source_url)
+            self._admit_probe_endpoint(validated_source_url)
             if current is None
             or probe_endpoint_requires_readmission(
                 current,
-                source_url=source_url,
+                source_url=validated_source_url,
                 admission=self._probe_endpoint_admission,
             )
             else None
@@ -3622,7 +3645,7 @@ class CameraControl:
         return self._store.update_camera(
             camera_id,
             name=validate_camera_name(name),
-            source_url=source_url,
+            source_url=validated_source_url,
             expected_revision=expected_revision,
             probe_endpoint=probe_endpoint,
         )
@@ -3632,8 +3655,14 @@ class CameraControl:
             return None
         try:
             return self._probe_endpoint_admission.admit(source_url)
-        except ProbeEndpointRejected:
-            raise InvalidCameraSource("camera_source_endpoint_rejected") from None
+        except ProbeEndpointRejected as error:
+            reason = str(error)
+            if reason not in {
+                "probe_source_policy_not_configured",
+                "probe_destination_not_allowed",
+            }:
+                reason = "camera_source_endpoint_rejected"
+            raise InvalidCameraSource(reason) from None
 
     def set_camera_enabled(
         self,
@@ -3994,7 +4023,7 @@ def tcp_port_is_bindable(port: int) -> bool:
     return True
 
 
-def validate_camera_source_url(value: str) -> str:
+def validate_camera_source_url(value: str, *, allow_credentials: bool = False) -> str:
     if len(value.encode("utf-8")) > MAX_CAMERA_SOURCE_URL_BYTES:
         raise InvalidCameraSource("camera_source_url_too_long")
     try:
@@ -4010,7 +4039,10 @@ def validate_camera_source_url(value: str) -> str:
         or port == 0
     ):
         raise InvalidCameraSource("camera_source_url_invalid")
-    if parsed.username is not None or parsed.password is not None or parsed.query:
+    if (
+        (parsed.username is not None or parsed.password is not None)
+        and not allow_credentials
+    ) or parsed.query:
         raise InvalidCameraSource("camera_source_secret_reference_required")
     return value
 

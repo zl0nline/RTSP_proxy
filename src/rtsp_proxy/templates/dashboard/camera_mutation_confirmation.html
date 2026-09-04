@@ -18,7 +18,9 @@
       {% if preview.operation.value == "update_source" %}
       <input type="hidden" name="name" value="{{ name }}">
       <label>Введите новый source URL ещё раз<input name="source_url" type="password" required maxlength="8192" autocomplete="new-password" spellcheck="false"></label>
-      <p>URL намеренно не повторяется в HTML. Повторный ввод должен точно совпасть с проверенным изменением.</p>
+      <label>Логин камеры ещё раз (если меняли)<input name="source_username" maxlength="64" autocomplete="off" spellcheck="false"></label>
+      <label>Пароль камеры ещё раз (если меняли)<input name="source_password" type="password" maxlength="256" autocomplete="new-password"></label>
+      <p>URL и credentials намеренно не повторяются в HTML. Повторный ввод должен точно совпасть с проверенным изменением.</p>
       {% elif preview.operation.value == "disable" %}
       <p>Текущий читатель будет отключён, камера перейдёт в состояние disabled.</p>
       {% else %}

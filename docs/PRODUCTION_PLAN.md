@@ -334,7 +334,7 @@ the recovery message reports the terminal failure-notification outcome.
 - `cameras`;
 - `camera_placements` and append-only placement history;
 - `camera_access_policies`;
-- `camera_credentials` / secret references;
+- `camera_source_credentials` with encrypted versioned envelopes;
 - `reconcile_targets/jobs`;
 - `groups/memberships`;
 - `probe_observations`;
@@ -759,8 +759,8 @@ least-loaded placement and no 101st camera.
 Status: **COMPLETE**. Implementation and independent Standards/Spec reviews
 passed; all six native amd64/arm64 jobs are green in
 [CI run 31547513916](https://github.com/zl0nline/RTSP_proxy/actions/runs/31547513916).
-Source credentials remain fail-closed until the encrypted secret-reference
-slice; this Phase B code never persists URL userinfo/query tokens. The binary
+Source credentials are accepted only as separate fields and persisted as
+camera-bound encrypted envelopes; URL userinfo/query tokens remain rejected. The binary
 and release manifest are bound to the packaged Alembic head named by the
 current phase; startup rejects any older or newer live database revision.
 
@@ -1384,9 +1384,10 @@ impact is measured.
   caller/shutdown cancellation is still pending);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] promote the reviewed broker/executor after integrated native evidence,
-  then implement encrypted source-secret references, the authoritative camera
-  probe profile, periodic risk-based producer and durable health-state
-  orchestration;
+  then implement the authoritative camera probe profile, periodic risk-based
+  producer and durable health-state orchestration;
+- [x] encrypted camera source credentials with separate API/dashboard fields,
+  camera-bound AES-GCM envelopes and versioned local keyring;
 - per-node 100-camera matrix;
 - multi-node server ladder and 24h soak;
 - chaos/failure/email/restore game days;

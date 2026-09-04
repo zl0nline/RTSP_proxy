@@ -11,7 +11,7 @@ import anyio
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rtsp_proxy.access import (
@@ -31,6 +31,7 @@ from rtsp_proxy.access import (
     PepperVerifier,
 )
 from rtsp_proxy.camera_dashboard import camera_dashboard_router
+from rtsp_proxy.camera_secrets import CameraSourceCredentials
 from rtsp_proxy.config import Settings
 from rtsp_proxy.dashboard import (
     DASHBOARD_CSP,
@@ -41,6 +42,7 @@ from rtsp_proxy.dashboard import (
     render_logout,
     render_node_detail,
     render_overview,
+    render_password_change,
     render_unavailable,
     require_fresh_snapshot,
 )
@@ -106,6 +108,7 @@ from rtsp_proxy.operator_access import (
 from rtsp_proxy.operator_identity import (
     BreakGlassControl,
     LocalOperatorLoginControl,
+    LocalOperatorPasswordControl,
     OidcLoginControl,
     OidcLoginInvalid,
     OidcLoginRateLimited,
@@ -332,15 +335,36 @@ class LocalLoginRequest(BaseModel):
     totp: str = Field(default="", pattern=r"^(?:[0-9]{6})?$")
 
 
+class OperatorPasswordChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=12, max_length=1024)
+    totp: str = Field(default="", pattern=r"^(?:[0-9]{6})?$")
+
+
+class CameraSourceCredentialsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
 class CameraCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=128)
     source_url: str
+    source_credentials: CameraSourceCredentialsRequest | None = None
     node_id: UUID | None = None
 
 
 class CameraUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=128)
     source_url: str
+    source_credentials: CameraSourceCredentialsRequest | None = None
     expected_revision: int | None = Field(default=None, ge=1)
     confirmation_token: str | None = Field(default=None, max_length=4096)
 
@@ -351,10 +375,13 @@ class CameraDisruptionRequest(BaseModel):
 
 
 class CameraMutationPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     operation: CameraMutationOperation
     expected_revision: int | None = Field(default=None, ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=128)
     source_url: str | None = None
+    source_credentials: CameraSourceCredentialsRequest | None = None
 
 
 class CameraMutationPreviewResponse(BaseModel):
@@ -675,6 +702,7 @@ def create_app(
     camera_live_updates: CameraLiveUpdateSource | None = None,
     operator_sessions: OperatorSessionControl | None = None,
     local_operator_login: LocalOperatorLoginControl | None = None,
+    local_operator_passwords: LocalOperatorPasswordControl | None = None,
     operator_login: OidcLoginControl | None = None,
     break_glass: BreakGlassControl | None = None,
     fleet_snapshot_max_age_seconds: float = 30,
@@ -753,6 +781,7 @@ def create_app(
                     render_local_login(
                         oidc_enabled=operator_login is not None,
                         error=True,
+                        username=payload.username,
                     ),
                     status_code=status.HTTP_401_UNAUTHORIZED,
                 )
@@ -885,6 +914,43 @@ def create_app(
             return response
 
     if operator_sessions is not None:
+
+        @app.post("/api/v1/operator/password")
+        def change_operator_password(
+            request: Request,
+            payload: OperatorPasswordChangeRequest,
+        ) -> dict[str, object]:
+            principal = _operator_principal(request)
+            if local_operator_passwords is None or principal.identity_source.value != "local":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "local_operator_password_change_unavailable"},
+                )
+            try:
+                version = local_operator_passwords.change(
+                    account_id=principal.account_id,
+                    current_session_id=principal.session_id,
+                    current_password=payload.current_password,
+                    new_password=payload.new_password,
+                    totp=payload.totp,
+                    context=request.state.operator_audit_context,
+                )
+            except OidcLoginInvalid:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={"code": "local_operator_password_change_denied"},
+                ) from None
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={"code": str(error)},
+                ) from None
+            except OidcLoginUnavailable:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"code": "local_operator_password_change_unavailable"},
+                ) from None
+            return {"status": "changed", "authz_version": version}
 
         @app.middleware("http")
         async def operator_access_boundary(
@@ -1093,6 +1159,7 @@ def create_app(
                     and 43 <= len(request.cookies.get("__Host-rtsp_proxy_csrf", "")) <= 1024
                 ),
                 poll_interval_seconds=settings.dashboard_poll_interval_seconds,
+                probe_source_policy_configured=bool(settings.probe_source_cidrs),
             )
         )
 
@@ -1122,6 +1189,89 @@ def create_app(
         )
         _clear_operator_session_cookies(response)
         return response
+
+    @app.get("/dashboard/password", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_password_page(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        if local_operator_passwords is None or principal.identity_source.value != "local":
+            return _dashboard_html_response(
+                render_password_change(
+                    principal=principal,
+                    csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+                    error="Смена пароля доступна только локальным операторам.",
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return _dashboard_html_response(
+            render_password_change(
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+            )
+        )
+
+    @app.post("/dashboard/password", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_password_change(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        csrf_token = request.cookies.get("__Host-rtsp_proxy_csrf", "")
+        try:
+            form = request.state.dashboard_form
+            form.require_exact_fields(
+                frozenset(
+                    {
+                        "_csrf",
+                        "current_password",
+                        "new_password",
+                        "new_password_confirmation",
+                        "totp",
+                    }
+                )
+            )
+            current_password = form.required("current_password", max_length=1024)
+            new_password = form.required("new_password", max_length=1024)
+            confirmation = form.required("new_password_confirmation", max_length=1024)
+            totp = form.optional("totp", max_length=6) or ""
+            if new_password != confirmation:
+                raise ValueError("local_operator_password_confirmation_failed")
+            if local_operator_passwords is None or principal.identity_source.value != "local":
+                raise OidcLoginUnavailable("local_operator_password_change_unavailable")
+            local_operator_passwords.change(
+                account_id=principal.account_id,
+                current_session_id=principal.session_id,
+                current_password=current_password,
+                new_password=new_password,
+                totp=totp,
+                context=request.state.operator_audit_context,
+            )
+        except OidcLoginInvalid:
+            message = "Текущий пароль или код TOTP неверен."
+        except ValueError as error:
+            message = (
+                "Новые пароли не совпадают."
+                if str(error) == "local_operator_password_confirmation_failed"
+                else "Новый пароль не соответствует политике сложности."
+            )
+        except (OidcLoginUnavailable, DashboardFormInvalid):
+            message = "Не удалось безопасно сменить пароль. Повторите попытку."  # noqa: RUF001
+        else:
+            return _dashboard_html_response(
+                render_password_change(
+                    principal=principal,
+                    csrf_token=csrf_token,
+                    changed=True,
+                )
+            )
+        return _dashboard_html_response(
+            render_password_change(
+                principal=principal,
+                csrf_token=csrf_token,
+                error=message,
+            ),
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
 
     app.include_router(
         camera_dashboard_router(
@@ -2116,6 +2266,14 @@ def create_app(
             camera = camera_control.create_camera(
                 name=payload.name,
                 source_url=payload.source_url,
+                source_credentials=(
+                    None
+                    if payload.source_credentials is None
+                    else CameraSourceCredentials(
+                        username=payload.source_credentials.username,
+                        password=payload.source_credentials.password,
+                    )
+                ),
                 node_id=payload.node_id,
                 mutation_context=_camera_operator_mutation_context(
                     request,
@@ -2214,13 +2372,26 @@ def create_app(
                 detail={"code": "camera_mutation_confirmation_unavailable"},
             )
         try:
-            camera = camera_mutation_control.update(
-                camera_id,
-                name=request.name,
-                source_url=request.source_url,
-                expected_revision=request.expected_revision,
-                confirmation_token=request.confirmation_token,
-            )
+            if request.source_credentials is None:
+                camera = camera_mutation_control.update(
+                    camera_id,
+                    name=request.name,
+                    source_url=request.source_url,
+                    expected_revision=request.expected_revision,
+                    confirmation_token=request.confirmation_token,
+                )
+            else:
+                camera = camera_mutation_control.update(
+                    camera_id,
+                    name=request.name,
+                    source_url=request.source_url,
+                    source_credentials=CameraSourceCredentials(
+                        username=request.source_credentials.username,
+                        password=request.source_credentials.password,
+                    ),
+                    expected_revision=request.expected_revision,
+                    confirmation_token=request.confirmation_token,
+                )
         except CameraNotFound:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2387,6 +2558,14 @@ def create_app(
                 expected_revision=request.expected_revision,
                 name=request.name,
                 source_url=request.source_url,
+                source_credentials=(
+                    None
+                    if request.source_credentials is None
+                    else CameraSourceCredentials(
+                        username=request.source_credentials.username,
+                        password=request.source_credentials.password,
+                    )
+                ),
             )
         except CameraNotFound:
             raise HTTPException(
@@ -3150,6 +3329,7 @@ def _operator_permission_for_request(request: Request) -> OperatorPermission:
         )
     if path.startswith("/dashboard") or path.startswith("/api/v1/dashboard/") or path in {
         "/api/v1/operator/session",
+        "/api/v1/operator/password",
         "/api/v1/dashboard/snapshot",
     }:
         return OperatorPermission.DASHBOARD_READ
@@ -3208,7 +3388,9 @@ def _operator_login_request_audit_context(request: Request) -> OperatorRequestAu
 def _operator_scope_for_request(request: Request) -> str | None:
     if request.url.path in {
         "/api/v1/operator/session",
+        "/api/v1/operator/password",
         "/dashboard/logout",
+        "/dashboard/password",
     }:
         return None
     for camera_resource_prefix in ("/dashboard/cameras/", "/api/v1/cameras/"):
@@ -3259,7 +3441,14 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
     method = _operator_audit_http_method(request.method)
     if method == "OTHER":
         return "request.unsupported", "server", "server"
-    if path in {"/api/v1/operator/session", "/dashboard/logout"}:
+    if path in {
+        "/api/v1/operator/session",
+        "/api/v1/operator/password",
+        "/dashboard/logout",
+        "/dashboard/password",
+    }:
+        if path.endswith("/password"):
+            return "operator.password_change", "session", "self"
         action = (
             "operator.session_logout" if method in {"POST", "DELETE"} else "operator.session_read"
         )

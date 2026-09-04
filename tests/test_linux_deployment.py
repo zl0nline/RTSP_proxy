@@ -430,7 +430,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.13.10/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.14.0/bin/mediamtx"
     )
 
 
@@ -782,6 +782,24 @@ def test_local_auth_bootstrap_has_valid_shell_syntax_and_no_password_argument() 
     assert "RTSP_PROXY_LOCAL_AUTH_ENABLED=true" in script
     assert "dropin_directory=/etc/systemd/system/rtsp-proxy-web.service.d" in script
     assert "dropin_file=$dropin_directory/local-auth.conf" in script
+
+
+def test_camera_source_bootstrap_is_atomic_and_requires_an_explicit_allowlist() -> None:
+    result = subprocess.run(
+        ["sh", "-n", "tools/configure_camera_sources.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    script = Path("tools/configure_camera_sources.sh").read_text(encoding="utf-8")
+
+    assert result.returncode == 0, result.stderr
+    assert "source CIDRs must not be empty" in script
+    assert "RTSP_PROXY_PROBE_SOURCE_CIDRS=" in script
+    assert "RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE=" in script
+    assert "chmod 0640" in script
+    assert "root:rtsp-proxy-access" in script
+    assert "mv -T" in script
 
 
 def test_deployment_wrappers_do_not_require_a_source_virtualenv() -> None:

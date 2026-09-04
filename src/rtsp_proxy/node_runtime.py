@@ -2613,7 +2613,10 @@ class UnixNodeSupervisorServer:
                         raise ValueError
                     path = MediaPathConfig(
                         name=name,
-                        source_url=validate_camera_source_url(payload.path.source_url),
+                        source_url=validate_camera_source_url(
+                            payload.path.source_url,
+                            allow_credentials=True,
+                        ),
                         max_readers=payload.path.max_readers,
                     )
                 else:

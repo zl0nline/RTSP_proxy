@@ -6,6 +6,7 @@ import getpass
 import os
 import sys
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -14,6 +15,7 @@ from rtsp_proxy.operator_access import (
     OperatorAccount,
     OperatorIdentitySource,
     OperatorMutationContext,
+    OperatorRequestAuditContext,
     OperatorRole,
 )
 from rtsp_proxy.operator_identity import (
@@ -44,10 +46,22 @@ def main(
     )
     parser.add_argument("--scope", action="append")
     parser.add_argument("--with-totp", action="store_true")
+    parser.add_argument(
+        "--rotate-password",
+        action="store_true",
+        help="rotate an existing local operator password and revoke all web sessions",
+    )
     parser.add_argument("--actor", default="system:local-bootstrap")
     parser.add_argument("--reason", default="initial local operator provisioning")
     arguments = parser.parse_args(argv)
     try:
+        if arguments.rotate_password:
+            account_id = rotate_password_from_environment(
+                username=arguments.username,
+                password_reader=password_reader,
+            )
+            print(f"rotated local operator {account_id}; all web sessions revoked")
+            return 0
         account_id, totp_secret = provision_from_environment(
             account_id=arguments.account_id or uuid4(),
             username=arguments.username,
@@ -129,6 +143,48 @@ def provision_from_environment(
     finally:
         store.close()
     return account_id, totp_secret
+
+
+def rotate_password_from_environment(
+    *,
+    username: str,
+    password_reader: Callable[[str], str] = getpass.getpass,
+) -> UUID:
+    database_url = os.environ.get("RTSP_PROXY_DATABASE_URL", "")
+    key_file_value = os.environ.get("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", "")
+    if not database_url or not key_file_value:
+        raise LocalOperatorProvisionError("local_operator_configuration_invalid")
+    current_password = password_reader("Current local operator password: ")
+    new_password = password_reader("New local operator password: ")
+    confirmation = password_reader("Repeat new local operator password: ")
+    totp = password_reader("Current TOTP code (leave empty if disabled): ")
+    if new_password != confirmation:
+        raise LocalOperatorProvisionError("local_operator_password_confirmation_failed")
+    store = PostgresLocalOperatorStore(
+        database_url,
+        encryption_key=_read_key(Path(key_file_value)),
+    )
+    try:
+        account_id = store.account_id_for_username(username)
+        if account_id is None:
+            raise LocalOperatorProvisionError("local_operator_account_not_found")
+        store.change_password(
+            account_id=account_id,
+            current_password=current_password,
+            new_password=new_password,
+            totp=totp,
+            current_session_id=None,
+            context=OperatorRequestAuditContext.internal(
+                action="operator.password_change",
+                resource_scope="session:self",
+                resource_type="session",
+                resource_id="self",
+            ),
+            now=datetime.now(UTC),
+        )
+    finally:
+        store.close()
+    return account_id
 
 
 def _read_key(path: Path) -> bytes:

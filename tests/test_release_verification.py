@@ -110,6 +110,11 @@ def test_database_migrations_are_packaged_with_the_application() -> None:
         "versions",
         "0021_local_operator_login.py",
     ).is_file()
+    assert package_root.joinpath(
+        "migrations",
+        "versions",
+        "0022_camera_source_credentials.py",
+    ).is_file()
 
 
 def sha256(payload: bytes) -> str:
@@ -543,7 +548,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
         "amd64",
         "arm64",
     }
-    assert {manifest.release_id for manifest in manifests} == {"0.13.10"}
+    assert {manifest.release_id for manifest in manifests} == {"0.14.0"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
     assert {manifest.probe_connect_guard.release_id for manifest in manifests} == {
         "0.1.0"

@@ -111,6 +111,7 @@ _AUDIT_ACTIONS = frozenset(
         "node.stop",
         "operator.admin",
         "operator.login",
+        "operator.password_change",
         "operator.session_logout",
         "operator.session_read",
         "request.unsupported",

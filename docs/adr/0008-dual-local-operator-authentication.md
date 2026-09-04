@@ -28,6 +28,9 @@ provider.
   boundary without making MFA mandatory for read-only and routine workflows.
 - The first local administrator is provisioned by an interactive CLI. Password
   and TOTP material are never accepted in argv or environment variables.
+- Local operators rotate their password through the authenticated dashboard or
+  API. The current session advances to the new authorization version and every
+  other session is revoked atomically. The CLI fallback revokes all sessions.
 - Local and OIDC identities use the same revocable PostgreSQL sessions, CSRF,
   scoped RBAC, progressive rate limiting and audit boundary.
 - Break-glass remains a distinct single emergency identity with critical
@@ -41,7 +44,7 @@ A one-server deployment can be installed and operated without any identity
 service beyond RTSP Proxy and PostgreSQL. Operators that already run a local
 IdP can enable OIDC without disabling local accounts. Local credential
 lifecycle, password rotation and TOTP recovery become responsibilities of the
-control plane and require dedicated CLI/runbook coverage.
+control plane and have dashboard, API, audit and CLI/runbook coverage.
 
 ## Alternatives
 

@@ -15,6 +15,7 @@ from rtsp_proxy.access import (
     AccessGrantSchemaUnavailable,
     AccessPolicyControl,
 )
+from rtsp_proxy.camera_secrets import CameraSourceCredentials
 from rtsp_proxy.dashboard import (
     DASHBOARD_CSP,
     DashboardUnavailable,
@@ -173,21 +174,27 @@ def camera_dashboard_router(
         if camera_control is None:
             return _creation_unavailable(principal)
         idempotency_key: UUID | None = None
+        entered_name = ""
+        placement_mode = "automatic"
+        raw_node_id: str | None = ""
         try:
             form = _form(request)
-            form.require_exact_fields(
-                frozenset(
-                    {
-                        "_csrf",
-                        "name",
-                        "source_url",
-                        "placement_mode",
-                        "node_id",
-                        "idempotency_key",
-                    }
-                )
+            base_fields = frozenset(
+                {
+                    "_csrf",
+                    "name",
+                    "source_url",
+                    "placement_mode",
+                    "node_id",
+                    "idempotency_key",
+                }
             )
+            credential_fields = frozenset({"source_username", "source_password"})
+            provided_fields = frozenset(form.values)
+            if provided_fields not in {base_fields, base_fields | credential_fields}:
+                raise DashboardFormInvalid("dashboard_form_invalid")
             idempotency_key = _idempotency_key(form)
+            entered_name = form.required("name", max_length=MAX_CAMERA_NAME_LENGTH)
             placement_mode = form.required("placement_mode", max_length=16)
             raw_node_id = form.optional("node_id", max_length=36)
             if placement_mode == "automatic":
@@ -203,9 +210,26 @@ def camera_dashboard_router(
                     raise DashboardFormInvalid("dashboard_form_invalid") from None
             else:
                 raise DashboardFormInvalid("dashboard_form_invalid")
+            source_credentials = None
+            if credential_fields <= provided_fields:
+                source_username = form.optional("source_username", max_length=64) or ""
+                source_password = form.optional("source_password", max_length=256) or ""
+                if bool(source_username) != bool(source_password):
+                    raise DashboardFormInvalid("dashboard_form_invalid")
+                if source_username:
+                    from rtsp_proxy.camera_secrets import CameraSourceCredentials
+
+                    try:
+                        source_credentials = CameraSourceCredentials(
+                            username=source_username,
+                            password=source_password,
+                        )
+                    except ValueError:
+                        raise DashboardFormInvalid("dashboard_form_invalid") from None
             camera = camera_control.create_camera(
-                name=form.required("name", max_length=MAX_CAMERA_NAME_LENGTH),
+                name=entered_name,
                 source_url=form.required("source_url", max_length=8192),
+                source_credentials=source_credentials,
                 node_id=node_id,
                 mutation_context=_access_mutation_context(
                     request,
@@ -230,7 +254,16 @@ def camera_dashboard_router(
                     expected_revision=None,
                     idempotency_key=idempotency_key,
                 )
-            expected = _creation_error(error, principal)
+            expected = _creation_error(
+                error,
+                principal,
+                camera_control=camera_control,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+                idempotency_key=idempotency_key or uuid4(),
+                entered_name=entered_name,
+                placement_mode=placement_mode,
+                selected_node_id=raw_node_id or "",
+            )
             if expected is not None:
                 return expected
             raise
@@ -943,20 +976,32 @@ def camera_dashboard_router(
             return _mutation_unavailable(principal)
         try:
             form = _form(request)
-            operation, expected_revision, name, source_url = _mutation_fields(form)
+            operation, expected_revision, name, source_url, source_credentials = (
+                _mutation_fields(form)
+            )
         except DashboardFormInvalid:
             return _form_invalid(principal)
         camera = _camera_item(camera_control, camera_id, principal)
         if isinstance(camera, Response):
             return camera
         try:
-            preview = camera_mutation_control.preview(
-                camera_id,
-                operation=operation,
-                expected_revision=expected_revision,
-                name=name,
-                source_url=source_url,
-            )
+            if source_credentials is None:
+                preview = camera_mutation_control.preview(
+                    camera_id,
+                    operation=operation,
+                    expected_revision=expected_revision,
+                    name=name,
+                    source_url=source_url,
+                )
+            else:
+                preview = camera_mutation_control.preview(
+                    camera_id,
+                    operation=operation,
+                    expected_revision=expected_revision,
+                    name=name,
+                    source_url=source_url,
+                    source_credentials=source_credentials,
+                )
             if not preview.occupied:
                 _apply_mutation(
                     camera_mutation_control,
@@ -965,6 +1010,7 @@ def camera_dashboard_router(
                     expected_revision=preview.desired_revision,
                     name=name,
                     source_url=source_url,
+                    source_credentials=source_credentials,
                     confirmation_token=None,
                 )
                 return _redirect(camera_id)
@@ -996,7 +1042,7 @@ def camera_dashboard_router(
             return _mutation_unavailable(principal)
         try:
             form = _form(request)
-            operation, expected_revision, name, source_url = _mutation_fields(
+            operation, expected_revision, name, source_url, source_credentials = _mutation_fields(
                 form,
                 confirmation=True,
             )
@@ -1008,6 +1054,7 @@ def camera_dashboard_router(
                 expected_revision=expected_revision,
                 name=name,
                 source_url=source_url,
+                source_credentials=source_credentials,
                 confirmation_token=confirmation_token,
             )
         except DashboardFormInvalid:
@@ -1142,7 +1189,13 @@ def _mutation_fields(
     form: DashboardForm,
     *,
     confirmation: bool = False,
-) -> tuple[CameraMutationOperation, int, str | None, str | None]:
+) -> tuple[
+    CameraMutationOperation,
+    int,
+    str | None,
+    str | None,
+    CameraSourceCredentials | None,
+]:
     try:
         operation = CameraMutationOperation(form.required("operation", max_length=32))
     except ValueError:
@@ -1152,15 +1205,32 @@ def _mutation_fields(
     if confirmation:
         base_fields.add("confirmation_token")
     if operation is CameraMutationOperation.UPDATE_SOURCE:
-        form.require_exact_fields(frozenset({*base_fields, "name", "source_url"}))
+        fields_without_credentials = frozenset({*base_fields, "name", "source_url"})
+        fields_with_credentials = frozenset(
+            {*fields_without_credentials, "source_username", "source_password"}
+        )
+        if form.values.keys() == fields_without_credentials:
+            form.require_exact_fields(fields_without_credentials)
+        else:
+            form.require_exact_fields(fields_with_credentials)
+        source_username = form.optional("source_username", max_length=64) or ""
+        source_password = form.optional("source_password", max_length=256) or ""
+        if bool(source_username) != bool(source_password):
+            raise DashboardFormInvalid("dashboard_form_invalid")
+        credentials = (
+            CameraSourceCredentials(username=source_username, password=source_password)
+            if source_username
+            else None
+        )
         return (
             operation,
             expected_revision,
             form.required("name", max_length=MAX_CAMERA_NAME_LENGTH),
             form.required("source_url", max_length=8192),
+            credentials,
         )
     form.require_exact_fields(frozenset(base_fields))
-    return operation, expected_revision, None, None
+    return operation, expected_revision, None, None, None
 
 
 def _move_fields(
@@ -1192,18 +1262,29 @@ def _apply_mutation(
     expected_revision: int,
     name: str | None,
     source_url: str | None,
+    source_credentials: CameraSourceCredentials | None,
     confirmation_token: str | None,
 ) -> None:
     if operation is CameraMutationOperation.UPDATE_SOURCE:
         if name is None or source_url is None:
             raise DashboardFormInvalid("dashboard_form_invalid")
-        control.update(
-            camera_id,
-            name=name,
-            source_url=source_url,
-            expected_revision=expected_revision,
-            confirmation_token=confirmation_token,
-        )
+        if source_credentials is None:
+            control.update(
+                camera_id,
+                name=name,
+                source_url=source_url,
+                expected_revision=expected_revision,
+                confirmation_token=confirmation_token,
+            )
+        else:
+            control.update(
+                camera_id,
+                name=name,
+                source_url=source_url,
+                source_credentials=source_credentials,
+                expected_revision=expected_revision,
+                confirmation_token=confirmation_token,
+            )
         return
     if operation is CameraMutationOperation.DISABLE:
         control.disable(
@@ -1490,6 +1571,13 @@ def _creation_unavailable(principal: OperatorPrincipal) -> HTMLResponse:
 def _creation_error(
     error: Exception,
     principal: OperatorPrincipal,
+    *,
+    camera_control: CameraControl,
+    csrf_token: str,
+    idempotency_key: UUID,
+    entered_name: str,
+    placement_mode: str,
+    selected_node_id: str,
 ) -> HTMLResponse | None:
     if isinstance(error, InvalidCameraName):
         return _unavailable_response(
@@ -1501,13 +1589,39 @@ def _creation_error(
             principal=principal,
         )
     if isinstance(error, InvalidCameraSource):
-        return _unavailable_response(
-            DashboardUnavailable(
-                title="Некорректный source URL",
-                message="Проверьте RTSP URL. Введённое значение не сохранено и не показано.",
+        messages = {
+            "probe_source_policy_not_configured": (
+                "Источник камер не настроен: задайте RTSP_PROXY_PROBE_SOURCE_CIDRS "
+                "в конфигурации control plane и перезапустите web-сервис."
+            ),
+            "probe_destination_not_allowed": (
+                "Сеть камеры не входит в разрешённые сети источника."
+            ),
+            "camera_source_url_invalid": "Source URL имеет некорректный формат.",
+            "camera_source_url_too_long": "Source URL превышает допустимый размер.",
+            "camera_source_secret_reference_required": (
+                "Логин и пароль нельзя помещать в URL; используйте отдельные поля credentials."
+            ),
+        }
+        try:
+            targets = camera_control.creation_targets()
+        except CameraCatalogUnavailable:
+            targets = ()
+        return _html_response(
+            render_camera_create(
+                targets=targets,
+                principal=principal,
+                csrf_token=csrf_token,
+                idempotency_key=idempotency_key,
+                error_message=messages.get(
+                    str(error),
+                    "Источник камеры отклонён политикой безопасности.",
+                ),
+                entered_name=entered_name,
+                placement_mode=placement_mode,
+                selected_node_id=selected_node_id,
             ),
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            principal=principal,
         )
     if isinstance(error, NodeNotFound):
         return _unavailable_response(

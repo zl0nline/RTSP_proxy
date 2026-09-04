@@ -16,8 +16,8 @@ from rtsp_proxy.probe_connect_guard import (
     trusted_probe_connect_guard_release_identity,
 )
 
-APPLICATION_SCHEMA = "0021_local_operator_login"
-PREVIOUS_APPLICATION_SCHEMA = "0020_probe_observations"
+APPLICATION_SCHEMA = "0022_camera_source_credentials"
+PREVIOUS_APPLICATION_SCHEMA = "0021_local_operator_login"
 MINIMUM_APPLICATION_SCHEMA = "0012_operator_sessions"
 CONFIG_SCHEMA_VERSION = 1
 

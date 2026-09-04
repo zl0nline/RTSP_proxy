@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -51,6 +52,12 @@ from rtsp_proxy.access import (
     AccessPolicy,
     AccessTarget,
 )
+from rtsp_proxy.camera_secrets import (
+    CameraSourceCredentialCipher,
+    CameraSourceSecretEnvelope,
+    attach_source_credentials,
+    split_source_credentials,
+)
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.nodes import (
     CameraCatalogItem,
@@ -68,6 +75,7 @@ from rtsp_proxy.nodes import (
     CameraRevisionConflict,
     CameraState,
     EligibleNodeMissing,
+    InvalidCameraSource,
     InvalidNodeRuntimeObservation,
     MaximumNodesReached,
     MediaNode,
@@ -217,6 +225,33 @@ cameras = Table(
     CheckConstraint("state IN ('enabled', 'disabled', 'deleting', 'deleted')"),
     CheckConstraint("desired_revision >= 1"),
     CheckConstraint("applied_revision BETWEEN 0 AND desired_revision"),
+)
+
+camera_source_credentials = Table(
+    "camera_source_credentials",
+    metadata,
+    Column(
+        "camera_id",
+        Uuid(as_uuid=True),
+        ForeignKey("cameras.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("key_id", String(64), nullable=False),
+    Column("ciphertext", LargeBinary, nullable=False),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    ),
+    CheckConstraint(
+        "key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'",
+        name="ck_camera_source_credentials_key_id",
+    ),
+    CheckConstraint(
+        "octet_length(ciphertext) BETWEEN 29 AND 1024",
+        name="ck_camera_source_credentials_ciphertext",
+    ),
 )
 
 camera_probe_endpoints = Table(
@@ -630,6 +665,7 @@ class PostgresNodeStore:
         lifecycle_lock_pool_size: int = 4,
         lifecycle_lock_timeout_seconds: float = 5,
         statement_timeout_ms: int | None = None,
+        camera_source_cipher: CameraSourceCredentialCipher | None = None,
     ) -> None:
         if lifecycle_lock_pool_size < 2 or lifecycle_lock_pool_size > 16:
             raise ValueError("node_lifecycle_lock_pool_size_invalid")
@@ -671,6 +707,7 @@ class PostgresNodeStore:
             connect_args=connect_args,
         )
         self._lifecycle_lock_timeout_seconds = lifecycle_lock_timeout_seconds
+        self._camera_source_cipher = camera_source_cipher
 
     def assert_schema_compatible(self) -> None:
         try:
@@ -689,6 +726,7 @@ class PostgresNodeStore:
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
             ("0019_dashboard_rate_limits",),
+            ("0020_probe_observations",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -2075,7 +2113,7 @@ class PostgresNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
+        source_url = validate_camera_source_url(source_url, allow_credentials=True)
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -2142,7 +2180,10 @@ class PostgresNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
+        source_url = validate_camera_source_url(source_url, allow_credentials=True)
+        _, source_credentials = split_source_credentials(source_url)
+        if source_credentials is not None and self._camera_source_cipher is None:
+            raise InvalidCameraSource("camera_source_credentials_unavailable")
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -2368,7 +2409,7 @@ class PostgresNodeStore:
         )
         if row is None:
             raise CameraLifecycleConflict("camera_idempotency_target_missing")
-        return _camera_placement(row)
+        return _camera_placement(row, self._camera_source_cipher)
 
     def list_camera_creation_targets(
         self,
@@ -2410,7 +2451,7 @@ class PostgresNodeStore:
     def list_cameras(self) -> tuple[CameraPlacement, ...]:
         with self._engine.connect() as connection:
             return tuple(
-                _camera_placement(row)
+                _camera_placement(row, self._camera_source_cipher)
                 for row in connection.execute(
                     self._camera_query(connection).where(
                         cameras.c.state != CameraState.DELETED.value
@@ -2421,7 +2462,7 @@ class PostgresNodeStore:
     def get_cameras(self, camera_ids: tuple[UUID, ...]) -> tuple[CameraPlacement, ...]:
         with self._engine.connect() as connection:
             return tuple(
-                _camera_placement(row)
+                _camera_placement(row, self._camera_source_cipher)
                 for row in connection.execute(
                     self._camera_query(connection).where(
                         cameras.c.id.in_(camera_ids),
@@ -2497,7 +2538,11 @@ class PostgresNodeStore:
                 .mappings()
                 .one_or_none()
             )
-            return None if row is None else _camera_placement(row)
+            return (
+                None
+                if row is None
+                else _camera_placement(row, self._camera_source_cipher)
+            )
 
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
         with self._engine.connect() as connection:
@@ -2509,7 +2554,7 @@ class PostgresNodeStore:
             ):
                 raise NodeNotFound("node_not_found")
             return tuple(
-                _camera_placement(row)
+                _camera_placement(row, self._camera_source_cipher)
                 for row in connection.execute(
                     self._camera_query(connection).where(
                         camera_placements.c.node_id == node_id
@@ -2518,14 +2563,8 @@ class PostgresNodeStore:
             )
 
     def list_node_active_moves(self, node_id: UUID) -> tuple[CameraMove, ...]:
-        statement = (
-            select(
-                camera_move_sagas,
-                cameras.c.public_id,
-                cameras.c.source_url,
-            )
-            .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
-            .where(
+        with self._engine.connect() as connection:
+            statement = self._camera_move_query(connection).where(
                 (
                     (camera_move_sagas.c.source_node_id == node_id)
                     | (camera_move_sagas.c.target_node_id == node_id)
@@ -2533,11 +2572,37 @@ class PostgresNodeStore:
                 camera_move_sagas.c.state.not_in(
                     (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
                 ),
+            ).order_by(camera_move_sagas.c.id)
+            return tuple(
+                _camera_move(row, self._camera_source_cipher)
+                for row in connection.execute(statement).mappings()
             )
-            .order_by(camera_move_sagas.c.id)
+
+    def _camera_move_query(self, connection: Connection) -> Select[tuple[object, ...]]:
+        credentials_supported = self._schema_is_current(connection)
+        credential_columns = (
+            (
+                camera_source_credentials.c.key_id.label("source_secret_key_id"),
+                camera_source_credentials.c.ciphertext.label("source_secret_ciphertext"),
+            )
+            if credentials_supported
+            else (
+                literal(None).label("source_secret_key_id"),
+                literal(None).label("source_secret_ciphertext"),
+            )
         )
-        with self._engine.connect() as connection:
-            return tuple(_camera_move(row) for row in connection.execute(statement).mappings())
+        query = select(
+            camera_move_sagas,
+            cameras.c.public_id,
+            cameras.c.source_url,
+            *credential_columns,
+        ).join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
+        if credentials_supported:
+            query = query.outerjoin(
+                camera_source_credentials,
+                camera_source_credentials.c.camera_id == cameras.c.id,
+            )
+        return query
 
     def _camera_query(self, connection: Connection) -> Select[tuple[object, ...]]:
         endpoint_supported = self._schema_is_current(connection)
@@ -2562,6 +2627,17 @@ class PostgresNodeStore:
                 literal(None).label("probe_source_sha256"),
             )
         )
+        credential_columns = (
+            (
+                camera_source_credentials.c.key_id.label("source_secret_key_id"),
+                camera_source_credentials.c.ciphertext.label("source_secret_ciphertext"),
+            )
+            if endpoint_supported
+            else (
+                literal(None).label("source_secret_key_id"),
+                literal(None).label("source_secret_ciphertext"),
+            )
+        )
         query = (
             select(
                 cameras.c.id,
@@ -2573,6 +2649,7 @@ class PostgresNodeStore:
                 cameras.c.applied_revision,
                 literal(endpoint_supported).label("probe_endpoint_schema_supported"),
                 *endpoint_columns,
+                *credential_columns,
                 camera_placements.c.node_id,
                 camera_placements.c.placement_mode,
                 camera_placements.c.generation.label("placement_generation"),
@@ -2586,6 +2663,9 @@ class PostgresNodeStore:
             query = query.outerjoin(
                 camera_probe_endpoints,
                 camera_probe_endpoints.c.camera_id == cameras.c.id,
+            ).outerjoin(
+                camera_source_credentials,
+                camera_source_credentials.c.camera_id == cameras.c.id,
             )
         return query
 
@@ -2666,7 +2746,11 @@ class PostgresNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
+        source_url = validate_camera_source_url(source_url, allow_credentials=True)
+        try:
+            stored_source_url, source_credentials = split_source_credentials(source_url)
+        except ValueError as error:
+            raise InvalidCameraSource(str(error)) from None
         with self._engine.begin() as connection:
             _require_synchronous_commit(connection)
             self._lock_placements(connection)
@@ -2681,7 +2765,7 @@ class PostgresNodeStore:
             )
             if current is None:
                 raise CameraNotFound("camera_not_found")
-            camera = _camera_placement(current)
+            camera = _camera_placement(current, self._camera_source_cipher)
             if camera.state is CameraState.DELETED:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
@@ -2713,15 +2797,35 @@ class PostgresNodeStore:
             endpoint_supported = self._schema_is_current(connection)
             if readmission_requested and not endpoint_supported:
                 raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
+            if source_credentials is not None and (
+                not endpoint_supported or self._camera_source_cipher is None
+            ):
+                raise InvalidCameraSource("camera_source_credentials_unavailable")
             connection.execute(
                 update(cameras)
                 .where(cameras.c.id == camera_id)
                 .values(
                     name=name,
-                    source_url=source_url,
+                    source_url=stored_source_url,
                     desired_revision=desired_revision,
                 )
             )
+            if endpoint_supported:
+                connection.execute(
+                    delete(camera_source_credentials).where(
+                        camera_source_credentials.c.camera_id == camera_id
+                    )
+                )
+                if source_credentials is not None:
+                    assert self._camera_source_cipher is not None
+                    envelope = self._camera_source_cipher.seal(camera_id, source_credentials)
+                    connection.execute(
+                        insert(camera_source_credentials).values(
+                            camera_id=camera_id,
+                            key_id=envelope.key_id,
+                            ciphertext=envelope.ciphertext,
+                        )
+                    )
             if endpoint_changed and endpoint_supported:
                 connection.execute(
                     delete(camera_probe_endpoints).where(
@@ -2786,7 +2890,7 @@ class PostgresNodeStore:
             )
             if current is None:
                 raise CameraNotFound("camera_not_found")
-            camera = _camera_placement(current)
+            camera = _camera_placement(current, self._camera_source_cipher)
             if camera.state is CameraState.DELETED:
                 raise CameraNotFound("camera_not_found")
             if camera.state is CameraState.DELETING:
@@ -2850,7 +2954,7 @@ class PostgresNodeStore:
             )
             if current is None:
                 raise CameraNotFound("camera_not_found")
-            camera = _camera_placement(current)
+            camera = _camera_placement(current, self._camera_source_cipher)
             if camera.state is CameraState.DELETED:
                 raise CameraNotFound("camera_not_found")
             if expected_revision is not None and camera.desired_revision != expected_revision:
@@ -2918,7 +3022,7 @@ class PostgresNodeStore:
             )
             if current is None:
                 raise CameraNotFound("camera_not_found")
-            camera = _camera_placement(current)
+            camera = _camera_placement(current, self._camera_source_cipher)
             if camera.state is not CameraState.ENABLED:
                 raise CameraLifecycleConflict("camera_not_enabled")
             if camera.desired_revision != expected_revision:
@@ -3002,36 +3106,28 @@ class PostgresNodeStore:
             return _camera_move_with_camera(row, camera)
 
     def get_camera_move(self, move_id: UUID) -> CameraMove | None:
-        statement = (
-            select(
-                camera_move_sagas,
-                cameras.c.public_id,
-                cameras.c.source_url,
-            )
-            .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
-            .where(camera_move_sagas.c.id == move_id)
-        )
         with self._engine.connect() as connection:
+            statement = self._camera_move_query(connection).where(
+                camera_move_sagas.c.id == move_id
+            )
             row = connection.execute(statement).mappings().one_or_none()
-            return None if row is None else _camera_move(row)
+            return (
+                None
+                if row is None
+                else _camera_move(row, self._camera_source_cipher)
+            )
 
     def list_incomplete_camera_moves(self) -> tuple[CameraMove, ...]:
-        statement = (
-            select(
-                camera_move_sagas,
-                cameras.c.public_id,
-                cameras.c.source_url,
-            )
-            .join(cameras, cameras.c.id == camera_move_sagas.c.camera_id)
-            .where(
+        with self._engine.connect() as connection:
+            statement = self._camera_move_query(connection).where(
                 camera_move_sagas.c.state.not_in(
                     (CameraMoveState.COMPLETE.value, CameraMoveState.ABORTED.value)
                 )
+            ).order_by(camera_move_sagas.c.created_at, camera_move_sagas.c.id)
+            return tuple(
+                _camera_move(row, self._camera_source_cipher)
+                for row in connection.execute(statement).mappings()
             )
-            .order_by(camera_move_sagas.c.created_at, camera_move_sagas.c.id)
-        )
-        with self._engine.connect() as connection:
-            return tuple(_camera_move(row) for row in connection.execute(statement).mappings())
 
     def switch_camera_move(
         self,
@@ -3064,7 +3160,7 @@ class PostgresNodeStore:
             )
             if camera_row is None:
                 raise CameraLifecycleConflict("camera_move_fenced")
-            camera = _camera_placement(camera_row)
+            camera = _camera_placement(camera_row, self._camera_source_cipher)
             move = _camera_move_with_camera(move_row, camera)
             if move.state is not CameraMoveState.PREPARE_TARGET:
                 return move
@@ -3414,7 +3510,7 @@ class PostgresNodeStore:
             )
             if current is None:
                 return False
-            camera = _camera_placement(current)
+            camera = _camera_placement(current, self._camera_source_cipher)
             active_move = connection.scalar(
                 select(func.count())
                 .select_from(camera_move_sagas)
@@ -3530,12 +3626,20 @@ class PostgresNodeStore:
         endpoint_supported = self._schema_is_current(connection)
         if endpoint_identity is not None and not endpoint_supported:
             raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
+        try:
+            stored_source_url, source_credentials = split_source_credentials(source_url)
+        except ValueError as error:
+            raise InvalidCameraSource(str(error)) from None
+        if source_credentials is not None and (
+            not endpoint_supported or self._camera_source_cipher is None
+        ):
+            raise InvalidCameraSource("camera_source_credentials_unavailable")
         connection.execute(insert(public_id_tombstones).values(public_id=str(public_id)))
         connection.execute(
             insert(cameras).values(
                 id=camera_id,
                 name=name,
-                source_url=source_url,
+                source_url=stored_source_url,
                 public_id=str(public_id),
                 state=CameraState.ENABLED.value,
                 desired_revision=1,
@@ -3548,6 +3652,16 @@ class PostgresNodeStore:
                     camera_id=camera_id,
                     admitted_revision=1,
                     **_probe_endpoint_values(endpoint_identity),
+                )
+            )
+        if source_credentials is not None:
+            assert self._camera_source_cipher is not None
+            envelope = self._camera_source_cipher.seal(camera_id, source_credentials)
+            connection.execute(
+                insert(camera_source_credentials).values(
+                    camera_id=camera_id,
+                    key_id=envelope.key_id,
+                    ciphertext=envelope.ciphertext,
                 )
             )
         connection.execute(
@@ -4122,7 +4236,10 @@ def _uuid(value: object) -> UUID:
     return UUID(str(value))
 
 
-def _camera_placement(row: RowMapping) -> CameraPlacement:
+def _camera_placement(
+    row: RowMapping,
+    source_cipher: CameraSourceCredentialCipher | None = None,
+) -> CameraPlacement:
     endpoint_generation = row["probe_endpoint_generation"]
     endpoint = (
         None
@@ -4136,10 +4253,24 @@ def _camera_placement(row: RowMapping) -> CameraPlacement:
             source_url_sha256=str(row["probe_source_sha256"]),
         )
     )
+    source_url = str(row["source_url"])
+    secret_key_id = row.get("source_secret_key_id")
+    secret_ciphertext = row.get("source_secret_ciphertext")
+    if secret_key_id is not None or secret_ciphertext is not None:
+        if source_cipher is None or secret_key_id is None or secret_ciphertext is None:
+            raise InvalidCameraSource("camera_source_credentials_unavailable")
+        credentials = source_cipher.open(
+            _uuid(row["id"]),
+            CameraSourceSecretEnvelope(
+                key_id=str(secret_key_id),
+                ciphertext=bytes(secret_ciphertext),
+            ),
+        )
+        source_url = attach_source_credentials(source_url, credentials)
     return CameraPlacement(
         id=_uuid(row["id"]),
         name=str(row["name"]),
-        source_url=str(row["source_url"]),
+        source_url=source_url,
         public_id=PublicId.parse(str(row["public_id"])),
         node_id=_uuid(row["node_id"]),
         node_port=int(row["node_port"]),
@@ -4331,12 +4462,29 @@ def _require_camera_registration_idempotency_schema(connection: Connection) -> N
         raise NodeRuntimeUnavailable("camera_registration_schema_unavailable")
 
 
-def _camera_move(row: RowMapping) -> CameraMove:
+def _camera_move(
+    row: RowMapping,
+    source_cipher: CameraSourceCredentialCipher | None = None,
+) -> CameraMove:
+    source_url = str(row["source_url"])
+    secret_key_id = row.get("source_secret_key_id")
+    secret_ciphertext = row.get("source_secret_ciphertext")
+    if secret_key_id is not None or secret_ciphertext is not None:
+        if source_cipher is None or secret_key_id is None or secret_ciphertext is None:
+            raise InvalidCameraSource("camera_source_credentials_unavailable")
+        credentials = source_cipher.open(
+            _uuid(row["camera_id"]),
+            CameraSourceSecretEnvelope(
+                key_id=str(secret_key_id),
+                ciphertext=bytes(secret_ciphertext),
+            ),
+        )
+        source_url = attach_source_credentials(source_url, credentials)
     return CameraMove(
         id=_uuid(row["id"]),
         camera_id=_uuid(row["camera_id"]),
         public_id=PublicId.parse(str(row["public_id"])),
-        source_url=str(row["source_url"]),
+        source_url=source_url,
         source_node_id=_uuid(row["source_node_id"]),
         target_node_id=_uuid(row["target_node_id"]),
         source_generation=int(row["source_generation"]),

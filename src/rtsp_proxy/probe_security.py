@@ -198,6 +198,8 @@ class ProbeEndpointAdmission:
         hostname, port, path_and_query, credential, source_sha256 = _parse_source_url(
             source_url
         )
+        if not self._allowed_networks:
+            raise ProbeEndpointRejected("probe_source_policy_not_configured")
         literal = _literal_address(hostname)
         if literal is None:
             canonical_hostname = _canonical_hostname(hostname)

@@ -158,6 +158,32 @@
   }
 
   const live = document.querySelector("[data-camera-live]");
+  const loginForm = document.querySelector("[data-login-form]");
+  if (loginForm instanceof HTMLFormElement) {
+    const password = loginForm.querySelector("#password");
+    const toggle = loginForm.querySelector("[data-password-toggle]");
+    const submit = loginForm.querySelector("[data-login-submit]");
+    const label = loginForm.querySelector("[data-login-label]");
+    if (password instanceof HTMLInputElement && toggle instanceof HTMLButtonElement) {
+      toggle.addEventListener("click", () => {
+        const visible = password.type === "text";
+        password.type = visible ? "password" : "text";
+        toggle.textContent = visible ? "Показать" : "Скрыть";
+        toggle.setAttribute("aria-label", visible ? "Показать пароль" : "Скрыть пароль");
+      });
+    }
+    loginForm.addEventListener("submit", () => {
+      if (submit instanceof HTMLButtonElement) {
+        submit.setAttribute("aria-busy", "true");
+        window.setTimeout(() => {
+          submit.disabled = true;
+        }, 0);
+      }
+      if (label instanceof HTMLElement) {
+        label.textContent = "Входим…";
+      }
+    });
+  }
   if (!(live instanceof HTMLElement)) {
     return;
   }

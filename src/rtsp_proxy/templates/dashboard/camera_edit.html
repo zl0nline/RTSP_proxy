@@ -16,7 +16,9 @@
       <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
       <label>Имя камеры<input name="name" required maxlength="128" value="{{ camera.name }}"></label>
       <label>Новый source URL<input name="source_url" type="password" required maxlength="8192" autocomplete="new-password" spellcheck="false" placeholder="rtsp://camera-host/path"></label>
-      <p>Текущий source URL никогда не возвращается в dashboard. Введите полный новый RTSP URL без userinfo и query; credentials задаются отдельной secret reference.</p>
+      <label>Логин камеры (необязательно)<input name="source_username" maxlength="64" autocomplete="off" spellcheck="false"></label>
+      <label>Пароль камеры (необязательно)<input name="source_password" type="password" maxlength="256" autocomplete="new-password"></label>
+      <p>Текущий source URL и credentials никогда не возвращаются в dashboard. Введите URL без логина и пароля. Если поля credentials оставить пустыми, сохранённые credentials останутся без изменений.</p>
       <div class="form-actions"><button type="submit">Проверить изменение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
     </form>
   </section>

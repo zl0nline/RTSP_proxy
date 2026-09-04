@@ -21,6 +21,7 @@
       <div class="operator" aria-label="Текущий оператор">
         <span>{{ principal.display_name }}</span>
         <span class="operator-role">{{ principal.roles | map(attribute='value') | sort | join(', ') }}</span>
+        {% if principal.identity_source.value == "local" %}<a href="/dashboard/password">Сменить пароль</a>{% endif %}
         <a href="/dashboard/logout">Выйти</a>
       </div>
       {% endif %}

@@ -16,6 +16,17 @@ from rtsp_proxy.probe_security import (
 )
 
 
+def test_empty_source_policy_reports_not_configured_instead_of_generic_denial() -> None:
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(),
+        resolve=lambda _hostname: ("10.40.0.11",),
+    )
+
+    with pytest.raises(ProbeEndpointRejected, match=r"^probe_source_policy_not_configured$"):
+        admission.admit("rtsp://camera.example/live")
+
+
 def test_endpoint_admission_resolves_once_and_emits_only_a_literal_target() -> None:
     resolved: list[str] = []
 
@@ -240,7 +251,7 @@ def test_empty_site_policy_is_an_explicit_deny_all() -> None:
         resolve=lambda _hostname: ("10.40.0.11",),
     )
 
-    with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
+    with pytest.raises(ProbeEndpointRejected, match="probe_source_policy_not_configured"):
         admission.admit("rtsp://camera.example/live")
 
 

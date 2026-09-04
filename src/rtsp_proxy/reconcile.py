@@ -12,6 +12,11 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from rtsp_proxy.camera_secrets import (
+    CameraSourceCredentials,
+    attach_source_credentials,
+    split_source_credentials,
+)
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaNodeError, MediaPathConfig, MediaPathInventory
 from rtsp_proxy.nodes import (
@@ -831,13 +836,18 @@ class CameraMutationControl:
         expected_revision: int | None = None,
         name: str | None = None,
         source_url: str | None = None,
+        source_credentials: CameraSourceCredentials | None = None,
     ) -> CameraMutationPreview:
         camera = self._camera(camera_id, expected_revision=expected_revision)
         if operation is CameraMutationOperation.UPDATE_SOURCE:
             if name is None or source_url is None:
                 raise ValueError("camera_mutation_payload_required")
             validate_camera_name(name)
-            validate_camera_source_url(source_url)
+            source_url = self._effective_source_url(
+                camera,
+                source_url=source_url,
+                source_credentials=source_credentials,
+            )
         mutation_sha256 = self._mutation_sha256(
             operation=operation,
             name=name,
@@ -874,12 +884,17 @@ class CameraMutationControl:
         *,
         name: str,
         source_url: str,
+        source_credentials: CameraSourceCredentials | None = None,
         expected_revision: int | None = None,
         confirmation_token: str | None,
     ) -> CameraPlacement:
         name = validate_camera_name(name)
-        source_url = validate_camera_source_url(source_url)
         camera = self._camera(camera_id, expected_revision=expected_revision)
+        source_url = self._effective_source_url(
+            camera,
+            source_url=source_url,
+            source_credentials=source_credentials,
+        )
         probe_endpoint = (
             self._admit_probe_endpoint(source_url)
             if probe_endpoint_requires_readmission(
@@ -912,13 +927,33 @@ class CameraMutationControl:
                 probe_endpoint=probe_endpoint,
             )
 
+    @staticmethod
+    def _effective_source_url(
+        camera: CameraPlacement,
+        *,
+        source_url: str,
+        source_credentials: CameraSourceCredentials | None,
+    ) -> str:
+        validated_source_url = validate_camera_source_url(source_url)
+        _, current_credentials = split_source_credentials(camera.source_url)
+        effective_credentials = source_credentials or current_credentials
+        if effective_credentials is None:
+            return validated_source_url
+        return attach_source_credentials(validated_source_url, effective_credentials)
+
     def _admit_probe_endpoint(self, source_url: str) -> AdmittedProbeEndpoint | None:
         if self._probe_endpoint_admission is None:
             return None
         try:
             return self._probe_endpoint_admission.admit(source_url)
-        except ProbeEndpointRejected:
-            raise InvalidCameraSource("camera_source_endpoint_rejected") from None
+        except ProbeEndpointRejected as error:
+            reason = str(error)
+            if reason not in {
+                "probe_source_policy_not_configured",
+                "probe_destination_not_allowed",
+            }:
+                reason = "camera_source_endpoint_rejected"
+            raise InvalidCameraSource(reason) from None
 
     def disable(
         self,

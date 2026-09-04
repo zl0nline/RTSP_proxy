@@ -42,11 +42,40 @@ class DashboardUnavailable:
     login_href: str | None = None
 
 
-def render_local_login(*, oidc_enabled: bool, error: bool = False) -> str:
+def render_local_login(
+    *,
+    oidc_enabled: bool,
+    error: bool = False,
+    username: str = "",
+) -> str:
     return (
         _environment()
         .get_template("dashboard/login.html")
-        .render(oidc_enabled=oidc_enabled, error=error, principal=None)
+        .render(
+            oidc_enabled=oidc_enabled,
+            error=error,
+            username=username,
+            principal=None,
+        )
+    )
+
+
+def render_password_change(
+    *,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+    error: str | None = None,
+    changed: bool = False,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/password_change.html")
+        .render(
+            principal=principal,
+            csrf_token=csrf_token,
+            error=error,
+            changed=changed,
+        )
     )
 
 
@@ -100,6 +129,7 @@ def render_overview(
     principal: OperatorPrincipal,
     can_manage_nodes: bool = False,
     poll_interval_seconds: int = 10,
+    probe_source_policy_configured: bool = True,
 ) -> str:
     return (
         _environment()
@@ -109,6 +139,7 @@ def render_overview(
             principal=principal,
             can_manage_nodes=can_manage_nodes,
             poll_interval_ms=poll_interval_seconds * 1000,
+            probe_source_policy_configured=probe_source_policy_configured,
         )
     )
 
@@ -237,6 +268,10 @@ def render_camera_create(
     principal: OperatorPrincipal,
     csrf_token: str,
     idempotency_key: UUID,
+    error_message: str | None = None,
+    entered_name: str = "",
+    placement_mode: str = "automatic",
+    selected_node_id: str = "",
 ) -> str:
     return (
         _environment()
@@ -246,6 +281,10 @@ def render_camera_create(
             principal=principal,
             csrf_token=csrf_token,
             idempotency_key=idempotency_key,
+            error_message=error_message,
+            entered_name=entered_name,
+            placement_mode=placement_mode,
+            selected_node_id=selected_node_id,
         )
     )
 

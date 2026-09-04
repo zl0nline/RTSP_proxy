@@ -44,6 +44,8 @@ from rtsp_proxy.operator_access import (
     OperatorAccount,
     OperatorIdentitySource,
     OperatorMutationContext,
+    OperatorPermission,
+    OperatorRequestAuditContext,
     OperatorRole,
     OperatorSessionControl,
     OperatorSessionUnavailable,
@@ -61,6 +63,7 @@ from rtsp_proxy.operator_identity import (
     LocalOperatorAuthentication,
     LocalOperatorCredentials,
     LocalOperatorLoginControl,
+    LocalOperatorPasswordControl,
     OidcFlow,
     OidcIdentity,
     OidcLoginControl,
@@ -314,6 +317,10 @@ def test_local_operator_has_a_browser_login_form_without_oidc() -> None:
                 sessions=sessions,
                 clock=lambda: NOW,
             ),
+            local_operator_passwords=LocalOperatorPasswordControl(
+                store=local_store,
+                clock=lambda: NOW,
+            ),
         ),
         base_url="https://management.example.test",
     )
@@ -341,9 +348,181 @@ def test_local_operator_has_a_browser_login_form_without_oidc() -> None:
     assert "локальные учётные данные" in login_page.text
     assert rejected.status_code == 401
     assert "Неверный логин" in rejected.text
+    assert 'value="admin"' in rejected.text
+    assert "wrong password" not in rejected.text
+    assert 'data-password-toggle' in login_page.text
+    assert 'class="login-submit"' in login_page.text
     assert accepted.status_code == 303
     assert accepted.headers["location"] == "/"
     assert accepted.cookies["__Host-rtsp_proxy_session"] == "S" * 43
+    password_page = client.get("/dashboard/password")
+    assert password_page.status_code == 200
+    assert 'action="/dashboard/password"' in password_page.text
+    assert "Текущий пароль" in password_page.text
+
+
+def test_local_operator_can_change_password_through_authenticated_api() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    local_store = InMemoryLocalOperatorStore(
+        account=account,
+        credentials=LocalOperatorCredentials(
+            password_scrypt=LocalOperatorCredentials.hash_password(
+                "correct horse battery staple",
+                salt=b"B" * 16,
+            )
+        ),
+    )
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("S" * 43, "C" * 43)).__next__,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            operator_sessions=sessions,
+            local_operator_login=LocalOperatorLoginControl(
+                store=local_store,
+                sessions=sessions,
+                clock=lambda: NOW,
+            ),
+            local_operator_passwords=LocalOperatorPasswordControl(
+                store=local_store,
+                clock=lambda: NOW,
+            ),
+        ),
+        base_url="https://management.example.test",
+    )
+    logged_in = client.post(
+        "/auth/local/login",
+        data={
+            "username": "admin",
+            "password": "correct horse battery staple",
+            "totp": "",
+        },
+        follow_redirects=False,
+    )
+
+    changed = client.post(
+        "/api/v1/operator/password",
+        headers={"X-CSRF-Token": "C" * 43},
+        json={
+            "current_password": "correct horse battery staple",
+            "new_password": "A much safer operator passphrase 2026!",
+            "totp": "",
+        },
+    )
+
+    assert logged_in.status_code == 303
+    assert changed.status_code == 200
+    assert changed.json() == {"status": "changed", "authz_version": 2}
+    with pytest.raises(OidcLoginInvalid):
+        local_store.authenticate(
+            username="admin",
+            password="correct horse battery staple",
+            totp="",
+            source_ip="192.0.2.10",
+            now=NOW,
+        )
+    assert local_store.authenticate(
+        username="admin",
+        password="A much safer operator passphrase 2026!",
+        totp="",
+        source_ip="192.0.2.10",
+        now=NOW,
+    ).authz_version == 2
+
+
+def test_postgres_password_change_keeps_current_session_and_revokes_others(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    local_store = PostgresLocalOperatorStore(postgres_database_url, encryption_key=b"K" * 32)
+    session_store = PostgresOperatorSessionStore(postgres_database_url)
+    sessions = OperatorSessionControl(
+        store=session_store,
+        token_factory=iter(("A" * 43, "B" * 43, "C" * 43, "D" * 43)).__next__,
+        session_id_factory=iter(
+            (
+                UUID("70000000-0000-4000-8000-000000000001"),
+                UUID("70000000-0000-4000-8000-000000000002"),
+            )
+        ).__next__,
+    )
+    try:
+        local_store.provision(
+            account=account,
+            credentials=LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(
+                    "correct horse battery staple", salt=b"P" * 16
+                )
+            ),
+            context=TEST_MUTATION_CONTEXT,
+        )
+        current = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+        other = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+        version = local_store.change_password(
+            account_id=ACCOUNT_ID,
+            current_password="correct horse battery staple",
+            new_password="A much safer operator passphrase 2026!",
+            totp="",
+            current_session_id=current.session.id,
+            context=OperatorRequestAuditContext.internal(
+                action="operator.password_change",
+                resource_scope="session:self",
+                resource_type="session",
+                resource_id="self",
+            ),
+            now=NOW,
+        )
+        assert version == 2
+        assert sessions.authenticate(
+            session_token=current.session_token,
+            permission=OperatorPermission.DASHBOARD_READ,
+            required_scope=None,
+        ).authz_version == 2
+        with pytest.raises(Exception, match="operator_session_revoked"):
+            sessions.authenticate(
+                session_token=other.session_token,
+                permission=OperatorPermission.DASHBOARD_READ,
+                required_scope=None,
+            )
+        engine = create_engine(postgres_database_url, hide_parameters=True)
+        with engine.connect() as connection:
+            payload = connection.scalar(
+                text(
+                    "SELECT payload::text FROM audit_events "
+                    "WHERE aggregate_id=:account_id "
+                    "AND event_type='operator.password_changed'"
+                ),
+                {"account_id": ACCOUNT_ID},
+            )
+        engine.dispose()
+        assert payload is not None
+        assert "revoked_sessions" in payload
+        assert "correct horse" not in payload
+        assert "safer operator" not in payload
+    finally:
+        local_store.close()
+        session_store.close()
 
 
 def test_postgres_local_operator_provision_and_login_keep_secrets_out_of_rows(

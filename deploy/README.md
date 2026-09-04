@@ -768,6 +768,24 @@ empty `path` on API and metrics permissions. Older releases can start MediaMTX
 but then fail closed with `node_process_identity_unavailable` or
 `node_api_config_mismatch`.
 
+Application release `0.14.0` adds schema revision
+`0022_camera_source_credentials`. It stores a credential-free URL in `cameras`;
+source username/password are accepted only as separate fields and sealed with
+AES-256-GCM in `camera_source_credentials`. WEB and reconciler must use the same
+camera-bound, versioned keyring. Before adding the first camera run:
+
+```sh
+sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
+  --release-id 0.14.0 \
+  --source-cidrs '10.180.5.0/24'
+```
+
+The command refuses an empty allowlist, creates the `0640
+root:rtsp-proxy-access` keyring only when absent, and atomically updates both
+environment files. Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
+deny-all (`probe_source_policy_not_configured`); a source outside a non-empty
+policy is `probe_destination_not_allowed`.
+
 ### Operator authentication modes
 
 There are two independent normal login paths, and they may be enabled at the
@@ -781,11 +799,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation, apply migration 0021 and run:
+For a first installation, apply migration 0022 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.13.10 \
+  --release-id 0.14.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -800,6 +818,12 @@ systemd. `--with-totp` prints a one-time enrollment URI. It is optional for
 normal password login, but a verified TOTP is required to establish recent MFA
 for sensitive actions. After WEB starts, use `/auth/local/login` and test both
 accepted and rejected credentials.
+Local operators rotate their own password at `/dashboard/password` or
+`POST /api/v1/operator/password`. The current session is preserved at the new
+authorization version, all other sessions are revoked, and a sanitized audit
+event is persisted. When WEB is unavailable,
+`rtsp-proxy-local-operator --rotate-password --username NAME` reads secrets
+from the terminal and revokes every session for the account.
 
 The OIDC WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as
