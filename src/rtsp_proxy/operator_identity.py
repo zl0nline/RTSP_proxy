@@ -649,7 +649,8 @@ class PostgresLocalOperatorStore:
                         text(
                             "UPDATE operator_sessions SET revoked_at=clock_timestamp() "
                             "WHERE account_id=:account_id AND revoked_at IS NULL "
-                            "AND (:session_id IS NULL OR id<>:session_id) RETURNING id"
+                            "AND (CAST(:session_id AS uuid) IS NULL "
+                            "OR id<>CAST(:session_id AS uuid)) RETURNING id"
                         ),
                         {"account_id": account_id, "session_id": current_session_id},
                     ).all()

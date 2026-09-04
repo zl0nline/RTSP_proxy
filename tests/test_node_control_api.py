@@ -42,6 +42,7 @@ from rtsp_proxy.nodes import (
     InMemoryNodeStore,
     InvalidCameraName,
     InvalidCameraSource,
+    MaximumNodesReached,
     MediaNode,
     NodeCameraCapacityReached,
     NodeCommandFence,
@@ -53,12 +54,14 @@ from rtsp_proxy.nodes import (
     NodeHealth,
     NodeLifecycleBusy,
     NodeLifecycleConflict,
+    NodeManagementPortRangeExhausted,
     NodeMutationContext,
     NodeNotEmpty,
     NodeNotFound,
     NodePortChange,
     NodePortInUse,
     NodePortOutOfRange,
+    NodePortRangeExhausted,
     NodeProvisioningPolicy,
     NodeRuntime,
     NodeRuntimeAction,
@@ -66,6 +69,7 @@ from rtsp_proxy.nodes import (
     NodeRuntimeObservation,
     NodeRuntimeUnavailable,
     NodeState,
+    ProbeEndpointSchemaUnavailable,
     camera_placement_fingerprint,
     tcp_port_is_bindable,
 )
@@ -765,6 +769,47 @@ def test_camera_create_reports_an_unconfigured_source_policy() -> None:
         "detail": {"code": "probe_source_policy_not_configured"}
     }
     assert store.list_cameras() == ()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    (
+        (MaximumNodesReached("max_nodes_reached"), 409, "max_nodes_reached"),
+        (NodePortRangeExhausted("node_ports_exhausted"), 409, "node_ports_exhausted"),
+        (
+            NodeManagementPortRangeExhausted("node_management_ports_exhausted"),
+            409,
+            "node_management_ports_exhausted",
+        ),
+        (NodeRuntimeUnavailable("node_runtime_unavailable"), 503, "node_runtime_unavailable"),
+        (
+            ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable"),
+            503,
+            "probe_endpoint_schema_unavailable",
+        ),
+    ),
+)
+def test_camera_create_maps_automatic_node_provisioning_failures(
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    class FailingCameraControl:
+        def create_camera(self, **_kwargs: object) -> None:
+            raise error
+
+    response = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            camera_control=cast(CameraControl, FailingCameraControl()),
+        )
+    ).post(
+        "/api/v1/cameras",
+        json={"name": "entrance", "source_url": "rtsp://camera.example/main"},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"]["code"] == expected_code
 
 
 def test_camera_create_accepts_credentials_separately_without_returning_them() -> None:

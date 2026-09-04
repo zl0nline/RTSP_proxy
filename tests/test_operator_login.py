@@ -76,6 +76,7 @@ from rtsp_proxy.operator_identity import (
     PostgresOidcAccountResolver,
     PostgresOidcFlowStore,
     Rs256OidcClaimsVerifier,
+    validate_local_operator_password,
 )
 
 NOW = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
@@ -211,6 +212,19 @@ def test_local_operator_store_rejects_invalid_configuration() -> None:
     with pytest.raises(ValueError, match="local_operator_account_invalid"):
         InMemoryLocalOperatorStore(account=account, credentials=credentials)
 
+    unavailable = PostgresLocalOperatorStore(
+        "postgresql+psycopg://postgres@127.0.0.1:1/unavailable",
+        encryption_key=b"K" * 32,
+        statement_timeout_ms=100,
+    )
+    try:
+        with pytest.raises(OidcLoginUnavailable, match="local_operator_store_unavailable"):
+            unavailable.assert_ready()
+        with pytest.raises(OidcLoginUnavailable, match="local_operator_store_unavailable"):
+            unavailable.account_id_for_username("admin")
+    finally:
+        unavailable.close()
+
 
 def test_local_operator_cli_reports_failure_and_one_time_totp(
     monkeypatch: pytest.MonkeyPatch,
@@ -267,6 +281,186 @@ def test_local_operator_cli_rejects_password_mismatch_and_invalid_key(
         match="local_operator_key_file_unsafe",
     ):
         local_operator_cli._read_key(tmp_path / "missing-key")
+
+
+def test_local_operator_cli_rotates_password_without_putting_secrets_in_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class FakeStore:
+        def __init__(self, database_url: str, *, encryption_key: bytes) -> None:
+            observed["database_url"] = database_url
+            observed["encryption_key"] = encryption_key
+
+        def account_id_for_username(self, username: str) -> UUID | None:
+            observed["username"] = username
+            return ACCOUNT_ID
+
+        def change_password(self, **kwargs: Any) -> int:
+            observed.update(kwargs)
+            return 2
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", "postgresql+psycopg://unused")
+    monkeypatch.setenv("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", "/unused/key")
+    monkeypatch.setattr(local_operator_cli, "_read_key", lambda _path: b"K" * 32)
+    monkeypatch.setattr(local_operator_cli, "PostgresLocalOperatorStore", FakeStore)
+    answers = iter(
+        (
+            "correct horse battery staple",
+            "A much safer operator passphrase 2026!",
+            "A much safer operator passphrase 2026!",
+            "123456",
+        )
+    )
+
+    result = local_operator_cli.main(
+        ["--rotate-password", "--username", "pilot-admin"],
+        password_reader=lambda _prompt: next(answers),
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert str(ACCOUNT_ID) in output
+    assert "safer operator" not in output
+    assert observed["database_url"] == "postgresql+psycopg://unused"
+    assert observed["username"] == "pilot-admin"
+    assert observed["current_password"] == "correct horse battery staple"
+    assert observed["new_password"] == "A much safer operator passphrase 2026!"
+    assert observed["totp"] == "123456"
+    assert observed["current_session_id"] is None
+    assert observed["closed"] is True
+
+
+def test_local_operator_cli_rotation_rejects_incomplete_configuration_and_unknown_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RTSP_PROXY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", raising=False)
+    with pytest.raises(
+        local_operator_cli.LocalOperatorProvisionError,
+        match="local_operator_configuration_invalid",
+    ):
+        local_operator_cli.rotate_password_from_environment(
+            username="admin",
+            password_reader=lambda _prompt: "unused",
+        )
+
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", "postgresql+psycopg://unused")
+    monkeypatch.setenv("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", "/unused/key")
+    answers = iter(("current", "new password", "different password", ""))
+    with pytest.raises(
+        local_operator_cli.LocalOperatorProvisionError,
+        match="local_operator_password_confirmation_failed",
+    ):
+        local_operator_cli.rotate_password_from_environment(
+            username="admin",
+            password_reader=lambda _prompt: next(answers),
+        )
+
+    class MissingAccountStore:
+        def __init__(self, _database_url: str, *, encryption_key: bytes) -> None:
+            assert encryption_key == b"K" * 32
+
+        def account_id_for_username(self, _username: str) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(local_operator_cli, "_read_key", lambda _path: b"K" * 32)
+    monkeypatch.setattr(local_operator_cli, "PostgresLocalOperatorStore", MissingAccountStore)
+    answers = iter(
+        (
+            "current password",
+            "New password phrase 2026!",
+            "New password phrase 2026!",
+            "",
+        )
+    )
+    with pytest.raises(
+        local_operator_cli.LocalOperatorProvisionError,
+        match="local_operator_account_not_found",
+    ):
+        local_operator_cli.rotate_password_from_environment(
+            username="missing",
+            password_reader=lambda _prompt: next(answers),
+        )
+
+
+def test_local_operator_password_policy_and_totp_rotation_are_enforced() -> None:
+    with pytest.raises(ValueError, match="local_operator_password_policy_failed"):
+        validate_local_operator_password("short")
+    with pytest.raises(ValueError, match="local_operator_password_policy_failed"):
+        validate_local_operator_password("onlylowercase")
+    assert validate_local_operator_password("this is a long passphrase") == (
+        "this is a long passphrase"
+    )
+
+    secret = b"T" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = InMemoryLocalOperatorStore(
+        account=account,
+        credentials=LocalOperatorCredentials(
+            password_scrypt=LocalOperatorCredentials.hash_password(
+                "correct horse battery staple", salt=b"P" * 16
+            ),
+            totp_secret=secret,
+        ),
+    )
+    context = OperatorRequestAuditContext.internal(
+        action="operator.password_change",
+        resource_scope="session:self",
+        resource_type="session",
+        resource_id="self",
+    )
+    code = TOTP(secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
+
+    with pytest.raises(OidcLoginInvalid, match="local_operator_password_change_denied"):
+        store.change_password(
+            account_id=UUID("60000000-0000-0000-0000-000000000007"),
+            current_password="correct horse battery staple",
+            new_password="A much safer operator passphrase 2026!",
+            totp=code,
+            current_session_id=None,
+            context=context,
+            now=NOW,
+        )
+    assert (
+        store.change_password(
+            account_id=ACCOUNT_ID,
+            current_password="correct horse battery staple",
+            new_password="A much safer operator passphrase 2026!",
+            totp=code,
+            current_session_id=None,
+            context=context,
+            now=NOW,
+        )
+        == 2
+    )
+    with pytest.raises(OidcLoginInvalid, match="local_operator_password_change_denied"):
+        store.change_password(
+            account_id=ACCOUNT_ID,
+            current_password="A much safer operator passphrase 2026!",
+            new_password="Another safer operator passphrase 2026!",
+            totp=code,
+            current_session_id=None,
+            context=context,
+            now=NOW,
+        )
 
 
 def test_local_operator_login_rejects_naive_clock_before_credentials() -> None:
@@ -359,6 +553,30 @@ def test_local_operator_has_a_browser_login_form_without_oidc() -> None:
     assert password_page.status_code == 200
     assert 'action="/dashboard/password"' in password_page.text
     assert "Текущий пароль" in password_page.text
+    mismatch = client.post(
+        "/dashboard/password",
+        data={
+            "_csrf": "C" * 43,
+            "current_password": "correct horse battery staple",
+            "new_password": "A much safer operator passphrase 2026!",
+            "new_password_confirmation": "A different operator passphrase 2026!",
+            "totp": "",
+        },
+    )
+    assert mismatch.status_code == 422
+    assert "Новые пароли не совпадают" in mismatch.text
+    changed = client.post(
+        "/dashboard/password",
+        data={
+            "_csrf": "C" * 43,
+            "current_password": "correct horse battery staple",
+            "new_password": "A much safer operator passphrase 2026!",
+            "new_password_confirmation": "A much safer operator passphrase 2026!",
+            "totp": "",
+        },
+    )
+    assert changed.status_code == 200
+    assert "Пароль изменён" in changed.text
 
 
 def test_local_operator_can_change_password_through_authenticated_api() -> None:
@@ -477,6 +695,9 @@ def test_postgres_password_change_keeps_current_session_and_revokes_others(
             ),
             context=TEST_MUTATION_CONTEXT,
         )
+        assert local_store.account_id_for_username("admin") == ACCOUNT_ID
+        assert local_store.account_id_for_username("missing") is None
+        assert local_store.account_id_for_username("invalid username") is None
         current = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=False)
         other = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=False)
         version = local_store.change_password(
@@ -494,6 +715,21 @@ def test_postgres_password_change_keeps_current_session_and_revokes_others(
             now=NOW,
         )
         assert version == 2
+        with pytest.raises(OidcLoginInvalid, match="local_operator_password_change_denied"):
+            local_store.change_password(
+                account_id=ACCOUNT_ID,
+                current_password="A much safer operator passphrase 2026!",
+                new_password="Another safer operator passphrase 2026!",
+                totp="",
+                current_session_id=UUID("70000000-0000-4000-8000-000000000099"),
+                context=OperatorRequestAuditContext.internal(
+                    action="operator.password_change",
+                    resource_scope="session:self",
+                    resource_type="session",
+                    resource_id="self",
+                ),
+                now=NOW + timedelta(seconds=30),
+            )
         assert sessions.authenticate(
             session_token=current.session_token,
             permission=OperatorPermission.DASHBOARD_READ,
@@ -523,6 +759,101 @@ def test_postgres_password_change_keeps_current_session_and_revokes_others(
     finally:
         local_store.close()
         session_store.close()
+
+
+def test_postgres_password_change_requires_fresh_totp(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    secret = b"T" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresLocalOperatorStore(postgres_database_url, encryption_key=b"K" * 32)
+    context = OperatorRequestAuditContext.internal(
+        action="operator.password_change",
+        resource_scope="session:self",
+        resource_type="session",
+        resource_id="self",
+    )
+    try:
+        store.provision(
+            account=account,
+            credentials=LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(
+                    "correct horse battery staple", salt=b"P" * 16
+                ),
+                totp_secret=secret,
+            ),
+            context=TEST_MUTATION_CONTEXT,
+        )
+        code = TOTP(secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
+
+        assert (
+            store.change_password(
+                account_id=ACCOUNT_ID,
+                current_password="correct horse battery staple",
+                new_password="A much safer operator passphrase 2026!",
+                totp=code,
+                current_session_id=None,
+                context=context,
+                now=NOW,
+            )
+            == 2
+        )
+        with pytest.raises(OidcLoginInvalid, match="local_operator_password_change_denied"):
+            store.change_password(
+                account_id=ACCOUNT_ID,
+                current_password="A much safer operator passphrase 2026!",
+                new_password="Another safer operator passphrase 2026!",
+                totp=code,
+                current_session_id=None,
+                context=context,
+                now=NOW,
+            )
+        with pytest.raises(OidcLoginInvalid, match="local_operator_password_change_denied"):
+            store.change_password(
+                account_id=ACCOUNT_ID,
+                current_password="A much safer operator passphrase 2026!",
+                new_password="Another safer operator passphrase 2026!",
+                totp="",
+                current_session_id=None,
+                context=context,
+                now=datetime(2026, 9, 4),
+            )
+        engine = create_engine(postgres_database_url, hide_parameters=True)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE operator_accounts SET authz_version=:version "
+                    "WHERE id=:account_id"
+                ),
+                {"account_id": ACCOUNT_ID, "version": (1 << 63) - 1},
+            )
+        engine.dispose()
+        next_now = NOW + timedelta(seconds=30)
+        next_code = TOTP(secret, 6, hashes.SHA1(), 30).generate(
+            int(next_now.timestamp())
+        ).decode("ascii")
+        with pytest.raises(OidcLoginInvalid, match="local_operator_password_change_denied"):
+            store.change_password(
+                account_id=ACCOUNT_ID,
+                current_password="A much safer operator passphrase 2026!",
+                new_password="Another safer operator passphrase 2026!",
+                totp=next_code,
+                current_session_id=None,
+                context=context,
+                now=next_now,
+            )
+    finally:
+        store.close()
 
 
 def test_postgres_local_operator_provision_and_login_keep_secrets_out_of_rows(

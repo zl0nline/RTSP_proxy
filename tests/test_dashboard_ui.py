@@ -55,6 +55,7 @@ from rtsp_proxy.nodes import (
     CameraState,
     EligibleNodeMissing,
     InMemoryNodeStore,
+    InvalidCameraName,
     InvalidCameraSource,
     MaximumNodesReached,
     MediaNode,
@@ -3213,7 +3214,7 @@ def test_dashboard_camera_registration_preserves_safe_fields_and_explains_source
 ) -> None:
     class RejectedCamera:
         def creation_targets(self) -> tuple[MediaNode, ...]:
-            return ()
+            raise CameraCatalogUnavailable("camera_catalog_unavailable")
 
         def create_camera(self, **_kwargs: object) -> None:
             raise InvalidCameraSource(reason)
@@ -3244,6 +3245,34 @@ def test_dashboard_camera_registration_preserves_safe_fields_and_explains_source
     assert 'value="manual" checked' in response.text
     assert "camera.internal/private" not in response.text
     assert "Дашборд недоступен" not in response.text
+
+
+def test_dashboard_camera_registration_reports_invalid_name_in_context() -> None:
+    class RejectedCamera:
+        def create_camera(self, **_kwargs: object) -> None:
+            raise InvalidCameraName("camera_name_invalid")
+
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, RejectedCamera()),
+        role=OperatorRole.OPERATOR,
+    )
+
+    response = client.post(
+        "/dashboard/cameras",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "name": "bad name",
+            "source_url": "rtsp://camera.internal/private",
+            "placement_mode": "automatic",
+            "node_id": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Некорректное имя камеры" in response.text
 
 
 def test_dashboard_camera_registration_accepts_separate_source_credentials() -> None:
