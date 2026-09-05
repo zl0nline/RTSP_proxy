@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_network
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -31,6 +32,7 @@ from rtsp_proxy.probe_worker import (
 from rtsp_proxy.probes import (
     BoundedProbeScheduler,
     ProbeExecutionResult,
+    ProbeFailureClass,
     ProbeHealthRecord,
     ProbeMethod,
     ProbeObservation,
@@ -40,6 +42,33 @@ from rtsp_proxy.probes import (
 from rtsp_proxy.reconcile import CameraRuntimeObservation
 
 NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
+
+
+def test_postgres_probe_worker_rejects_invalid_policy_and_unowned_access(
+    postgres_database_url: str,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    with pytest.raises(ValueError, match="store_policy_invalid"):
+        PostgresProbeWorkStore("")
+
+    upgrade_database(postgres_database_url)
+    store = PostgresProbeWorkStore(postgres_database_url)
+    try:
+        with pytest.raises(ProbeWorkerUnavailable, match="not_started"):
+            store.assert_owned()
+        store.acquire()
+        with pytest.raises(ValueError, match="batch_invalid"):
+            store.active_profiles(limit=0)
+        with pytest.raises(
+            ValueError, match="execution_identity_invalid",
+        ), store.execution_permit(
+            cast(ProbeTarget, object()),
+            profile_revision=1,
+        ):
+            pass
+    finally:
+        store.close()
 
 
 def test_postgres_probe_worker_lock_is_singleton_and_recoverable(
@@ -139,6 +168,15 @@ def test_postgres_probe_worker_pages_past_the_first_bounded_batch(
             profile_revision=first[0].revision,
         ) as permitted:
             assert permitted is False
+        store.mark_attempt(first[0].camera_id, revision=first[0].revision)
+        engine = create_engine(postgres_database_url)
+        with engine.connect() as connection:
+            attempted_at = connection.scalar(text(
+                "SELECT last_attempt_at FROM camera_probe_profiles "
+                "WHERE camera_id=:camera_id"
+            ), {"camera_id": first[0].camera_id})
+        engine.dispose()
+        assert isinstance(attempted_at, datetime)
     finally:
         store.close()
 
@@ -231,6 +269,7 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     class Client:
         def __init__(self) -> None:
             self.calls = 0
+            self.fail = False
 
         def execute(
             self,
@@ -241,6 +280,8 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
             cancelled: Callable[[], bool] | None = None,
         ) -> ProbeExecutionResult:
             self.calls += 1
+            if self.fail:
+                raise RuntimeError("broker execution failed")
             assert endpoint.identity == camera.probe_endpoint
             return ProbeExecutionResult(
                 outcome=ProbeOutcome.HEALTHY,
@@ -262,6 +303,8 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     )
 
     worker.start()
+    with pytest.raises(ValueError, match="time_invalid"):
+        worker.run_once(now=NOW.replace(tzinfo=None))
     cycle = worker.run_once(now=NOW)
 
     assert cycle.candidates == cycle.submitted == cycle.executed == cycle.persisted == 1
@@ -297,6 +340,34 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     assert work.marked == []
     assert rejected_scheduler.diagnostics().active == 0
     assert rejected_scheduler.diagnostics().queued == 0
+    rejected_worker.close()
+
+    # Unexpected client failures are isolated and projected as infrastructure
+    # inconclusive rather than killing the authoritative cycle.
+    work.permitted = True
+    work.marked.clear()
+    failing_observations = Observations()
+    failing_client = Client()
+    failing_client.fail = True
+    failing_worker = ProbeMonitoringWorker(
+        work=work, cameras=Cameras(), observations=failing_observations,
+        runtime=Runtime(), admission=admission, client=failing_client,
+        scheduler=BoundedProbeScheduler(
+            global_limit=2, per_node_limit=1, per_site_limit=2, source_limit=2,
+            path_limit=1, queue_limit=8, lease_seconds=15, retry_delay_seconds=1,
+            max_attempts=1,
+        ),
+        batch_limit=8, execution_workers=2,
+    )
+    failing_worker.start()
+    failed = failing_worker.run_once(now=NOW)
+
+    assert failed.candidates == failed.submitted == failed.executed == failed.persisted == 1
+    assert failing_client.calls == 1
+    assert failing_observations.saved[0][0].outcome is ProbeOutcome.INCONCLUSIVE
+    assert failing_observations.saved[0][0].failure_class is ProbeFailureClass.EXECUTOR
+    assert work.marked == [(camera_id, 3)]
+    failing_worker.close()
 
 
 def test_runtime_failure_is_isolated_to_one_camera() -> None:
@@ -397,6 +468,7 @@ def test_runtime_failure_is_isolated_to_one_camera() -> None:
 def _seed_profile_rows(database_url: str, *, count: int) -> tuple[UUID, ...]:
     node_id = uuid4()
     camera_ids = tuple(uuid4() for _ in range(count))
+    updated_at = datetime.now(UTC) - timedelta(hours=1)
     engine = create_engine(database_url)
     with engine.begin() as connection:
         connection.execute(text(
@@ -443,7 +515,7 @@ def _seed_profile_rows(database_url: str, *, count: int) -> tuple[UUID, ...]:
                 "require_audio, routine_seconds, confirmation_seconds, timeout_seconds, "
                 "updated_at) VALUES (:camera_id, 1, true, 2, true, false, 300, 30, 15, "
                 ":updated_at)"
-            ), {"camera_id": camera_id, "updated_at": NOW - timedelta(hours=1)})
+            ), {"camera_id": camera_id, "updated_at": updated_at})
     engine.dispose()
     return camera_ids
 

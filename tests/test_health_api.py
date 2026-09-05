@@ -1287,6 +1287,77 @@ def test_reconciler_background_role_starts_and_stops_its_bounded_loop(
         assert client.get("/health/live").status_code == 200
 
 
+def test_probe_background_role_starts_ready_and_releases_ownership(
+    postgres_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rtsp_proxy.camera_secrets import CameraSourceCredentialCipher, CameraSourceKeyRing
+    from rtsp_proxy.migrate import upgrade_database
+    from rtsp_proxy.probe_worker import PostgresProbeWorkStore
+
+    upgrade_database(postgres_database_url)
+    cipher = CameraSourceCredentialCipher(
+        CameraSourceKeyRing(primary_key_id="test", keys={"test": b"k" * 32})
+    )
+    monkeypatch.setattr("rtsp_proxy.runtime.load_camera_source_cipher", lambda _path: cipher)
+    socket_path = Path("/tmp") / f"rtsp-proxy-{uuid4().hex}.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    listener.settimeout(3)
+
+    def answer_health() -> None:
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return
+        with connection:
+            connection.makefile("rb").readline(65_537)
+            connection.sendall(
+                b'{"error":null,"observation":null,"ok":true,"schema_version":1}\n'
+            )
+
+    health_thread = Thread(target=answer_health)
+    health_thread.start()
+    settings = Settings.model_validate({
+        "role": RuntimeRole.PROBE,
+        "database_url": postgres_database_url,
+        "node_runtime_socket": socket_path,
+        "node_mediamtx_binary_sha256": TRUSTED_MEDIAMTX_SHA256,
+        "camera_source_keys_file": tmp_path / "unused-camera-source-keys.json",
+        "probe_source_cidrs": ("192.0.2.0/24",),
+        "probe_broker_socket": Path("/run/missing-probe-broker.sock"),
+        "probe_interval_seconds": 1,
+        "probe_batch_limit": 8,
+        "probe_execution_workers": 2,
+    })
+    app = create_background_app(settings, expected_role=RuntimeRole.PROBE)
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health/ready")
+            assert response.status_code == 200, response.text
+            assert {item["name"]: item["status"] for item in response.json()["checks"]} == {
+                "database": "pass",
+                "schema": "pass",
+                "probe_runtime": "pass",
+            }
+    finally:
+        listener.close()
+        health_thread.join(timeout=4)
+        socket_path.unlink(missing_ok=True)
+    assert not health_thread.is_alive()
+
+    # Lifespan shutdown must release the advisory singleton for a systemd restart.
+    successor = PostgresProbeWorkStore(postgres_database_url)
+    try:
+        successor.acquire()
+        successor.assert_owned()
+    finally:
+        successor.close()
+
+
 def test_collector_background_role_starts_and_persists_empty_fleet_snapshot(
     postgres_database_url: str,
 ) -> None:

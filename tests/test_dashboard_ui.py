@@ -99,7 +99,11 @@ from rtsp_proxy.operator_access import (
     OperatorSessionUnavailable,
     PostgresOperatorSessionStore,
 )
-from rtsp_proxy.probe_routine import CameraProbeProfile, StoredCameraProbeProfile
+from rtsp_proxy.probe_routine import (
+    CameraProbeProfile,
+    CameraProbeProfileUnavailable,
+    StoredCameraProbeProfile,
+)
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
     CameraMovePreview,
@@ -3989,6 +3993,124 @@ def test_camera_probe_profile_is_explicit_revision_fenced_and_operator_attribute
     assert api.status_code == 200
     assert api.json()["mode"] == "active"
     assert api.headers["cache-control"] == "no-store"
+
+
+def test_camera_probe_profile_api_maps_authoritative_store_failures() -> None:
+    class Profiles:
+        read_failure: Exception | None = None
+        update_failure: Exception | None = None
+
+        def camera_probe_profile(self, camera_id: UUID) -> StoredCameraProbeProfile:
+            if self.read_failure is not None:
+                raise self.read_failure
+            return StoredCameraProbeProfile(camera_id, 0, CameraProbeProfile())
+
+        def update_camera_probe_profile(
+            self,
+            camera_id: UUID,
+            *,
+            profile: CameraProbeProfile,
+            expected_revision: int,
+            mutation_context: NodeMutationContext,
+        ) -> StoredCameraProbeProfile:
+            if self.update_failure is not None:
+                raise self.update_failure
+            return StoredCameraProbeProfile(camera_id, expected_revision + 1, profile)
+
+    profiles = Profiles()
+    client, cookie_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_probe_profiles=profiles,
+        role=OperatorRole.ADMIN,
+    )
+    path = f"/api/v1/cameras/{CAMERA_ID}/probe-profile"
+    headers = {**cookie_headers, "X-CSRF-Token": CSRF_TOKEN}
+    payload = {
+        "expected_revision": 0,
+        "enabled": True,
+        "max_source_sessions": 2,
+        "require_video": True,
+        "require_audio": False,
+        "routine_seconds": 300,
+        "confirmation_seconds": 30,
+        "timeout_seconds": 15,
+    }
+
+    for failure, status, code in (
+        (CameraNotFound("camera_not_found"), 404, "camera_not_found"),
+        (
+            CameraLifecycleConflict("probe_profile_revision_conflict"),
+            409,
+            "camera_probe_profile_revision_conflict",
+        ),
+        (ValueError("camera_probe_profile_invalid"), 422, "camera_probe_profile_invalid"),
+        (
+            CameraProbeProfileUnavailable("probe_profile_store_unavailable"),
+            503,
+            "camera_probe_profiles_unavailable",
+        ),
+    ):
+        profiles.update_failure = failure
+        response = client.put(path, headers=headers, json=payload)
+        assert response.status_code == status
+        assert response.json()["detail"]["code"] == code
+
+    for failure, status, code in (
+        (CameraNotFound("camera_not_found"), 404, "camera_not_found"),
+        (
+            CameraProbeProfileUnavailable("probe_profile_store_unavailable"),
+            503,
+            "camera_probe_profiles_unavailable",
+        ),
+    ):
+        profiles.read_failure = failure
+        response = client.get(path, headers=cookie_headers)
+        assert response.status_code == status
+        assert response.json()["detail"]["code"] == code
+
+    unavailable, unavailable_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_probe_profiles=None,
+        role=OperatorRole.ADMIN,
+    )
+    response = unavailable.get(path, headers=unavailable_headers)
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "camera_probe_profiles_unavailable"
+
+    viewer, viewer_headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_probe_profiles=profiles,
+        role=OperatorRole.VIEWER,
+    )
+    response = viewer.put(
+        path,
+        headers={**viewer_headers, "X-CSRF-Token": CSRF_TOKEN},
+        json=payload,
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "operator_permission_denied"
+
+    profiles.update_failure = None
+    invalid_form = client.post(
+        f"/dashboard/cameras/{CAMERA_ID}/probe-profile",
+        headers=cookie_headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "0",
+            "enabled": "yes",
+            "max_source_sessions": "2",
+            "require_video": "true",
+            "require_audio": "false",
+            "routine_seconds": "300",
+            "confirmation_seconds": "30",
+            "timeout_seconds": "15",
+        },
+    )
+    assert invalid_form.status_code == 422
+    assert invalid_form.json()["detail"]["code"] == "camera_probe_profile_invalid"
 
 
 def test_camera_detail_live_snapshot_and_sse_use_the_bounded_aggregated_source() -> None:
