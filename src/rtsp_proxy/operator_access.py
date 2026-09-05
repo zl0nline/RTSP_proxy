@@ -89,6 +89,8 @@ _AUDIT_ACTIONS = frozenset(
         "camera.move_preview",
         "camera.move_read",
         "camera.mutation_preview",
+        "camera.probe_profile_read",
+        "camera.probe_profile_update",
         "camera.read",
         "camera.runtime_read",
         "camera.update",
@@ -906,6 +908,7 @@ class PostgresOperatorSessionStore:
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
             ("0021_local_operator_login",),
+            ("0022_camera_source_credentials",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         )

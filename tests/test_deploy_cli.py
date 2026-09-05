@@ -561,12 +561,14 @@ def test_linux_host_installs_only_static_assets_and_examples(
     source = tmp_path / "source"
     for relative in (
         "deploy/systemd/rtsp-proxy-web.service",
+        "deploy/systemd/rtsp-proxy-web.service.d/camera-source.conf",
         "deploy/systemd/rtsp-proxy-probe-broker.socket",
         "deploy/systemd/mediamtx.service",
         "deploy/sysusers.d/rtsp-proxy.conf",
         "deploy/tmpfiles.d/rtsp-proxy.conf",
         "deploy/tmpfiles.d/rtsp-proxy-probe-broker.conf",
         "deploy/rtsp-proxy.env.example",
+        "deploy/probe-worker.env.example",
         "deploy/systemd/rtsp-proxy-web-auth.conf.example",
         "deploy/systemd/rtsp-proxy-web-local-auth.conf.example",
         "deploy/nftables/rtsp-proxy.nft",
@@ -594,9 +596,14 @@ def test_linux_host_installs_only_static_assets_and_examples(
     host.install_assets(source, release)
 
     assert (paths.root / "etc/systemd/system/rtsp-proxy-web.service").is_file()
+    assert (
+        paths.root
+        / "etc/systemd/system/rtsp-proxy-web.service.d/camera-source.conf"
+    ).is_file()
     assert (paths.root / "etc/systemd/system/rtsp-proxy-probe-broker.socket").is_file()
     assert not (paths.root / "etc/systemd/system/mediamtx.service").exists()
     assert (paths.root / "etc/rtsp-proxy/examples/rtsp-proxy.env.example").is_file()
+    assert (paths.root / "etc/rtsp-proxy/examples/probe-worker.env.example").is_file()
     assert (paths.root / "etc/rtsp-proxy/examples/rtsp-proxy.nft.example").is_file()
     assert (
         paths.root / "etc/rtsp-proxy/examples/rtsp-proxy-web-auth.conf.example"

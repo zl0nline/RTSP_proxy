@@ -80,7 +80,8 @@ else:
     ), encoding="utf-8")
     web = tmp_path / "web.env"
     reconciler = tmp_path / "reconciler.env"
-    for path in (web, reconciler):
+    probe = tmp_path / "probe.env"
+    for path in (web, reconciler, probe):
         path.write_text("EXISTING=value\n", encoding="utf-8")
         path.chmod(0o640)
     key = tmp_path / "keys" / "camera-source-keys.json"
@@ -91,7 +92,8 @@ else:
     arguments = [
         "sh", str(script), "--release-id", "test", "--source-cidrs", "192.0.2.0/24",
         "--web-environment", str(web), "--reconciler-environment", str(reconciler),
-        "--key-file", str(key),
+        "--probe-environment", str(probe),
+        "--key-file", str(key), "--camera-environment", str(tmp_path / "camera-source.env"),
     ]
     return arguments, environment, key
 

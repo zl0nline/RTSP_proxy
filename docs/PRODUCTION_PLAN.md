@@ -1309,14 +1309,15 @@ source URL performs a new bounded admission, increments the camera revision and
 atomically replaces the endpoint generation. It is not treated as a no-op and
 does not require an artificial URL change.
 
-The completed-probe SSE/dashboard event consumes only that safe store. It does
-not imply that a deployable executor exists. Research proved that a user-manager
-unit is not an enforcement boundary and that `IPAddressAllow=` cannot restrict
-the destination port. ADR 0004 therefore remains Proposed until a narrow root
-broker, system-manager transient service, root-attached cgroup
-`connect4`/`connect6` tuple guard, controlled no-redirect ffprobe build and
-credential/log/cleanup canaries pass on native Linux amd64 and arm64. The fixed
-4/3/3 weights and concurrency values remain spike hypotheses until media-plane
+The completed-probe SSE/dashboard event consumes only that safe store. Research
+proved that a user-manager unit is not an enforcement boundary and that
+`IPAddressAllow=` cannot restrict the destination port. The resulting narrow
+root broker, system-manager transient service, root-attached cgroup
+`connect4`/`connect6` tuple guard and controlled no-redirect ffprobe passed the
+required native credential/log/cleanup canaries; ADR 0004 is Accepted. The
+periodic worker is a separate unprivileged role with a PostgreSQL session lock,
+an explicit revision-fenced camera profile and fail-closed schema/runtime
+readiness. The fixed concurrency values remain hypotheses until media-plane
 impact is measured.
 
 - [x] bounded scheduler/result/state foundation with claim-time one-reader and
@@ -1386,23 +1387,28 @@ impact is measured.
   the socket-activated broker/executor candidate's installed success/failure
   matrix is native amd64/arm64 green in CI run 33439334327; cancellation is
   additionally green in run 33959755605 and network-policy contracts in
-  run 33966428098; ADR acceptance and worker integration remain separate gates);
+  run 33966428098; worker integration is recorded separately below);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
   immutable input plus release gate, 64 KiB output cap and exact collection
   (direct Linux systemd 259 and independently reviewed; privileged systemd 255
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
-  the root-broker wiring remains unpromoted; its integrated success/failure
-  matrix is native amd64/arm64 green in CI run 33439334327; explicit
+  the root-broker wiring was subsequently promoted after its integrated
+  success/failure matrix became native amd64/arm64 green in CI run 33439334327; explicit
   caller/shutdown cancellation is green in run 33959755605);
-- [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
-- [ ] promote the reviewed broker/executor after integrated native evidence,
-  then implement the authoritative camera probe profile, periodic risk-based
-  producer and durable health-state orchestration;
-  [Routine policy and durable projection candidate](evidence/phase-g-routine-health-state.md)
-  implements the scheduling policy and atomic health persistence, but not the
-  enabled worker/profile-management/reader-race integration.
+- [x] accept isolated probe boundary ADR 0004 after privileged native evidence;
+- [x] promote the reviewed broker/executor after integrated native evidence and
+  implement the authoritative camera probe profile, periodic risk-based producer
+  and durable health-state orchestration. Schema 0024 adds explicit passive
+  defaults and revision fencing; Dashboard/API mutations are authenticated,
+  authorized, CSRF-protected and normatively audited. The singleton unprivileged
+  worker restores only generation-bound admitted endpoints, repeats runtime
+  admission, uses the accepted broker and projects only current results. Exact
+  schema/ownership/helper failure is fail-closed without changing camera health
+  or media service; see [worker evidence](evidence/phase-g-probe-worker.md).
+  The earlier [routine policy candidate](evidence/phase-g-routine-health-state.md)
+  remains the policy/state foundation.
   Owner decision (2026-09-05): single-upstream-session cameras are passive-only,
   even when idle. No separate SOURCE/PATH probe, including manual requests, may
   delay a new reader. Unknown capacity defaults to one; the downstream limit
@@ -1416,10 +1422,10 @@ impact is measured.
   0.14.0; see the [limited real-camera media smoke](evidence/phase-g-live-camera-media-smoke.md).
 - [x] encrypted camera source credentials with separate API/dashboard fields,
   camera-bound AES-GCM envelopes and versioned local keyring;
-- per-node 100-camera matrix;
-- multi-node server ladder and 24h soak;
-- chaos/failure/email/restore game days;
-- publish architecture/hardware-specific capacity envelope.
+- [ ] per-node 100-camera matrix;
+- [ ] multi-node server ladder and 24h soak;
+- [ ] chaos/failure/email/restore game days;
+- [ ] publish architecture/hardware-specific capacity envelope.
 
 Exit: explicit GO/HOLD for pilot.
 

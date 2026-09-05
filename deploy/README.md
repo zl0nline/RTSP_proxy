@@ -776,24 +776,27 @@ camera-bound, versioned keyring. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.15.3 \
+  --release-id 0.16.0 \
   --source-cidrs '10.180.5.0/24'
 ```
 
 The command refuses an empty allowlist, creates the `0640
-root:rtsp-proxy-access` keyring only when absent, and atomically replaces each
-environment file. Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
+root:rtsp-proxy-access` keyring only when absent, and atomically replaces the
+shared `camera-source.env` loaded by WEB, reconciler, probe worker and broker.
+Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
 deny-all (`probe_source_policy_not_configured`); a source outside a non-empty
 policy is `probe_destination_not_allowed`.
 
-The `0.15.2` setup script serializes all invocations with one server-wide
+The `0.15.2` setup script serialized all invocations with one server-wide
 nonblocking `flock`, including callers with different custom key paths. If setup
 is already running, wait and retry; do not unlink its lock file. Bootstrap
 installs `util-linux`. Existing keyring size, JSON and key structure are checked
 before environment changes. An invalid keyring requires restoration of its
 original backup, not regeneration: existing camera passwords need the original
-key. Environment replacement is atomic per file, not a two-file transaction;
-after an interrupted write, resolve the error and rerun before restarting services.
+key. In that historical candidate, replacement was atomic per role file rather
+than a cross-file transaction. Candidate `0.16.0` replaces one shared
+`camera-source.env` atomically; after an interrupted write, resolve the error
+and rerun before restarting services.
 
 Application `0.15.0` adds schema `0023_probe_health_states`, retaining schema
 0022 bridge compatibility before migration. It does not enable the periodic
@@ -811,7 +814,15 @@ bundle with an already-installed release ID.
 Candidate `0.15.3` enforces passive-only admission for single-upstream-session
 cameras, including idle cameras and manual SOURCE/PATH requests. Unknown source
 capacity defaults to one. No reader delay is introduced; missing fresh deep
-evidence is not a camera fault. This does not enable the worker/profile UI.
+evidence is not a camera fault. It retains schema 0023 and does not enable the
+worker/profile UI.
+
+Candidate `0.16.0` adds schema `0024_camera_probe_profiles`, revision-fenced
+profile management in Dashboard/API and the singleton periodic SOURCE worker.
+Only an explicit enabled profile with confirmed upstream capacity of at least
+two can reach the accepted root broker. The worker uses the durable health
+projection and read-only node-runtime observer; ownership/schema/helper failure
+makes its readiness fail without changing camera health or media service.
 
 ### Operator authentication modes
 
@@ -826,11 +837,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.15.3 candidate, apply migration 0023 and run:
+For a first installation of the 0.16.0 candidate, apply migration 0024 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.15.3 \
+  --release-id 0.16.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

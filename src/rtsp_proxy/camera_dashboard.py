@@ -73,6 +73,7 @@ from rtsp_proxy.operator_access import (
     OperatorSessionControl,
     OperatorSessionUnavailable,
 )
+from rtsp_proxy.probe_routine import CameraProbeProfiles, CameraProbeProfileUnavailable
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
     CameraMoveControl,
@@ -97,6 +98,7 @@ def camera_dashboard_router(
     recent_mfa_seconds: int,
     secret_reveal_seconds: int,
     poll_interval_seconds: int,
+    camera_probe_profiles: CameraProbeProfiles | None = None,
 ) -> APIRouter:
     """Build the complete secret-free camera dashboard surface."""
 
@@ -281,8 +283,17 @@ def camera_dashboard_router(
         camera = _camera_item(camera_control, camera_id, principal)
         if isinstance(camera, Response):
             return camera
+        try:
+            probe_profile = (
+                None
+                if camera_probe_profiles is None
+                else camera_probe_profiles.camera_probe_profile(camera_id)
+            )
+        except CameraProbeProfileUnavailable:
+            probe_profile = None
         return _html_response(
             render_camera_detail(
+                probe_profile=probe_profile,
                 camera=camera,
                 principal=principal,
                 csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),

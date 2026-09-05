@@ -1513,11 +1513,12 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'node_registration_requests', 'access_grant_issue_requests', "
                 "'operator_action_rate_limits', 'camera_registration_requests', "
                 "'probe_observations', 'camera_probe_endpoints', "
-                "'camera_source_credentials', 'probe_health_states')"
+                "'camera_source_credentials', 'probe_health_states', "
+                "'camera_probe_profiles')"
             )
         )
-        assert revision == "0023_probe_health_states"
-    assert table_count == 14
+        assert revision == "0024_camera_probe_profiles"
+    assert table_count == 15
 
 
 def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(
@@ -1754,7 +1755,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0023_probe_health_states"
+            "0024_camera_probe_profiles"
         )
 
 
@@ -1787,7 +1788,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0023_probe_health_states"
+            "0024_camera_probe_profiles"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})

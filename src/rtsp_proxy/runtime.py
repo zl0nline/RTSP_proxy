@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+import signal
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -73,8 +74,14 @@ from rtsp_proxy.operator_identity import (
     Rs256OidcClaimsVerifier,
     read_operator_secret_file,
 )
+from rtsp_proxy.probe_client import UnixProbeBrokerClient
 from rtsp_proxy.probe_security import BoundedGetentResolver, ProbeEndpointAdmission
-from rtsp_proxy.probes import PostgresProbeObservationStore
+from rtsp_proxy.probe_worker import (
+    PostgresProbeWorkStore,
+    ProbeMonitoringWorker,
+    ProbeWorkerUnavailable,
+)
+from rtsp_proxy.probes import BoundedProbeScheduler, PostgresProbeObservationStore
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
     CameraMoveReconciler,
@@ -124,6 +131,10 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_NODE_RUNTIME_TIMEOUT_SECONDS": "node_runtime_timeout_seconds",
     "RTSP_PROXY_RECONCILE_INTERVAL_SECONDS": "reconcile_interval_seconds",
     "RTSP_PROXY_COLLECTOR_INTERVAL_SECONDS": "collector_interval_seconds",
+    "RTSP_PROXY_PROBE_INTERVAL_SECONDS": "probe_interval_seconds",
+    "RTSP_PROXY_PROBE_BATCH_LIMIT": "probe_batch_limit",
+    "RTSP_PROXY_PROBE_EXECUTION_WORKERS": "probe_execution_workers",
+    "RTSP_PROXY_PROBE_BROKER_SOCKET": "probe_broker_socket",
     "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "dashboard_poll_interval_seconds",
     "RTSP_PROXY_PROBE_SOURCE_CIDRS": "probe_source_cidrs",
     "RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE": "camera_source_keys_file",
@@ -506,6 +517,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         ),
         fleet_snapshots=observability,
         probe_observations=probe_observations,
+        camera_probe_profiles=store if store.schema_is_current() else None,
         fleet_snapshot_max_age_seconds=settings.collector_interval_seconds * 3,
         operator_sessions=(None if operator_security is None else operator_security.sessions),
         local_operator_login=(
@@ -786,12 +798,114 @@ def create_background_app(
         raise ConfigurationError("background_role_required")
     if settings.role is not expected_role:
         raise ConfigurationError("background_role_mismatch")
-    if expected_role is RuntimeRole.PROBE:
-        raise ConfigurationError("probe_role_not_implemented")
     store = _open_verified_store(settings)
     startup: Callable[[], None] | None = None
     shutdown: Callable[[], None] | None = None if store is None else store.close
     worker_security_alerts_enabled: bool | None = None
+    probe_worker_ready: Callable[[], None] | None = None
+    if (
+        store is not None
+        and expected_role is RuntimeRole.PROBE
+        and settings.node_runtime_socket is not None
+    ):
+        assert settings.database_url is not None
+        admission = ProbeEndpointAdmission(
+            site_key=settings.probe_source_site_key,
+            allowed_networks=settings.probe_source_cidrs,
+            resolve=BoundedGetentResolver(),
+        )
+        observations = PostgresProbeObservationStore(
+            settings.database_url,
+            source_policy_sha256=admission.policy_sha256,
+            statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+        )
+        work = PostgresProbeWorkStore(
+            settings.database_url, statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+        )
+        media = UnixMediaNodeClientFactory(
+            socket_path=settings.node_runtime_socket,
+            timeout_seconds=min(10, settings.node_runtime_timeout_seconds),
+        )
+        probe_worker = ProbeMonitoringWorker(
+            work=work, cameras=store, observations=observations,
+            runtime=CameraRuntimeObserver(store=store, media_nodes=media),
+            admission=admission,
+            client=UnixProbeBrokerClient(socket_path=settings.probe_broker_socket),
+            scheduler=BoundedProbeScheduler(
+                global_limit=settings.probe_execution_workers,
+                per_node_limit=min(2, settings.probe_execution_workers),
+                per_site_limit=settings.probe_execution_workers,
+                source_limit=settings.probe_execution_workers,
+                path_limit=1,
+                queue_limit=settings.probe_batch_limit,
+                lease_seconds=30,
+                retry_delay_seconds=5,
+                max_attempts=1,
+            ),
+            batch_limit=settings.probe_batch_limit,
+            execution_workers=settings.probe_execution_workers,
+        )
+        stop = threading.Event()
+        failed = threading.Event()
+        probe_thread: threading.Thread | None = None
+
+        def probe_loop() -> None:
+            while not stop.is_set():
+                try:
+                    probe_worker.run_once(cancelled=stop.is_set)
+                except ProbeWorkerUnavailable:
+                    LOGGER.exception("probe worker lost authoritative ownership")
+                    failed.set()
+                    # The advisory session is the singleton boundary. Do not
+                    # leave an apparently running process behind after it is
+                    # lost: ask uvicorn's main thread to perform normal lifespan
+                    # shutdown, then let systemd restart the role.
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    break
+                except Exception:
+                    LOGGER.exception("probe monitoring cycle failed")
+                stop.wait(settings.probe_interval_seconds)
+
+        def start_probe_worker() -> None:
+            nonlocal probe_thread
+            try:
+                probe_worker.start()
+            except BaseException:
+                try:
+                    observations.close()
+                finally:
+                    store.close()
+                raise
+            probe_thread = threading.Thread(
+                target=probe_loop, name="rtsp-proxy-probe-worker", daemon=False,
+            )
+            probe_thread.start()
+
+        def stop_probe_worker() -> None:
+            stop.set()
+            try:
+                if probe_thread is not None:
+                    probe_thread.join(timeout=35 + settings.probe_interval_seconds)
+                    if probe_thread.is_alive():
+                        raise RuntimeError("probe_worker_shutdown_timeout")
+            finally:
+                if probe_thread is None or not probe_thread.is_alive():
+                    try:
+                        probe_worker.close()
+                    finally:
+                        try:
+                            observations.close()
+                        finally:
+                            store.close()
+
+        def assert_probe_worker_ready() -> None:
+            if failed.is_set() or (probe_thread is not None and not probe_thread.is_alive()):
+                raise RuntimeError("probe_worker_unavailable")
+            work.assert_owned()
+
+        startup = start_probe_worker
+        shutdown = stop_probe_worker
+        probe_worker_ready = assert_probe_worker_ready
     if (
         store is not None
         and expected_role is RuntimeRole.RECONCILER
@@ -1052,6 +1166,7 @@ def create_background_app(
             expected_role=expected_role,
             store=store,
             worker_security_alerts_enabled=worker_security_alerts_enabled,
+            probe_worker_ready=probe_worker_ready,
         ),
         startup=startup,
         shutdown=shutdown,
@@ -1085,6 +1200,7 @@ def _background_readiness(
     expected_role: RuntimeRole,
     store: PostgresNodeStore | None,
     worker_security_alerts_enabled: bool | None = None,
+    probe_worker_ready: Callable[[], None] | None = None,
 ) -> RoleReadinessProvider:
     if store is None:
         return RoleReadinessProvider({})
@@ -1124,6 +1240,15 @@ def _background_readiness(
                 observability.close()
 
         checks["outbox"] = outbox_ready
+    elif expected_role is RuntimeRole.PROBE:
+        if probe_worker_ready is None:
+            raise RuntimeError("probe_worker_not_configured")
+
+        def probe_runtime_ready() -> None:
+            probe_worker_ready()
+            media_helper_ready()
+
+        checks["probe_runtime"] = probe_runtime_ready
     elif expected_role is RuntimeRole.RECONCILER:
         checks["media_adapter"] = media_helper_ready
     elif expected_role is RuntimeRole.COLLECTOR:
@@ -1164,7 +1289,13 @@ def _open_verified_store(settings: Settings) -> PostgresNodeStore | None:
             if settings.role is RuntimeRole.AUTH
             else (
                 _BACKGROUND_DATABASE_TIMEOUT_MS
-                if settings.role in {RuntimeRole.WEB, RuntimeRole.COLLECTOR, RuntimeRole.WORKER}
+                if settings.role
+                in {
+                    RuntimeRole.WEB,
+                    RuntimeRole.COLLECTOR,
+                    RuntimeRole.WORKER,
+                    RuntimeRole.PROBE,
+                }
                 else None
             )
         ),

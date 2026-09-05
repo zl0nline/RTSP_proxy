@@ -22,6 +22,7 @@ from rtsp_proxy.nodes import (
 )
 from rtsp_proxy.observability import FleetSnapshot, NodeSnapshot, SnapshotReader
 from rtsp_proxy.operator_access import OperatorPermission, OperatorPrincipal
+from rtsp_proxy.probe_routine import StoredCameraProbeProfile
 from rtsp_proxy.reconcile import (
     CameraMovePreview,
     CameraMoveTarget,
@@ -299,6 +300,7 @@ def render_camera_detail(
     can_manage_access: bool = False,
     live_updates_enabled: bool = False,
     poll_interval_seconds: int = 10,
+    probe_profile: StoredCameraProbeProfile | None = None,
 ) -> str:
     return (
         _environment()
@@ -312,6 +314,7 @@ def render_camera_detail(
             can_manage_access=can_manage_access,
             live_updates_enabled=live_updates_enabled,
             poll_interval_ms=poll_interval_seconds * 1000,
+            probe_profile=probe_profile,
         )
     )
 

@@ -1108,6 +1108,25 @@ def test_background_entrypoint_accepts_only_non_web_roles() -> None:
         )
 
 
+def test_probe_role_requires_explicit_source_policy_keyring_and_local_sockets() -> None:
+    common = {
+        "role": RuntimeRole.PROBE,
+        "database_url": "postgresql+psycopg://db/rtsp_proxy",
+        "node_runtime_socket": Path("/run/rtsp-proxy-node-runtime/control.sock"),
+        "node_mediamtx_binary_sha256": TRUSTED_MEDIAMTX_SHA256,
+    }
+    with pytest.raises(ValidationError, match="probe_worker_configuration_incomplete"):
+        Settings.model_validate(common)
+    settings = Settings.model_validate({
+        **common,
+        "probe_source_cidrs": ("192.0.2.0/24",),
+        "camera_source_keys_file": Path("/etc/rtsp-proxy/camera-keys.json"),
+        "probe_broker_socket": Path("/run/rtsp-proxy-probe-broker/control.sock"),
+    })
+    assert settings.probe_execution_workers == 4
+    assert settings.probe_batch_limit == 256
+
+
 def test_console_entrypoints_enforce_role_and_pass_validated_apps_to_uvicorn(
     postgres_database_url: str,
     tmp_path: Path,

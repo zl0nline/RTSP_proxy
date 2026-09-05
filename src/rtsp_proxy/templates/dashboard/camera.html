@@ -52,6 +52,40 @@
   </section>
   {% endif %}
 
+  <section class="panel" aria-labelledby="probe-profile-title">
+    <div class="panel-heading"><h2 id="probe-profile-title">Мониторинг камеры</h2></div>
+    <p class="detail-note">При одном или неизвестном числе соединений источника используется только пассивный мониторинг. Дополнительное соединение для проверки не открывается — даже когда поток свободен. Отсутствие свежей глубокой проверки не означает неисправность камеры; наличие трафика само по себе не доказывает декодирование кадров.</p>
+    {% if probe_profile is none %}
+    <p>Настройки мониторинга недоступны в текущем контуре. После обновления схемы перезапустите web-сервис.</p>
+    {% else %}
+    {% set profile = probe_profile.profile %}
+    <p>Режим профиля: <strong>{% if profile.enabled and profile.max_source_sessions > 1 %}активные проверки разрешены{% else %}пассивный{% endif %}</strong>. Сохранение настроек не перезапускает вещание.</p>
+    {% if can_mutate %}
+    <form method="post" action="/dashboard/cameras/{{ camera.id }}/probe-profile">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="expected_revision" value="{{ probe_profile.revision }}">
+      <label>Разрешить активные проверки
+        <select name="enabled"><option value="false" {% if not profile.enabled %}selected{% endif %}>Нет</option><option value="true" {% if profile.enabled %}selected{% endif %}>Да, если источник допускает несколько соединений</option></select>
+      </label>
+      <label>Подтверждённый лимит одновременных соединений источника
+        <input name="max_source_sessions" type="number" min="1" max="16" value="{{ profile.max_source_sessions }}" required>
+      </label>
+      <p class="detail-note">Не увеличивайте лимит без подтверждения возможностей камеры. Это не лимит клиентов proxy: downstream-клиент по-прежнему один.</p>
+      <label>Требовать видео
+        <select name="require_video"><option value="true" {% if profile.require_video %}selected{% endif %}>Да</option><option value="false" {% if not profile.require_video %}selected{% endif %}>Нет</option></select>
+      </label>
+      <label>Требовать аудио
+        <select name="require_audio"><option value="false" {% if not profile.require_audio %}selected{% endif %}>Нет</option><option value="true" {% if profile.require_audio %}selected{% endif %}>Да</option></select>
+      </label>
+      <label>Период обычной проверки, секунд<input name="routine_seconds" type="number" min="30" max="86400" value="{{ profile.routine_interval.total_seconds() | int }}" required></label>
+      <label>Период подтверждения сбоя/восстановления, секунд<input name="confirmation_seconds" type="number" min="1" max="3600" value="{{ profile.confirmation_interval.total_seconds() | int }}" required></label>
+      <label>Тайм-аут проверки, секунд<input name="timeout_seconds" type="number" min="1" max="30" value="{{ profile.execution_timeout.total_seconds() | int }}" required></label>
+      <button type="submit">Сохранить мониторинг</button>
+    </form>
+    {% endif %}
+    {% endif %}
+  </section>
+
   {% if can_mutate and camera.state.value in ["enabled", "disabled"] %}
   <section class="panel camera-actions" aria-labelledby="camera-actions-title">
     <div class="panel-heading"><h2 id="camera-actions-title">Управление камерой</h2></div>

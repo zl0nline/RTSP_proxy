@@ -8,7 +8,7 @@ import anyio
 from starlette.requests import ClientDisconnect, Request
 
 MAX_DASHBOARD_FORM_BYTES = 32_768
-MAX_DASHBOARD_FORM_FIELDS = 8
+MAX_DASHBOARD_FORM_FIELDS = 10
 DASHBOARD_FORM_READ_TIMEOUT_SECONDS = 2.0
 
 

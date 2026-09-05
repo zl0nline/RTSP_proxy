@@ -99,6 +99,7 @@ from rtsp_proxy.operator_access import (
     OperatorSessionUnavailable,
     PostgresOperatorSessionStore,
 )
+from rtsp_proxy.probe_routine import CameraProbeProfile, StoredCameraProbeProfile
 from rtsp_proxy.reconcile import (
     CameraMoveControl,
     CameraMovePreview,
@@ -1064,6 +1065,7 @@ def _authenticated_dashboard(
     dashboard_read_limit_per_minute: int = 600,
     secret_reveal_seconds: int = 30,
     live_updates: CameraLiveUpdateSource | None = None,
+    camera_probe_profiles: object | None = None,
 ) -> tuple[TestClient, dict[str, str]]:
     account = OperatorAccount(
         identity_source=identity_source,
@@ -1107,6 +1109,7 @@ def _authenticated_dashboard(
             node_control=cast(Any, node_control),
             access_secret_reveal_seconds=secret_reveal_seconds,
             camera_live_updates=live_updates,
+            camera_probe_profiles=cast(Any, camera_probe_profiles),
         ),
         base_url="https://management.example.test",
         raise_server_exceptions=raise_server_exceptions,
@@ -1550,7 +1553,7 @@ def test_local_operator_can_create_node() -> None:
         follow_redirects=False,
     )
 
-    assert response.status_code == 303
+    assert response.status_code == 303, response.text
     context = cast(
         NodeMutationContext,
         cast(dict[str, object], control.calls[0][1])["mutation_context"],
@@ -3926,6 +3929,66 @@ def test_camera_detail_is_authenticated_escaped_and_secret_free() -> None:
     assert "admin:secret" not in response.text
     assert missing.status_code == 404
     assert "Камера не найдена" in missing.text
+
+
+def test_camera_probe_profile_is_explicit_revision_fenced_and_operator_attributed() -> None:
+    class Profiles:
+        def __init__(self) -> None:
+            self.record = StoredCameraProbeProfile(CAMERA_ID, 0, CameraProbeProfile())
+            self.calls: list[tuple[UUID, CameraProbeProfile, int, NodeMutationContext]] = []
+
+        def camera_probe_profile(self, camera_id: UUID) -> StoredCameraProbeProfile:
+            assert camera_id == CAMERA_ID
+            return self.record
+
+        def update_camera_probe_profile(
+            self,
+            camera_id: UUID,
+            *,
+            profile: CameraProbeProfile,
+            expected_revision: int,
+            mutation_context: NodeMutationContext,
+        ) -> StoredCameraProbeProfile:
+            self.calls.append((camera_id, profile, expected_revision, mutation_context))
+            self.record = StoredCameraProbeProfile(camera_id, expected_revision + 1, profile)
+            return self.record
+
+    profiles = Profiles()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        camera_probe_profiles=profiles,
+        role=OperatorRole.ADMIN,
+    )
+    path = f"/dashboard/cameras/{CAMERA_ID}"
+    detail = client.get(path, headers=headers)
+    assert detail.status_code == 200
+    assert "При одном или неизвестном числе соединений" in detail.text
+    assert 'name="max_source_sessions"' in detail.text
+
+    response = client.post(
+        f"{path}/probe-profile",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN, "expected_revision": "0", "enabled": "true",
+            "max_source_sessions": "2", "require_video": "true",
+            "require_audio": "false", "routine_seconds": "300",
+            "confirmation_seconds": "30", "timeout_seconds": "15",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == path
+    _, profile, revision, context = profiles.calls[0]
+    assert profile.enabled and profile.max_source_sessions == 2
+    assert revision == 0
+    assert context.action == "camera.probe_profile_update"
+    assert context.resource_scope == f"camera:{CAMERA_ID}"
+
+    api = client.get(f"/api/v1/cameras/{CAMERA_ID}/probe-profile", headers=headers)
+    assert api.status_code == 200
+    assert api.json()["mode"] == "active"
+    assert api.headers["cache-control"] == "no-store"
 
 
 def test_camera_detail_live_snapshot_and_sse_use_the_bounded_aggregated_source() -> None:

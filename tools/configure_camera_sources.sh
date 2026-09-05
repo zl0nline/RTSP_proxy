@@ -5,7 +5,9 @@ release_id=""
 source_cidrs=""
 web_environment=/etc/rtsp-proxy/control-plane/rtsp-proxy.env
 reconciler_environment=/etc/rtsp-proxy/control-plane/rtsp-proxy-reconciler.env
+probe_environment=/etc/rtsp-proxy/control-plane/rtsp-proxy-probe.env
 key_file=/etc/rtsp-proxy/control-plane/camera-source-keys.json
+camera_environment=/etc/rtsp-proxy/control-plane/camera-source.env
 setup_lock_directory=/run/rtsp-proxy-camera-source-setup
 
 usage() {
@@ -22,7 +24,9 @@ while [ "$#" -gt 0 ]; do
     --source-cidrs) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; source_cidrs=$2; shift 2 ;;
     --web-environment) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; web_environment=$2; shift 2 ;;
     --reconciler-environment) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; reconciler_environment=$2; shift 2 ;;
+    --probe-environment) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; probe_environment=$2; shift 2 ;;
     --key-file) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; key_file=$2; shift 2 ;;
+    --camera-environment) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; camera_environment=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -40,7 +44,7 @@ esac
 case "$source_cidrs" in
   *[!0-9A-Fa-f:.,/[:space:]]*) printf '%s\n' 'source CIDRs contain invalid characters' >&2; exit 2 ;;
 esac
-for path in "$web_environment" "$reconciler_environment" "$key_file"; do
+for path in "$web_environment" "$reconciler_environment" "$probe_environment" "$key_file" "$camera_environment"; do
   case "$path" in /*) ;; *) printf '%s\n' 'all paths must be absolute' >&2; exit 2 ;; esac
 done
 
@@ -54,6 +58,7 @@ release_python=/opt/rtsp-proxy/releases/$release_id/.venv/bin/python
 }
 [ -f "$web_environment" ] || { printf '%s\n' "environment file missing: $web_environment" >&2; exit 1; }
 [ -f "$reconciler_environment" ] || { printf '%s\n' "environment file missing: $reconciler_environment" >&2; exit 1; }
+[ -f "$probe_environment" ] || { printf '%s\n' "environment file missing: $probe_environment" >&2; exit 1; }
 command -v flock >/dev/null 2>&1 || {
   printf '%s\n' 'flock is required; install the util-linux package' >&2
   exit 1
@@ -101,24 +106,21 @@ parse_camera_source_keyring(payload.decode("utf-8"))
   exit 1
 }
 
-update_environment() {
-  target_file=$1
-  target_temp=$(mktemp "$(dirname "$target_file")/.camera-source-env.XXXXXX")
-  awk '
-    index($0, "RTSP_PROXY_PROBE_SOURCE_CIDRS=") == 1 { next }
-    index($0, "RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE=") == 1 { next }
-    { print }
-  ' "$target_file" >"$target_temp"
-  printf 'RTSP_PROXY_PROBE_SOURCE_CIDRS=%s\n' "$source_cidrs" >>"$target_temp"
-  printf 'RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE=%s\n' "$key_file" >>"$target_temp"
-  chmod "$(stat -c '%a' "$target_file")" "$target_temp"
-  chown --reference="$target_file" "$target_temp"
-  mv -T "$target_temp" "$target_file"
-}
-
-update_environment "$web_environment"
-update_environment "$reconciler_environment"
+# WEB, reconciler, probe worker and broker load this shared policy file.
+# A single rename makes the network policy/key path one atomic host setting;
+# a crash can no longer leave web, reconciler and probe on different policies.
+install -d -m 0750 -o root -g rtsp-proxy-access "$(dirname "$camera_environment")"
+environment_temp=$(mktemp "$(dirname "$camera_environment")/.camera-source-env.XXXXXX")
+cleanup_environment() { rm -f "$environment_temp"; }
+trap cleanup_environment EXIT HUP INT TERM
+printf 'RTSP_PROXY_PROBE_SOURCE_CIDRS=%s\n' "$source_cidrs" >"$environment_temp"
+printf 'RTSP_PROXY_PROBE_ALLOWED_CIDRS=%s\n' "$source_cidrs" >>"$environment_temp"
+printf 'RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE=%s\n' "$key_file" >>"$environment_temp"
+chmod 0640 "$environment_temp"
+chown root:rtsp-proxy-access "$environment_temp"
+mv -T "$environment_temp" "$camera_environment"
+trap - EXIT HUP INT TERM
 
 printf '%s\n' \
   'Camera source policy and encrypted credential storage configured.' \
-  'Restart rtsp-proxy-web.service and rtsp-proxy@reconciler.service.'
+  'Restart rtsp-proxy-web.service, rtsp-proxy@reconciler.service and rtsp-proxy@probe.service.'

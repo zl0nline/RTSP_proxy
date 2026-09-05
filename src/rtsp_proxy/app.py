@@ -114,6 +114,8 @@ from rtsp_proxy.operator_identity import (
     OidcLoginRateLimited,
     OidcLoginUnavailable,
 )
+from rtsp_proxy.probe_profile_routes import camera_probe_profile_router
+from rtsp_proxy.probe_routine import CameraProbeProfiles
 from rtsp_proxy.probes import ProbeObservationReader
 from rtsp_proxy.reconcile import (
     CameraDisruptionConfirmationRequired,
@@ -699,6 +701,7 @@ def create_app(
     access_grant_control: AccessGrantControl | None = None,
     fleet_snapshots: SnapshotReader | None = None,
     probe_observations: ProbeObservationReader | None = None,
+    camera_probe_profiles: CameraProbeProfiles | None = None,
     camera_live_updates: CameraLiveUpdateSource | None = None,
     operator_sessions: OperatorSessionControl | None = None,
     local_operator_login: LocalOperatorLoginControl | None = None,
@@ -1275,6 +1278,7 @@ def create_app(
 
     app.include_router(
         camera_dashboard_router(
+            camera_probe_profiles=camera_probe_profiles,
             camera_control=camera_control,
             camera_mutation_control=camera_mutation_control,
             camera_move_control=camera_move_control,
@@ -1287,6 +1291,7 @@ def create_app(
             poll_interval_seconds=settings.dashboard_poll_interval_seconds,
         )
     )
+    app.include_router(camera_probe_profile_router(camera_probe_profiles))
     app.include_router(node_dashboard_router(node_control=node_control, settings=settings))
 
     @app.get(
@@ -3422,7 +3427,7 @@ def _operator_action_bucket(
         return None
     if action in {"camera.grant_issue", "camera.grant_rotate"}:
         return OperatorActionBucket.SECRET_ISSUE
-    if action == "camera.create":
+    if action in {"camera.create", "camera.probe_profile_update"}:
         return OperatorActionBucket.CAMERA_MUTATION
     if action in {"camera.access_policy_update", "camera.grant_revoke"}:
         return OperatorActionBucket.ACCESS_MUTATION
@@ -3558,6 +3563,7 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
                 "disable": "camera.disable",
                 "access": "camera.access_read",
                 "access-policy": "camera.access_policy_update",
+                "probe-profile": "camera.probe_profile_update",
             }.get(suffix, "request.unsupported")
             if suffix == "access-grants":
                 action = "camera.grant_list" if method == "GET" else "camera.grant_issue"
@@ -3582,6 +3588,10 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
                     else "camera.access_policy_read"
                 ),
                 "access-grants": "camera.grant_issue",
+                "probe-profile": (
+                    "camera.probe_profile_update"
+                    if method == "PUT" else "camera.probe_profile_read"
+                ),
             }.get(suffix, "request.unsupported")
             if suffix == "access-grants" and method == "GET":
                 action = "camera.grant_list"

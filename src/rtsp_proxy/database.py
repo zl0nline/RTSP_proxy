@@ -114,6 +114,11 @@ from rtsp_proxy.nodes import (
     validate_camera_source_url,
     validate_runtime_observation,
 )
+from rtsp_proxy.probe_routine import (
+    CameraProbeProfile,
+    CameraProbeProfileUnavailable,
+    StoredCameraProbeProfile,
+)
 from rtsp_proxy.probe_security import AdmittedProbeEndpoint, ProbeEndpointIdentity
 from rtsp_proxy.release import APPLICATION_SCHEMA, PREVIOUS_APPLICATION_SCHEMA
 
@@ -728,6 +733,7 @@ class PostgresNodeStore:
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
             ("0021_local_operator_login",),
+            ("0022_camera_source_credentials",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -759,6 +765,7 @@ class PostgresNodeStore:
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
             ("0021_local_operator_login",),
+            ("0022_camera_source_credentials",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -807,6 +814,7 @@ class PostgresNodeStore:
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
             ("0021_local_operator_login",),
+            ("0022_camera_source_credentials",),
             (PREVIOUS_APPLICATION_SCHEMA,),
         ):
             return str(revisions[0])
@@ -830,6 +838,7 @@ class PostgresNodeStore:
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
             ("0021_local_operator_login",),
+            ("0022_camera_source_credentials",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         )
@@ -2569,6 +2578,124 @@ class PostgresNodeStore:
                 else _camera_placement(row, self._camera_source_cipher)
             )
 
+    def camera_probe_profile(self, camera_id: UUID) -> StoredCameraProbeProfile:
+        """Read only operator configuration; absence never enables active work."""
+        try:
+            with self._engine.connect() as connection:
+                if connection.scalar(
+                    select(cameras.c.id).where(
+                        cameras.c.id == camera_id,
+                        cameras.c.state != CameraState.DELETED.value,
+                    )
+                ) is None:
+                    raise CameraNotFound("camera_not_found")
+                row = connection.execute(
+                    text("SELECT * FROM camera_probe_profiles WHERE camera_id=:camera_id"),
+                    {"camera_id": camera_id},
+                ).mappings().one_or_none()
+                if row is None:
+                    return StoredCameraProbeProfile(camera_id, 0, CameraProbeProfile())
+                return _stored_camera_probe_profile(row)
+        except CameraNotFound:
+            raise
+        except (SQLAlchemyError, ValueError):
+            raise CameraProbeProfileUnavailable(
+                "camera_probe_profiles_unavailable"
+            ) from None
+
+    def update_camera_probe_profile(
+        self,
+        camera_id: UUID,
+        *,
+        profile: CameraProbeProfile,
+        expected_revision: int,
+        mutation_context: NodeMutationContext,
+    ) -> StoredCameraProbeProfile:
+        if (
+            not isinstance(profile, CameraProbeProfile)
+            or type(expected_revision) is not int
+            or expected_revision < 0
+            or not isinstance(mutation_context, NodeMutationContext)
+        ):
+            raise ValueError("camera_probe_profile_invalid")
+        intervals = {
+            "routine_seconds": profile.routine_interval.total_seconds(),
+            "confirmation_seconds": profile.confirmation_interval.total_seconds(),
+            "timeout_seconds": profile.execution_timeout.total_seconds(),
+        }
+        if any(not value.is_integer() for value in intervals.values()):
+            raise ValueError("camera_probe_profile_interval_invalid")
+        values = {
+            "camera_id": camera_id,
+            "revision": expected_revision + 1,
+            "enabled": profile.enabled,
+            "max_source_sessions": profile.max_source_sessions,
+            "require_video": profile.require_video,
+            "require_audio": profile.require_audio,
+            **{key: int(value) for key, value in intervals.items()},
+        }
+        try:
+            with self._engine.begin() as connection:
+                _require_synchronous_commit(connection)
+                camera = connection.execute(
+                    select(cameras.c.state).where(cameras.c.id == camera_id).with_for_update()
+                ).one_or_none()
+                if camera is None or camera.state == CameraState.DELETED.value:
+                    raise CameraNotFound("camera_not_found")
+                revision = connection.scalar(
+                    text(
+                        "SELECT revision FROM camera_probe_profiles WHERE camera_id=:camera_id"
+                    ),
+                    {"camera_id": camera_id},
+                )
+                if (0 if revision is None else revision) != expected_revision:
+                    raise CameraLifecycleConflict("camera_probe_profile_revision_conflict")
+                connection.execute(
+                    text(
+                        "INSERT INTO camera_probe_profiles "
+                        "(camera_id, revision, enabled, max_source_sessions, require_video, "
+                        "require_audio, routine_seconds, confirmation_seconds, timeout_seconds) "
+                        "VALUES (:camera_id, :revision, :enabled, :max_source_sessions, "
+                        ":require_video, :require_audio, :routine_seconds, "
+                        ":confirmation_seconds, :timeout_seconds) "
+                        "ON CONFLICT (camera_id) DO UPDATE SET revision=EXCLUDED.revision, "
+                        "enabled=EXCLUDED.enabled, "
+                        "max_source_sessions=EXCLUDED.max_source_sessions, "
+                        "require_video=EXCLUDED.require_video, "
+                        "require_audio=EXCLUDED.require_audio, "
+                        "routine_seconds=EXCLUDED.routine_seconds, "
+                        "confirmation_seconds=EXCLUDED.confirmation_seconds, "
+                        "timeout_seconds=EXCLUDED.timeout_seconds, "
+                        "updated_at=clock_timestamp(), last_attempt_at=NULL"
+                    ),
+                    values,
+                )
+                # A profile changes probe admission, not the media path. Rotate its
+                # admission generation so old decoded results cannot be interpreted
+                # using new media requirements or source capacity. No node restart,
+                # camera revision change, DNS resolution or credential rewrite.
+                connection.execute(
+                    update(camera_probe_endpoints)
+                    .where(camera_probe_endpoints.c.camera_id == camera_id)
+                    .values(endpoint_generation=uuid4()),
+                )
+                _record_normative_event(
+                    connection,
+                    aggregate_type="camera",
+                    aggregate_id=camera_id,
+                    event_type="camera.probe_profile_updated",
+                    aggregate_revision=expected_revision + 1,
+                    payload={key: value for key, value in values.items() if key != "camera_id"},
+                    mutation_context=mutation_context,
+                )
+        except (CameraNotFound, CameraLifecycleConflict):
+            raise
+        except SQLAlchemyError:
+            raise CameraProbeProfileUnavailable(
+                "camera_probe_profiles_unavailable"
+            ) from None
+        return StoredCameraProbeProfile(camera_id, expected_revision + 1, profile)
+
     def list_node_cameras(self, node_id: UUID) -> tuple[CameraPlacement, ...]:
         with self._engine.connect() as connection:
             if (
@@ -2728,6 +2855,7 @@ class PostgresNodeStore:
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
             ("0021_local_operator_login",),
+            ("0022_camera_source_credentials",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -4474,6 +4602,7 @@ def _require_access_grant_idempotency_schema(connection: Connection) -> None:
         ("0019_dashboard_rate_limits",),
         ("0020_probe_observations",),
         ("0021_local_operator_login",),
+        ("0022_camera_source_credentials",),
         (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):
@@ -4487,6 +4616,7 @@ def _require_camera_registration_idempotency_schema(connection: Connection) -> N
         ("0019_dashboard_rate_limits",),
         ("0020_probe_observations",),
         ("0021_local_operator_login",),
+        ("0022_camera_source_credentials",),
         (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):
@@ -4575,6 +4705,22 @@ def _node_port_change(row: RowMapping) -> NodePortChange:
         registered_cameras=int(row["registered_cameras"]),
         blast_radius_sha256=str(row["blast_radius_sha256"]),
         state=NodePortChangeState(str(row["state"])),
+    )
+
+
+def _stored_camera_probe_profile(row: RowMapping) -> StoredCameraProbeProfile:
+    return StoredCameraProbeProfile(
+        camera_id=row["camera_id"],
+        revision=row["revision"],
+        profile=CameraProbeProfile(
+            enabled=row["enabled"],
+            max_source_sessions=row["max_source_sessions"],
+            require_video=row["require_video"],
+            require_audio=row["require_audio"],
+            routine_interval=timedelta(seconds=row["routine_seconds"]),
+            confirmation_interval=timedelta(seconds=row["confirmation_seconds"]),
+            execution_timeout=timedelta(seconds=row["timeout_seconds"]),
+        ),
     )
 
 

@@ -180,6 +180,14 @@ class LinuxDeploymentHost:
         ) + tuple(
             (path, Path("etc/systemd/system") / path.name, 0o644)
             for path in sorted((source_root / "deploy/systemd").glob("*.socket"))
+        ) + tuple(
+            (
+                path,
+                Path("etc/systemd/system")
+                / path.relative_to(source_root / "deploy/systemd"),
+                0o644,
+            )
+            for path in sorted((source_root / "deploy/systemd").glob("*.service.d/*.conf"))
         ) + (
             (
                 source_root / "deploy/sysusers.d/rtsp-proxy.conf",

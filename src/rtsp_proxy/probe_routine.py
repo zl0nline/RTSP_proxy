@@ -6,9 +6,10 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from typing import Protocol
 from uuid import UUID
 
-from rtsp_proxy.nodes import NodeState
+from rtsp_proxy.nodes import NodeMutationContext, NodeState
 from rtsp_proxy.probes import (
     BoundedProbeScheduler,
     ProbeExecutionResult,
@@ -24,6 +25,10 @@ from rtsp_proxy.probes import (
     ProbeSingleFlightConflict,
     ProbeTarget,
 )
+
+
+class CameraProbeProfileUnavailable(RuntimeError):
+    """The authoritative monitoring configuration cannot be read or changed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +80,34 @@ class CameraProbeProfile:
                 failure_class=ProbeFailureClass.CODEC,
             )
         return result
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCameraProbeProfile:
+    """A revision-fenced operator profile; revision zero is the passive default."""
+
+    camera_id: UUID
+    revision: int
+    profile: CameraProbeProfile
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.camera_id, UUID)
+            or self.camera_id.version != 4
+            or type(self.revision) is not int
+            or self.revision < 0
+            or not isinstance(self.profile, CameraProbeProfile)
+        ):
+            raise ValueError("camera_probe_profile_identity_invalid")
+
+
+class CameraProbeProfiles(Protocol):
+    def camera_probe_profile(self, camera_id: UUID) -> StoredCameraProbeProfile: ...
+
+    def update_camera_probe_profile(
+        self, camera_id: UUID, *, profile: CameraProbeProfile, expected_revision: int,
+        mutation_context: NodeMutationContext,
+    ) -> StoredCameraProbeProfile: ...
 
 
 @dataclass(frozen=True, slots=True)

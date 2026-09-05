@@ -94,7 +94,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.15.3-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.16.0-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -116,7 +116,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.15.3-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.16.0-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -170,9 +170,12 @@ sudo install -o root -g rtsp-proxy-access -m 0640 \
 sudo install -o root -g rtsp-proxy-access -m 0640 \
   /etc/rtsp-proxy/examples/rtsp-proxy-role.env.example \
   /etc/rtsp-proxy/control-plane/rtsp-proxy-reconciler.env
+sudo install -o root -g rtsp-proxy-access -m 0640 \
+  /etc/rtsp-proxy/examples/probe-worker.env.example \
+  /etc/rtsp-proxy/control-plane/rtsp-proxy-probe.env
 ```
 
-Откройте оба файла редактором и обязательно замените
+Откройте три role-файла редактором и обязательно замените
 `RTSP_PROXY_DATABASE_URL`, `RTSP_PROXY_CONFIRMATION_SECRET`, release identity,
 SHA-256 MediaMTX и диапазоны портов. Не добавляйте пустую строку
 `RTSP_PROXY_NODE_PORT_RESERVED=`: если резервируемых портов нет, параметр должен
@@ -183,6 +186,8 @@ SHA-256 MediaMTX и диапазоны портов. Не добавляйте �
 `probe-broker.env.example` → `/etc/rtsp-proxy/probe-broker.env` и
 `rtsp-proxy-auth.env.example` →
 `/etc/rtsp-proxy/control-plane/rtsp-proxy-auth.env`.
+В probe environment также замените release identity и MediaMTX SHA-256: worker
+получает только read-only runtime observation через проверенный node helper.
 
 Для стандартного диапазона портов `10000-10999` установите готовую policy:
 
@@ -211,12 +216,12 @@ source venv:
 sudo systemd-run --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.15.3/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.16.0/.venv/bin/rtsp-proxy-migrate
 sudo -u postgres psql --dbname rtsp_proxy --tuples-only --no-align \
   --command 'SELECT version_num FROM alembic_version;'
 ```
 
-Вторая команда должна вывести `0023_probe_health_states`. Отсутствие вывода
+Вторая команда должна вывести `0024_camera_probe_profiles`. Отсутствие вывода
 первой команды само по себе не считается успехом; проверяйте её exit status и
 фактическую ревизию schema до создания администратора.
 
@@ -232,7 +237,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.15.3 \
+  --release-id 0.16.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -260,11 +265,13 @@ WEB environment file и запустите `rtsp-proxy-local-operator --rotate-p
 
 ### 5.1. Разрешённые сети и credentials исходных камер
 
-Политика кандидата `0.15.3`: если камера допускает только одно подключение к
+Политика кандидата `0.16.0`: если камера допускает только одно подключение к
 источнику (или её ёмкость неизвестна), отдельные SOURCE/PATH проверки запрещены,
 включая ручные. Зритель не должен ждать ffprobe. Используются только пассивные
 сведения существующего потока; без свежей глубокой проверки нельзя объявлять
-камеру неисправной. Production worker и управление профилями пока не включены.
+камеру неисправной. Активный probe включается оператором отдельно для каждой
+камеры только после подтверждения `max_source_sessions >= 2`. Revision-fenced
+профиль также задаёт обязательные media types, интервалы и hard timeout.
 
 Без этого шага пустой `RTSP_PROXY_PROBE_SOURCE_CIDRS` означает deny-all, поэтому
 создание камеры завершится кодом `probe_source_policy_not_configured`. Укажите
@@ -273,15 +280,16 @@ WEB environment file и запустите `rtsp-proxy-local-operator --rotate-p
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.15.3 \
+  --release-id 0.16.0 \
   --source-cidrs '10.180.5.0/24'
 ```
 
 Скрипт не перезаписывает существующий keyring, атомарно создаёт
 `/etc/rtsp-proxy/control-plane/camera-source-keys.json` с владельцем
-`root:rtsp-proxy-access` и mode `0640`, затем одинаково обновляет WEB и
-reconciler environment files. Source URL вводится без `login:password@`; логин
-и пароль камеры вводятся в отдельные поля и никогда не возвращаются dashboard.
+`root:rtsp-proxy-access` и mode `0640`, затем одной атомарной заменой обновляет
+общий `/etc/rtsp-proxy/control-plane/camera-source.env`, загружаемый WEB,
+reconciler, probe worker и broker. Source URL вводится без `login:password@`;
+логин и пароль камеры вводятся в отдельные поля и никогда не возвращаются dashboard.
 
 Повторный запуск сохраняет прежний ключ. Одновременные запуски, в том числе с
 разными `--key-file`, блокируются общей блокировкой сервера: при сообщении
@@ -292,17 +300,17 @@ reconciler environment files. Source URL вводится без `login:password
 До изменения environment скрипт проверяет размер, JSON и структуру keyring.
 При `camera keyring is invalid` восстановите **исходный** файл из резервной
 копии: не удаляйте его и не создавайте новый ключ — сохранённые пароли камер
-зашифрованы прежним ключом. Обновление каждого environment-файла выполняется
-атомарной заменой; общей транзакции на два файла нет. Если запись прервана,
-устраните причину ошибки и повторите команду до перезапуска WEB/reconciler.
+зашифрованы прежним ключом. Общий environment-файл заменяется атомарно, поэтому
+роли не получают разные CIDR policy/key path. Если запись прервана, устраните
+причину и повторите команду до перезапуска WEB/reconciler/probe/broker.
 
 ## 6. Первая активация
 
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.15.3/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.15.3 \
+sudo /opt/rtsp-proxy/releases/0.16.0/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.16.0 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -311,10 +319,22 @@ sudo /opt/rtsp-proxy/releases/0.15.3/.venv/bin/rtsp-proxy-deploy activate \
 При первой активации активных units ещё нет, поэтому команда только переключит
 symlink, не запуская их. Явно включите sockets/services в документированном
 порядке зависимостей, затем потребуйте успешную readiness-проверку и выполнение
-native probe-broker contract. Из шаблонного unit включайте только
-`rtsp-proxy@reconciler.service`: отдельная роль `rtsp-proxy@probe.service` в
-этом релизе не реализована, а unit намеренно пропустит её запуск без restart
-loop. Пока не включайте production probe scheduling.
+native probe-broker contract. После настройки всех active env-файлов включите
+обе root socket boundaries до непривилегированных ролей:
+
+```sh
+sudo systemctl enable --now rtsp-proxy-nftables.service
+sudo systemctl enable --now rtsp-proxy-node-runtime.socket
+sudo systemctl enable --now rtsp-proxy-probe-broker.socket
+sudo systemctl enable --now rtsp-proxy-auth.service
+sudo systemctl enable --now rtsp-proxy-web.service
+sudo systemctl enable --now rtsp-proxy@reconciler.service
+sudo systemctl enable --now rtsp-proxy@probe.service
+```
+
+До включения хотя бы одного active camera profile worker остаётся singleton,
+но не создаёт исходящих probe-подключений. Проверяйте readiness самой роли на
+её loopback-порту из `rtsp-proxy-probe.env`.
 
 Полезные команды для проверки:
 
@@ -370,7 +390,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.15.3-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.16.0-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -396,11 +416,12 @@ Deploy tool не объединяет шаги 1 и 3, потому что migra
 сделать предыдущее приложение несовместимым. После migration rollback разрешён,
 только если manifest целевого релиза всё ещё содержит точную live revision.
 
-Для перехода `0.14.0` → `0.15.3` сначала активируйте новый код на schema 0022,
-проверьте smoke, затем выполните migration нового релиза до 0023. Старый manifest
+Для перехода `0.14.0` → `0.16.0` сначала активируйте новый код на schema 0022,
+проверьте smoke, затем выполните migration нового релиза до 0024. Старый manifest
 `0.14.0` допускает максимум 0022: после migration обычный rollback на него
 будет отклонён. Возврат потребует отдельной процедуры восстановления из backup,
-а не Alembic downgrade. Schema 0023 сама по себе не включает роль `probe`.
+а не Alembic downgrade. Bridge на 0023 сохраняет прежний control plane, но
+profile UI/API и роль `probe` включайте только после успешной migration 0024.
 
 ## 8. Откат и fix-forward
 
@@ -479,9 +500,9 @@ deployment failed: host_command_failed command=git exit_code=128 stderr=...
 | запуск/перезапуск ноды завершается `node_process_identity_unavailable` или `node_api_config_mismatch` | установлен release не ниже 0.13.10; runtime helper должен иметь только `CAP_SYS_PTRACE`, а smoke-проверка — учитывать канонический пустой `path` в management permissions MediaMTX API |
 | `local_operator_store_unavailable` | migration 0021 применена и PostgreSQL доступен локально |
 | `local_operator_password_confirmation_failed` | пароль не короче 12 символов и оба ввода совпадают |
-| `probe_source_policy_not_configured` | выполните `configure_camera_sources.sh` с точными непустыми CIDR и перезапустите WEB/reconciler |
+| `probe_source_policy_not_configured` | выполните `configure_camera_sources.sh` с точными непустыми CIDR и перезапустите WEB/reconciler/probe/broker |
 | `probe_destination_not_allowed` | адрес камеры не входит в configured camera CIDR; расширяйте policy только до нужной подсети |
-| `camera_source_credentials_unavailable` | migration 0022 применена, keyring существует с mode `0640 root:rtsp-proxy-access`, его путь одинаков в WEB/reconciler env |
+| `camera_source_credentials_unavailable` | migration 0022 применена, keyring существует с mode `0640 root:rtsp-proxy-access`, а общий camera-source env загружается WEB/reconciler/probe |
 | форма камеры сообщает про userinfo | удалите `login:password@` из URL и заполните отдельные поля логина и пароля |
 
 После исправления причины безопасно повторите ту же команду: незавершённый

@@ -5,14 +5,14 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecCondition=/usr/bin/test %i = reconciler
+ExecCondition=/usr/bin/sh -c 'case "$1" in reconciler|probe) exit 0;; *) exit 1;; esac' -- %i
 User=rtsp-proxy
 Group=rtsp-proxy
 Environment=RTSP_PROXY_ROLE=%i
 EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env
 WorkingDirectory=/opt/rtsp-proxy/current
 ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i
-Restart=on-failure
+Restart=always
 RestartSec=5s
 TimeoutStartSec=30s
 TimeoutStopSec=30s

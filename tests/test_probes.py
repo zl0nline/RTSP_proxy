@@ -20,7 +20,13 @@ from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.migrate import upgrade_database
-from rtsp_proxy.nodes import CameraControl, NodeState, ProbeEndpointSchemaUnavailable
+from rtsp_proxy.nodes import (
+    CameraControl,
+    CameraLifecycleConflict,
+    NodeMutationContext,
+    NodeState,
+    ProbeEndpointSchemaUnavailable,
+)
 from rtsp_proxy.probe_routine import CameraProbeProfile
 from rtsp_proxy.probe_security import ProbeEndpointAdmission
 from rtsp_proxy.probes import (
@@ -59,6 +65,63 @@ NODE_RUNTIME = ProbeNodeRuntimeGeneration(
 )
 SOURCE_ENDPOINT_GENERATION = UUID("70000000-0000-4000-8000-000000000001")
 SOURCE_POLICY_SHA256 = "b" * 64
+
+
+def test_persisted_probe_profile_is_passive_by_default_and_fences_old_results(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    target = _target(1)
+    _seed_probe_target(postgres_database_url, target)
+    store = PostgresNodeStore(postgres_database_url)
+    observations = _postgres_store(postgres_database_url)
+    context = NodeMutationContext(
+        actor_account_id=uuid4(), actor_session_id=uuid4(), identity_source="local",
+        actor_subject="local:operator", roles=("operator",), scopes=("server:*",),
+        authz_version=1, request_id=uuid4(), action="camera.probe_profile_update",
+        http_method="PUT", resource_scope=f"camera:{target.camera_id}",
+        resource_type="camera", resource_id=str(target.camera_id),
+        source_ip_sha256="1" * 64, user_agent_sha256="2" * 64,
+    )
+    try:
+        default = store.camera_probe_profile(target.camera_id)
+        assert default.revision == 0
+        assert default.profile == CameraProbeProfile()
+        updated = store.update_camera_probe_profile(
+            target.camera_id, profile=CameraProbeProfile(enabled=True, max_source_sessions=2),
+            expected_revision=0, mutation_context=context,
+        )
+        assert updated.revision == 1
+        assert store.camera_probe_profile(target.camera_id) == updated
+        with pytest.raises(CameraLifecycleConflict, match="probe_profile_revision_conflict"):
+            store.update_camera_probe_profile(
+                target.camera_id, profile=CameraProbeProfile(),
+                expected_revision=0, mutation_context=context,
+            )
+        # Updating monitoring does not schedule a media-path mutation, but a
+        # result admitted under the previous profile must no longer be current.
+        engine = create_engine(postgres_database_url)
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT desired_revision FROM cameras")) == 1
+            generation = connection.scalar(text(
+                "SELECT endpoint_generation FROM camera_probe_endpoints"
+            ))
+            assert generation != target.source_endpoint_generation
+            assert connection.scalar(text(
+                "SELECT count(*) FROM audit_events WHERE event_type='camera.probe_profile_updated'"
+            )) == 1
+            assert connection.scalar(text(
+                "SELECT count(*) FROM outbox_messages "
+                "WHERE event_type='camera.probe_profile_updated'"
+            )) == 1
+        engine.dispose()
+        observation = _observation(
+            target, started_at=_database_now(postgres_database_url) - timedelta(seconds=2),
+        )
+        assert not observations.record_if_current(observation)
+    finally:
+        observations.close()
+        store.close()
 
 
 def _target(

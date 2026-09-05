@@ -41,7 +41,10 @@ def test_service_users_can_traverse_only_their_own_config_directory() -> None:
 
     web = read_unit("rtsp-proxy-web.service")
     media = read_unit("mediamtx.service")
-    assert web["Service"]["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy.env")
+    assert web["Service"]["EnvironmentFile"] == "/etc/rtsp-proxy/control-plane/rtsp-proxy.env"
+    assert read_unit("rtsp-proxy-web.service.d/camera-source.conf")["Service"][
+        "EnvironmentFile"
+    ] == "-/etc/rtsp-proxy/control-plane/camera-source.env"
     assert web["Service"]["Environment"] == "RTSP_PROXY_ROLE=web"
     assert web["Service"]["ExecStart"] == (
         "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-web "
@@ -102,12 +105,19 @@ def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
 def test_background_roles_use_a_separate_systemd_template() -> None:
     service = read_unit("rtsp-proxy@.service")["Service"]
 
-    assert service["ExecCondition"] == "/usr/bin/test %i = reconciler"
+    assert "reconciler|probe" in service["ExecCondition"]
     assert service["Environment"] == "RTSP_PROXY_ROLE=%i"
     assert service["ExecStart"] == (
         "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i"
     )
-    assert service["EnvironmentFile"] == ("/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env")
+    assert service["Restart"] == "always"
+    assert service["EnvironmentFile"] == "/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env"
+    assert read_unit("rtsp-proxy@.service.d/camera-source.conf")["Service"][
+        "EnvironmentFile"
+    ] == "-/etc/rtsp-proxy/control-plane/camera-source.env"
+    assert read_unit("rtsp-proxy-probe-broker.service.d/camera-source.conf")["Service"][
+        "EnvironmentFile"
+    ] == "-/etc/rtsp-proxy/control-plane/camera-source.env"
 
 
 def test_background_role_example_contains_required_startup_identity() -> None:
@@ -439,7 +449,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.15.3/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.16.0/bin/mediamtx"
     )
 
 
@@ -805,11 +815,12 @@ def test_camera_source_bootstrap_is_atomic_and_requires_an_explicit_allowlist() 
     assert result.returncode == 0, result.stderr
     assert "source CIDRs must not be empty" in script
     assert "RTSP_PROXY_PROBE_SOURCE_CIDRS=" in script
+    assert "RTSP_PROXY_PROBE_ALLOWED_CIDRS=" in script
     assert "RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE=" in script
     assert "chmod 0640" in script
     assert "root:rtsp-proxy-access" in script
     assert "mv -T" in script
-    assert "Restart rtsp-proxy-web.service and rtsp-proxy@reconciler.service." in script
+    assert "rtsp-proxy@probe.service" in script
 
 
 @pytest.mark.parametrize("release_id", [".", "..", "../escape"])

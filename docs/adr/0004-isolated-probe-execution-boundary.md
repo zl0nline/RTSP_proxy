@@ -1,7 +1,8 @@
 # ADR 0004: Isolated execution boundary for source probes
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-10
+- Accepted: 2026-09-06
 - Decision owners: technical owner, security owner, operations owner
 
 ## Context
@@ -15,7 +16,7 @@ The first Phase 0A implementation placed such a runner in the production
 package. Exit review rejected it. It has been removed; the executable lab uses
 only synthetic credentials and is not a deployable dependency provider.
 
-## Candidate decision
+## Decision
 
 Production source probes run behind a dedicated execution boundary, not inside
 the web, scheduler or reconciler process:
@@ -35,10 +36,12 @@ the web, scheduler or reconciler process:
   and required only by the relevant camera profile, while audio streams remain
   valid observations.
 
-The exact IPC/credential-delivery mechanism is deliberately not selected until
-the Linux spike compares a systemd socket-activated helper with a continuously
-running worker. A transient helper that requires broad sudo or D-Bus authority
-from the web process is not acceptable.
+The unprivileged periodic worker connects to a root-owned, socket-activated
+broker over authenticated AF_UNIX. It sends a bounded request envelope and one
+sealed memfd containing the short-lived ffconcat input. The broker validates
+the peer, target, deadline and descriptor, then owns a transient systemd unit
+and its cgroup/connect guard through terminal cleanup. The web and reconciler
+receive no sudo or D-Bus authority.
 
 The address-and-port enforcement primitive is selected more narrowly after the
 2026-08-29/30 amd64 spike: the root boundary attaches project-owned cgroup
@@ -55,8 +58,7 @@ The throwaway mechanism proof is retained outside `main` at
 address; attaching the programs before the run gate preserved the chosen port
 and denied the second for IPv4 and IPv6, followed by explicit detach and zero
 pin/cgroup/process residue. The parameterized ABI and native contract live in
-the production tree, but this ADR remains Proposed until the broker, credential
-transport, no-redirect ffprobe and both-architecture failure matrix pass.
+the production tree.
 
 ## Evidence required before Accepted
 
@@ -69,8 +71,24 @@ transport, no-redirect ffprobe and both-architecture failure matrix pass.
   within resource budgets and return credential-free results;
 - the egress policy blocks every address except the admitted camera target.
 
+All gates passed before acceptance. The reproducible records are:
+
+- [integrated installed broker contract](../evidence/phase-g-integrated-probe-broker-contract.md);
+- [sealed transport contract](../evidence/phase-g-probe-broker-transport-contract.md);
+- [cancellation and cleanup](../evidence/phase-g-probe-cancellation.md);
+- [network/special-range policy](../evidence/phase-g-probe-network-policy.md);
+- [systemd execution contract](../evidence/phase-g-probe-systemd-contract.md).
+
+The worker additionally prevents concurrent copies through a PostgreSQL
+session lock. The broker independently retains destination ownership through
+terminal cleanup, so a caller timeout, worker restart or stale lease cannot
+open a second probe to the same camera endpoint while the first remains alive.
+
 ## Consequences
 
-Phase 0A can retain a black-box compatibility lab, but no production probe
-runner is shipped until this boundary is implemented and accepted in the
-health/security slices.
+Production active probes are permitted only through this boundary and only for
+an explicit camera monitoring profile whose confirmed upstream capacity is
+greater than one. Single-session and unconfigured cameras remain passive-only.
+An unavailable broker, ownership lock or durable projection makes monitoring
+inconclusive/unready; it never marks a camera failed and never affects its
+existing media stream.
