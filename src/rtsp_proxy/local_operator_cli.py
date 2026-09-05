@@ -20,6 +20,7 @@ from rtsp_proxy.operator_access import (
 )
 from rtsp_proxy.operator_identity import (
     LocalOperatorCredentials,
+    OidcLoginInvalid,
     OidcLoginUnavailable,
     PostgresLocalOperatorStore,
     read_operator_secret_file,
@@ -73,7 +74,20 @@ def main(
             reason=arguments.reason,
             password_reader=password_reader,
         )
-    except (LocalOperatorProvisionError, OidcLoginUnavailable) as error:
+    except OidcLoginInvalid:
+        print(
+            "local operator password change failed: local_operator_password_change_denied",
+            file=sys.stderr,
+        )
+        return 1
+    except ValueError as error:
+        if not isinstance(error, LocalOperatorProvisionError) and str(error) != (
+            "local_operator_password_policy_failed"
+        ):
+            raise
+        print(f"local operator provisioning failed: {error}", file=sys.stderr)
+        return 1
+    except OidcLoginUnavailable as error:
         print(f"local operator provisioning failed: {error}", file=sys.stderr)
         return 1
     print(f"provisioned local operator {account_id} at revision 1")

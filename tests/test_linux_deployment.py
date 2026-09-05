@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from configparser import ConfigParser
@@ -800,6 +801,33 @@ def test_camera_source_bootstrap_is_atomic_and_requires_an_explicit_allowlist() 
     assert "chmod 0640" in script
     assert "root:rtsp-proxy-access" in script
     assert "mv -T" in script
+    assert "Restart rtsp-proxy-web.service and rtsp-proxy@reconciler.service." in script
+
+
+@pytest.mark.parametrize("release_id", [".", "..", "../escape"])
+def test_camera_source_bootstrap_rejects_relative_release_ids(
+    tmp_path: Path, release_id: str
+) -> None:
+    for command, output in (("uname", "Linux"), ("id", "0")):
+        stub = tmp_path / command
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n", encoding="utf-8")
+        stub.chmod(0o755)
+    result = subprocess.run(
+        [
+            "sh",
+            "tools/configure_camera_sources.sh",
+            "--release-id",
+            release_id,
+            "--source-cidrs",
+            "192.0.2.0/24",
+        ],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert result.stderr.strip() == "invalid release id"
 
 
 def test_deployment_wrappers_do_not_require_a_source_virtualenv() -> None:

@@ -1274,6 +1274,11 @@ Exit: operator workflows complete without direct DB/systemctl/MediaMTX access.
 
 ### Phase G — probes and production evidence
 
+Актуальный промежуточный аудит Linux pilot, результатов прямой проверки
+12 источников и очереди оставшихся работ:
+[2026-09-05](evidence/production-audit-2026-09-05.md). Прямая диагностика
+источника не закрывает proxy acceptance, capacity или soak gates.
+
 Status: **IN PROGRESS / PRODUCTION NO-GO**. The independently reviewed and
 native-CI-green foundation implements a
 bounded single-flight scheduler, hard global/per-node/per-site and independent

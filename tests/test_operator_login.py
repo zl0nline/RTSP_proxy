@@ -226,6 +226,29 @@ def test_local_operator_store_rejects_invalid_configuration() -> None:
         unavailable.close()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (
+        OidcLoginInvalid("local_operator_password_change_denied"),
+        ValueError("local_operator_password_policy_failed"),
+    ),
+)
+def test_local_operator_cli_rotation_reports_expected_rejections(
+    failure: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def reject(**_kwargs: object) -> UUID:
+        raise failure
+
+    monkeypatch.setattr(local_operator_cli, "rotate_password_from_environment", reject)
+    assert local_operator_cli.main(["--rotate-password"]) == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert str(failure) in captured.err
+    assert captured.out == ""
+
+
 def test_local_operator_cli_reports_failure_and_one_time_totp(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -75,12 +75,15 @@ restart прерывает только потоки выбранной ноды
 | HTTPS management boundary | Реализовано |
 | Immutable install, update и rollback tooling | Реализовано |
 | Глубокие source/path probes | Кандидат проверен; production scheduling выключен |
-| Реальные камеры, capacity и 24h soak | Не выполнено |
+| Реальные камеры, capacity и 24h soak | Прямая диагностика начата; proxy acceptance и нагрузочные gates не закрыты |
 | Production admission | **NO-GO** |
 
 Подробная матрица реализованных фаз и оставшихся gates находится в
 [Production plan](docs/PRODUCTION_PLAN.md), а воспроизводимые результаты — в
 [`docs/evidence/`](docs/evidence/).
+
+Текущие результаты и очередь работ:
+[аудит pilot-контура от 5 сентября 2026](docs/evidence/production-audit-2026-09-05.md).
 
 ## Быстрый старт для pilot-сервера
 

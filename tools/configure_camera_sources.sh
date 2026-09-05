@@ -30,7 +30,7 @@ done
 [ "$(uname -s)" = Linux ] || { printf '%s\n' 'Linux host required' >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { printf '%s\n' 'run this command through sudo' >&2; exit 1; }
 case "$release_id" in
-  ''|*[!0-9A-Za-z._-]*) printf '%s\n' 'invalid release id' >&2; exit 2 ;;
+  ''|.|..|*[!0-9A-Za-z._-]*) printf '%s\n' 'invalid release id' >&2; exit 2 ;;
 esac
 [ -n "$source_cidrs" ] || {
   printf '%s\n' 'source CIDRs must not be empty (empty policy intentionally denies every camera)' >&2
@@ -94,4 +94,4 @@ update_environment "$reconciler_environment"
 
 printf '%s\n' \
   'Camera source policy and encrypted credential storage configured.' \
-  'Restart rtsp-proxy-web.service and rtsp-proxy-reconciler.service.'
+  'Restart rtsp-proxy-web.service and rtsp-proxy@reconciler.service.'
