@@ -158,6 +158,63 @@ def test_probe_broker_service_returns_only_the_normalized_execution_result() -> 
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+def test_same_destination_stays_reserved_until_cleanup_finishes() -> None:
+    cleanup_entered = Event()
+    release_cleanup = Event()
+
+    class PausedCleanupExecutor(_Executor):
+        def retry_pending_cleanup(self, *, timeout_seconds: float) -> int:
+            cleanup_entered.set()
+            assert release_cleanup.wait(timeout=5)
+            return super().retry_pending_cleanup(timeout_seconds=timeout_seconds)
+
+    executor = PausedCleanupExecutor()
+    service = _service(executor)
+    workers: list[Thread] = []
+    clients: list[socket.socket] = []
+
+    def call(request: ProbeBrokerRequest) -> ProbeExecutionResult:
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        clients.append(client)
+        worker = Thread(target=_serve_once, args=(service, server))
+        workers.append(worker)
+        worker.start()
+        payload = _FFCONCAT.replace(b"192.0.2.10", str(request.target.address).encode("ascii"))
+        send_probe_broker_request(
+            client, request, create_sealed_probe_input(payload), timeout_seconds=1,
+        )
+        return receive_probe_broker_response(client, expected_request=request, timeout_seconds=1)
+
+    try:
+        assert call(_request()).outcome is ProbeOutcome.HEALTHY
+        assert cleanup_entered.wait(timeout=2)
+        # A response is not proof of cleanup. Even a new request/generation must
+        # not allocate a second upstream process for this IP and port yet.
+        retry = replace(_request(), request_id=UUID("a80cecb9-f4e0-462d-8199-c565f195d04f"))
+        assert call(retry).outcome is ProbeOutcome.INCONCLUSIVE
+        assert executor.events.count("execute") == 1
+        other = replace(
+            retry,
+            target=ProbeConnectGuardTarget(address=ip_address("192.0.2.11"), port=8554),
+        )
+        assert call(other).outcome is ProbeOutcome.HEALTHY
+        assert executor.events.count("execute") == 2
+        release_cleanup.set()
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+        assert call(retry).outcome is ProbeOutcome.HEALTHY
+        assert executor.events.count("execute") == 3
+    finally:
+        release_cleanup.set()
+        for client in clients:
+            client.close()
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
 @pytest.mark.parametrize(
     ("address", "network", "allowed"),
     [

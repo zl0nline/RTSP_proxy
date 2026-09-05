@@ -19,6 +19,7 @@ from rtsp_proxy.probe_broker import (
     receive_probe_broker_request,
     send_probe_broker_response,
 )
+from rtsp_proxy.probe_executor import ProbeConnectGuardTarget
 from rtsp_proxy.probe_security import probe_destination_is_forbidden
 from rtsp_proxy.probes import ProbeExecutionResult, ProbeFailureClass, ProbeOutcome
 
@@ -110,6 +111,7 @@ class ProbeBrokerService:
         self._cleanup_failed = Event()
         self._stopping = Event()
         self._admission_lock = Lock()
+        self._active_targets: set[ProbeConnectGuardTarget] = set()
 
     def reconcile_startup(self) -> None:
         try:
@@ -158,6 +160,9 @@ class ProbeBrokerService:
                         raise ProbeBrokerServiceError("probe_broker_cleanup_failed")
                     if self._stopping.is_set():
                         raise ProbeBrokerServiceError("probe_broker_stopping")
+                    if request.target in self._active_targets:
+                        raise ProbeBrokerServiceError("probe_broker_target_busy")
+                    self._active_targets.add(request.target)
                     execution_started = True
                 result = self._executor.execute(
                     received,
@@ -198,6 +203,12 @@ class ProbeBrokerService:
                     self._publish_cleanup_failure()
             if execution_started and not self._cleanup_is_resolved():
                 self._publish_cleanup_failure()
+            if execution_started and request is not None:
+                # A disconnected client or expired deadline does not prove that
+                # the upstream process is gone. Keep ownership through cleanup;
+                # unresolved cleanup closes all admission before releasing it.
+                with self._admission_lock:
+                    self._active_targets.discard(request.target)
 
     def serve_forever(self, listener: socket.socket) -> None:
         if (
