@@ -51,14 +51,25 @@ priority, occupied single-session suppression, bounded queue/single-flight,
 durable failure confirmation, replay, inconclusive outcomes, generation reset,
 transaction rollback and weakened-constraint rejection on real PostgreSQL.
 
-Independent re-review of `443320c...83f8107`: Standards PASS, Spec PASS.
+Independent final re-review of `443320c...f783dd8`: Standards PASS, Spec PASS.
 The initial review's confirmation-bound mismatch was fixed, with an accepted
 one-hour PostgreSQL boundary test. Prior schema 0020–0022 feature readiness is
-preserved and regression-tested. Local verification: 1,618 tests passed before
-the final review fixes; the updated focused suite passed 253 tests. Ruff and
-mypy passed. The updated native Linux/PostgreSQL full suite passed 1,688 tests,
-with 49 opt-in contracts skipped and 90.10% coverage. Native CI results must be
-recorded before closing this slice.
+preserved and regression-tested. Final verification of `f783dd8`:
+
+- local full suite: 1,634 passed, 113 platform/opt-in skips;
+- native Linux/PostgreSQL full suite: 1,698 passed, 49 opt-in skips;
+- release/deployment regression suite: 74 passed;
+- Ruff, mypy (80 source files), sdist/wheel build passed;
+- locked dependency audit reported no known vulnerabilities;
+- installed-binary media contracts and the limited real-camera smoke are
+  recorded [separately](phase-g-live-camera-media-smoke.md).
+
+All nine native CI jobs passed for `f783dd8` in
+[run 33963164548](https://github.com/zl0nline/RTSP_proxy/actions/runs/33963164548),
+including both architecture release bundles, installed root-broker contracts,
+media/load contracts and the browser gate. The amd64 application job passed
+1,698 tests with 49 expected opt-in skips and 90.11% coverage. This verifies this
+slice, not the deferred worker or production capacity.
 
 Additional readiness audit reproduced seven false-positive readiness cases:
 PostgreSQL's comma-separated privilege argument accepts any listed privilege,

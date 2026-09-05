@@ -1398,6 +1398,11 @@ impact is measured.
   [Routine policy and durable projection candidate](evidence/phase-g-routine-health-state.md)
   implements the scheduling policy and atomic health persistence, but not the
   enabled worker/profile-management/reader-race integration.
+  The `0.15.0` candidate at `f783dd8` passed both independent reviews and all
+  nine native CI jobs in [run 33963164548](https://github.com/zl0nline/RTSP_proxy/actions/runs/33963164548).
+  Its schema-0022 bridge preserves encrypted camera credentials and admitted
+  endpoints before additive migration to 0023. The installed pilot remains
+  0.14.0; see the [limited real-camera media smoke](evidence/phase-g-live-camera-media-smoke.md).
 - [x] encrypted camera source credentials with separate API/dashboard fields,
   camera-bound AES-GCM envelopes and versioned local keyring;
 - per-node 100-camera matrix;
