@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_network
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -34,6 +34,7 @@ from rtsp_proxy.probes import (
     ProbeNodeRuntimeGeneration,
     ProbeObservation,
     ProbeObservationState,
+    ProbeObservationUnavailable,
     ProbeOutcome,
     ProbePriority,
     ProbeQueueFull,
@@ -1047,6 +1048,126 @@ def test_probe_store_readiness_rejects_same_named_wrong_index(
             match="probe_observation_schema_incompatible",
         ):
             store.assert_ready()
+    finally:
+        store.close()
+
+
+def test_health_state_is_atomic_durable_idempotent_and_ignores_inconclusive(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    target = _target(1)
+    _seed_probe_target(postgres_database_url, target)
+    started = _database_now(postgres_database_url) - timedelta(seconds=120)
+    failed = replace(
+        _observation(target, started_at=started),
+        outcome=ProbeOutcome.UNHEALTHY,
+        failure_class=ProbeFailureClass.AUTHENTICATION,
+        video_codec=None,
+        audio_codec=None,
+    )
+    second = replace(
+        failed,
+        observation_id=uuid4(),
+        request_id=uuid4(),
+        started_at=failed.started_at + timedelta(seconds=31),
+        completed_at=failed.completed_at + timedelta(seconds=31),
+    )
+    spacing = timedelta(seconds=30)
+    store = _postgres_store(postgres_database_url)
+    try:
+        store.assert_health_ready()
+        assert store.record_if_current(failed, confirmation_spacing=spacing)
+        assert store.health_for(target, method=ProbeMethod.SOURCE).health_state is (
+            ProbeHealthState.SUSPECT
+        )
+        assert store.record_if_current(second, confirmation_spacing=spacing)
+        confirmed = store.health_for(target, method=ProbeMethod.SOURCE)
+        assert confirmed.health_state is ProbeHealthState.UNHEALTHY
+        assert confirmed.consecutive_failures == 2
+        assert store.record_if_current(second, confirmation_spacing=spacing)
+        assert store.health_for(target, method=ProbeMethod.SOURCE) == confirmed
+        inconclusive = replace(
+            second,
+            observation_id=uuid4(),
+            request_id=uuid4(),
+            started_at=second.started_at + timedelta(seconds=31),
+            completed_at=second.completed_at + timedelta(seconds=31),
+            outcome=ProbeOutcome.INCONCLUSIVE,
+            failure_class=ProbeFailureClass.EXECUTOR,
+        )
+        assert store.record_if_current(inconclusive, confirmation_spacing=spacing)
+        assert store.health_for(target, method=ProbeMethod.SOURCE) == confirmed
+    finally:
+        store.close()
+    restarted = _postgres_store(postgres_database_url)
+    try:
+        assert restarted.health_for(target, method=ProbeMethod.SOURCE) == confirmed
+        assert restarted.health_for(target, method=ProbeMethod.PATH).health_state is (
+            ProbeHealthState.UNKNOWN
+        )
+        changed = replace(target, desired_revision=target.desired_revision + 1)
+        assert restarted.health_for(changed, method=ProbeMethod.SOURCE).health_state is (
+            ProbeHealthState.UNKNOWN
+        )
+    finally:
+        restarted.close()
+
+
+def test_health_readiness_rejects_weakened_constraints(postgres_database_url: str) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE probe_health_states DROP CONSTRAINT ck_probe_health_counters")
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE probe_health_states "
+                    "ADD CONSTRAINT ck_probe_health_counters CHECK (true)"
+                )
+            )
+    finally:
+        engine.dispose()
+    store = _postgres_store(postgres_database_url)
+    try:
+        with pytest.raises(ProbeObservationUnavailable, match="probe_health_schema_incompatible"):
+            store.assert_health_ready()
+    finally:
+        store.close()
+
+
+def test_health_write_failure_rolls_back_observation_in_same_transaction(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    target = _target(1)
+    _seed_probe_target(postgres_database_url, target)
+    observation = _observation(
+        target,
+        started_at=_database_now(postgres_database_url) - timedelta(seconds=2),
+    )
+    engine = create_engine(postgres_database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE probe_health_states ADD CONSTRAINT test_reject_write CHECK (false)"
+                )
+            )
+    finally:
+        engine.dispose()
+    store = _postgres_store(postgres_database_url)
+    try:
+        with pytest.raises(
+            ProbeObservationUnavailable, match="probe_observation_store_unavailable"
+        ):
+            store.record_if_current(observation, confirmation_spacing=timedelta(seconds=30))
+        assert store.latest_for((target.camera_id,)) == {}
+        assert store.health_for(target, method=ProbeMethod.SOURCE).health_state is (
+            ProbeHealthState.UNKNOWN
+        )
     finally:
         store.close()
 

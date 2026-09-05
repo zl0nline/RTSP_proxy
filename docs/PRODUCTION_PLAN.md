@@ -1366,8 +1366,11 @@ impact is measured.
 - [x] production unprivileged AF_UNIX client with root `SO_PEERCRED`, sealed-fd
   request handoff and normalized infrastructure failure, plus DNS-free exact
   persisted endpoint restoration under the current site/policy/source digest;
-- [ ] define and prove explicit caller/shutdown cancellation plus the remaining
-  integrated special-range/alternate-protocol cases before broker promotion;
+- [x] explicit cooperative caller/shutdown cancellation, fragmented-response
+  cancellation and owned cleanup; both independent reviews passed and all nine
+  native CI jobs green in [run 33959755605](https://github.com/zl0nline/RTSP_proxy/actions/runs/33959755605);
+  see [cancellation evidence](evidence/phase-g-probe-cancellation.md);
+- [ ] remaining integrated special-range/alternate-protocol cases before broker promotion;
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
@@ -1391,6 +1394,9 @@ impact is measured.
 - [ ] promote the reviewed broker/executor after integrated native evidence,
   then implement the authoritative camera probe profile, periodic risk-based
   producer and durable health-state orchestration;
+  [Routine policy and durable projection candidate](evidence/phase-g-routine-health-state.md)
+  implements the scheduling policy and atomic health persistence, but not the
+  enabled worker/profile-management/reader-race integration.
 - [x] encrypted camera source credentials with separate API/dashboard fields,
   camera-bound AES-GCM envelopes and versioned local keyring;
 - per-node 100-camera matrix;

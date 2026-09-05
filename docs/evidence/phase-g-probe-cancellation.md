@@ -1,6 +1,6 @@
 # Phase G: cooperative caller and broker shutdown cancellation
 
-Status: implementation candidate; privileged amd64/arm64 acceptance pending.
+Status: cancellation slice verified on native amd64/arm64; production worker remains disabled.
 This slice does not enable the production probe worker or accept ADR 0004.
 
 ## Contract
@@ -33,7 +33,15 @@ service shutdown. Coordinator tests cover cancellation before allocation,
 after unit start and after guard installation, with no gate release. The pipe
 test proves a 30-second output wait can be cancelled without waiting its deadline.
 
-Linux pilot scratch checkout (not installed release): 212 focused tests passed.
+Linux pilot scratch checkout (not installed release): 212 focused tests passed,
+then 50 transport/cancellation tests passed after fixing the final-response race.
+Full Linux suite with PostgreSQL: 1657 passed, 49 opt-in contracts skipped.
+Standards review: zero actionable findings. Spec review: two findings fixed
+(response completion race and nondeterministic partial-frame synchronization),
+then PASS. All nine jobs, including the installed privileged caller/shutdown
+contracts on amd64/arm64, passed in
+[CI run 33959755605](https://github.com/zl0nline/RTSP_proxy/actions/runs/33959755605),
+commit `443320c`.
 
 ```sh
 uv run pytest -q tests/test_probe_execution.py tests/test_probe_systemd.py \
@@ -48,6 +56,5 @@ inconclusive completion, unit collection, BPF pin/receipt removal and continued
 broker availability. Run only in the dedicated CI contract environment: it
 uses `/opt/rtsp-proxy/releases/probe-contract`, not a running pilot installation.
 
-Before promotion: both-architecture privileged results, separate Standards and
-Spec reviews, plus the remaining network-policy contracts. Real-camera smoke
-does not replace these cancellation/failure tests.
+Before broker promotion: the remaining network-policy contracts and ADR
+acceptance. Real-camera smoke does not replace these cancellation/failure tests.

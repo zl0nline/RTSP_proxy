@@ -727,6 +727,7 @@ class PostgresNodeStore:
             ("0018_camera_registration_keys",),
             ("0019_dashboard_rate_limits",),
             ("0020_probe_observations",),
+            ("0021_local_operator_login",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):

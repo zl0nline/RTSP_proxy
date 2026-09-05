@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -930,7 +931,13 @@ class PostgresProbeObservationStore:
         ):
             raise ProbeObservationUnavailable("probe_observation_schema_incompatible")
 
-    def record_if_current(self, observation: ProbeObservation) -> bool:
+    def record_if_current(
+        self, observation: ProbeObservation, *, confirmation_spacing: timedelta | None = None,
+    ) -> bool:
+        if confirmation_spacing is not None and not (
+            timedelta(seconds=1) <= confirmation_spacing <= timedelta(hours=1)
+        ):
+            raise ValueError("probe_confirmation_spacing_invalid")
         _require_probe_eligible(observation.target, observation.method)
         target = observation.target
         runtime = target.node_runtime
@@ -975,9 +982,105 @@ class PostgresProbeObservationStore:
             with self._engine.begin() as connection:
                 connection.execute(text("SET LOCAL synchronous_commit = on"))
                 inserted = connection.scalar(text(_UPSERT_OBSERVATION), parameters)
+                if inserted == observation.observation_id and confirmation_spacing is not None:
+                    self._advance_health(connection, observation, confirmation_spacing)
         except SQLAlchemyError:
             raise ProbeObservationUnavailable("probe_observation_store_unavailable") from None
         return isinstance(inserted, UUID) and inserted == observation.observation_id
+
+    def health_for(self, target: ProbeTarget, *, method: ProbeMethod) -> ProbeHealthRecord:
+        """Read one durable generation-bound health projection; mismatch resets it."""
+        try:
+            with self._engine.connect() as connection:
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT * FROM probe_health_states WHERE camera_id=:camera_id "
+                            "AND method=:method"
+                        ),
+                        {"camera_id": target.camera_id, "method": method.value},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                return _health_record_from_row(target, method, None if row is None else dict(row))
+        except (SQLAlchemyError, ValueError):
+            raise ProbeObservationUnavailable("probe_health_store_unavailable") from None
+
+    def assert_health_ready(self) -> None:
+        """Require the exact additive health schema before enabling a producer."""
+        try:
+            with self._engine.connect() as connection:
+                columns = _schema_rows(
+                    connection,
+                    _PROBE_OBSERVATION_COLUMNS.replace(
+                        "probe_observations",
+                        "probe_health_states",
+                    ),
+                )
+                constraints = _schema_rows(
+                    connection,
+                    _PROBE_OBSERVATION_CONSTRAINTS.replace(
+                        "probe_observations",
+                        "probe_health_states",
+                    ),
+                )
+                privileges = connection.scalar(
+                    text(
+                        "SELECT has_table_privilege(current_user, "
+                        "'public.probe_health_states', 'SELECT') "
+                        "AND has_table_privilege(current_user, "
+                        "'public.probe_health_states', 'INSERT') "
+                        "AND has_table_privilege(current_user, "
+                        "'public.probe_health_states', 'UPDATE')"
+                    )
+                )
+        except SQLAlchemyError:
+            raise ProbeObservationUnavailable("probe_health_store_unavailable") from None
+        if (
+            columns != _EXPECTED_HEALTH_COLUMNS
+            or constraints != _EXPECTED_HEALTH_CONSTRAINTS
+            or privileges is not True
+        ):
+            raise ProbeObservationUnavailable("probe_health_schema_incompatible")
+
+    @staticmethod
+    def _advance_health(
+        connection: Connection,
+        observation: ProbeObservation,
+        confirmation_spacing: timedelta,
+    ) -> None:
+        target = observation.target
+        method = observation.method
+        row = (
+            connection.execute(
+                text(
+                    "SELECT * FROM probe_health_states WHERE camera_id=:camera_id "
+                    "AND method=:method FOR UPDATE"
+                ),
+                {"camera_id": target.camera_id, "method": method.value},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        previous = _health_record_from_row(target, method, None if row is None else dict(row))
+        if previous.last_observation_id == observation.observation_id:
+            return
+        current = previous.observe_deep(observation, confirmation_spacing=confirmation_spacing)
+        connection.execute(
+            text(_UPSERT_HEALTH),
+            {
+                "camera_id": target.camera_id,
+                "method": method.value,
+                "generation_sha256": _health_generation_sha256(target, method),
+                "health_state": current.health_state.value,
+                "consecutive_failures": current.consecutive_failures,
+                "consecutive_successes": current.consecutive_successes,
+                "last_observation_id": current.last_observation_id,
+                "last_deep_at": current.last_deep_at,
+                "last_success_at": current.last_success_at,
+            },
+        )
 
     def latest_for(self, camera_ids: tuple[UUID, ...]) -> Mapping[UUID, ProbeObservation]:
         if (
@@ -1602,6 +1705,114 @@ def _datetime_field(row: Mapping[str, object], name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise TypeError(name)
     return value
+
+
+_EXPECTED_HEALTH_COLUMNS = {
+    "camera_id": ("uuid", True, ""),
+    "method": ("character varying(16)", True, ""),
+    "generation_sha256": ("character varying(64)", True, ""),
+    "health_state": ("character varying(16)", True, ""),
+    "consecutive_failures": ("integer", True, ""),
+    "consecutive_successes": ("integer", True, ""),
+    "last_observation_id": ("uuid", False, ""),
+    "last_deep_at": ("timestamp with time zone", False, ""),
+    "last_success_at": ("timestamp with time zone", False, ""),
+}
+_EXPECTED_HEALTH_CONSTRAINTS = {
+    "probe_health_states_pkey": ("p", True, "PRIMARY KEY (camera_id, method)"),
+    "probe_health_states_camera_id_fkey": (
+        "f",
+        True,
+        "FOREIGN KEY (camera_id) REFERENCES cameras(id) ON DELETE CASCADE",
+    ),
+    "ck_probe_health_method": (
+        "c",
+        True,
+        "CHECK (method::text = ANY (ARRAY['source'::character varying, "
+        "'path'::character varying]::text[]))",
+    ),
+    "ck_probe_health_generation": (
+        "c",
+        True,
+        "CHECK (generation_sha256::text ~ '^[0-9a-f]{64}$'::text)",
+    ),
+    "ck_probe_health_state": (
+        "c",
+        True,
+        "CHECK (health_state::text = ANY (ARRAY['unknown'::character varying, "
+        "'healthy'::character varying, 'suspect'::character varying, "
+        "'unhealthy'::character varying, 'recovering'::character varying]::text[]))",
+    ),
+    "ck_probe_health_counters": (
+        "c",
+        True,
+        "CHECK (consecutive_failures >= 0 AND consecutive_failures <= 2 "
+        "AND consecutive_successes >= 0 AND consecutive_successes <= 2)",
+    ),
+    "ck_probe_health_times": (
+        "c",
+        True,
+        "CHECK ((last_observation_id IS NULL) = (last_deep_at IS NULL) AND "
+        "(last_success_at IS NULL OR last_deep_at IS NOT NULL "
+        "AND last_success_at <= last_deep_at))",
+    ),
+}
+
+_UPSERT_HEALTH = """
+INSERT INTO probe_health_states (
+    camera_id, method, generation_sha256, health_state, consecutive_failures,
+    consecutive_successes, last_observation_id, last_deep_at, last_success_at
+) VALUES (
+    :camera_id, :method, :generation_sha256, :health_state, :consecutive_failures,
+    :consecutive_successes, :last_observation_id, :last_deep_at, :last_success_at
+)
+ON CONFLICT (camera_id, method) DO UPDATE SET
+    generation_sha256=EXCLUDED.generation_sha256,
+    health_state=EXCLUDED.health_state,
+    consecutive_failures=EXCLUDED.consecutive_failures,
+    consecutive_successes=EXCLUDED.consecutive_successes,
+    last_observation_id=EXCLUDED.last_observation_id,
+    last_deep_at=EXCLUDED.last_deep_at,
+    last_success_at=EXCLUDED.last_success_at
+"""
+
+
+def _health_generation_sha256(target: ProbeTarget, method: ProbeMethod) -> str:
+    identity = (
+        target.camera_id,
+        target.public_id,
+        target.node_id,
+        target.desired_revision,
+        target.placement_generation,
+        target.source_endpoint_generation,
+        target.node_runtime if method is ProbeMethod.PATH else None,
+    )
+    return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+
+
+def _health_record_from_row(
+    target: ProbeTarget,
+    method: ProbeMethod,
+    row: Mapping[str, object] | None,
+) -> ProbeHealthRecord:
+    if row is None or row["generation_sha256"] != _health_generation_sha256(target, method):
+        return ProbeHealthRecord.for_target(target, method=method)
+    return ProbeHealthRecord(
+        target=target,
+        method=method,
+        health_state=ProbeHealthState(_str_field(row, "health_state")),
+        consecutive_failures=_int_field(row, "consecutive_failures"),
+        consecutive_successes=_int_field(row, "consecutive_successes"),
+        last_observation_id=(
+            None if row["last_observation_id"] is None else _uuid_field(row, "last_observation_id")
+        ),
+        last_deep_at=(
+            None if row["last_deep_at"] is None else _datetime_field(row, "last_deep_at")
+        ),
+        last_success_at=(
+            None if row["last_success_at"] is None else _datetime_field(row, "last_success_at")
+        ),
+    )
 
 
 def _same_probe_generation(left: ProbeTarget, right: ProbeTarget) -> bool:
