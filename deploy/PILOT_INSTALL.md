@@ -302,7 +302,9 @@ reconciler, probe worker и broker. Source URL вводится без `login:pa
 копии: не удаляйте его и не создавайте новый ключ — сохранённые пароли камер
 зашифрованы прежним ключом. Общий environment-файл заменяется атомарно, поэтому
 роли не получают разные CIDR policy/key path. Если запись прервана, устраните
-причину и повторите команду до перезапуска WEB/reconciler/probe/broker.
+причину и повторите команду до перезапуска WEB, reconciler, probe worker и
+`rtsp-proxy-probe-broker.service`; socket-activated broker иначе продолжит
+работать с прежней CIDR policy.
 
 ## 6. Первая активация
 

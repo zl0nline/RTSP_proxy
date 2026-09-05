@@ -648,6 +648,22 @@ class BoundedProbeScheduler:
                 audio_codec=result.audio_codec,
             )
 
+    def cancel(self, lease: ProbeLease) -> None:
+        """Remove one exact active lease after final pre-execution admission fails."""
+        with self._lock:
+            current = self._active.get(lease.request_id)
+            request = self._requests_by_camera.get(lease.target.camera_id)
+            if (
+                current != lease
+                or request is None
+                or request.request_id != lease.request_id
+            ):
+                raise ValueError("probe_lease_invalid")
+            self._active.pop(lease.request_id)
+            self._requests_by_camera.pop(lease.target.camera_id)
+            self._attempts.pop(lease.request_id, None)
+            self._rejected_total += 1
+
     def diagnostics(self) -> ProbeSchedulerDiagnostics:
         with self._lock:
             queued_by_method = {

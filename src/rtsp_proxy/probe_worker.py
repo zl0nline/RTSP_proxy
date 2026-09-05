@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -14,7 +15,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine, RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 
-from rtsp_proxy.nodes import CameraNotFound, CameraPlacement, CameraState, MediaNode
+from rtsp_proxy.media import MediaNodeError
+from rtsp_proxy.nodes import CameraNotFound, CameraPlacement, CameraState, MediaNode, NodeState
 from rtsp_proxy.probe_routine import (
     CameraProbeProfile,
     RoutineProbeCandidate,
@@ -26,6 +28,7 @@ from rtsp_proxy.probes import (
     ProbeExecutionResult,
     ProbeFailureClass,
     ProbeHealthRecord,
+    ProbeLease,
     ProbeMethod,
     ProbeObservation,
     ProbeOutcome,
@@ -62,6 +65,9 @@ class ProbeWorkSource(Protocol):
     def acquire(self) -> None: ...
     def assert_owned(self) -> None: ...
     def active_profiles(self, *, limit: int) -> tuple[_ProfileRow, ...]: ...
+    def execution_permit(
+        self, camera_id: UUID, *, profile_revision: int, endpoint_generation: UUID,
+    ) -> AbstractContextManager[bool]: ...
     def mark_attempt(self, camera_id: UUID, *, revision: int) -> None: ...
     def close(self) -> None: ...
 
@@ -108,11 +114,24 @@ class _ExecutableCandidate:
 class PostgresProbeWorkStore:
     """Hold singleton ownership and page explicit active profiles from PostgreSQL."""
 
-    def __init__(self, database_url: str, *, statement_timeout_ms: int = 1000) -> None:
-        if not database_url or not 100 <= statement_timeout_ms <= 5000:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        statement_timeout_ms: int = 1000,
+        execution_slots: int = 4,
+    ) -> None:
+        if (
+            not database_url
+            or not 100 <= statement_timeout_ms <= 5000
+            or not 1 <= execution_slots <= 16
+        ):
             raise ValueError("probe_worker_store_policy_invalid")
         self._engine: Engine = create_engine(
-            database_url, pool_pre_ping=True, hide_parameters=True, pool_size=2,
+            database_url,
+            pool_pre_ping=True,
+            hide_parameters=True,
+            pool_size=execution_slots + 2,
             max_overflow=0, pool_timeout=statement_timeout_ms / 1000,
             connect_args={
                 "connect_timeout": max(1, statement_timeout_ms // 1000),
@@ -121,6 +140,7 @@ class PostgresProbeWorkStore:
         )
         self._owner: Connection | None = None
         self._lock = Lock()
+        self._cursor: tuple[datetime, UUID] | None = None
 
     def acquire(self) -> None:
         with self._lock:
@@ -191,20 +211,48 @@ class PostgresProbeWorkStore:
         self.assert_owned()
         try:
             with self._engine.connect() as connection:
-                rows = connection.execute(text(
-                    "SELECT profile.* FROM camera_probe_profiles AS profile "
-                    "JOIN cameras AS camera ON camera.id=profile.camera_id "
-                    "JOIN camera_placements AS placement ON placement.camera_id=camera.id "
-                    "JOIN media_nodes AS node ON node.id=placement.node_id "
-                    "WHERE profile.enabled=true AND profile.max_source_sessions > 1 "
-                    "AND camera.state='enabled' AND node.state='running' "
-                    "AND node.maintenance=false "
-                    "ORDER BY COALESCE(profile.last_attempt_at, profile.updated_at), "
-                    "profile.camera_id LIMIT :limit"
-                ), {"limit": limit}).mappings()
+                rows = self._profile_page(connection, limit=limit, cursor=self._cursor)
+                if not rows and self._cursor is not None:
+                    self._cursor = None
+                    rows = self._profile_page(connection, limit=limit, cursor=None)
+                if rows:
+                    last = rows[-1]
+                    scan_time = last["scan_time"]
+                    camera_id = last["camera_id"]
+                    if not isinstance(scan_time, datetime) or not isinstance(camera_id, UUID):
+                        raise ProbeWorkerUnavailable("probe_worker_profile_invalid")
+                    self._cursor = (scan_time, camera_id)
                 return tuple(_profile_row(row) for row in rows)
         except SQLAlchemyError:
             raise ProbeWorkerUnavailable("probe_worker_store_unavailable") from None
+
+    @staticmethod
+    def _profile_page(
+        connection: Connection,
+        *,
+        limit: int,
+        cursor: tuple[datetime, UUID] | None,
+    ) -> list[RowMapping]:
+        cursor_time, cursor_id = (None, None) if cursor is None else cursor
+        return list(connection.execute(text(
+            "SELECT profile.*, "
+            "COALESCE(profile.last_attempt_at, profile.updated_at) AS scan_time "
+            "FROM camera_probe_profiles AS profile "
+            "JOIN cameras AS camera ON camera.id=profile.camera_id "
+            "JOIN camera_placements AS placement ON placement.camera_id=camera.id "
+            "JOIN media_nodes AS node ON node.id=placement.node_id "
+            "WHERE profile.enabled=true AND profile.max_source_sessions > 1 "
+            "AND camera.state='enabled' AND node.state='running' "
+            "AND node.maintenance=false AND (CAST(:cursor_time AS timestamptz) IS NULL "
+            "OR COALESCE(profile.last_attempt_at, profile.updated_at) > :cursor_time "
+            "OR (COALESCE(profile.last_attempt_at, profile.updated_at) = :cursor_time "
+            "AND profile.camera_id > CAST(:cursor_id AS uuid))) "
+            "ORDER BY scan_time, profile.camera_id LIMIT :limit"
+        ), {
+            "cursor_time": cursor_time,
+            "cursor_id": cursor_id,
+            "limit": limit,
+        }).mappings())
 
     def mark_attempt(self, camera_id: UUID, *, revision: int) -> None:
         self.assert_owned()
@@ -215,6 +263,65 @@ class PostgresProbeWorkStore:
                     "UPDATE camera_probe_profiles SET last_attempt_at=clock_timestamp() "
                     "WHERE camera_id=:camera_id AND revision=:revision"
                 ), {"camera_id": camera_id, "revision": revision})
+        except SQLAlchemyError:
+            raise ProbeWorkerUnavailable("probe_worker_store_unavailable") from None
+
+    @contextmanager
+    def execution_permit(
+        self,
+        camera_id: UUID,
+        *,
+        profile_revision: int,
+        endpoint_generation: UUID,
+    ) -> Iterator[bool]:
+        """Lock camera/profile admission through one broker execution.
+
+        Profile and camera mutations take the camera row first too, so a
+        capacity downgrade cannot commit while the corresponding source probe
+        is alive. A shared node-row lock lets probes for the same node coexist
+        while preventing a maintenance/state transition during execution.
+        """
+        if (
+            not isinstance(camera_id, UUID)
+            or camera_id.version != 4
+            or type(profile_revision) is not int
+            or profile_revision < 1
+            or not isinstance(endpoint_generation, UUID)
+            or endpoint_generation.version != 4
+        ):
+            raise ValueError("probe_worker_execution_identity_invalid")
+        self.assert_owned()
+        try:
+            with self._engine.connect() as connection, connection.begin():
+                row = connection.execute(text(
+                    "SELECT profile.revision, profile.enabled, "
+                    "profile.max_source_sessions, camera.state AS camera_state, "
+                    "node.state AS node_state, node.maintenance, "
+                    "endpoint.endpoint_generation "
+                    "FROM cameras AS camera "
+                    "JOIN camera_probe_profiles AS profile "
+                    "ON profile.camera_id=camera.id "
+                    "JOIN camera_placements AS placement "
+                    "ON placement.camera_id=camera.id "
+                    "JOIN media_nodes AS node ON node.id=placement.node_id "
+                    "JOIN camera_probe_endpoints AS endpoint "
+                    "ON endpoint.camera_id=camera.id "
+                    "WHERE camera.id=:camera_id "
+                    "FOR UPDATE OF camera, profile, endpoint SKIP LOCKED "
+                    "FOR SHARE OF node SKIP LOCKED"
+                ), {"camera_id": camera_id}).mappings().one_or_none()
+                permitted = bool(
+                    row is not None
+                    and row["revision"] == profile_revision
+                    and row["enabled"] is True
+                    and type(row["max_source_sessions"]) is int
+                    and row["max_source_sessions"] > 1
+                    and row["camera_state"] == CameraState.ENABLED.value
+                    and row["node_state"] == NodeState.RUNNING.value
+                    and row["maintenance"] is False
+                    and row["endpoint_generation"] == endpoint_generation
+                )
+                yield permitted
         except SQLAlchemyError:
             raise ProbeWorkerUnavailable("probe_worker_store_unavailable") from None
 
@@ -274,14 +381,16 @@ class ProbeMonitoringWorker:
         targets = {camera_id: item.routine.target for camera_id, item in by_camera.items()}
         leases = self._scheduler.claim_available(cycle_time, targets)
         persisted = 0
+        executed = 0
         with ThreadPoolExecutor(
             max_workers=self._execution_workers, thread_name_prefix="rtsp-probe-worker",
         ) as pool:
             futures = {
                 pool.submit(
-                    self._client.execute, request_id=lease.request_id,
-                    endpoint=by_camera[lease.target.camera_id].endpoint,
-                    deadline_at=lease.lease_expires_at, cancelled=cancelled,
+                    self._execute_lease,
+                    lease,
+                    by_camera[lease.target.camera_id],
+                    cancelled,
                 ): lease
                 for lease in leases
             }
@@ -290,12 +399,22 @@ class ProbeMonitoringWorker:
                 item = by_camera[lease.target.camera_id]
                 try:
                     result = future.result()
+                except ProbeWorkerUnavailable:
+                    self._scheduler.cancel(lease)
+                    raise
                 except Exception:
                     result = ProbeExecutionResult(
                         outcome=ProbeOutcome.INCONCLUSIVE,
-                        completed_at=min(datetime.now(UTC), lease.lease_expires_at),
+                        completed_at=max(
+                            lease.started_at,
+                            min(datetime.now(UTC), lease.lease_expires_at),
+                        ),
                         failure_class=ProbeFailureClass.EXECUTOR,
                     )
+                if result is None:
+                    self._scheduler.cancel(lease)
+                    continue
+                executed += 1
                 result = item.routine.profile.classify(result)
                 try:
                     observation = self._scheduler.complete(lease, result)
@@ -310,10 +429,33 @@ class ProbeMonitoringWorker:
                 ):
                     persisted += 1
                 self._work.mark_attempt(lease.target.camera_id, revision=item.profile_revision)
-        return ProbeWorkerCycle(len(executable), len(submitted), len(leases), persisted)
+        return ProbeWorkerCycle(len(executable), len(submitted), executed, persisted)
 
     def close(self) -> None:
         self._work.close()
+
+    def _execute_lease(
+        self,
+        lease: ProbeLease,
+        item: _ExecutableCandidate,
+        cancelled: Callable[[], bool],
+    ) -> ProbeExecutionResult | None:
+        generation = item.routine.target.source_endpoint_generation
+        if generation is None:
+            return None
+        with self._work.execution_permit(
+            lease.target.camera_id,
+            profile_revision=item.profile_revision,
+            endpoint_generation=generation,
+        ) as permitted:
+            if not permitted:
+                return None
+            return self._client.execute(
+                request_id=lease.request_id,
+                endpoint=item.endpoint,
+                deadline_at=lease.lease_expires_at,
+                cancelled=cancelled,
+            )
 
     def _load_candidates(
         self, now: datetime, cancelled: Callable[[], bool],
@@ -347,7 +489,7 @@ class ProbeMonitoringWorker:
                     source_endpoint_generation=camera.probe_endpoint.generation,
                 )
                 health = self._observations.health_for(target, method=ProbeMethod.SOURCE)
-            except (CameraNotFound, ReconcileRetry, ValueError):
+            except (CameraNotFound, MediaNodeError, ReconcileRetry, ValueError):
                 continue
             candidates.append(_ExecutableCandidate(
                 routine=RoutineProbeCandidate(

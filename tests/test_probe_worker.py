@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_network
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
-from rtsp_proxy.identifiers import PublicId
+from rtsp_proxy.identifiers import PublicId, generate_public_id
+from rtsp_proxy.media import MediaNodeUnavailable
 from rtsp_proxy.nodes import (
     CameraPlacement,
     CameraState,
@@ -82,6 +85,55 @@ def test_postgres_probe_worker_rejects_a_weakened_profile_schema(
         store.close()
 
 
+def test_postgres_probe_worker_pages_past_the_first_bounded_batch(
+    postgres_database_url: str,
+) -> None:
+    from rtsp_proxy.migrate import upgrade_database
+
+    upgrade_database(postgres_database_url)
+    camera_ids = _seed_profile_rows(postgres_database_url, count=3)
+    store = PostgresProbeWorkStore(postgres_database_url)
+    try:
+        store.acquire()
+        first = store.active_profiles(limit=2)
+        second = store.active_profiles(limit=2)
+        wrapped = store.active_profiles(limit=2)
+        engine = create_engine(postgres_database_url)
+        with engine.connect() as connection:
+            generation = connection.scalar(text(
+                "SELECT endpoint_generation FROM camera_probe_endpoints "
+                "WHERE camera_id=:camera_id"
+            ), {"camera_id": first[0].camera_id})
+        engine.dispose()
+        assert isinstance(generation, UUID)
+        with store.execution_permit(
+            first[0].camera_id,
+            profile_revision=first[0].revision,
+            endpoint_generation=generation,
+        ) as permitted:
+            assert permitted is True
+            competing = create_engine(postgres_database_url)
+            try:
+                with pytest.raises(SQLAlchemyError), competing.begin() as connection:
+                    connection.execute(text("SET LOCAL lock_timeout = '100ms'"))
+                    connection.execute(text(
+                        "UPDATE camera_probe_profiles SET max_source_sessions=1 "
+                        "WHERE camera_id=:camera_id"
+                    ), {"camera_id": first[0].camera_id})
+            finally:
+                competing.dispose()
+    finally:
+        store.close()
+
+    assert len(first) == 2
+    assert len(second) == 1
+    assert {row.camera_id for row in first}.isdisjoint(
+        {row.camera_id for row in second}
+    )
+    assert {row.camera_id for row in (*first, *second)} == set(camera_ids)
+    assert tuple(row.camera_id for row in wrapped) == tuple(row.camera_id for row in first)
+
+
 def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     source_url = "rtsp://camera.example.invalid/live"
     # Admission resolves only while the operator creates/updates the camera.
@@ -109,12 +161,21 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     class Work:
         def __init__(self) -> None:
             self.marked: list[tuple[UUID, int]] = []
+            self.permitted = True
 
         def acquire(self) -> None: pass
         def assert_owned(self) -> None: pass
         def active_profiles(self, *, limit: int) -> tuple[_ProfileRow, ...]:
             assert limit == 8
             return (_ProfileRow(camera_id, 3, profile, NOW - timedelta(hours=1), None),)
+        @contextmanager
+        def execution_permit(
+            self, requested: UUID, *, profile_revision: int, endpoint_generation: UUID,
+        ) -> Iterator[bool]:
+            assert requested == camera_id
+            assert profile_revision == 3
+            assert endpoint_generation == endpoint.identity.generation
+            yield self.permitted
         def mark_attempt(self, camera_id: UUID, *, revision: int) -> None:
             self.marked.append((camera_id, revision))
         def close(self) -> None: pass
@@ -148,6 +209,9 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
             return True
 
     class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def execute(
             self,
             *,
@@ -156,6 +220,7 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
             deadline_at: datetime,
             cancelled: Callable[[], bool] | None = None,
         ) -> ProbeExecutionResult:
+            self.calls += 1
             assert endpoint.identity == camera.probe_endpoint
             return ProbeExecutionResult(
                 outcome=ProbeOutcome.HEALTHY,
@@ -164,6 +229,7 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
 
     work = Work()
     observations = Observations()
+    client = Client()
     scheduler = BoundedProbeScheduler(
         global_limit=2, per_node_limit=1, per_site_limit=2, source_limit=2,
         path_limit=1, queue_limit=8, lease_seconds=15, retry_delay_seconds=1,
@@ -171,7 +237,7 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     )
     worker = ProbeMonitoringWorker(
         work=work, cameras=Cameras(), observations=observations,
-        runtime=Runtime(), admission=admission, client=Client(), scheduler=scheduler,
+        runtime=Runtime(), admission=admission, client=client, scheduler=scheduler,
         batch_limit=8, execution_workers=2,
     )
 
@@ -182,3 +248,181 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
     assert work.marked == [(camera_id, 3)]
     assert len(observations.saved) == 1
     assert observations.saved[0][0].video_codec == "h264"
+    assert client.calls == 1
+
+    # Simulate an authoritative capacity downgrade after batch loading/claim
+    # but immediately before the broker launch. The execution permit is the
+    # final database-backed admission boundary.
+    work.permitted = False
+    work.marked.clear()
+    rejected_observations = Observations()
+    rejected_client = Client()
+    rejected_scheduler = BoundedProbeScheduler(
+        global_limit=2, per_node_limit=1, per_site_limit=2, source_limit=2,
+        path_limit=1, queue_limit=8, lease_seconds=15, retry_delay_seconds=1,
+        max_attempts=1,
+    )
+    rejected_worker = ProbeMonitoringWorker(
+        work=work, cameras=Cameras(), observations=rejected_observations,
+        runtime=Runtime(), admission=admission, client=rejected_client,
+        scheduler=rejected_scheduler, batch_limit=8, execution_workers=2,
+    )
+    rejected_worker.start()
+    rejected = rejected_worker.run_once(now=NOW)
+
+    assert rejected.candidates == rejected.submitted == 1
+    assert rejected.executed == rejected.persisted == 0
+    assert rejected_client.calls == 0
+    assert rejected_observations.saved == []
+    assert work.marked == []
+    assert rejected_scheduler.diagnostics().active == 0
+    assert rejected_scheduler.diagnostics().queued == 0
+
+
+def test_runtime_failure_is_isolated_to_one_camera() -> None:
+    source_url = "rtsp://camera.example.invalid/live"
+    admission = ProbeEndpointAdmission(
+        site_key="local", allowed_networks=(ip_network("192.0.2.0/24"),),
+        resolve=lambda _host: ("192.0.2.10",),
+    )
+    node_id = uuid4()
+    cameras = tuple(
+        CameraPlacement(
+            id=uuid4(), name=f"Camera {number}", source_url=source_url,
+            public_id=PublicId(generate_public_id()), node_id=node_id, node_port=10554,
+            placement_mode=PlacementMode.AUTOMATIC, state=CameraState.ENABLED,
+            desired_revision=1, applied_revision=1,
+            probe_endpoint=admission.admit(source_url).identity,
+        )
+        for number in range(2)
+    )
+    node = MediaNode(
+        id=node_id, name="node", external_port=10554, state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING, health=NodeHealth.HEALTHY,
+        maintenance=False, management_fresh=True, config_compatible=True,
+        desired_revision=1, applied_revision=1,
+    )
+    profile = CameraProbeProfile(enabled=True, max_source_sessions=2)
+
+    class Work:
+        def acquire(self) -> None: pass
+        def assert_owned(self) -> None: pass
+        def active_profiles(self, *, limit: int) -> tuple[_ProfileRow, ...]:
+            return tuple(
+                _ProfileRow(camera.id, 1, profile, NOW - timedelta(hours=1), None)
+                for camera in cameras
+            )
+        @contextmanager
+        def execution_permit(
+            self, camera_id: UUID, *, profile_revision: int, endpoint_generation: UUID,
+        ) -> Iterator[bool]:
+            yield True
+        def mark_attempt(self, camera_id: UUID, *, revision: int) -> None: pass
+        def close(self) -> None: pass
+
+    class Catalog:
+        def get_cameras(self, camera_ids: tuple[UUID, ...]) -> tuple[CameraPlacement, ...]:
+            return cameras
+        def get_node(self, requested: UUID) -> MediaNode | None:
+            return node
+
+    class Runtime:
+        def observe(self, requested: UUID) -> CameraRuntimeObservation:
+            if requested == cameras[0].id:
+                raise MediaNodeUnavailable("node unavailable")
+            return CameraRuntimeObservation(requested, node_id, False, 0, False, False)
+
+    class Observations:
+        def __init__(self) -> None:
+            self.saved: list[ProbeObservation] = []
+        def assert_ready(self) -> None: pass
+        def assert_health_ready(self) -> None: pass
+        def health_for(self, target: ProbeTarget, *, method: ProbeMethod) -> ProbeHealthRecord:
+            return ProbeHealthRecord.for_target(target, method=method)
+        def record_if_current(
+            self, observation: ProbeObservation, *,
+            confirmation_spacing: timedelta | None = None,
+        ) -> bool:
+            self.saved.append(observation)
+            return True
+
+    class Client:
+        def execute(
+            self, *, request_id: UUID, endpoint: AdmittedProbeEndpoint,
+            deadline_at: datetime, cancelled: Callable[[], bool] | None = None,
+        ) -> ProbeExecutionResult:
+            return ProbeExecutionResult(
+                ProbeOutcome.HEALTHY, NOW + timedelta(seconds=1), video_codec="h264",
+            )
+
+    observations = Observations()
+    worker = ProbeMonitoringWorker(
+        work=Work(), cameras=Catalog(), observations=observations, runtime=Runtime(),
+        admission=admission, client=Client(),
+        scheduler=BoundedProbeScheduler(
+            global_limit=2, per_node_limit=2, per_site_limit=2, source_limit=2,
+            path_limit=1, queue_limit=8, lease_seconds=15, retry_delay_seconds=1,
+            max_attempts=1,
+        ),
+        batch_limit=8, execution_workers=2,
+    )
+    worker.start()
+
+    cycle = worker.run_once(now=NOW)
+
+    assert cycle.candidates == cycle.submitted == cycle.executed == cycle.persisted == 1
+    assert observations.saved[0].target.camera_id == cameras[1].id
+
+
+def _seed_profile_rows(database_url: str, *, count: int) -> tuple[UUID, ...]:
+    node_id = uuid4()
+    camera_ids = tuple(uuid4() for _ in range(count))
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO media_nodes "
+            "(id, name, external_port, api_port, metrics_port, state, runtime_state, "
+            "health, camera_capacity, registered_cameras, active_sources, maintenance, "
+            "management_fresh, config_compatible, release_id, mediamtx_binary_sha256, "
+            "desired_revision, applied_revision) "
+            "VALUES (:id, 'probe-node', 12000, 13000, 14000, 'running', 'running', "
+            "'healthy', 100, :count, 0, false, true, true, '0.2.1', :digest, 1, 1)"
+        ), {"id": node_id, "count": count, "digest": "a" * 64})
+        for number, camera_id in enumerate(camera_ids):
+            public_id = generate_public_id()
+            connection.execute(text(
+                "INSERT INTO cameras "
+                "(id, name, source_url, public_id, state, desired_revision, applied_revision) "
+                "VALUES (:id, :name, 'rtsp://192.0.2.10/live', :public_id, "
+                "'enabled', 1, 1)"
+            ), {"id": camera_id, "name": f"camera-{number}", "public_id": public_id})
+            connection.execute(
+                text("INSERT INTO public_id_tombstones (public_id) VALUES (:public_id)"),
+                {"public_id": public_id},
+            )
+            connection.execute(text(
+                "INSERT INTO camera_placements "
+                "(camera_id, node_id, placement_mode, generation) "
+                "VALUES (:camera_id, :node_id, 'automatic', 1)"
+            ), {"camera_id": camera_id, "node_id": node_id})
+            connection.execute(text(
+                "INSERT INTO camera_probe_endpoints "
+                "(camera_id, admitted_revision, endpoint_generation, endpoint_address, "
+                "endpoint_port, site_key, policy_sha256, source_sha256) "
+                "VALUES (:camera_id, 1, :generation, '192.0.2.10', 554, 'local', "
+                ":policy, :source)"
+            ), {
+                "camera_id": camera_id,
+                "generation": uuid4(),
+                "policy": "b" * 64,
+                "source": "a" * 64,
+            })
+            connection.execute(text(
+                "INSERT INTO camera_probe_profiles "
+                "(camera_id, revision, enabled, max_source_sessions, require_video, "
+                "require_audio, routine_seconds, confirmation_seconds, timeout_seconds, "
+                "updated_at) VALUES (:camera_id, 1, true, 2, true, false, 300, 30, 15, "
+                ":updated_at)"
+            ), {"camera_id": camera_id, "updated_at": NOW - timedelta(hours=1)})
+    engine.dispose()
+    return camera_ids

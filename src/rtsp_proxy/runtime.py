@@ -161,6 +161,7 @@ ENV_TO_FIELD = {
 LOGGER = logging.getLogger(__name__)
 
 _BACKGROUND_DATABASE_TIMEOUT_MS = 2_000
+_PROBE_WORKER_JOIN_TIMEOUT_SECONDS = 40.0
 _COLLECTOR_HELPER_TIMEOUT_SECONDS = 2.0
 _COLLECTOR_CYCLE_TIMEOUT_SECONDS = 8.0
 _COLLECTOR_JOIN_TIMEOUT_SECONDS = 20.0
@@ -809,6 +810,7 @@ def create_background_app(
         and settings.node_runtime_socket is not None
     ):
         assert settings.database_url is not None
+        assert settings.probe_broker_socket is not None
         admission = ProbeEndpointAdmission(
             site_key=settings.probe_source_site_key,
             allowed_networks=settings.probe_source_cidrs,
@@ -820,7 +822,9 @@ def create_background_app(
             statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
         )
         work = PostgresProbeWorkStore(
-            settings.database_url, statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+            settings.database_url,
+            statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
+            execution_slots=settings.probe_execution_workers,
         )
         media = UnixMediaNodeClientFactory(
             socket_path=settings.node_runtime_socket,
@@ -872,9 +876,12 @@ def create_background_app(
                 probe_worker.start()
             except BaseException:
                 try:
-                    observations.close()
+                    probe_worker.close()
                 finally:
-                    store.close()
+                    try:
+                        observations.close()
+                    finally:
+                        store.close()
                 raise
             probe_thread = threading.Thread(
                 target=probe_loop, name="rtsp-proxy-probe-worker", daemon=False,
@@ -885,7 +892,7 @@ def create_background_app(
             stop.set()
             try:
                 if probe_thread is not None:
-                    probe_thread.join(timeout=35 + settings.probe_interval_seconds)
+                    probe_thread.join(timeout=_PROBE_WORKER_JOIN_TIMEOUT_SECONDS)
                     if probe_thread.is_alive():
                         raise RuntimeError("probe_worker_shutdown_timeout")
             finally:

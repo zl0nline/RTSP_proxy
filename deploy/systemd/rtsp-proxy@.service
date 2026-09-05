@@ -15,7 +15,7 @@ ExecStart=/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i
 Restart=always
 RestartSec=5s
 TimeoutStartSec=30s
-TimeoutStopSec=30s
+TimeoutStopSec=45s
 UMask=0077
 
 RuntimeDirectory=rtsp-proxy-%i

@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     probe_interval_seconds: float = Field(default=5, ge=1, le=60)
     probe_batch_limit: int = Field(default=256, ge=1, le=256)
     probe_execution_workers: int = Field(default=4, ge=1, le=16)
-    probe_broker_socket: Path = Path("/run/rtsp-proxy-probe-broker/control.sock")
+    probe_broker_socket: Path | None = None
     dashboard_poll_interval_seconds: int = Field(default=10, ge=5, le=30)
     probe_source_site_key: str = Field(
         default="local",
@@ -266,6 +266,7 @@ class Settings(BaseSettings):
             not self.probe_source_cidrs
             or self.camera_source_keys_file is None
             or not self.camera_source_keys_file.is_absolute()
+            or self.probe_broker_socket is None
             or not self.probe_broker_socket.is_absolute()
             or ".." in self.probe_broker_socket.parts
         ):

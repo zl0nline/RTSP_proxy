@@ -796,7 +796,8 @@ original backup, not regeneration: existing camera passwords need the original
 key. In that historical candidate, replacement was atomic per role file rather
 than a cross-file transaction. Candidate `0.16.0` replaces one shared
 `camera-source.env` atomically; after an interrupted write, resolve the error
-and rerun before restarting services.
+and rerun before restarting WEB, reconciler, probe worker and the already-active
+`rtsp-proxy-probe-broker.service` so none retains the old CIDR policy.
 
 Application `0.15.0` adds schema `0023_probe_health_states`, retaining schema
 0022 bridge compatibility before migration. It does not enable the periodic

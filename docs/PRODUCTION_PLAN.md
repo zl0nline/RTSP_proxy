@@ -1404,7 +1404,8 @@ impact is measured.
   defaults and revision fencing; Dashboard/API mutations are authenticated,
   authorized, CSRF-protected and normatively audited. The singleton unprivileged
   worker restores only generation-bound admitted endpoints, repeats runtime
-  admission, uses the accepted broker and projects only current results. Exact
+  admission and holds a final camera/profile/endpoint permit through bounded
+  broker execution, then projects only current results. Exact
   schema/ownership/helper failure is fail-closed without changing camera health
   or media service; see [worker evidence](evidence/phase-g-probe-worker.md).
   The earlier [routine policy candidate](evidence/phase-g-routine-health-state.md)

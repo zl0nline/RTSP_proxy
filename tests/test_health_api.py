@@ -1117,6 +1117,12 @@ def test_probe_role_requires_explicit_source_policy_keyring_and_local_sockets() 
     }
     with pytest.raises(ValidationError, match="probe_worker_configuration_incomplete"):
         Settings.model_validate(common)
+    with pytest.raises(ValidationError, match="probe_worker_configuration_incomplete"):
+        Settings.model_validate({
+            **common,
+            "probe_source_cidrs": ("192.0.2.0/24",),
+            "camera_source_keys_file": Path("/etc/rtsp-proxy/camera-keys.json"),
+        })
     settings = Settings.model_validate({
         **common,
         "probe_source_cidrs": ("192.0.2.0/24",),

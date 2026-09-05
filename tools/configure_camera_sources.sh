@@ -123,4 +123,4 @@ trap - EXIT HUP INT TERM
 
 printf '%s\n' \
   'Camera source policy and encrypted credential storage configured.' \
-  'Restart rtsp-proxy-web.service, rtsp-proxy@reconciler.service and rtsp-proxy@probe.service.'
+  'Restart rtsp-proxy-web.service, rtsp-proxy@reconciler.service, rtsp-proxy@probe.service and rtsp-proxy-probe-broker.service.'

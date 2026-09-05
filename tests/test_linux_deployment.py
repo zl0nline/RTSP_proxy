@@ -103,6 +103,8 @@ def test_units_keep_release_tree_read_only_and_drop_privileges() -> None:
 
 
 def test_background_roles_use_a_separate_systemd_template() -> None:
+    from rtsp_proxy.runtime import _PROBE_WORKER_JOIN_TIMEOUT_SECONDS
+
     service = read_unit("rtsp-proxy@.service")["Service"]
 
     assert "reconciler|probe" in service["ExecCondition"]
@@ -111,6 +113,8 @@ def test_background_roles_use_a_separate_systemd_template() -> None:
         "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-role --expected-role=%i"
     )
     assert service["Restart"] == "always"
+    assert service["TimeoutStopSec"] == "45s"
+    assert _PROBE_WORKER_JOIN_TIMEOUT_SECONDS < 45
     assert service["EnvironmentFile"] == "/etc/rtsp-proxy/control-plane/rtsp-proxy-%i.env"
     assert read_unit("rtsp-proxy@.service.d/camera-source.conf")["Service"][
         "EnvironmentFile"
@@ -821,6 +825,7 @@ def test_camera_source_bootstrap_is_atomic_and_requires_an_explicit_allowlist() 
     assert "root:rtsp-proxy-access" in script
     assert "mv -T" in script
     assert "rtsp-proxy@probe.service" in script
+    assert "rtsp-proxy-probe-broker.service" in script
 
 
 @pytest.mark.parametrize("release_id", [".", "..", "../escape"])

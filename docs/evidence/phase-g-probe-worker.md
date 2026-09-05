@@ -25,14 +25,19 @@ Date: 2026-09-06. Candidate release: `0.16.0`. Application schema:
 - Execution goes only through the accepted root AF_UNIX broker. Concurrency is
   bounded globally, per node and per site. Attempt time is durable and fenced by
   profile revision; health transitions remain generation-bound.
-- Loss of singleton ownership makes readiness fail and requests normal process
-  termination; the systemd role uses `Restart=always`. Ordinary executor or
-  infrastructure failures remain `INCONCLUSIVE` and never change media service.
+- Final broker launch holds a camera/profile/endpoint database permit, so a
+  concurrent capacity downgrade cannot commit until that bounded execution is
+  gone; a change before permit acquisition cancels the scheduler lease without
+  opening a connection. Loss of singleton ownership makes readiness fail and
+  requests normal process termination; the systemd role uses `Restart=always`.
+  Ordinary executor or infrastructure failures remain `INCONCLUSIVE` and never
+  change media service.
 
 The systemd installer ships the probe env example and three optional
 `camera-source.env` drop-ins. Optional loading preserves the schema-0023 upgrade
 bridge; the configuration tool then replaces one shared CIDR/key-path file
-atomically for WEB, reconciler, probe worker and broker.
+atomically for WEB, reconciler, probe worker and broker and explicitly requires
+restarting an already-active broker.
 
 ## Reproducible verification
 
@@ -41,13 +46,14 @@ On macOS arm64 with native PostgreSQL:
 ```text
 uv run ruff check .                         -> passed
 uv run mypy src                             -> 83 source files, passed
-uv run pytest -q --tb=short -rN             -> 1685 passed, 182 skipped
+uv run pytest -q --tb=short -rN             -> 1687 passed, 182 skipped
 ```
 
 On the isolated `grob` Linux amd64 scratch tree, without modifying the installed
 pilot:
 
 ```text
+full application suite                       -> 1595 passed, 274 skipped
 deployment/bootstrap/worker/install tests  -> 50 passed, 2 opt-in skips
 systemd-analyze verify                      -> no candidate-unit errors
 ```
