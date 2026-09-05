@@ -202,6 +202,16 @@ endpoint generation; пустая policy означает deny-all. Probe job п
 WEB/reconciler и требует отдельной
 принятой Linux execution boundary.
 
+## Upstream session capacity
+
+Подтверждённое число одновременных подключений к исходной камере; оно не связано
+с лимитом одного downstream reader у прокси. Неизвестная ёмкость считается равной одному.
+
+## Passive monitoring
+
+Наблюдение существующего медиапотока без отдельного подключения к камере или
+proxy path; отсутствие свежей глубокой проверки не является неисправностью камеры.
+
 ## Capacity envelope
 
 Измеренная workload/hardware комбинация. Per-node envelope и per-server

@@ -22,7 +22,7 @@ from rtsp_proxy.probes import (
 NOW = datetime(2026, 9, 5, tzinfo=UTC)
 
 
-def _candidate(**profile: object) -> RoutineProbeCandidate:
+def _candidate(*, max_source_sessions: int = 2, **profile: object) -> RoutineProbeCandidate:
     target = ProbeTarget(
         camera_id=uuid4(),
         public_id=PublicId("a" * 26),
@@ -35,12 +35,14 @@ def _candidate(**profile: object) -> RoutineProbeCandidate:
         maintenance=False,
         occupied=False,
         source_pull_active=False,
-        max_source_sessions=1,
+        max_source_sessions=max_source_sessions,
         source_endpoint_generation=uuid4(),
     )
     return RoutineProbeCandidate(
         target=target,
-        profile=CameraProbeProfile(enabled=True, **profile),
+        profile=CameraProbeProfile(
+            enabled=True, max_source_sessions=max_source_sessions, **profile,
+        ),
         health=ProbeHealthRecord.for_target(target, method=ProbeMethod.SOURCE),
         last_attempt_at=None,
         registered_at=NOW - timedelta(hours=1),
@@ -165,13 +167,25 @@ def test_unavailable_node_suppresses_routine_probe_storms(state: NodeState) -> N
 
 
 def test_disabled_profile_and_active_single_session_source_do_not_submit() -> None:
-    candidate = _candidate()
+    candidate = _candidate(max_source_sessions=1)
     target = replace(candidate.target, source_pull_active=True, occupied=True)
     candidate = replace(candidate, target=target, health=replace(candidate.health, target=target))
     producer = RoutineProbeProducer(_scheduler())
     assert producer.enqueue({target.camera_id: candidate}, now=NOW) == ()
     candidate = replace(candidate, profile=replace(candidate.profile, enabled=False))
     assert producer.enqueue({target.camera_id: candidate}, now=NOW) == ()
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_single_session_profile_never_queues_a_routine_probe(active: bool) -> None:
+    candidate = _candidate(max_source_sessions=1)
+    target = replace(candidate.target, source_pull_active=active, occupied=active)
+    candidate = replace(candidate, target=target, health=replace(candidate.health, target=target))
+    scheduler = _scheduler()
+    assert RoutineProbeProducer(scheduler).enqueue({target.camera_id: candidate}, now=NOW) == ()
+    assert scheduler.diagnostics().queued == 0
+    assert candidate.health.health_state is ProbeHealthState.UNKNOWN
+    assert candidate.last_attempt_at is None
 
 
 def test_producer_preserves_scheduler_single_flight_and_bounded_queue() -> None:

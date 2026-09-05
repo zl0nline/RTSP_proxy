@@ -170,7 +170,7 @@ class ProbeTarget:
             )
         ) or (not self.enabled and self.maintenance):
             raise ValueError("probe_target_state_invalid")
-        if not 1 <= self.max_source_sessions <= 16:
+        if type(self.max_source_sessions) is not int or not 1 <= self.max_source_sessions <= 16:
             raise ValueError("probe_source_session_limit_invalid")
         if self.node_runtime is not None and not isinstance(
             self.node_runtime, ProbeNodeRuntimeGeneration
@@ -1848,6 +1848,10 @@ def _require_probe_eligible(target: ProbeTarget, method: ProbeMethod) -> None:
         raise ProbeIneligible("camera_disabled")
     if target.maintenance:
         raise ProbeIneligible("camera_maintenance")
+    # An idle snapshot does not reserve the only upstream session. Neither a
+    # SOURCE nor a PATH probe may race a new reader for a single-session camera.
+    if target.max_source_sessions == 1:
+        raise ProbeIneligible("camera_passive_only")
     if target.source_endpoint_generation is None:
         raise ProbeIneligible("source_endpoint_unavailable")
     if method is ProbeMethod.PATH and target.node_state is not NodeState.RUNNING:
@@ -1858,12 +1862,6 @@ def _require_probe_eligible(target: ProbeTarget, method: ProbeMethod) -> None:
         raise ProbeIneligible("path_source_pull_active")
     if method is ProbeMethod.PATH and target.node_runtime is None:
         raise ProbeIneligible("node_runtime_unavailable")
-    if (
-        method is ProbeMethod.SOURCE
-        and target.source_pull_active
-        and target.max_source_sessions <= 1
-    ):
-        raise ProbeIneligible("source_session_budget")
 
 
 def _priority_reservations(global_limit: int) -> Mapping[ProbePriority, int]:

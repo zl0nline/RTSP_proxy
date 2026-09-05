@@ -91,8 +91,11 @@ This slice must not be described as completing automatic health monitoring.
 Still required: authoritative profile management and snapshot producer, singleton
 worker ownership, execution/result persistence loop, fresh admission at dispatch,
 shutdown wiring, dashboard health projection and manual-trigger workflow.
-The final worker must resolve the race between an idle single-session SOURCE
-probe and a new downstream reader; an idle snapshot alone is not a reservation.
+The owner has selected passive-only monitoring for single-session cameras,
+including idle cameras: no separate SOURCE/PATH probe and no reader delay.
+The [admission policy](phase-g-passive-only-policy.md) now enforces this rule.
+The final worker must still bind authoritative profiles and passive observations;
+an idle snapshot alone must never be treated as a reservation.
 Profile changes must also invalidate incompatible health interpretations.
 Do not enable active probes merely because this policy module exists.
 

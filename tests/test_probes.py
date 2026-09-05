@@ -169,7 +169,7 @@ def test_probe_target_rejects_unsafe_or_ambiguous_identity() -> None:
         (
             _target(4, source_pull_active=True, max_source_sessions=1),
             ProbeMethod.SOURCE,
-            "source_session_budget",
+            "camera_passive_only",
         ),
         (
             _target(5, node_state=NodeState.DRAINING),
@@ -198,6 +198,46 @@ def test_scheduler_never_bypasses_camera_or_reader_admission(
             deadline_at=NOW + timedelta(minutes=1),
         )
     assert scheduler.diagnostics().queued == 0
+
+
+@pytest.mark.parametrize("method", list(ProbeMethod))
+@pytest.mark.parametrize("priority", list(ProbePriority))
+@pytest.mark.parametrize("active", [False, True])
+def test_single_session_camera_is_passive_only_even_when_idle_or_manually_requested(
+    method: ProbeMethod, priority: ProbePriority, active: bool,
+) -> None:
+    scheduler = _scheduler()
+    target = _target(
+        1, max_source_sessions=1, source_pull_active=active,
+        occupied=active, node_runtime=NODE_RUNTIME,
+    )
+    with pytest.raises(ProbeIneligible, match="camera_passive_only"):
+        scheduler.submit(
+            target=target, method=method, priority=priority,
+            requested_at=NOW, deadline_at=NOW + timedelta(minutes=1),
+        )
+    assert scheduler.diagnostics().queued == 0
+    assert _claim(scheduler, NOW, target) == ()
+
+
+@pytest.mark.parametrize("method", list(ProbeMethod))
+def test_claim_drops_idle_work_when_source_capacity_becomes_single_session(
+    method: ProbeMethod,
+) -> None:
+    scheduler = _scheduler()
+    target = _target(1, max_source_sessions=2, node_runtime=NODE_RUNTIME)
+    scheduler.submit(
+        target=target, method=method, priority=ProbePriority.MANUAL,
+        requested_at=NOW, deadline_at=NOW + timedelta(minutes=1),
+    )
+    assert _claim(scheduler, NOW, replace(target, max_source_sessions=1)) == ()
+    assert scheduler.diagnostics().queued == 0
+
+
+@pytest.mark.parametrize("capacity", [True, False, 1.5, 2.0])
+def test_source_session_capacity_requires_a_real_integer(capacity: object) -> None:
+    with pytest.raises(ValueError, match="probe_source_session_limit_invalid"):
+        _target(1, max_source_sessions=capacity)
 
 
 def test_scheduler_is_single_flight_bounded_and_generation_aware() -> None:

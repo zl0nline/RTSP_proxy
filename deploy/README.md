@@ -776,7 +776,7 @@ camera-bound, versioned keyring. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.15.2 \
+  --release-id 0.15.3 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -808,6 +808,11 @@ camera admission rejects loopback too; only an explicitly loopback-only broker
 CIDR admits native contract listeners. Use its verified bundle, not a rebuilt
 bundle with an already-installed release ID.
 
+Candidate `0.15.3` enforces passive-only admission for single-upstream-session
+cameras, including idle cameras and manual SOURCE/PATH requests. Unknown source
+capacity defaults to one. No reader delay is introduced; missing fresh deep
+evidence is not a camera fault. This does not enable the worker/profile UI.
+
 ### Operator authentication modes
 
 There are two independent normal login paths, and they may be enabled at the
@@ -821,11 +826,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.15.2 candidate, apply migration 0023 and run:
+For a first installation of the 0.15.3 candidate, apply migration 0023 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.15.2 \
+  --release-id 0.15.3 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
