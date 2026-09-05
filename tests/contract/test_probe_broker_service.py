@@ -983,6 +983,13 @@ def test_installed_broker_rejects_untrusted_protocol_input_before_execution(
 ) -> None:
     if os.geteuid() != 0:
         pytest.fail("installed broker contract requires root")
+    # Type=simple reports active before startup recovery and the D-Bus event
+    # loop are initialized. A root-peer refusal can occur only after the real
+    # accept loop starts; it sends no request/fd and cannot allocate an executor.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as readiness:
+        readiness.settimeout(35)
+        readiness.connect("/run/rtsp-proxy-probe-broker/control.sock")
+        assert readiness.recv(1) == b""
     request_id = uuid4()
     process_id = int(_service_property("MainPID"))
     descriptors_before = len(list(Path(f"/proc/{process_id}/fd").iterdir()))

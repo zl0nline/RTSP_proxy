@@ -72,6 +72,15 @@ matrix could pass solely through CIDR mismatch. The dedicated broad-policy
 loopback regression above addresses that evidence gap; Standards found no
 actionable issue. Final re-review and native results are pending.
 
+The first native run, [33965851594](https://github.com/zl0nline/RTSP_proxy/actions/runs/33965851594),
+passed 40 installed contracts on each architecture but failed the first hostile
+FD-baseline check after restart (`7 != 4`). `Type=simple` had reported active
+before startup recovery initialized the persistent D-Bus event-loop descriptors.
+The remaining 14 hostile cases passed without accumulating descriptors. The test
+now waits for the real accept loop using a bounded root-peer refusal, with no
+request or input descriptor, before taking the baseline. Exact PID/FD equality
+and no-execution assertions remain unchanged; the failed run is not acceptance.
+
 ```sh
 uv run pytest -q tests/test_probe_security.py tests/test_probe_policy_payloads.py \
   tests/test_probe_broker_service.py
