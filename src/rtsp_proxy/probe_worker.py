@@ -66,7 +66,7 @@ class ProbeWorkSource(Protocol):
     def assert_owned(self) -> None: ...
     def active_profiles(self, *, limit: int) -> tuple[_ProfileRow, ...]: ...
     def execution_permit(
-        self, camera_id: UUID, *, profile_revision: int, endpoint_generation: UUID,
+        self, target: ProbeTarget, *, profile_revision: int,
     ) -> AbstractContextManager[bool]: ...
     def mark_attempt(self, camera_id: UUID, *, revision: int) -> None: ...
     def close(self) -> None: ...
@@ -269,10 +269,9 @@ class PostgresProbeWorkStore:
     @contextmanager
     def execution_permit(
         self,
-        camera_id: UUID,
+        target: ProbeTarget,
         *,
         profile_revision: int,
-        endpoint_generation: UUID,
     ) -> Iterator[bool]:
         """Lock camera/profile admission through one broker execution.
 
@@ -282,22 +281,22 @@ class PostgresProbeWorkStore:
         while preventing a maintenance/state transition during execution.
         """
         if (
-            not isinstance(camera_id, UUID)
-            or camera_id.version != 4
+            not isinstance(target, ProbeTarget)
             or type(profile_revision) is not int
             or profile_revision < 1
-            or not isinstance(endpoint_generation, UUID)
-            or endpoint_generation.version != 4
+            or target.source_endpoint_generation is None
         ):
             raise ValueError("probe_worker_execution_identity_invalid")
         self.assert_owned()
         try:
             with self._engine.connect() as connection, connection.begin():
                 row = connection.execute(text(
-                    "SELECT profile.revision, profile.enabled, "
+                    "SELECT profile.revision, profile.enabled, camera.public_id, "
                     "profile.max_source_sessions, camera.state AS camera_state, "
+                    "camera.desired_revision, placement.node_id, "
+                    "placement.generation AS placement_generation, "
                     "node.state AS node_state, node.maintenance, "
-                    "endpoint.endpoint_generation "
+                    "endpoint.site_key, endpoint.endpoint_generation "
                     "FROM cameras AS camera "
                     "JOIN camera_probe_profiles AS profile "
                     "ON profile.camera_id=camera.id "
@@ -307,9 +306,9 @@ class PostgresProbeWorkStore:
                     "JOIN camera_probe_endpoints AS endpoint "
                     "ON endpoint.camera_id=camera.id "
                     "WHERE camera.id=:camera_id "
-                    "FOR UPDATE OF camera, profile, endpoint SKIP LOCKED "
+                    "FOR UPDATE OF camera, profile, placement, endpoint SKIP LOCKED "
                     "FOR SHARE OF node SKIP LOCKED"
-                ), {"camera_id": camera_id}).mappings().one_or_none()
+                ), {"camera_id": target.camera_id}).mappings().one_or_none()
                 permitted = bool(
                     row is not None
                     and row["revision"] == profile_revision
@@ -317,9 +316,14 @@ class PostgresProbeWorkStore:
                     and type(row["max_source_sessions"]) is int
                     and row["max_source_sessions"] > 1
                     and row["camera_state"] == CameraState.ENABLED.value
+                    and row["public_id"] == str(target.public_id)
+                    and row["desired_revision"] == target.desired_revision
+                    and row["node_id"] == target.node_id
+                    and row["placement_generation"] == target.placement_generation
                     and row["node_state"] == NodeState.RUNNING.value
                     and row["maintenance"] is False
-                    and row["endpoint_generation"] == endpoint_generation
+                    and row["site_key"] == target.site_key
+                    and row["endpoint_generation"] == target.source_endpoint_generation
                 )
                 yield permitted
         except SQLAlchemyError:
@@ -440,13 +444,10 @@ class ProbeMonitoringWorker:
         item: _ExecutableCandidate,
         cancelled: Callable[[], bool],
     ) -> ProbeExecutionResult | None:
-        generation = item.routine.target.source_endpoint_generation
-        if generation is None:
+        if item.routine.target.source_endpoint_generation is None:
             return None
         with self._work.execution_permit(
-            lease.target.camera_id,
-            profile_revision=item.profile_revision,
-            endpoint_generation=generation,
+            lease.target, profile_revision=item.profile_revision,
         ) as permitted:
             if not permitted:
                 return None

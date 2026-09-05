@@ -98,18 +98,10 @@ def test_postgres_probe_worker_pages_past_the_first_bounded_batch(
         first = store.active_profiles(limit=2)
         second = store.active_profiles(limit=2)
         wrapped = store.active_profiles(limit=2)
-        engine = create_engine(postgres_database_url)
-        with engine.connect() as connection:
-            generation = connection.scalar(text(
-                "SELECT endpoint_generation FROM camera_probe_endpoints "
-                "WHERE camera_id=:camera_id"
-            ), {"camera_id": first[0].camera_id})
-        engine.dispose()
-        assert isinstance(generation, UUID)
+        target = _stored_probe_target(postgres_database_url, first[0].camera_id)
         with store.execution_permit(
-            first[0].camera_id,
+            target,
             profile_revision=first[0].revision,
-            endpoint_generation=generation,
         ) as permitted:
             assert permitted is True
             competing = create_engine(postgres_database_url)
@@ -122,6 +114,31 @@ def test_postgres_probe_worker_pages_past_the_first_bounded_batch(
                     ), {"camera_id": first[0].camera_id})
             finally:
                 competing.dispose()
+            competing = create_engine(postgres_database_url)
+            try:
+                with pytest.raises(SQLAlchemyError), competing.begin() as connection:
+                    connection.execute(text("SET LOCAL lock_timeout = '100ms'"))
+                    connection.execute(text(
+                        "UPDATE camera_placements SET generation=generation + 1 "
+                        "WHERE camera_id=:camera_id"
+                    ), {"camera_id": first[0].camera_id})
+            finally:
+                competing.dispose()
+
+        # A move can preserve the admitted endpoint generation. The final
+        # permit must still reject the target claimed before that move.
+        engine = create_engine(postgres_database_url)
+        with engine.begin() as connection:
+            connection.execute(text(
+                "UPDATE camera_placements SET generation=generation + 1 "
+                "WHERE camera_id=:camera_id"
+            ), {"camera_id": first[0].camera_id})
+        engine.dispose()
+        with store.execution_permit(
+            target,
+            profile_revision=first[0].revision,
+        ) as permitted:
+            assert permitted is False
     finally:
         store.close()
 
@@ -170,11 +187,14 @@ def test_monitoring_worker_runs_one_authoritative_bounded_cycle() -> None:
             return (_ProfileRow(camera_id, 3, profile, NOW - timedelta(hours=1), None),)
         @contextmanager
         def execution_permit(
-            self, requested: UUID, *, profile_revision: int, endpoint_generation: UUID,
+            self, target: ProbeTarget, *, profile_revision: int,
         ) -> Iterator[bool]:
-            assert requested == camera_id
+            assert target.camera_id == camera_id
+            assert target.node_id == node_id
+            assert target.desired_revision == camera.desired_revision
+            assert target.placement_generation == camera.placement_generation
             assert profile_revision == 3
-            assert endpoint_generation == endpoint.identity.generation
+            assert target.source_endpoint_generation == endpoint.identity.generation
             yield self.permitted
         def mark_attempt(self, camera_id: UUID, *, revision: int) -> None:
             self.marked.append((camera_id, revision))
@@ -314,7 +334,7 @@ def test_runtime_failure_is_isolated_to_one_camera() -> None:
             )
         @contextmanager
         def execution_permit(
-            self, camera_id: UUID, *, profile_revision: int, endpoint_generation: UUID,
+            self, target: ProbeTarget, *, profile_revision: int,
         ) -> Iterator[bool]:
             yield True
         def mark_attempt(self, camera_id: UUID, *, revision: int) -> None: pass
@@ -426,3 +446,38 @@ def _seed_profile_rows(database_url: str, *, count: int) -> tuple[UUID, ...]:
             ), {"camera_id": camera_id, "updated_at": NOW - timedelta(hours=1)})
     engine.dispose()
     return camera_ids
+
+
+def _stored_probe_target(database_url: str, camera_id: UUID) -> ProbeTarget:
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(text(
+                "SELECT camera.public_id, camera.desired_revision, "
+                "placement.node_id, placement.generation AS placement_generation, "
+                "node.state AS node_state, node.maintenance, endpoint.site_key, "
+                "endpoint.endpoint_generation, profile.max_source_sessions "
+                "FROM cameras AS camera "
+                "JOIN camera_placements AS placement ON placement.camera_id=camera.id "
+                "JOIN media_nodes AS node ON node.id=placement.node_id "
+                "JOIN camera_probe_endpoints AS endpoint ON endpoint.camera_id=camera.id "
+                "JOIN camera_probe_profiles AS profile ON profile.camera_id=camera.id "
+                "WHERE camera.id=:camera_id"
+            ), {"camera_id": camera_id}).mappings().one()
+    finally:
+        engine.dispose()
+    return ProbeTarget(
+        camera_id=camera_id,
+        public_id=PublicId.parse(row["public_id"]),
+        node_id=row["node_id"],
+        site_key=row["site_key"],
+        desired_revision=row["desired_revision"],
+        placement_generation=row["placement_generation"],
+        node_state=NodeState(row["node_state"]),
+        enabled=True,
+        maintenance=row["maintenance"],
+        occupied=False,
+        source_pull_active=False,
+        max_source_sessions=row["max_source_sessions"],
+        source_endpoint_generation=row["endpoint_generation"],
+    )
