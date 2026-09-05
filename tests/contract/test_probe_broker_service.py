@@ -4,6 +4,7 @@ import json
 import os
 import pwd
 import re
+import runpy
 import shutil
 import socket
 import struct
@@ -32,6 +33,9 @@ _CURRENT_RELEASE = Path("/opt/rtsp-proxy/current")
 _PIN_ROOT = Path("/sys/fs/bpf/rtsp-proxy-probe-broker")
 _OWNERSHIP_ROOT = Path("/run/rtsp-proxy-probe-broker/guard-ownership")
 _SECRET_CANARY = "probe-broker-secret-canary"
+_HOSTILE_INPUT_CASES = runpy.run_path(
+    str(Path("tests/fixtures/probe_broker_client.py"))
+)["HOSTILE_INPUT_CASES"]
 _SAFE_JOURNAL_FIELDS = ("EXIT_CODE", "EXIT_STATUS", "JOB_RESULT", "UNIT_RESULT")
 _SYSTEMD_EXIT = re.compile(
     r"Main process exited, code=([a-z-]+), status=([0-9]{1,3})(?:/[A-Z0-9_-]+)?"
@@ -229,6 +233,7 @@ def _run_client(
     drop_privileges: bool = True,
     deadline_after_ms: int = 20_000,
     cancellation_input: bool = False,
+    input_case: str | None = None,
 ) -> subprocess.Popen[bytes]:
     raw_client = os.environ.get(_BROKER_CLIENT_ENV, "")
     client_path = Path(raw_client)
@@ -249,6 +254,8 @@ def _run_client(
         str(port),
         str(deadline_after_ms),
     ]
+    if input_case is not None:
+        arguments.append(input_case)
     if drop_privileges:
         setpriv = shutil.which("setpriv")
         if setpriv is None:
@@ -891,32 +898,64 @@ def test_installed_broker_refuses_redirect_without_secret_or_residue() -> None:
     assert secret_canary not in journal.stdout + journal.stderr
 
 
-def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit() -> None:
+@pytest.mark.parametrize(
+    ("drop_privileges", "address"),
+    [
+        (False, "127.0.0.1"), (True, "127.0.0.2"),
+        (True, "169.254.169.254"), (True, "fd00:ec2::254"),
+        (True, "fd00:ec2::23"), (True, "100.100.100.200"),
+        (True, "0.0.0.0"), (True, "::"), (True, "fe80::1"),
+        (True, "224.0.0.1"), (True, "ff02::1"),
+        (True, "240.0.0.1"), (True, "::2"),
+    ],
+)
+def test_installed_broker_denies_root_peer_and_out_of_policy_target_without_unit(
+    drop_privileges: bool, address: str,
+) -> None:
     if os.geteuid() != 0:
         pytest.fail("installed broker contract requires root")
-    for drop_privileges, address in ((False, "127.0.0.1"), (True, "127.0.0.2")):
-        request_id = uuid4()
-        unit_name = f"rtsp-probe-{request_id.hex}.service"
-        client = _run_client(
-            request_id,
-            uuid4(),
-            address,
-            9,
-            drop_privileges=drop_privileges,
-        )
-        stdout, stderr = client.communicate(timeout=5)
+    request_id = uuid4()
+    client = _run_client(request_id, uuid4(), address, 9, drop_privileges=drop_privileges)
+    stdout, stderr = client.communicate(timeout=5)
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {
+        "audio_codec": None, "failure_class": "executor",
+        "outcome": "inconclusive", "video_codec": None,
+    }
+    _assert_no_request_execution(request_id)
 
-        assert client.returncode == 0
-        assert stderr == b""
-        assert json.loads(stdout) == {
-            "audio_codec": None,
-            "failure_class": "executor",
-            "outcome": "inconclusive",
-            "video_codec": None,
-        }
-        assert _unit_is_collected(unit_name)
-        assert not (_PIN_ROOT / request_id.hex).exists()
-        assert not (_OWNERSHIP_ROOT / f"{request_id.hex}.json").exists()
+
+def _assert_no_request_execution(request_id: UUID) -> None:
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    assert _unit_is_collected(unit_name)
+    assert not (_PIN_ROOT / request_id.hex).exists()
+    assert not (_OWNERSHIP_ROOT / f"{request_id.hex}.json").exists()
+    journal = subprocess.run(
+        ["journalctl", "--unit", unit_name, "--no-pager", "--output=json", "--lines=1"],
+        capture_output=True, check=True, timeout=3,
+    )
+    assert not journal.stdout.strip(), "rejected request created unit journal entries"
+
+
+@pytest.mark.parametrize("input_case", _HOSTILE_INPUT_CASES)
+def test_installed_broker_rejects_untrusted_protocol_input_before_execution(
+    input_case: str,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    request_id = uuid4()
+    process_id = int(_service_property("MainPID"))
+    descriptors_before = len(list(Path(f"/proc/{process_id}/fd").iterdir()))
+    client = _run_client(request_id, uuid4(), "127.0.0.1", 8554, input_case=input_case)
+    stdout, stderr = client.communicate(timeout=5)
+    assert client.returncode == 0
+    assert stderr == b""
+    assert json.loads(stdout) == {"rejected": True}
+    _assert_no_request_execution(request_id)
+    assert _service_property("ActiveState") == "active"
+    assert int(_service_property("MainPID")) == process_id
+    assert len(list(Path(f"/proc/{process_id}/fd").iterdir())) == descriptors_before
 
 
 @pytest.mark.parametrize(

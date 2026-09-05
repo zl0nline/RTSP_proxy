@@ -19,6 +19,7 @@ from rtsp_proxy.probe_broker import (
     receive_probe_broker_request,
     send_probe_broker_response,
 )
+from rtsp_proxy.probe_security import probe_destination_is_forbidden
 from rtsp_proxy.probes import ProbeExecutionResult, ProbeFailureClass, ProbeOutcome
 
 _MAX_WORKERS = 128
@@ -135,10 +136,19 @@ class ProbeBrokerService:
                 wall_clock_ms=self._wall_clock_ms,
             )
             request = received.request
-            if not any(
-                request.target.address in network
+            matching_networks = tuple(
+                network
                 for network in self._allowed_networks
                 if network.version == request.target.address.version
+                and request.target.address in network
+            )
+            # Native installed contracts use explicitly assigned loopback listeners.
+            # A broad /0 is not such an assignment and cannot bypass special-use denial.
+            controlled_loopback = request.target.address.is_loopback and any(
+                network.is_loopback for network in matching_networks
+            )
+            if not matching_networks or (
+                probe_destination_is_forbidden(request.target.address) and not controlled_loopback
             ):
                 raise ProbeBrokerServiceError("probe_broker_target_denied")
             try:

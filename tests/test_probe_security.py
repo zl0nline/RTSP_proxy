@@ -71,6 +71,12 @@ def test_endpoint_admission_resolves_once_and_emits_only_a_literal_target() -> N
         ("127.0.0.1",),
         ("::1",),
         ("224.0.0.1",),
+        ("fd00:ec2::254",),
+        ("10.40.0.11", "fd00:ec2::254"),
+        ("fd00:ec2::23",),
+        ("100.100.100.200",),
+        ("240.0.0.1",),
+        ("::2",),
     ],
 )
 def test_endpoint_admission_rejects_every_special_or_mixed_dns_answer(
@@ -109,6 +115,31 @@ def test_endpoint_admission_rejects_protocol_and_credential_ambiguity(
     )
     with pytest.raises(ProbeEndpointRejected):
         admission.admit(source_url)
+
+
+@pytest.mark.parametrize(
+    ("metadata_address", "network", "camera_address"),
+    [
+        ("fd00:ec2::254", "fd00::/8", "fd00::8"),
+        ("fd00:ec2::23", "fd00::/8", "fd00::8"),
+        ("100.100.100.200", "100.64.0.0/10", "100.64.0.8"),
+    ],
+)
+def test_metadata_literal_and_persisted_admission_are_rejected_inside_allowed_networks(
+    metadata_address: str, network: str, camera_address: str,
+) -> None:
+    admission = ProbeEndpointAdmission(
+        site_key="site-a", allowed_networks=(ip_network(network),),
+        resolve=lambda _hostname: (camera_address,),
+    )
+    address = ip_address(metadata_address)
+    authority = f"[{metadata_address}]" if address.version == 6 else metadata_address
+    with pytest.raises(ProbeEndpointRejected, match="probe_destination_forbidden"):
+        admission.admit(f"rtsp://{authority}/live")
+    endpoint = admission.admit("rtsp://camera.example/live")
+    metadata_identity = replace(endpoint.identity, address=address)
+    with pytest.raises(ProbeEndpointRejected, match="probe_endpoint_identity_invalid"):
+        admission.restore("rtsp://camera.example/live", metadata_identity)
 
 
 def test_literal_endpoint_never_uses_dns_and_must_be_in_the_site_policy() -> None:

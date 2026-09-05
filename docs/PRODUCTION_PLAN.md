@@ -1371,6 +1371,9 @@ impact is measured.
   native CI jobs green in [run 33959755605](https://github.com/zl0nline/RTSP_proxy/actions/runs/33959755605);
   see [cancellation evidence](evidence/phase-g-probe-cancellation.md);
 - [ ] remaining integrated special-range/alternate-protocol cases before broker promotion;
+  [Network-policy candidate](evidence/phase-g-probe-network-policy.md) adds
+  independent broker special-use denial and hostile sealed-input contracts;
+  native evidence and independent review remain required before closing this gate.
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+import runpy
 import socket
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
-from ipaddress import ip_address, ip_network
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from pathlib import Path
 from threading import Event, Thread
 from uuid import UUID
@@ -29,6 +31,7 @@ from rtsp_proxy.probes import ProbeExecutionResult, ProbeFailureClass, ProbeOutc
 _REQUEST_ID = UUID("447a1c4e-4c79-4c50-8e51-42c4dfa5fb19")
 _GENERATION = UUID("d7cbf9ca-5328-4ed2-a5eb-b9e1b0ca9914")
 _NOW_MS = 1_800_000_000_000
+_HOSTILE_FIXTURE = runpy.run_path(str(Path("tests/fixtures/probe_broker_client.py")))
 _FFCONCAT = (
     b"ffconcat version 1.0\n"
     b"file 'rtsp://camera:secret@192.0.2.10:8554/live'\n"
@@ -109,12 +112,13 @@ def _service(
     executor: _Executor,
     *,
     wall_clock_ms: Callable[[], int] = lambda: _NOW_MS,
+    allowed_networks: tuple[IPv4Network | IPv6Network, ...] = (ip_network("192.0.2.0/24"),),
 ) -> ProbeBrokerService:
     return ProbeBrokerService(
         executor=executor,
         expected_uid=os.getuid(),
         expected_gid=os.getgid(),
-        allowed_networks=(ip_network("192.0.2.0/24"),),
+        allowed_networks=allowed_networks,
         request_frame_timeout_seconds=1,
         response_frame_timeout_seconds=1,
         startup_timeout_seconds=5,
@@ -151,6 +155,101 @@ def test_probe_broker_service_returns_only_the_normalized_execution_result() -> 
         server.close()
     assert executor.events == ["execute", "retry"]
     assert worker.is_alive() is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")
+@pytest.mark.parametrize(
+    ("address", "network", "allowed"),
+    [
+        ("169.254.169.254", "0.0.0.0/0", False),
+        ("fd00:ec2::254", "fd00::/8", False),
+        ("fd00:ec2::23", "fd00::/8", False),
+        ("100.100.100.200", "100.64.0.0/10", False),
+        ("0.0.0.0", "0.0.0.0/0", False),
+        ("::", "::/0", False),
+        ("fe80::1", "::/0", False),
+        ("224.0.0.1", "0.0.0.0/0", False),
+        ("ff02::1", "::/0", False),
+        ("240.0.0.1", "0.0.0.0/0", False),
+        ("::2", "::/0", False),
+        ("127.0.0.1", "0.0.0.0/0", False),
+        ("::1", "::/0", False),
+        ("127.0.0.1", "127.0.0.1/32", True),
+        ("::1", "::1/128", True),
+        ("fd00::8", "fd00::/8", True),
+    ],
+)
+def test_broker_special_ranges_do_not_become_allowed_by_broad_cidrs(
+    address: str, network: str, allowed: bool,
+) -> None:
+    executor = _Executor()
+    service = _service(executor, allowed_networks=(ip_network(network),))
+    literal = ip_address(address)
+    authority = f"[{address}]" if literal.version == 6 else address
+    payload = _FFCONCAT.replace(b"192.0.2.10", authority.encode("ascii"))
+    request = replace(_request(), target=ProbeConnectGuardTarget(address=literal, port=8554))
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    worker = Thread(target=_serve_once, args=(service, server))
+    worker.start()
+    try:
+        send_probe_broker_request(
+            client, request, create_sealed_probe_input(payload), timeout_seconds=1,
+        )
+        if allowed:
+            result = receive_probe_broker_response(
+                client, expected_request=request, timeout_seconds=1,
+            )
+            assert result == executor.result
+        else:
+            client.settimeout(1)
+            assert client.recv(1) == b""
+    finally:
+        client.close()
+        worker.join(timeout=2)
+        server.close()
+    assert not worker.is_alive()
+    assert executor.events == (["execute", "retry"] if allowed else [])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux sealed AF_UNIX input contract")
+@pytest.mark.parametrize("input_case", _HOSTILE_FIXTURE["HOSTILE_INPUT_CASES"])
+def test_hostile_fixture_reaches_real_broker_transport_without_execution(
+    tmp_path: Path, input_case: str,
+) -> None:
+    executor = _Executor()
+    service = _service(executor, allowed_networks=(ip_network("127.0.0.1/32"),))
+    endpoint = _HOSTILE_FIXTURE["_contract_endpoint"](
+        endpoint_generation=_GENERATION, address=ip_address("127.0.0.1"), port=8554,
+    )
+    request = replace(
+        _request(), target=ProbeConnectGuardTarget(address=endpoint.identity.address, port=8554),
+    )
+    socket_path = tmp_path / "b"
+    errors: list[BaseException] = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        listener.settimeout(3)
+
+        def serve() -> None:
+            try:
+                connection, _address = listener.accept()
+                _serve_once(service, connection)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = Thread(target=serve)
+        worker.start()
+        try:
+            _HOSTILE_FIXTURE["_send_hostile_input"](
+                request, _HOSTILE_FIXTURE["_hostile_payload"](endpoint, input_case),
+                socket_path=str(socket_path), expected_uid=os.getuid(), expected_gid=os.getgid(),
+            )
+        finally:
+            worker.join(timeout=4)
+    assert not worker.is_alive()
+    assert not errors
+    assert executor.events == []
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux AF_UNIX contract")

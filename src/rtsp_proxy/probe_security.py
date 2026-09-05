@@ -24,6 +24,11 @@ from rtsp_proxy.probe_executor import (
 _IpAddress = IPv4Address | IPv6Address
 _IpNetwork = IPv4Network | IPv6Network
 _SITE_KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+# Non-link-local metadata/credential endpoints. Primary-source references and
+# scope are recorded in docs/evidence/phase-g-probe-network-policy.md.
+_PLATFORM_METADATA_ENDPOINTS = frozenset(
+    (IPv6Address("fd00:ec2::254"), IPv6Address("fd00:ec2::23"), IPv4Address("100.100.100.200"))
+)
 
 
 class ProbeEndpointRejected(ValueError):
@@ -220,7 +225,7 @@ class ProbeEndpointAdmission:
                 raise ProbeEndpointRejected("probe_destination_unavailable") from None
         else:
             addresses = (_normalize_address(literal),)
-        if any(_address_forbidden(address) for address in addresses):
+        if any(probe_destination_is_forbidden(address) for address in addresses):
             raise ProbeEndpointRejected("probe_destination_forbidden")
         if any(not self._allowed(address) for address in addresses):
             raise ProbeEndpointRejected("probe_destination_not_allowed")
@@ -258,7 +263,7 @@ class ProbeEndpointAdmission:
             or identity.policy_sha256 != self._policy_sha256
             or identity.source_url_sha256 != source_sha256
             or identity.port != port
-            or _address_forbidden(identity.address)
+            or probe_destination_is_forbidden(identity.address)
             or not self._allowed(identity.address)
             or (
                 literal is not None
@@ -356,13 +361,16 @@ def _normalize_address(address: _IpAddress) -> _IpAddress:
     return address
 
 
-def _address_forbidden(address: _IpAddress) -> bool:
+def probe_destination_is_forbidden(address: _IpAddress) -> bool:
+    """Reject special-use targets independently of the configured camera CIDRs."""
+
     return bool(
         address.is_unspecified
         or address.is_loopback
         or address.is_link_local
         or address.is_multicast
         or address.is_reserved
+        or address in _PLATFORM_METADATA_ENDPOINTS
     )
 
 
