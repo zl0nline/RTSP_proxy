@@ -45,7 +45,7 @@ if [ "$bootstrap_mode" = --install ]; then
   DEBIAN_FRONTEND=noninteractive apt-get \
     -o Acquire::Retries=10 -o Acquire::https::Timeout=30 install --yes \
     bpftool ca-certificates curl git jq nftables openssl postgresql-client \
-    systemd systemd-container
+    systemd systemd-container util-linux
 fi
 
 test -x "$deploy_uv" || {

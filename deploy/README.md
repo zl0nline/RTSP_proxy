@@ -776,15 +776,24 @@ camera-bound, versioned keyring. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.15.1 \
+  --release-id 0.15.2 \
   --source-cidrs '10.180.5.0/24'
 ```
 
 The command refuses an empty allowlist, creates the `0640
-root:rtsp-proxy-access` keyring only when absent, and atomically updates both
-environment files. Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
+root:rtsp-proxy-access` keyring only when absent, and atomically replaces each
+environment file. Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
 deny-all (`probe_source_policy_not_configured`); a source outside a non-empty
 policy is `probe_destination_not_allowed`.
+
+The `0.15.2` setup script serializes all invocations with one server-wide
+nonblocking `flock`, including callers with different custom key paths. If setup
+is already running, wait and retry; do not unlink its lock file. Bootstrap
+installs `util-linux`. Existing keyring size, JSON and key structure are checked
+before environment changes. An invalid keyring requires restoration of its
+original backup, not regeneration: existing camera passwords need the original
+key. Environment replacement is atomic per file, not a two-file transaction;
+after an interrupted write, resolve the error and rerun before restarting services.
 
 Application `0.15.0` adds schema `0023_probe_health_states`, retaining schema
 0022 bridge compatibility before migration. It does not enable the periodic
@@ -812,11 +821,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.15.1 candidate, apply migration 0023 and run:
+For a first installation of the 0.15.2 candidate, apply migration 0023 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.15.1 \
+  --release-id 0.15.2 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

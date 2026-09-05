@@ -94,7 +94,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.15.1-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.15.2-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -116,7 +116,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.15.1-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.15.2-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -211,7 +211,7 @@ source venv:
 sudo systemd-run --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.15.1/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.15.2/.venv/bin/rtsp-proxy-migrate
 sudo -u postgres psql --dbname rtsp_proxy --tuples-only --no-align \
   --command 'SELECT version_num FROM alembic_version;'
 ```
@@ -232,7 +232,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.15.1 \
+  --release-id 0.15.2 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -267,7 +267,7 @@ WEB environment file и запустите `rtsp-proxy-local-operator --rotate-p
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.15.1 \
+  --release-id 0.15.2 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -277,13 +277,26 @@ sudo ./tools/configure_camera_sources.sh \
 reconciler environment files. Source URL вводится без `login:password@`; логин
 и пароль камеры вводятся в отдельные поля и никогда не возвращаются dashboard.
 
+Повторный запуск сохраняет прежний ключ. Одновременные запуски, в том числе с
+разными `--key-file`, блокируются общей блокировкой сервера: при сообщении
+`camera source setup already running` дождитесь завершения первой команды и
+повторите запуск. Не удаляйте файл блокировки вручную. Утилиту `flock` поставляет
+пакет `util-linux`, который устанавливает штатный bootstrap.
+
+До изменения environment скрипт проверяет размер, JSON и структуру keyring.
+При `camera keyring is invalid` восстановите **исходный** файл из резервной
+копии: не удаляйте его и не создавайте новый ключ — сохранённые пароли камер
+зашифрованы прежним ключом. Обновление каждого environment-файла выполняется
+атомарной заменой; общей транзакции на два файла нет. Если запись прервана,
+устраните причину ошибки и повторите команду до перезапуска WEB/reconciler.
+
 ## 6. Первая активация
 
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.15.1/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.15.1 \
+sudo /opt/rtsp-proxy/releases/0.15.2/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.15.2 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -351,7 +364,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.15.1-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.15.2-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -377,7 +390,7 @@ Deploy tool не объединяет шаги 1 и 3, потому что migra
 сделать предыдущее приложение несовместимым. После migration rollback разрешён,
 только если manifest целевого релиза всё ещё содержит точную live revision.
 
-Для перехода `0.14.0` → `0.15.1` сначала активируйте новый код на schema 0022,
+Для перехода `0.14.0` → `0.15.2` сначала активируйте новый код на schema 0022,
 проверьте smoke, затем выполните migration нового релиза до 0023. Старый manifest
 `0.14.0` допускает максимум 0022: после migration обычный rollback на него
 будет отклонён. Возврат потребует отдельной процедуры восстановления из backup,

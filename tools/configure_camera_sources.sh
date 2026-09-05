@@ -6,6 +6,7 @@ source_cidrs=""
 web_environment=/etc/rtsp-proxy/control-plane/rtsp-proxy.env
 reconciler_environment=/etc/rtsp-proxy/control-plane/rtsp-proxy-reconciler.env
 key_file=/etc/rtsp-proxy/control-plane/camera-source-keys.json
+setup_lock_directory=/run/rtsp-proxy-camera-source-setup
 
 usage() {
   printf '%s\n' \
@@ -53,7 +54,21 @@ release_python=/opt/rtsp-proxy/releases/$release_id/.venv/bin/python
 }
 [ -f "$web_environment" ] || { printf '%s\n' "environment file missing: $web_environment" >&2; exit 1; }
 [ -f "$reconciler_environment" ] || { printf '%s\n' "environment file missing: $reconciler_environment" >&2; exit 1; }
+command -v flock >/dev/null 2>&1 || {
+  printf '%s\n' 'flock is required; install the util-linux package' >&2
+  exit 1
+}
 
+# Keep the lock file: unlinking it could let another caller lock a new inode.
+# One server-wide lock also serializes callers using different custom key paths.
+install -d -m 0700 -o root -g root "$setup_lock_directory"
+umask 077
+[ ! -L "$setup_lock_directory/lock" ] || { printf '%s\n' 'unsafe camera keyring lock' >&2; exit 1; }
+exec 9>>"$setup_lock_directory/lock"
+flock --nonblock 9 || {
+  printf '%s\n' 'camera source setup already running; retry after it finishes' >&2
+  exit 1
+}
 install -d -m 0750 -o root -g rtsp-proxy-access "$(dirname "$key_file")"
 if [ ! -e "$key_file" ]; then
   key_temp=$(mktemp "$(dirname "$key_file")/.camera-source-keys.XXXXXX")
@@ -71,6 +86,18 @@ fi
 key_mode=$(stat -c '%a:%U:%G:%F:%h' "$key_file")
 [ "$key_mode" = '640:root:rtsp-proxy-access:regular file:1' ] || {
   printf '%s\n' "unsafe camera keyring: expected 640:root:rtsp-proxy-access:regular file:1, got $key_mode" >&2
+  exit 1
+}
+"$release_python" -c '
+import sys
+from rtsp_proxy.camera_secrets import parse_camera_source_keyring
+with open(sys.argv[1], "rb") as source:
+    payload = source.read(4097)
+if not 1 <= len(payload) <= 4096:
+    raise ValueError("camera_source_keyring_size_invalid")
+parse_camera_source_keyring(payload.decode("utf-8"))
+' "$key_file" >/dev/null 2>&1 || {
+  printf '%s\n' 'camera keyring is invalid; restore its backup, do not regenerate it' >&2
   exit 1
 }
 
