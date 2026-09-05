@@ -6,6 +6,7 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+from threading import Event, Thread
 from uuid import UUID
 
 from rtsp_proxy.probe_client import UnixProbeBrokerClient
@@ -48,10 +49,18 @@ def main() -> int:
             address=address,
             port=port,
         )
+        cancelled = Event()
+
+        def read_cancellation() -> None:
+            if sys.stdin.buffer.readline(16) == b"cancel\n":
+                cancelled.set()
+
+        Thread(target=read_cancellation, daemon=True).start()
         result = UnixProbeBrokerClient().execute(
             request_id=request_id,
             endpoint=endpoint,
             deadline_at=datetime.now(UTC) + timedelta(milliseconds=deadline_after_ms),
+            cancelled=cancelled.is_set,
         )
         print(
             json.dumps(

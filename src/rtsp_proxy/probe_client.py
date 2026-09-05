@@ -70,6 +70,7 @@ class UnixProbeBrokerClient:
         request_id: UUID,
         endpoint: AdmittedProbeEndpoint,
         deadline_at: datetime,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ProbeExecutionResult:
         """Return only a normalized result; local infrastructure failures are inconclusive."""
 
@@ -103,6 +104,8 @@ class UnixProbeBrokerClient:
         descriptor = -1
         connection: socket.socket | None = None
         try:
+            if cancelled is not None and cancelled():
+                raise ProbeClientError("probe_client_cancelled")
             descriptor = create_sealed_probe_input(
                 endpoint.ffconcat_payload(
                     io_timeout_microseconds=io_timeout_microseconds,
@@ -135,6 +138,7 @@ class UnixProbeBrokerClient:
             return receive_probe_broker_response(
                 connection,
                 expected_request=request,
+                cancelled=cancelled,
                 timeout_seconds=self._remaining_seconds(
                     deadline_unix_ms=deadline_unix_ms,
                     observed_at=self._read_clock(),

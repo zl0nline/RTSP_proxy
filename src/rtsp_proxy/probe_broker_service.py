@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import select
 import socket
 import time
 from collections.abc import Callable
@@ -51,6 +52,7 @@ class ProbeExecutor(Protocol):
         received: ReceivedProbeInput,
         *,
         timeout_seconds: float,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ProbeExecutionResult: ...
 
     def retry_pending_cleanup(self, *, timeout_seconds: float) -> int: ...
@@ -105,6 +107,7 @@ class ProbeBrokerService:
         self._max_workers = max_workers
         self._wall_clock_ms = wall_clock_ms
         self._cleanup_failed = Event()
+        self._stopping = Event()
         self._admission_lock = Lock()
 
     def reconcile_startup(self) -> None:
@@ -143,10 +146,13 @@ class ProbeBrokerService:
                 with self._admission_lock:
                     if self._cleanup_failed.is_set():
                         raise ProbeBrokerServiceError("probe_broker_cleanup_failed")
+                    if self._stopping.is_set():
+                        raise ProbeBrokerServiceError("probe_broker_stopping")
                     execution_started = True
                 result = self._executor.execute(
                     received,
                     timeout_seconds=remaining,
+                    cancelled=lambda: self._request_cancelled(connection),
                 )
                 if not isinstance(result, ProbeExecutionResult):
                     raise ProbeBrokerServiceError("probe_broker_execution_failed")
@@ -198,22 +204,32 @@ class ProbeBrokerService:
                 max_workers=self._max_workers,
                 thread_name_prefix="rtsp-probe-broker",
             ) as workers:
-                while self._admission_is_open():
-                    if not capacity.acquire(timeout=0.5):
-                        continue
-                    try:
-                        connection, _ = listener.accept()
-                    except TimeoutError:
-                        capacity.release()
-                        continue
-                    except BaseException:
-                        capacity.release()
-                        raise
-                    if not self._admission_is_open():
-                        connection.close()
-                        capacity.release()
-                        break
-                    workers.submit(self._serve_owned_connection, connection, capacity)
+                try:
+                    while self._admission_is_open():
+                        if not capacity.acquire(timeout=0.5):
+                            continue
+                        try:
+                            connection, _ = listener.accept()
+                        except TimeoutError:
+                            capacity.release()
+                            continue
+                        except BaseException:
+                            capacity.release()
+                            raise
+                        if not self._admission_is_open():
+                            connection.close()
+                            capacity.release()
+                            break
+                        try:
+                            workers.submit(self._serve_owned_connection, connection, capacity)
+                        except BaseException:
+                            connection.close()
+                            capacity.release()
+                            raise
+                finally:
+                    # Signal workers before ThreadPoolExecutor waits for them, including
+                    # SIGTERM/SystemExit and listener failures.
+                    self.request_shutdown()
         finally:
             if not self._cleanup_is_resolved():
                 self._publish_cleanup_failure()
@@ -275,7 +291,22 @@ class ProbeBrokerService:
 
     def _admission_is_open(self) -> bool:
         with self._admission_lock:
-            return not self._cleanup_failed.is_set()
+            return not self._cleanup_failed.is_set() and not self._stopping.is_set()
+
+    def request_shutdown(self) -> None:
+        """Stop new admission and cooperatively cancel every owned execution."""
+        self._stopping.set()
+
+    def _request_cancelled(self, connection: socket.socket) -> bool:
+        if not self._admission_is_open():
+            return True
+        try:
+            readable, _, _ = select.select((connection,), (), (), 0)
+        except (OSError, ValueError):
+            return True
+        # A request owns its connection until the response: EOF is cancellation;
+        # any extra data is a protocol violation and must also stop execution.
+        return bool(readable)
 
     @staticmethod
     def _bounded_timeout(value: object, *, maximum: float) -> bool:

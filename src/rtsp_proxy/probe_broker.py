@@ -397,6 +397,7 @@ def receive_probe_broker_response(
     expected_request: ProbeBrokerRequest,
     timeout_seconds: float,
     monotonic: Callable[[], float] = time.monotonic,
+    cancelled: Callable[[], bool] | None = None,
 ) -> ProbeExecutionResult:
     """Receive one request-bound result and reject any descriptor smuggling."""
 
@@ -412,6 +413,7 @@ def receive_probe_broker_response(
         connection,
         io_deadline=response_deadline,
         monotonic=monotonic,
+        cancelled=cancelled,
     )
     io_deadline = _start_io_deadline(
         timeout_seconds=min(5.0, remaining),
@@ -426,6 +428,7 @@ def receive_probe_broker_response(
                 descriptors,
                 io_deadline=io_deadline,
                 monotonic=monotonic,
+                cancelled=cancelled,
             )
         except ProbeBrokerError as error:
             if str(error) == "probe_broker_request_truncated":
@@ -441,6 +444,7 @@ def receive_probe_broker_response(
                 descriptors,
                 io_deadline=io_deadline,
                 monotonic=monotonic,
+                cancelled=cancelled,
             )
         except ProbeBrokerError as error:
             if str(error) == "probe_broker_request_truncated":
@@ -704,40 +708,48 @@ def _wait_until_readable(
     *,
     io_deadline: float,
     monotonic: Callable[[], float],
+    cancelled: Callable[[], bool] | None = None,
 ) -> float:
-    try:
-        observed = monotonic()
-        remaining = io_deadline - observed
-    except (ArithmeticError, OSError, TypeError, ValueError):
-        raise ProbeBrokerError("probe_broker_unavailable") from None
-    if (
-        isinstance(observed, bool)
-        or not isinstance(observed, (int, float))
-        or not math.isfinite(observed)
-        or not math.isfinite(remaining)
-        or remaining <= 0
-    ):
-        raise ProbeBrokerError("probe_broker_unavailable")
-    try:
-        readable, _, _ = select.select((connection,), (), (), remaining)
-    except (OSError, ValueError):
-        raise ProbeBrokerError("probe_broker_unavailable") from None
-    if readable != [connection]:
-        raise ProbeBrokerError("probe_broker_unavailable")
-    try:
-        observed_after_wait = monotonic()
-        remaining_after_wait = io_deadline - observed_after_wait
-    except (ArithmeticError, OSError, TypeError, ValueError):
-        raise ProbeBrokerError("probe_broker_unavailable") from None
-    if (
-        isinstance(observed_after_wait, bool)
-        or not isinstance(observed_after_wait, (int, float))
-        or not math.isfinite(observed_after_wait)
-        or not math.isfinite(remaining_after_wait)
-        or remaining_after_wait <= 0
-    ):
-        raise ProbeBrokerError("probe_broker_unavailable")
-    return remaining_after_wait
+    while True:
+        if cancelled is not None and cancelled():
+            raise ProbeBrokerError("probe_broker_cancelled")
+        try:
+            observed = monotonic()
+            remaining = io_deadline - observed
+        except (ArithmeticError, OSError, TypeError, ValueError):
+            raise ProbeBrokerError("probe_broker_unavailable") from None
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or not math.isfinite(observed)
+            or not math.isfinite(remaining)
+            or remaining <= 0
+        ):
+            raise ProbeBrokerError("probe_broker_unavailable")
+        try:
+            readable, _, _ = select.select(
+                (connection,), (), (), min(remaining, 0.1) if cancelled is not None else remaining
+            )
+        except (OSError, ValueError):
+            raise ProbeBrokerError("probe_broker_unavailable") from None
+        if readable != [connection]:
+            if cancelled is not None:
+                continue
+            raise ProbeBrokerError("probe_broker_unavailable")
+        try:
+            observed_after_wait = monotonic()
+            remaining_after_wait = io_deadline - observed_after_wait
+        except (ArithmeticError, OSError, TypeError, ValueError):
+            raise ProbeBrokerError("probe_broker_unavailable") from None
+        if (
+            isinstance(observed_after_wait, bool)
+            or not isinstance(observed_after_wait, (int, float))
+            or not math.isfinite(observed_after_wait)
+            or not math.isfinite(remaining_after_wait)
+            or remaining_after_wait <= 0
+        ):
+            raise ProbeBrokerError("probe_broker_unavailable")
+        return remaining_after_wait
 
 
 def require_probe_broker_peer(
@@ -779,10 +791,16 @@ def _recv_exact(
     *,
     io_deadline: float,
     monotonic: Callable[[], float],
+    cancelled: Callable[[], bool] | None = None,
 ) -> bytes:
     payload = bytearray()
     descriptor_size = array.array("i").itemsize
     while len(payload) < size:
+        if cancelled is not None:
+            _wait_until_readable(
+                connection, io_deadline=io_deadline, monotonic=monotonic,
+                cancelled=cancelled,
+            )
         _set_remaining_timeout(
             connection,
             io_deadline=io_deadline,

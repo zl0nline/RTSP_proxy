@@ -90,6 +90,7 @@ class _SystemdController(Protocol):
         output_fd: int,
         timeout_seconds: float,
         ownership: OwnershipLedger[ProbeTransientLease],
+        cancelled: Callable[[], bool] | None = None,
     ) -> bytes:
         """Call collected only after the exact unit is definitively gone."""
 
@@ -256,6 +257,7 @@ class ProbeExecutionBroker:
         received: ReceivedProbeInput,
         *,
         timeout_seconds: float,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ProbeExecutionResult:
         if not isinstance(received, ReceivedProbeInput):
             raise ProbeExecutionError("probe_execution_request_invalid")
@@ -268,6 +270,7 @@ class ProbeExecutionBroker:
                 request,
                 ownership,
                 timeout_seconds=timeout,
+                cancelled=cancelled,
             )
         finally:
             try:
@@ -281,11 +284,17 @@ class ProbeExecutionBroker:
         ownership: _ExecutionOwnership,
         *,
         timeout_seconds: float,
+        cancelled: Callable[[], bool] | None,
     ) -> ProbeExecutionResult:
         received = ownership.received
         primary_error: BaseException | None = None
         result: ProbeExecutionResult | None = None
         stage = "channels"
+
+        def require_active() -> None:
+            if cancelled is not None and cancelled():
+                raise ProbeExecutionError("probe_execution_cancelled")
+
         try:
             with self._active_lock:
                 if not self._recovery_ready:
@@ -299,12 +308,14 @@ class ProbeExecutionBroker:
                 request,
                 timeout_seconds=timeout_seconds,
             )
+            require_active()
             self._channels.create_owned(
                 received,
                 publish=ownership.channels.publish,
             )
             execution_channels = self._require_channels(ownership)
             stage = "systemd"
+            require_active()
             self._systemd.start_owned(
                 request,
                 descriptors=execution_channels.descriptors,
@@ -314,11 +325,13 @@ class ProbeExecutionBroker:
             execution_channels.close_child_ends()
             unit_name = f"rtsp-probe-{request.request_id.hex}.service"
             stage = "cgroup"
+            require_active()
             cgroup_path = self._cgroups.resolve(
                 unit_name=unit_name,
                 timeout_seconds=self._remaining(deadline),
             )
             stage = "guard"
+            require_active()
             self._guard.install_owned(
                 request_id=request.request_id,
                 unit_name=unit_name,
@@ -330,6 +343,7 @@ class ProbeExecutionBroker:
             self._require_request_live(request)
             _ = self._remaining(deadline)
             stage = "release"
+            require_active()
             execution_channels.release_gate()
             systemd_lease = self._require_systemd_lease(ownership)
             stage = "output"
@@ -338,8 +352,10 @@ class ProbeExecutionBroker:
                 output_fd=execution_channels.output_fd,
                 timeout_seconds=self._remaining(deadline),
                 ownership=ownership.systemd,
+                cancelled=cancelled,
             )
             stage = "result"
+            require_active()
             result = self._decode_result(raw_result)
         except BaseException as error:
             primary_error = (

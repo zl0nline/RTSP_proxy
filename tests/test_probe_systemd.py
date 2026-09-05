@@ -6,6 +6,7 @@ import traceback
 from dataclasses import replace
 from ipaddress import ip_address
 from threading import Event, Thread
+from time import monotonic
 from typing import Never, SupportsIndex, cast
 from uuid import UUID, uuid4
 
@@ -23,6 +24,7 @@ from rtsp_proxy.probe_systemd import (
     ProbeTransientLease,
     ProbeTransientUnit,
     SystemdProbeManager,
+    _read_bounded_output,
     build_probe_transient_unit,
 )
 
@@ -30,6 +32,39 @@ _REQUEST_ID = UUID("447a1c4e-4c79-4c50-8e51-42c4dfa5fb19")
 _GENERATION = UUID("d7cbf9ca-5328-4ed2-a5eb-b9e1b0ca9914")
 _NOW_MS = 1_800_000_000_000
 _LAUNCHER = "/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-probe-launcher"
+
+
+def test_output_reader_cancellation_interrupts_idle_pipe_without_waiting_for_deadline() -> None:
+    read_fd, write_fd = os.pipe()
+    cancel = Event()
+    entered = Event()
+    failures: list[str] = []
+
+    def cancelled() -> bool:
+        entered.set()
+        return cancel.is_set()
+
+    def read() -> None:
+        try:
+            _read_bounded_output(read_fd, timeout_seconds=30, cancelled=cancelled)
+        except ProbeSystemdError as error:
+            failures.append(str(error))
+
+    worker = Thread(target=read)
+    started = monotonic()
+    worker.start()
+    try:
+        assert entered.wait(1)
+        cancel.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert monotonic() - started < 2
+        assert failures == ["probe_transient_cancelled"]
+    finally:
+        cancel.set()
+        os.close(write_fd)
+        worker.join(2)
+        os.close(read_fd)
 
 
 class _RecordingTransport(ProbeSystemdTransport):

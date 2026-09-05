@@ -83,6 +83,7 @@ class _Executor:
         received: ReceivedProbeInput,
         *,
         timeout_seconds: float,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ProbeExecutionResult:
         assert timeout_seconds > 0
         self.events.append("execute")

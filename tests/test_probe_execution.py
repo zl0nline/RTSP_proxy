@@ -160,6 +160,7 @@ class _Systemd:
         output_fd: int,
         timeout_seconds: float,
         ownership: OwnershipLedger[ProbeTransientLease],
+        cancelled: Callable[[], bool] | None = None,
     ) -> bytes:
         assert lease is self.lease
         assert output_fd == 102
@@ -398,6 +399,30 @@ def test_probe_execution_orders_guard_before_release_and_collects_everything() -
         "guard.release",
         "channels.close",
     ]
+    with pytest.raises(RuntimeError, match="probe_broker_descriptor_closed"):
+        _ = received.descriptor
+
+
+@pytest.mark.parametrize("cancel_after", [None, "systemd.start", "guard.install"])
+def test_probe_execution_cancellation_never_releases_gate_and_collects_owned_resources(
+    cancel_after: str | None,
+) -> None:
+    events: list[str] = []
+    received = _received_request()
+    broker = _broker(events)
+    with pytest.raises(ProbeExecutionError, match=r"^probe_execution_cancelled$"):
+        broker.execute(
+            received, timeout_seconds=5,
+            cancelled=lambda: cancel_after is None or cancel_after in events,
+        )
+    assert "channels.release_gate" not in events
+    assert "systemd.read_output" not in events
+    if cancel_after is not None:
+        assert "systemd.cancel" in events
+        assert events[-1] == "channels.close"
+    if cancel_after == "guard.install":
+        assert events.index("systemd.cancel") < events.index("guard.release")
+    assert broker.retry_pending_cleanup(timeout_seconds=1) == 0
     with pytest.raises(RuntimeError, match="probe_broker_descriptor_closed"):
         _ = received.descriptor
 

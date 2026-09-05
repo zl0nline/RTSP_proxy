@@ -228,6 +228,7 @@ def _run_client(
     *,
     drop_privileges: bool = True,
     deadline_after_ms: int = 20_000,
+    cancellation_input: bool = False,
 ) -> subprocess.Popen[bytes]:
     raw_client = os.environ.get(_BROKER_CLIENT_ENV, "")
     client_path = Path(raw_client)
@@ -261,7 +262,7 @@ def _run_client(
         ]
     return subprocess.Popen(
         arguments,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if cancellation_input else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
@@ -1045,6 +1046,69 @@ def test_installed_broker_deadline_collects_stalled_probe_and_remains_available(
     assert not receipt.exists()
     assert _service_property("ActiveState") == "active"
     assert _service_property("SubState") == "running"
+
+
+@pytest.mark.parametrize("cause", ["caller", "shutdown"])
+def test_installed_broker_cancellation_collects_probe_before_deadline(cause: str) -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    request_id = uuid4()
+    unit_name = f"rtsp-probe-{request_id.hex}.service"
+    scope = _PIN_ROOT / request_id.hex
+    receipt = _OWNERSHIP_ROOT / f"{request_id.hex}.json"
+    connected = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    server = threading.Thread(
+        target=_serve_stalled_source, args=(listener,),
+        kwargs={"connected": connected, "release": release, "errors": errors}, daemon=True,
+    )
+    server.start()
+    client = _run_client(
+        request_id, uuid4(), "127.0.0.1", listener.getsockname()[1],
+        deadline_after_ms=60_000, cancellation_input=True,
+    )
+    try:
+        _wait_for_source_or_client(connected, client, timeout=10)
+        assert connected.is_set(), _service_snapshot()
+        assert scope.is_dir()
+        assert receipt.is_file()
+        if cause == "caller":
+            assert client.stdin is not None
+            client.stdin.write(b"cancel\n")
+            client.stdin.flush()
+        else:
+            subprocess.run(
+                ["systemctl", "stop", _BROKER_UNIT], check=True,
+                capture_output=True, timeout=10,
+            )
+        stdout, stderr = client.communicate(timeout=5)
+        assert client.returncode == 0
+        assert stderr == b""
+        assert json.loads(stdout)["outcome"] == "inconclusive"
+        _wait_until(lambda: _unit_is_collected(unit_name), failure="cancelled probe remained",
+                    timeout=5)
+        _wait_until(lambda: not scope.exists(), failure="cancelled guard remained", timeout=5)
+        assert not receipt.exists()
+    finally:
+        release.set()
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2)
+        server.join(timeout=2)
+        listener.close()
+        if cause == "shutdown":
+            subprocess.run(
+                ["systemctl", "start", _BROKER_UNIT], check=True,
+                capture_output=True, timeout=40,
+            )
+    assert errors == []
+    assert not server.is_alive()
+    assert _service_property("ActiveState") == "active"
 
 
 def test_installed_broker_restart_recovers_inflight_probe_on_startup() -> None:

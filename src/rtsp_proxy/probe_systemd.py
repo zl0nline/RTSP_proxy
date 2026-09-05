@@ -5,6 +5,7 @@ import os
 import select
 import stat
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from ipaddress import IPv4Address
 from math import isfinite
@@ -424,6 +425,7 @@ class SystemdProbeManager:
         output_fd: int,
         timeout_seconds: float,
         ownership: OwnershipLedger[ProbeTransientLease] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> bytes:
         """Read one bounded result and always collect its exact transient unit."""
 
@@ -432,6 +434,7 @@ class SystemdProbeManager:
             output_fd=output_fd,
             timeout_seconds=timeout_seconds,
             ownership=ownership,
+            cancelled=cancelled,
         )
         if output is None:
             raise ProbeSystemdError("probe_transient_output_failed")
@@ -486,6 +489,7 @@ class SystemdProbeManager:
         output_fd: int | None,
         timeout_seconds: float | None,
         ownership: OwnershipLedger[ProbeTransientLease] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> bytes | None:
         deadline = self._cleanup_deadline(timeout_seconds)
         if not isinstance(lease, ProbeTransientLease):
@@ -548,6 +552,7 @@ class SystemdProbeManager:
                     output = _read_bounded_output(
                         output_fd,
                         timeout_seconds=self._remaining_cleanup(deadline),
+                        cancelled=cancelled,
                     )
                 except ProbeSystemdError as error:
                     failure = str(error)
@@ -879,7 +884,12 @@ def _raise_after_recovery(
         raise ProbeSystemdError(failure) from None
 
 
-def _read_bounded_output(descriptor: int, *, timeout_seconds: float) -> bytes:
+def _read_bounded_output(
+    descriptor: int,
+    *,
+    timeout_seconds: float,
+    cancelled: Callable[[], bool] | None = None,
+) -> bytes:
     if (
         isinstance(descriptor, bool)
         or not isinstance(descriptor, int)
@@ -893,13 +903,17 @@ def _read_bounded_output(descriptor: int, *, timeout_seconds: float) -> bytes:
     deadline = monotonic() + timeout_seconds
     output = bytearray()
     while True:
+        if cancelled is not None and cancelled():
+            raise ProbeSystemdError("probe_transient_cancelled")
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise ProbeSystemdError("probe_transient_output_timeout")
         try:
-            ready, _, _ = select.select([descriptor], [], [], remaining)
+            ready, _, _ = select.select(
+                [descriptor], [], [], min(remaining, 0.1) if cancelled is not None else remaining
+            )
             if not ready:
-                raise ProbeSystemdError("probe_transient_output_timeout")
+                continue
             chunk = os.read(descriptor, min(16_384, _PROBE_OUTPUT_MAX_BYTES + 1 - len(output)))
         except ProbeSystemdError:
             raise
