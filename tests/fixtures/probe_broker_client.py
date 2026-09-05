@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -52,7 +53,8 @@ def main() -> int:
         cancelled = Event()
 
         def read_cancellation() -> None:
-            if sys.stdin.buffer.readline(16) == b"cancel\n":
+            # A daemon must not hold Python's buffered-stdin lock at interpreter exit.
+            if os.read(sys.stdin.fileno(), 16) == b"cancel\n":
                 cancelled.set()
 
         Thread(target=read_cancellation, daemon=True).start()
