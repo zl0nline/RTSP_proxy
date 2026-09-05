@@ -231,7 +231,7 @@ def _probe_target() -> ProbeTarget:
         maintenance=False,
         occupied=False,
         source_pull_active=False,
-        max_source_sessions=1,
+        max_source_sessions=2,
         source_endpoint_generation=UUID(
             "70000000-0000-4000-8000-000000000001"
         ),
