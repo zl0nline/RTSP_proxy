@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -1778,16 +1779,32 @@ ON CONFLICT (camera_id, method) DO UPDATE SET
 
 
 def _health_generation_sha256(target: ProbeTarget, method: ProbeMethod) -> str:
-    identity = (
-        target.camera_id,
-        target.public_id,
-        target.node_id,
+    identity = ("probe-health-v1", *_probe_generation_key(target, method))
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def _probe_generation_key(
+    target: ProbeTarget, method: ProbeMethod,
+) -> tuple[str | int | None, ...]:
+    identity: tuple[str | int | None, ...] = (
+        target.camera_id.hex,
+        str(target.public_id),
+        target.node_id.hex,
         target.desired_revision,
         target.placement_generation,
-        target.source_endpoint_generation,
-        target.node_runtime if method is ProbeMethod.PATH else None,
+        (
+            None
+            if target.source_endpoint_generation is None
+            else target.source_endpoint_generation.hex
+        ),
     )
-    return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+    if method is ProbeMethod.SOURCE:
+        return identity
+    runtime = target.node_runtime
+    return identity + ((None,) if runtime is None else (
+        runtime.node_applied_revision, runtime.process_id, runtime.process_start_ticks,
+        runtime.process_boot_id.hex, runtime.release_id,
+    ))
 
 
 def _health_record_from_row(
@@ -1816,13 +1833,8 @@ def _health_record_from_row(
 
 
 def _same_probe_generation(left: ProbeTarget, right: ProbeTarget) -> bool:
-    return (
-        left.camera_id == right.camera_id
-        and left.public_id == right.public_id
-        and left.node_id == right.node_id
-        and left.desired_revision == right.desired_revision
-        and left.placement_generation == right.placement_generation
-        and left.source_endpoint_generation == right.source_endpoint_generation
+    return _probe_generation_key(left, ProbeMethod.SOURCE) == _probe_generation_key(
+        right, ProbeMethod.SOURCE
     )
 
 
@@ -1831,9 +1843,7 @@ def _same_health_generation(
     right: ProbeTarget,
     method: ProbeMethod,
 ) -> bool:
-    return _same_probe_generation(left, right) and (
-        method is ProbeMethod.SOURCE or left.node_runtime == right.node_runtime
-    )
+    return _probe_generation_key(left, method) == _probe_generation_key(right, method)
 
 
 def _require_probe_eligible(target: ProbeTarget, method: ProbeMethod) -> None:

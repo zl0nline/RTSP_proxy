@@ -10,7 +10,8 @@ this slice is not a deployable periodic worker.
   session, required video, five-minute routine interval, 30-second confirmation
   interval, 15-second execution timeout. These are conservative initial settings,
   not capacity-calibrated recommendations. Profile persistence/management is not
-  yet wired.
+  yet wired. Confirmation spacing is bounded to one hour and cannot exceed the
+  routine interval, matching the durable health writer's accepted range.
 - Media requirements apply only to a decoded `HEALTHY` result. Missing required
   audio/video becomes `UNHEALTHY/CODEC`; `INCONCLUSIVE` is never reclassified as a
   camera fault. This does not add new codecs to the controlled ffprobe build.
@@ -26,7 +27,9 @@ this slice is not a deployable periodic worker.
 - Additive schema `0023_probe_health_states` stores independent SOURCE/PATH
   state, confirmation counters and timestamps. It contains no source URL or
   credential material. Generation changes reset the projection to UNKNOWN;
-  PATH additionally binds the node runtime generation.
+  PATH additionally binds the node runtime generation. The generation fingerprint
+  uses versioned canonical JSON of primitive identity fields, shared with in-memory
+  generation comparisons rather than Python object representations.
 - `record_if_current(..., confirmation_spacing=...)` writes the latest accepted
   observation and health transition in the same PostgreSQL transaction. Replays
   do not count twice; rejected old-generation observations do not update health;

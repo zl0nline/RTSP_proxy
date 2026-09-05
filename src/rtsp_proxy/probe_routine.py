@@ -54,7 +54,9 @@ class CameraProbeProfile:
             or not isinstance(self.routine_interval, timedelta)
             or not timedelta(seconds=30) <= self.routine_interval <= timedelta(days=1)
             or not isinstance(self.confirmation_interval, timedelta)
-            or not timedelta(seconds=1) <= self.confirmation_interval <= self.routine_interval
+            or not timedelta(seconds=1) <= self.confirmation_interval <= min(
+                self.routine_interval, timedelta(hours=1)
+            )
             or not isinstance(self.execution_timeout, timedelta)
             or not timedelta(seconds=1) <= self.execution_timeout <= timedelta(seconds=30)
         ):

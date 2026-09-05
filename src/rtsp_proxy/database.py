@@ -757,6 +757,8 @@ class PostgresNodeStore:
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
             ("0019_dashboard_rate_limits",),
+            ("0020_probe_observations",),
+            ("0021_local_operator_login",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -785,6 +787,8 @@ class PostgresNodeStore:
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
             ("0019_dashboard_rate_limits",),
+            ("0020_probe_observations",),
+            ("0021_local_operator_login",),
             (PREVIOUS_APPLICATION_SCHEMA,),
         ):
             return False
@@ -806,6 +810,8 @@ class PostgresNodeStore:
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
             ("0019_dashboard_rate_limits",),
+            ("0020_probe_observations",),
+            ("0021_local_operator_login",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         )
@@ -2702,6 +2708,8 @@ class PostgresNodeStore:
             ("0017_access_grant_keys",),
             ("0018_camera_registration_keys",),
             ("0019_dashboard_rate_limits",),
+            ("0020_probe_observations",),
+            ("0021_local_operator_login",),
             (PREVIOUS_APPLICATION_SCHEMA,),
             (APPLICATION_SCHEMA,),
         ):
@@ -4446,6 +4454,8 @@ def _require_access_grant_idempotency_schema(connection: Connection) -> None:
         ("0017_access_grant_keys",),
         ("0018_camera_registration_keys",),
         ("0019_dashboard_rate_limits",),
+        ("0020_probe_observations",),
+        ("0021_local_operator_login",),
         (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):
@@ -4457,6 +4467,8 @@ def _require_camera_registration_idempotency_schema(connection: Connection) -> N
     if revisions not in (
         ("0018_camera_registration_keys",),
         ("0019_dashboard_rate_limits",),
+        ("0020_probe_observations",),
+        ("0021_local_operator_login",),
         (PREVIOUS_APPLICATION_SCHEMA,),
         (APPLICATION_SCHEMA,),
     ):

@@ -73,6 +73,7 @@ from rtsp_proxy.nodes import (
     camera_placement_fingerprint,
     tcp_port_is_bindable,
 )
+from rtsp_proxy.operator_access import PostgresOperatorSessionStore
 from rtsp_proxy.phase_d_transition import (
     PhaseDTransitionError,
     export_transition,
@@ -1438,6 +1439,27 @@ def test_registered_node_survives_control_application_restart(
     assert list_response.json()["items"] == [create_response.json()]
 
 
+@pytest.mark.parametrize("revision", [
+    "0020_probe_observations", "0021_local_operator_login", "0022_camera_source_credentials",
+])
+def test_additive_health_schema_preserves_prior_feature_readiness(
+    postgres_database_url: str, revision: str,
+) -> None:
+    upgrade_database(postgres_database_url, revision)
+    store = PostgresNodeStore(postgres_database_url)
+    sessions = PostgresOperatorSessionStore(postgres_database_url)
+    try:
+        store.assert_schema_compatible()
+        assert store.schema_is_current() is False
+        assert store.schema_supports_operator_login() is True
+        store.assert_camera_catalog_ready()
+        store._assert_node_registration_ready()
+        assert sessions.supports_dashboard_rate_limits() is True
+    finally:
+        sessions.close()
+        store.close()
+
+
 def test_packaged_migration_runner_upgrades_an_empty_database(
     postgres_database_url: str,
 ) -> None:
@@ -1456,11 +1478,11 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'node_registration_requests', 'access_grant_issue_requests', "
                 "'operator_action_rate_limits', 'camera_registration_requests', "
                 "'probe_observations', 'camera_probe_endpoints', "
-                "'camera_source_credentials')"
+                "'camera_source_credentials', 'probe_health_states')"
             )
         )
         assert revision == "0023_probe_health_states"
-    assert table_count == 13
+    assert table_count == 14
 
 
 def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(

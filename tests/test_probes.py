@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_network
@@ -19,6 +20,7 @@ from rtsp_proxy.database import PostgresNodeStore
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.migrate import upgrade_database
 from rtsp_proxy.nodes import CameraControl, NodeState, ProbeEndpointSchemaUnavailable
+from rtsp_proxy.probe_routine import CameraProbeProfile
 from rtsp_proxy.probe_security import ProbeEndpointAdmission
 from rtsp_proxy.probes import (
     BoundedProbeScheduler,
@@ -40,6 +42,7 @@ from rtsp_proxy.probes import (
     ProbeQueueFull,
     ProbeSingleFlightConflict,
     ProbeTarget,
+    _health_generation_sha256,
 )
 from rtsp_proxy.reconcile import CameraMutationControl, ConfirmationTokenService
 
@@ -1048,6 +1051,42 @@ def test_probe_store_readiness_rejects_same_named_wrong_index(
             match="probe_observation_schema_incompatible",
         ):
             store.assert_ready()
+    finally:
+        store.close()
+
+
+def test_health_generation_uses_pinned_primitive_encoding() -> None:
+    expected = (
+        b'["probe-health-v1","20000000000040008000000000000001",'
+        b'"aaaaaaaaaaaaaaaaaaaaaaaaaa","10000000000040008000000000000001",'
+        b'1,1,"70000000000040008000000000000001"]'
+    )
+    assert _health_generation_sha256(_target(1), ProbeMethod.SOURCE) == (
+        hashlib.sha256(expected).hexdigest()
+    )
+
+
+def test_maximum_profile_confirmation_interval_is_accepted_by_health_persistence(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    target = _target(1)
+    _seed_probe_target(postgres_database_url, target)
+    profile = CameraProbeProfile(
+        enabled=True, routine_interval=timedelta(hours=2),
+        confirmation_interval=timedelta(hours=1),
+    )
+    observation = _observation(
+        target, started_at=_database_now(postgres_database_url) - timedelta(seconds=2),
+    )
+    store = _postgres_store(postgres_database_url)
+    try:
+        assert store.record_if_current(
+            observation, confirmation_spacing=profile.confirmation_interval,
+        )
+        assert store.health_for(target, method=ProbeMethod.SOURCE).health_state is (
+            ProbeHealthState.HEALTHY
+        )
     finally:
         store.close()
 

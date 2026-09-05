@@ -74,6 +74,7 @@ def _scheduler(*, queue_limit: int = 10) -> BoundedProbeScheduler:
         {"routine_interval": timedelta(days=2)},
         {"confirmation_interval": timedelta(0)},
         {"confirmation_interval": timedelta(minutes=6)},
+        {"routine_interval": timedelta(hours=2), "confirmation_interval": timedelta(hours=2)},
         {"execution_timeout": timedelta(0)},
         {"execution_timeout": timedelta(seconds=31)},
     ],

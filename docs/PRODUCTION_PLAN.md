@@ -1379,8 +1379,9 @@ impact is measured.
   transport tests, green in
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
   the socket-activated broker/executor candidate's installed success/failure
-  matrix is native amd64/arm64 green in CI run 33439334327, but explicit
-  cancellation and remaining network-policy cases still block promotion);
+  matrix is native amd64/arm64 green in CI run 33439334327; cancellation is
+  additionally green in run 33959755605, while remaining network-policy cases
+  still block promotion);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
   immutable input plus release gate, 64 KiB output cap and exact collection
@@ -1388,8 +1389,8 @@ impact is measured.
   amd64/arm64 tests green in
   [CI run 33293333254](https://github.com/zl0nline/RTSP_proxy/actions/runs/33293333254);
   the root-broker wiring remains unpromoted; its integrated success/failure
-  matrix is native amd64/arm64 green in CI run 33439334327 and explicit
-  caller/shutdown cancellation is still pending);
+  matrix is native amd64/arm64 green in CI run 33439334327; explicit
+  caller/shutdown cancellation is green in run 33959755605);
 - [ ] accept isolated probe boundary ADR 0004 after privileged native evidence;
 - [ ] promote the reviewed broker/executor after integrated native evidence,
   then implement the authoritative camera probe profile, periodic risk-based
