@@ -39,8 +39,24 @@ Production роль `probe` всё ещё выключена; установле
 До изменения 18 целевых тестов падали: свободная односессионная камера допускала
 активную проверку, очередь запускала её после изменения ёмкости, а bool/float
 принимались как session capacity. После изменения policy/store/producer suite:
-97 passed. Полный прогон и независимые ревью фиксируются ниже по завершении.
+97 passed.
 
 ```sh
 uv run pytest -q tests/test_probes.py tests/test_probe_routine.py --tb=short -rN
 ```
+
+Независимые ревью `6ae4d40...da832f1`: Standards PASS, Spec PASS. Полный локальный
+прогон: 1679 passed, 181 platform/opt-in skips. На первом полном Linux-прогоне
+было 1781 passed и два отказа старых SSE fixtures, создававших успешную глубокую
+проверку для односессионной камеры. Fixtures теперь явно задают ёмкость два;
+повторный целевой прогон policy/store/producer/SSE на grob: 134 passed. Эти два
+отказа не скрыты ослаблением admission или отключением assertions. Ruff, mypy
+(80 исходных файлов), сборка wheel/sdist и diff check пройдены.
+
+Согласованное исключение добавлено в issue №6. Candidate release — `0.15.3`,
+schema 0023 без изменений; предыдущие immutable bundles не перезаписываются.
+
+Финальный [CI 33968464546](https://github.com/zl0nline/RTSP_proxy/actions/runs/33968464546)
+на `da832f1` полностью зелёный: все девять заданий, включая native amd64/arm64
+сборки, тесты приложения, установленные broker contracts, media/load и browser.
+Policy slice завершён; это не завершение будущего worker или production GO.
