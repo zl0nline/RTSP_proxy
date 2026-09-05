@@ -69,6 +69,35 @@ def _healthy_response() -> ProbeBrokerResponse:
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SCM_RIGHTS contract")
+def test_response_cancellation_wins_when_final_body_becomes_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = threading.Event()
+    real_select = broker_module.select.select
+    waits = 0
+
+    def wait(*args: object) -> object:
+        nonlocal waits
+        waits += 1
+        ready = real_select(*args)
+        if waits == 3:
+            cancelled.set()
+        return ready
+
+    monkeypatch.setattr(broker_module.select, "select", wait)
+    client, server = socket.socketpair()
+    with client, server:
+        payload = _healthy_response().encode()
+        server.sendall(struct.pack("!I", len(payload)) + payload)
+        with pytest.raises(ProbeBrokerError, match="probe_broker_cancelled"):
+            receive_probe_broker_response(
+                client, expected_request=_request(), timeout_seconds=1,
+                cancelled=cancelled.is_set,
+            )
+    assert waits == 3
+
+
 def _unix_socket_without_peer() -> socket.socket:
     connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     peer.close()

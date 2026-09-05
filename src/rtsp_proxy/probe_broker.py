@@ -465,6 +465,8 @@ def receive_probe_broker_response(
             raise ProbeBrokerError("probe_broker_response_invalid") from None
         if response_completed_at_us > deadline_us:
             raise ProbeBrokerError("probe_broker_response_mismatch")
+        if cancelled is not None and cancelled():
+            raise ProbeBrokerError("probe_broker_cancelled")
         return response.result
     except BaseException as primary_error:
         cleanup_errors: list[BaseException] = []
@@ -732,6 +734,8 @@ def _wait_until_readable(
             )
         except (OSError, ValueError):
             raise ProbeBrokerError("probe_broker_unavailable") from None
+        if cancelled is not None and cancelled():
+            raise ProbeBrokerError("probe_broker_cancelled")
         if readable != [connection]:
             if cancelled is not None:
                 continue

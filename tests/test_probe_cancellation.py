@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 
+import rtsp_proxy.probe_broker as broker_module
 from rtsp_proxy.probe_broker import ReceivedProbeInput, receive_probe_broker_request
 from rtsp_proxy.probe_broker_service import ProbeBrokerService
 from rtsp_proxy.probe_client import UnixProbeBrokerClient
@@ -46,9 +47,23 @@ def _execute(path: Path, cancelled: Callable[[], bool]) -> ProbeExecutionResult:
 def test_client_cancels_waiting_and_partial_response_and_closes_socket(
     tmp_path: Path,
     partial_frame: bytes,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "broker.sock"
     cancelled = Event()
+    waiting_after_prefix = Event()
+    waits = 0
+    expected_wait = 1 if not partial_frame else (3 if len(partial_frame) == 1 else 4)
+    original_wait = broker_module._wait_until_readable
+
+    def wait(*args: object, **kwargs: object) -> float:
+        nonlocal waits
+        waits += 1
+        if waits == expected_wait:
+            waiting_after_prefix.set()
+        return original_wait(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(broker_module, "_wait_until_readable", wait)
     failures: list[BaseException] = []
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(str(path))
@@ -69,6 +84,7 @@ def test_client_cancels_waiting_and_partial_response_and_closes_socket(
                 ):
                     if partial_frame:
                         connection.sendall(partial_frame)
+                    assert waiting_after_prefix.wait(2)
                     cancelled.set()
                     connection.settimeout(2)
                     # Closing a stream with unread partial response bytes may reset it.
