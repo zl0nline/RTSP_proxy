@@ -1403,6 +1403,11 @@ impact is measured.
   [Routine policy and durable projection candidate](evidence/phase-g-routine-health-state.md)
   implements the scheduling policy and atomic health persistence, but not the
   enabled worker/profile-management/reader-race integration.
+  Before enabling a single-upstream-session camera, an operator policy decision
+  is pending: passive-only monitoring without delaying a new reader, or explicit
+  bounded reader delay while an idle-camera deep probe owns the source slot.
+  The downstream one-reader limit does not prove spare upstream capacity.
+  Neither behavior has been silently enabled; the question was sent to the owner.
   The `0.15.0` candidate at `f783dd8` passed both independent reviews and all
   nine native CI jobs in [run 33963164548](https://github.com/zl0nline/RTSP_proxy/actions/runs/33963164548).
   Its schema-0022 bridge preserves encrypted camera credentials and admitted
