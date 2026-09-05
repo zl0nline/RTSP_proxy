@@ -1,7 +1,7 @@
 # Phase G: special-address and untrusted-protocol boundary
 
-Status: implementation candidate, based on `25efd66`. Native installed evidence
-and independent re-review are required before this slice is closed. It does not
+Status: reviewed and native-CI verified through `c10b4a4`, based on `25efd66`.
+This network-policy slice is closed. It does not
 enable the production probe worker or accept ADR 0004. The candidate bundle is
 `0.15.1`, retaining schema 0023 and the reviewed schema-0022 bridge.
 
@@ -70,7 +70,7 @@ instead of leaving unhandled test-thread warnings.
 Independent Spec review identified that the original installed special-address
 matrix could pass solely through CIDR mismatch. The dedicated broad-policy
 loopback regression above addresses that evidence gap; Standards found no
-actionable issue. Final re-review and native results are pending.
+actionable issue. Final re-review through `c10b4a4`: Standards PASS, Spec PASS.
 
 The first native run, [33965851594](https://github.com/zl0nline/RTSP_proxy/actions/runs/33965851594),
 passed 40 installed contracts on each architecture but failed the first hostile
@@ -80,6 +80,15 @@ The remaining 14 hostile cases passed without accumulating descriptors. The test
 now waits for the real accept loop using a bounded root-peer refusal, with no
 request or input descriptor, before taking the baseline. Exact PID/FD equality
 and no-execution assertions remain unchanged; the failed run is not acceptance.
+
+Final [CI run 33966428098](https://github.com/zl0nline/RTSP_proxy/actions/runs/33966428098)
+passed all nine jobs on `c10b4a4`, including all 41 installed root-broker
+contracts on each native architecture, verified release bundles, media/load
+contracts and browser acceptance. Local full tests before the opt-in readiness
+addition: 1,659 passed, 171 platform/opt-in skips. The grob scratch full suite:
+1,754 passed, 76 opt-in skips. The readiness fix changes only the privileged
+contract; it is covered by the final native run, not by those skipped local cases.
+Ruff, mypy (80 source files), wheel/sdist build and diff checks passed.
 
 ```sh
 uv run pytest -q tests/test_probe_security.py tests/test_probe_policy_payloads.py \

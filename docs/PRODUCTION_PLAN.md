@@ -1370,10 +1370,12 @@ impact is measured.
   cancellation and owned cleanup; both independent reviews passed and all nine
   native CI jobs green in [run 33959755605](https://github.com/zl0nline/RTSP_proxy/actions/runs/33959755605);
   see [cancellation evidence](evidence/phase-g-probe-cancellation.md);
-- [ ] remaining integrated special-range/alternate-protocol cases before broker promotion;
-  [Network-policy candidate](evidence/phase-g-probe-network-policy.md) adds
-  independent broker special-use denial and hostile sealed-input contracts;
-  native evidence and independent review remain required before closing this gate.
+- [x] integrated special-range/alternate-protocol contracts before broker promotion;
+  [Network-policy evidence](evidence/phase-g-probe-network-policy.md) covers
+  independent broker denial, installed broad-policy loopback refusal and hostile
+  sealed input. Both independent reviews passed; all 41 installed broker contracts
+  passed on each architecture and all nine jobs are green in
+  [run 33966428098](https://github.com/zl0nline/RTSP_proxy/actions/runs/33966428098).
 - [x] bounded secret-free AF_UNIX request envelope with exact `SO_PEERCRED`,
   one `SCM_RIGHTS` sealed fd, one absolute monotonic frame deadline,
   authoritative request-expiry recheck, tuple binding, sender consumption and
@@ -1383,8 +1385,8 @@ impact is measured.
   [CI run 33283293698](https://github.com/zl0nline/RTSP_proxy/actions/runs/33283293698);
   the socket-activated broker/executor candidate's installed success/failure
   matrix is native amd64/arm64 green in CI run 33439334327; cancellation is
-  additionally green in run 33959755605, while remaining network-policy cases
-  still block promotion);
+  additionally green in run 33959755605 and network-policy contracts in
+  run 33966428098; ADR acceptance and worker integration remain separate gates);
 - [x] direct system-manager transient-unit primitive with a fixed property
   allowlist, opaque lease ownership, bounded D-Bus/output/recovery deadlines,
   immutable input plus release gate, 64 KiB output cap and exact collection
