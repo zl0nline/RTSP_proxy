@@ -27,6 +27,13 @@ enable the production probe worker or accept ADR 0004. The candidate bundle is
   or ownership receipt. Hostile-input cases also require unchanged broker PID/FD
   count and continued availability. The normal production client maps refusal
   to infrastructure `INCONCLUSIVE`, not a camera fault.
+- An installed broad-policy regression temporarily replaces the dedicated CI
+  broker CIDRs with `/0`, tests only IPv4/IPv6 loopback targets, and restores the
+  exact original configuration with a restart in `finally`. Even a regression
+  cannot contact metadata services. This distinguishes the new special-use
+  check from ordinary CIDR mismatch. The rest of the installed special-address
+  matrix uses narrow CIDRs; broad-policy coverage for those destinations runs
+  through the real Linux transport with a non-networking stub executor.
 
 ## Non-link-local platform endpoint sources
 
@@ -59,6 +66,11 @@ The first native hostile-sender run exposed a test portability issue: supported
 Python 3.12 builds need not export `fcntl.F_ADD_SEALS`. The fixture now uses the
 same Linux ABI value as the production sealer. Thread failures are collected
 instead of leaving unhandled test-thread warnings.
+
+Independent Spec review identified that the original installed special-address
+matrix could pass solely through CIDR mismatch. The dedicated broad-policy
+loopback regression above addresses that evidence gap; Standards found no
+actionable issue. Final re-review and native results are pending.
 
 ```sh
 uv run pytest -q tests/test_probe_security.py tests/test_probe_policy_payloads.py \

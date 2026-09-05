@@ -938,6 +938,45 @@ def _assert_no_request_execution(request_id: UUID) -> None:
     assert not journal.stdout.strip(), "rejected request created unit journal entries"
 
 
+def test_installed_broker_broad_policy_cannot_admit_unassigned_loopback() -> None:
+    if os.geteuid() != 0:
+        pytest.fail("installed broker contract requires root")
+    # Dedicated installed-contract host only. Even a broken guard can contact
+    # only these loopback targets; never send metadata targets under broad CIDRs.
+    assert _CURRENT_RELEASE.resolve() == _CONTRACT_RELEASE
+    environment = Path("/etc/rtsp-proxy/probe-broker.env")
+    original = environment.read_bytes()
+    narrow = b"RTSP_PROXY_PROBE_ALLOWED_CIDRS=127.0.0.1/32,::1/128\n"
+    assert original.count(narrow) == 1
+    try:
+        environment.write_bytes(original.replace(
+            narrow, b"RTSP_PROXY_PROBE_ALLOWED_CIDRS=0.0.0.0/0,::/0\n",
+        ))
+        subprocess.run(["systemctl", "restart", _BROKER_UNIT], check=True, timeout=90)
+        for address in ("127.0.0.2", "::1"):
+            request_id = uuid4()
+            client = _run_client(
+                request_id, uuid4(), address, 9, deadline_after_ms=10_000,
+            )
+            try:
+                stdout, stderr = client.communicate(timeout=15)
+            finally:
+                if client.poll() is None:
+                    client.kill()
+                    client.communicate(timeout=3)
+            assert client.returncode == 0
+            assert stderr == b""
+            assert json.loads(stdout) == {
+                "audio_codec": None, "failure_class": "executor",
+                "outcome": "inconclusive", "video_codec": None,
+            }
+            _assert_no_request_execution(request_id)
+    finally:
+        environment.write_bytes(original)
+        subprocess.run(["systemctl", "restart", _BROKER_UNIT], check=True, timeout=90)
+    assert _service_property("ActiveState") == "active"
+
+
 @pytest.mark.parametrize("input_case", _HOSTILE_INPUT_CASES)
 def test_installed_broker_rejects_untrusted_protocol_input_before_execution(
     input_case: str,
