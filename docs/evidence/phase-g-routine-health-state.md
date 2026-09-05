@@ -66,6 +66,14 @@ not all of them. The observation/endpoint readiness queries now require each
 permission independently. Regression tests revoke each required permission from
 a real restricted role and require readiness rejection.
 
+Post-fix verification: 77 local policy/store tests and 260 native Linux
+policy/store/API tests passed. The readiness delta also passed both independent
+reviews. CI run 33961920864 hit the ffprobe arm64 job's ten-minute infrastructure
+budget after seven minutes of snapshot package installation and nearly three
+minutes of compilation. The job budget was increased to twenty minutes without
+changing test-level deadlines or release admission checks; this run is not a
+successful CI result.
+
 ## Remaining integration work
 
 This slice must not be described as completing automatic health monitoring.

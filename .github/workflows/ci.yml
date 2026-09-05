@@ -257,7 +257,9 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    # Snapshot package installation can take seven minutes before native arm64
+    # compilation starts. Keep room for the contracts; their own deadlines stay fixed.
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09

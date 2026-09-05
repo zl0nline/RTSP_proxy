@@ -81,10 +81,17 @@ uv run mypy src
    существующий keyring и нестандартные значения путей/environment. Пока
    это открытые проверки, а не подтверждённые исправленные дефекты.
    Провести restore drill с БД и ключами, не только health rollback бинарника.
-5. **Завершение Phase G.** Explicit caller/shutdown cancellation, оставшиеся
-   integrated special-range/alternate-protocol contracts, принятие ADR 0004,
+5. **Завершение Phase G.** Оставшиеся integrated special-range/alternate-protocol
+   contracts, принятие ADR 0004,
    production broker/executor и periodic producer с durable health-state
    orchestration. Не включать незавершённую роль `probe` вручную.
+   Explicit caller/shutdown cancellation уже проверена на обеих архитектурах:
+   [результаты](phase-g-probe-cancellation.md). Реализованы политика периодических
+   проверок и атомарное хранение состояния, но не готовый фоновый worker:
+   [границы реализации](phase-g-routine-health-state.md). Короткая проверка рабочей
+   камеры через отдельный медиапрокси также пройдена, включая 453 и добавление
+   пути без разрыва; она не заменяет пункт 2:
+   [результаты](phase-g-live-camera-media-smoke.md).
 6. **Аварии и уведомления.** Отказ/возврат камеры, падение ноды и перезапуск
    сервера; одно уведомление об аварии и одно о восстановлении, без повторов
    и автоматического failover. Проверять через контролируемый SMTP-приёмник.

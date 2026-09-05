@@ -30,6 +30,9 @@ Both test processes were stopped in a bounded `finally` cleanup.
   did not create a second upstream pull to the same physical camera.
 - The installed web, auth, collector, node-runtime and reconciler services were
   active after the test; `current` remained `releases/0.14.0`.
+- Separately, all four synthetic RTSP transparency contracts passed on this
+  host with the installed binaries (`tests/contract/test_rtsp_transparency.py`,
+  90.60 seconds). These used isolated listeners and synthetic media.
 
 ## Limits
 
