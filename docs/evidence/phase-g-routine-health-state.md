@@ -92,3 +92,11 @@ The initial templates still declared 0022 after the migration was added; that
 packaging error was reproduced by two failing tests and corrected before
 deployment. Installation/upgrade requires the verified new immutable bundle;
 the already-installed pilot 0.14.0 has not been changed by this work.
+
+Packaging re-review also caught an unsafe schema-0022 bridge: exact-head checks
+hid existing encrypted credentials/endpoints and rejected camera writes before
+migration. These reads/writes and the completed-observation runtime now use a
+feature-specific schema gate. A real PostgreSQL regression exercises encrypted
+camera registration, admission, credential-preserving source update, credential
+replacement, move restoration and reopening after 0023 migration, starting from
+both 0022 and the current head. Exact-head reporting remains separate.

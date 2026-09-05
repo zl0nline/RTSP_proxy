@@ -773,11 +773,29 @@ class PostgresNodeStore:
 
     @staticmethod
     def _schema_is_current(connection: Connection) -> bool:
+        return PostgresNodeStore._supported_schema_revision(connection) == APPLICATION_SCHEMA
+
+    def schema_supports_camera_sources(self) -> bool:
+        try:
+            with self._engine.connect() as connection:
+                return self._schema_supports_camera_sources(connection)
+        except SQLAlchemyError:
+            raise DatabaseSchemaMismatch("database_schema_mismatch") from None
+
+    @staticmethod
+    def _schema_supports_camera_sources(connection: Connection) -> bool:
+        # This feature predates the health table. Advancing the application head
+        # must not hide existing credentials during an additive-schema bridge.
+        revision = PostgresNodeStore._supported_schema_revision(connection)
+        return int(revision.split("_", 1)[0]) >= 22
+
+    @staticmethod
+    def _supported_schema_revision(connection: Connection) -> str:
         revisions = tuple(
             connection.scalars(text("SELECT version_num FROM alembic_version"))
         )
         if revisions == (APPLICATION_SCHEMA,):
-            return True
+            return APPLICATION_SCHEMA
         if revisions in (
             ("0012_operator_sessions",),
             ("0013_operator_login",),
@@ -791,7 +809,7 @@ class PostgresNodeStore:
             ("0021_local_operator_login",),
             (PREVIOUS_APPLICATION_SCHEMA,),
         ):
-            return False
+            return str(revisions[0])
         raise DatabaseSchemaMismatch("database_schema_mismatch")
 
     def schema_supports_operator_login(self) -> bool:
@@ -2586,7 +2604,7 @@ class PostgresNodeStore:
             )
 
     def _camera_move_query(self, connection: Connection) -> Select[tuple[object, ...]]:
-        credentials_supported = self._schema_is_current(connection)
+        credentials_supported = self._schema_supports_camera_sources(connection)
         credential_columns = (
             (
                 camera_source_credentials.c.key_id.label("source_secret_key_id"),
@@ -2612,7 +2630,7 @@ class PostgresNodeStore:
         return query
 
     def _camera_query(self, connection: Connection) -> Select[tuple[object, ...]]:
-        endpoint_supported = self._schema_is_current(connection)
+        endpoint_supported = self._schema_supports_camera_sources(connection)
         endpoint_columns = (
             (
                 camera_probe_endpoints.c.endpoint_generation.label(
@@ -2803,7 +2821,7 @@ class PostgresNodeStore:
             ):
                 return camera
             desired_revision = camera.desired_revision + 1
-            endpoint_supported = self._schema_is_current(connection)
+            endpoint_supported = self._schema_supports_camera_sources(connection)
             if readmission_requested and not endpoint_supported:
                 raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
             if source_credentials is not None and (
@@ -3632,7 +3650,7 @@ class PostgresNodeStore:
         probe_endpoint: AdmittedProbeEndpoint | None = None,
     ) -> CameraPlacement:
         endpoint_identity = probe_endpoint_identity(source_url, probe_endpoint)
-        endpoint_supported = self._schema_is_current(connection)
+        endpoint_supported = self._schema_supports_camera_sources(connection)
         if endpoint_identity is not None and not endpoint_supported:
             raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
         try:

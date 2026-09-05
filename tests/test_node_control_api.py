@@ -855,10 +855,11 @@ def test_camera_create_accepts_credentials_separately_without_returning_them() -
     assert "never-return-this-password" not in response.text
 
 
+@pytest.mark.parametrize("schema_revision", ["0022_camera_source_credentials", "head"])
 def test_postgres_camera_source_credentials_are_encrypted_and_restored(
-    postgres_database_url: str,
+    postgres_database_url: str, schema_revision: str,
 ) -> None:
-    upgrade_database(postgres_database_url)
+    upgrade_database(postgres_database_url, schema_revision)
     cipher = CameraSourceCredentialCipher(
         CameraSourceKeyRing(primary_key_id="2026-09", keys={"2026-09": b"k" * 32})
     )
@@ -884,6 +885,10 @@ def test_postgres_camera_source_credentials_are_encrypted_and_restored(
         store=store,
         new_camera_id=lambda: UUID("10000000-0000-4000-8000-000000000001"),
         new_public_id=lambda: "a234567a234567a234567a2344",
+        probe_endpoint_admission=ProbeEndpointAdmission(
+            site_key="bridge", allowed_networks=(ip_network("10.40.0.0/24"),),
+            resolve=lambda _hostname: ("10.40.0.11",),
+        ),
     )
     camera = control.create_camera(
         name="entrance",
@@ -942,7 +947,34 @@ def test_postgres_camera_source_credentials_are_encrypted_and_restored(
     assert updated_row.source_url == "rtsp://camera.example/sub"
     assert replacement_password.encode() not in bytes(updated_row.ciphertext)
 
+    target = store.register_automatically(
+        name="media-b", allowed_ports=(12000, 12001), max_nodes=2,
+        preferred_port=12001, choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000002"),
+        api_ports=(13000, 13001), metrics_ports=(14000, 14001),
+    )
+    target_running = store.request_desired_state(target.id, NodeState.RUNNING)
+    store.apply_runtime_observation(
+        target.id, SuccessfulNodeRuntime().execute(NodeRuntimeAction.START, target_running),
+    )
+    move = store.create_camera_move(
+        move_id=UUID("30000000-0000-4000-8000-000000000001"), camera_id=camera.id,
+        target_node_id=target.id, expected_revision=replaced.desired_revision, force=False,
+    )
+    assert move.source_url == replaced.source_url
+    assert store.get_camera_move(move.id) == move
+    assert store.list_incomplete_camera_moves() == (move,)
+    persisted = store.get_camera(camera.id)
+    assert persisted is not None and persisted.source_url == replaced.source_url
     store.close()
+    upgrade_database(postgres_database_url)
+    reopened = PostgresNodeStore(postgres_database_url, camera_source_cipher=cipher)
+    try:
+        assert reopened.get_camera(camera.id) == persisted
+        assert reopened.list_node_cameras(node.id) == (persisted,)
+        assert reopened.get_camera_move(move.id) == move
+    finally:
+        reopened.close()
     without_key = PostgresNodeStore(postgres_database_url)
     with pytest.raises(InvalidCameraSource, match="camera_source_credentials_unavailable"):
         without_key.get_camera(camera.id)
@@ -1451,6 +1483,9 @@ def test_additive_health_schema_preserves_prior_feature_readiness(
     try:
         store.assert_schema_compatible()
         assert store.schema_is_current() is False
+        assert store.schema_supports_camera_sources() is (
+            revision == "0022_camera_source_credentials"
+        )
         assert store.schema_supports_operator_login() is True
         store.assert_camera_catalog_ready()
         store._assert_node_registration_ready()

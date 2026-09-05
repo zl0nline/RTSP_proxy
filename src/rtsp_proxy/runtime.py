@@ -397,7 +397,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             source_policy_sha256=probe_endpoint_admission.policy_sha256,
             statement_timeout_ms=_BACKGROUND_DATABASE_TIMEOUT_MS,
         )
-        if store.schema_is_current()
+        if store.schema_supports_camera_sources()
         else None
     )
     try:
