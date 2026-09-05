@@ -51,6 +51,21 @@ priority, occupied single-session suppression, bounded queue/single-flight,
 durable failure confirmation, replay, inconclusive outcomes, generation reset,
 transaction rollback and weakened-constraint rejection on real PostgreSQL.
 
+Independent re-review of `443320c...83f8107`: Standards PASS, Spec PASS.
+The initial review's confirmation-bound mismatch was fixed, with an accepted
+one-hour PostgreSQL boundary test. Prior schema 0020–0022 feature readiness is
+preserved and regression-tested. Local verification: 1,618 tests passed before
+the final review fixes; the updated focused suite passed 253 tests. Ruff and
+mypy passed. The updated native Linux/PostgreSQL full suite passed 1,688 tests,
+with 49 opt-in contracts skipped and 90.10% coverage. Native CI results must be
+recorded before closing this slice.
+
+Additional readiness audit reproduced seven false-positive readiness cases:
+PostgreSQL's comma-separated privilege argument accepts any listed privilege,
+not all of them. The observation/endpoint readiness queries now require each
+permission independently. Regression tests revoke each required permission from
+a real restricted role and require readiness rejection.
+
 ## Remaining integration work
 
 This slice must not be described as completing automatic health monitoring.

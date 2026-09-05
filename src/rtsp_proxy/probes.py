@@ -1487,11 +1487,9 @@ _EXPECTED_PROBE_OBSERVATION_INDEX = (
     ["camera_id", "completed_at"],
 )
 _PROBE_OBSERVATION_PRIVILEGES = """
-SELECT has_table_privilege(
-    current_user,
-    'public.probe_observations',
-    'SELECT, INSERT, UPDATE'
-)
+SELECT has_table_privilege(current_user, 'public.probe_observations', 'SELECT')
+   AND has_table_privilege(current_user, 'public.probe_observations', 'INSERT')
+   AND has_table_privilege(current_user, 'public.probe_observations', 'UPDATE')
 """
 _EXPECTED_PROBE_ENDPOINT_COLUMNS = {
     "camera_id": ("uuid", True, ""),
@@ -1568,11 +1566,10 @@ WHERE namespace_entry.nspname = 'public'
   AND constraint_entry.contype <> 'n'
 """
 _PROBE_ENDPOINT_PRIVILEGES = """
-SELECT has_table_privilege(
-    current_user,
-    'public.camera_probe_endpoints',
-    'SELECT, INSERT, UPDATE, DELETE'
-)
+SELECT has_table_privilege(current_user, 'public.camera_probe_endpoints', 'SELECT')
+   AND has_table_privilege(current_user, 'public.camera_probe_endpoints', 'INSERT')
+   AND has_table_privilege(current_user, 'public.camera_probe_endpoints', 'UPDATE')
+   AND has_table_privilege(current_user, 'public.camera_probe_endpoints', 'DELETE')
 """
 
 _LATEST_OBSERVATIONS = """

@@ -12,6 +12,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from rtsp_proxy.app import create_app
@@ -1029,6 +1030,51 @@ def test_probe_store_readiness_rejects_schema_drift(postgres_database_url: str) 
             store.assert_ready()
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "missing_privilege"),
+    [
+        ("probe_observations", "SELECT"),
+        ("probe_observations", "INSERT"),
+        ("probe_observations", "UPDATE"),
+        ("camera_probe_endpoints", "SELECT"),
+        ("camera_probe_endpoints", "INSERT"),
+        ("camera_probe_endpoints", "UPDATE"),
+        ("camera_probe_endpoints", "DELETE"),
+    ],
+)
+def test_probe_readiness_requires_every_table_privilege(
+    postgres_database_url: str, table: str, missing_privilege: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    role = f"probe_readiness_{uuid4().hex}"
+    administrator = create_engine(postgres_database_url)
+    restricted_url = make_url(postgres_database_url).set(username=role, password=None)
+    store = _postgres_store(restricted_url.render_as_string(hide_password=False))
+    try:
+        with administrator.begin() as connection:
+            connection.execute(text(f"CREATE ROLE {role} LOGIN"))
+            connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+            connection.execute(text(
+                f"GRANT SELECT, INSERT, UPDATE ON probe_observations TO {role}"
+            ))
+            connection.execute(text(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON camera_probe_endpoints TO {role}"
+            ))
+        store.assert_ready()
+        with administrator.begin() as connection:
+            connection.execute(text(f"REVOKE {missing_privilege} ON {table} FROM {role}"))
+        with pytest.raises(
+            ProbeObservationUnavailable, match=r"^probe_observation_schema_incompatible$",
+        ):
+            store.assert_ready()
+    finally:
+        store.close()
+        with administrator.begin() as connection:
+            connection.execute(text(f"DROP OWNED BY {role}"))
+            connection.execute(text(f"DROP ROLE {role}"))
+        administrator.dispose()
 
 
 def test_probe_store_readiness_rejects_same_named_wrong_index(
