@@ -17,6 +17,14 @@ class CaseSensitiveConfigParser(ConfigParser):
         return optionstr
 
 
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+def test_release_bundle_templates_match_the_application_schema(architecture: str) -> None:
+    manifest = json.loads(
+        Path(f"deploy/release-manifest.{architecture}.example.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema_compatibility"]["maximum"] == APPLICATION_SCHEMA
+
+
 def read_unit(name: str) -> ConfigParser:
     parser = CaseSensitiveConfigParser(interpolation=None, strict=True)
     parser.read(Path("deploy/systemd") / name)
@@ -431,7 +439,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.14.0/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.15.0/bin/mediamtx"
     )
 
 

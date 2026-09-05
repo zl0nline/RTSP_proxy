@@ -93,7 +93,8 @@ mechanism testing с отдельно установленными Python 3.12 �
 
 Полная пошаговая инструкция: **[Pilot installation, update and rollback](deploy/PILOT_INSTALL.md)**.
 
-Для новой установки используйте release `0.14.0` или новее. Release `0.13.1`
+Примеры установки соответствуют кандидату `0.15.0`; используйте только bundle
+из полностью успешного CI для его точного коммита. Release `0.13.1`
 исправляет загрузку local-auth credentials, а `0.13.2` также убирает скрытую
 зависимость installer-а от development venv в source checkout. Release `0.13.3`
 нормализует release tree, `0.13.4` — и root-managed Python независимо от
@@ -114,6 +115,10 @@ Release `0.14.0` устраняет блокеры пилотного добав
 пустую source-CIDR policy, принимает credentials камеры только отдельными полями,
 хранит их в PostgreSQL в шифрованном виде, сохраняет безопасные поля формы при
 ошибке и добавляет смену пароля локального оператора через dashboard/API/CLI.
+Кандидат `0.15.0` добавляет отмену диагностических запросов, политику периодических
+проверок и атомарное хранение состояния в schema 0023. Фоновый worker ещё
+выключен; это не допуск к production. Установленный pilot `0.14.0` автоматически
+не обновляется. Подробнее: [границы реализации](docs/evidence/phase-g-routine-health-state.md).
 Release
 `0.13.0` несовместим с фактическим mode системных credentials и после
 активации уходит в restart loop. Dashboard привязывается к конкретному IP
@@ -180,7 +185,7 @@ keyring сразу для WEB и reconciler можно одной командо
 
 ```sh
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.14.0 \
+  --release-id 0.15.0 \
   --source-cidrs '10.180.5.0/24,192.168.50.0/24'
 ```
 

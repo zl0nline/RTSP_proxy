@@ -776,7 +776,7 @@ camera-bound, versioned keyring. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.14.0 \
+  --release-id 0.15.0 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -785,6 +785,13 @@ root:rtsp-proxy-access` keyring only when absent, and atomically updates both
 environment files. Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
 deny-all (`probe_source_policy_not_configured`); a source outside a non-empty
 policy is `probe_destination_not_allowed`.
+
+The `0.15.0` candidate adds schema `0023_probe_health_states`, retaining schema
+0022 bridge compatibility before migration. It does not enable the periodic
+probe worker. Its new release ID avoids overwriting the immutable `0.14.0`
+pilot. Activate and smoke the bridge first, then migrate from the new release
+after backup. After migration, the `0.14.0` manifest no longer admits the live
+schema, so binary-only rollback to it is refused.
 
 ### Operator authentication modes
 
@@ -799,11 +806,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation, apply migration 0022 and run:
+For a first installation of the 0.15.0 candidate, apply migration 0023 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.14.0 \
+  --release-id 0.15.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

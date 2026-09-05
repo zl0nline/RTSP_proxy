@@ -86,5 +86,9 @@ Profile changes must also invalidate incompatible health interpretations.
 Do not enable active probes merely because this policy module exists.
 
 Broker promotion still depends on remaining network-policy contracts and ADR
-acceptance. Installation/upgrade needs a new immutable release supporting schema
-0023; the already-installed pilot 0.14.0 has not been changed by this work.
+acceptance. The 0.15.0 candidate bundle templates admit schema 0023, with a
+regression check against the application's schema head on both architectures.
+The initial templates still declared 0022 after the migration was added; that
+packaging error was reproduced by two failing tests and corrected before
+deployment. Installation/upgrade requires the verified new immutable bundle;
+the already-installed pilot 0.14.0 has not been changed by this work.
