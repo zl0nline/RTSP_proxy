@@ -25,11 +25,13 @@ Date: 2026-09-06. Candidate release: `0.16.0`. Application schema:
 - Execution goes only through the accepted root AF_UNIX broker. Concurrency is
   bounded globally, per node and per site. Attempt time is durable and fenced by
   profile revision; health transitions remain generation-bound.
-- Final broker launch holds a camera/profile/endpoint database permit, so a
-  concurrent capacity downgrade cannot commit until that bounded execution is
-  gone; a change before permit acquisition cancels the scheduler lease without
-  opening a connection. Loss of singleton ownership makes readiness fail and
-  requests normal process termination; the systemd role uses `Restart=always`.
+- Final broker launch holds a camera/profile/placement/endpoint database permit
+  plus a shared lock on the selected node. It compares the complete persistent
+  target generation, so neither a capacity downgrade nor a camera move can
+  commit until that bounded execution is gone; a change before permit
+  acquisition cancels the scheduler lease without opening a connection. Loss
+  of singleton ownership makes readiness fail and requests normal process
+  termination; the systemd role uses `Restart=always`.
   Ordinary executor or infrastructure failures remain `INCONCLUSIVE` and never
   change media service.
 
@@ -45,25 +47,36 @@ On macOS arm64 with native PostgreSQL:
 
 ```text
 uv run ruff check .                         -> passed
-uv run mypy src                             -> 83 source files, passed
-uv run pytest -q --tb=short -rN             -> 1687 passed, 182 skipped
+uv run mypy                                 -> 87 source files, passed
+uv run pytest -q --tb=short -rN             -> 1690 passed, 182 skipped
 ```
 
 On the isolated `grob` Linux amd64 scratch tree, without modifying the installed
 pilot:
 
 ```text
-full application suite                       -> 1595 passed, 274 skipped
+full application suite                       -> 1795 passed, 77 skipped
+coverage --precision=2 --fail-under=90       -> 90.04%, passed
 deployment/bootstrap/worker/install tests  -> 50 passed, 2 opt-in skips
 systemd-analyze verify                      -> no candidate-unit errors
 ```
 
+The final amd64/arm64, browser and native-media CI run completed all nine jobs
+successfully for commit `a28e9e6`:
+[GitHub Actions run 33999497696](https://github.com/zl0nline/RTSP_proxy/actions/runs/33999497696).
+Independent Standards and Spec re-reviews both returned PASS after the final
+execution-generation fence; the test-only coverage follow-up also returned
+PASS with no coverage-gaming or flakiness finding.
+
 The PostgreSQL tests include singleton lock release/reacquisition, rejection of
 a deliberately weakened profile constraint, passive default, optimistic-update
-conflict, audit/outbox emission and old-generation result rejection. The worker
-contract executes one complete admitted schedule/broker/result/persistence
-cycle with bounded fakes. Dashboard coverage proves the explicit passive warning,
-profile attribution and no-store API projection.
+conflict, audit/outbox emission, old-generation result rejection, placement
+mutation exclusion while executing, and rejection of a move completed before
+permit acquisition. The worker contract executes one complete admitted
+schedule/broker/result/persistence cycle, normalizes unexpected executor
+failures, and proves the real role lifecycle releases singleton ownership.
+Dashboard coverage proves the explicit passive warning, profile attribution,
+fail-closed API mapping and no-store projection.
 
 ## Remaining production gates
 
