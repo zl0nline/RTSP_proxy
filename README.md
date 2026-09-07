@@ -93,7 +93,7 @@ mechanism testing с отдельно установленными Python 3.12 �
 
 Полная пошаговая инструкция: **[Pilot installation, update and rollback](deploy/PILOT_INSTALL.md)**.
 
-Примеры установки соответствуют кандидату `0.16.0`; используйте только bundle
+Примеры установки соответствуют кандидату `0.16.1`; используйте только bundle
 из полностью успешного CI для его точного коммита. Release `0.13.1`
 исправляет загрузку local-auth credentials, а `0.13.2` также убирает скрытую
 зависимость installer-а от development venv в source checkout. Release `0.13.3`
@@ -124,7 +124,7 @@ Release `0.14.0` устраняет блокеры пилотного добав
 production-допуском; установленный pilot `0.14.0` автоматически не обновляется.
 Подробнее: [границы реализации](docs/evidence/phase-g-routine-health-state.md).
 
-Кандидат `0.16.0` добавляет schema 0024, явный revision-fenced monitoring profile
+Кандидат `0.16.1` добавляет schema 0024, явный revision-fenced monitoring profile
 в Dashboard/API и singleton periodic worker. Активные SOURCE probes допускаются
 только при включённом профиле и подтверждённой ёмкости источника не менее двух;
 при одном или неизвестном числе сессий сохраняется passive-only режим. Worker
@@ -203,7 +203,7 @@ keyring сразу для WEB, reconciler, probe worker и broker можно о�
 
 ```sh
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.16.0 \
+  --release-id 0.16.1 \
   --source-cidrs '10.180.5.0/24,192.168.50.0/24'
 ```
 
