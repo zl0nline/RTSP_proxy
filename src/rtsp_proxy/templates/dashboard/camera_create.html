@@ -25,7 +25,7 @@
       <p>{{ error_message }}</p>
     </div>
     {% endif %}
-    <form class="mutation-form" method="post" action="/dashboard/cameras">
+    <form class="mutation-form" method="post" action="/dashboard/cameras" data-raw-source-credentials>
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
       <label>
@@ -44,7 +44,7 @@
       <label>
         <span>Пароль камеры <small>(необязательно)</small></span>
         <input type="password" name="source_password" maxlength="256" autocomplete="new-password" spellcheck="false">
-        <small>Credentials шифруются перед сохранением и никогда не возвращаются в Dashboard, API, аудит или журналы.</small>
+        <small>Введите логин и пароль в исходном (не percent-encoded) виде. Последовательности вида %HH считаются буквальными символами; кодирование выполнит сервер ровно один раз. Credentials шифруются перед сохранением и никогда не возвращаются в Dashboard, API, аудит или журналы.</small>
       </label>
       <fieldset>
         <legend>Размещение</legend>

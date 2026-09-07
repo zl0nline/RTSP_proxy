@@ -81,6 +81,23 @@ def test_source_credentials_are_percent_encoded_into_a_runtime_only_url() -> Non
     ) == "rtsp://user%40site:p%3Aa%2Fss@[2001:db8::5]:8554/live/main"
 
 
+def test_raw_source_credentials_round_trip_literal_reserved_characters_once() -> None:
+    credentials = CameraSourceCredentials(
+        username="raw$user%@site",
+        password="p:$%40@word",
+    )
+
+    runtime_url = attach_source_credentials("rtsp://camera.local/live", credentials)
+
+    assert runtime_url == (
+        "rtsp://raw%24user%25%40site:p%3A%24%2540%40word@camera.local/live"
+    )
+    assert split_source_credentials(runtime_url) == (
+        "rtsp://camera.local/live",
+        credentials,
+    )
+
+
 def test_camera_source_key_file_requires_exact_private_ownership(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

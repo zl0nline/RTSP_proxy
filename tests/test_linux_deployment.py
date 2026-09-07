@@ -803,6 +803,7 @@ def test_local_auth_bootstrap_has_valid_shell_syntax_and_no_password_argument() 
     assert result.returncode == 0
     assert "--password" not in script
     assert "RTSP_PROXY_LOCAL_AUTH_ENABLED=true" in script
+    assert "--enroll-totp" in script
     assert "dropin_directory=/etc/systemd/system/rtsp-proxy-web.service.d" in script
     assert "dropin_file=$dropin_directory/local-auth.conf" in script
 

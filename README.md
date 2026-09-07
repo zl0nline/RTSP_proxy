@@ -176,6 +176,13 @@ RTSP Proxy не требует внешнего сервера авториза�
 паролю на `/auth/local/login`. TOTP можно добавить сразу, но он необязателен для
 обычного входа и нужен для действий, требующих недавнего MFA.
 
+Для существующей password-only учётной записи TOTP добавляется интерактивно:
+`sudo ./tools/configure_local_auth.sh --release-id VERSION --username admin
+--enroll-totp`. CLI требует текущий пароль, показывает одноразовый URI и
+проверяет текущий код authenticator. Успешный enrollment повышает authz
+revision, отзывает все web-сессии и записывает событие аудита; повторная замена
+TOTP этой командой запрещена.
+
 Пароль меняется в меню оператора «Сменить пароль». Текущая сессия остаётся
 активной, остальные сессии этой учётной записи отзываются. Если WEB недоступен,
 используйте интерактивный CLI с `--rotate-password --username admin`; CLI
@@ -201,7 +208,9 @@ sudo ./tools/configure_camera_sources.sh \
 ```
 
 В форме камеры вводите `rtsp://camera-host/path` без userinfo, а логин и пароль —
-в отдельных полях. Они шифруются AES-256-GCM локальным versioned keyring,
+в отдельных полях в исходном виде: не применяйте percent-encoding вручную;
+сервер кодирует reserved characters ровно один раз. Они шифруются AES-256-GCM
+локальным versioned keyring,
 привязанным к UUID камеры; API, dashboard, аудит и таблица `cameras` их не
 возвращают. Не удаляйте `camera-source-keys.json`: без него credentialed-камеры
 fail closed.

@@ -772,7 +772,9 @@ Application release `0.14.0` adds schema revision
 `0022_camera_source_credentials`. It stores a credential-free URL in `cameras`;
 source username/password are accepted only as separate fields and sealed with
 AES-256-GCM in `camera_source_credentials`. WEB and reconciler must use the same
-camera-bound, versioned keyring. Before adding the first camera run:
+camera-bound, versioned keyring. Credential fields contain raw values, not
+pre-percent-encoded strings; the runtime URL assembler encodes them exactly
+once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
@@ -863,6 +865,12 @@ authorization version, all other sessions are revoked, and a sanitized audit
 event is persisted. When WEB is unavailable,
 `rtsp-proxy-local-operator --rotate-password --username NAME` reads secrets
 from the terminal and revokes every session for the account.
+For an existing password-only account, run
+`configure_local_auth.sh --release-id VERSION --username NAME --enroll-totp`.
+The command verifies the current password and a code generated from the
+one-time URI, increments the authorization version, revokes every session, and
+records a sanitized audit/outbox event. It refuses to replace an existing TOTP
+secret.
 
 The OIDC WEB authentication files are delivered by installing
 `deploy/systemd/rtsp-proxy-web-auth.conf.example` as

@@ -2447,6 +2447,33 @@ class NodeControl:
                         node.id.int,
                     ),
                 )
+            refreshable = tuple(
+                node
+                for node in self._store.list_nodes()
+                if node.state is NodeState.RUNNING
+                and not node.maintenance
+                and node.registered_cameras < node.camera_capacity
+            )
+            for node in refreshable:
+                with self._store.lifecycle_guard(node.id):
+                    self._observe_node_locked(node.id)
+            eligible = tuple(
+                node
+                for node in self._store.list_nodes()
+                if is_node_eligible(
+                    node,
+                    management_freshness_seconds=policy.management_freshness_seconds,
+                )
+            )
+            if eligible:
+                return min(
+                    eligible,
+                    key=lambda node: (
+                        node.registered_cameras,
+                        node.active_sources,
+                        node.id.int,
+                    ),
+                )
             retryable = tuple(
                 node
                 for node in self._store.list_nodes()
@@ -3603,6 +3630,12 @@ class CameraControl:
         except Exception:
             raise CameraCatalogUnavailable("camera_catalog_unavailable") from None
 
+    def catalog_nodes(self) -> tuple[MediaNode, ...]:
+        try:
+            return tuple(sorted(self._store.list_nodes(), key=lambda node: node.id.int)[:100])
+        except Exception:
+            raise CameraCatalogUnavailable("camera_catalog_nodes_unavailable") from None
+
     def detail(self, camera_id: UUID) -> CameraCatalogItem | None:
         try:
             return self._store.camera_detail(camera_id)
@@ -3835,6 +3868,8 @@ class NodeStore(Protocol):
 
 
 class CameraStore(Protocol):
+    def list_nodes(self) -> tuple[MediaNode, ...]: ...
+
     def reserve_camera_registration(
         self,
         idempotency: CameraRegistrationIdempotency,

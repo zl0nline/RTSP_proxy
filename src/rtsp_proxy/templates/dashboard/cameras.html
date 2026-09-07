@@ -19,8 +19,13 @@
       <input type="search" name="q" value="{{ query.search or '' }}" minlength="3" maxlength="128" placeholder="Минимум 3 символа">
     </label>
     <label>
-      <span>UUID ноды</span>
-      <input type="text" name="node_id" value="{{ query.node_id or '' }}" maxlength="36" placeholder="Все ноды">
+      <span>Нода</span>
+      <select name="node_id">
+        <option value="">Все ноды</option>
+        {% for node in nodes %}
+        <option value="{{ node.id }}"{% if query.node_id == node.id %} selected{% endif %}>{{ node.name }} · {{ node.id }}</option>
+        {% endfor %}
+      </select>
     </label>
     <label>
       <span>Состояние</span>
@@ -69,7 +74,7 @@
             </th>
             <td><code>/{{ camera.public_id }}</code></td>
             <td>
-              {{ camera.node_name }}
+              <a href="/dashboard/nodes/{{ camera.node_id }}">{{ camera.node_name }}</a>
               <small class="node-id">{{ camera.node_id }}</small>
             </td>
             <td><code>{{ camera.node_port }}</code></td>

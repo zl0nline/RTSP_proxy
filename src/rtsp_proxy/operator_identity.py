@@ -337,6 +337,112 @@ class PostgresLocalOperatorStore:
         except SQLAlchemyError:
             raise OidcLoginUnavailable("local_operator_store_unavailable") from None
 
+    def enroll_totp(
+        self,
+        *,
+        account_id: UUID,
+        current_password: str,
+        totp_secret: bytes,
+        totp: str,
+        context: OperatorRequestAuditContext,
+        now: datetime,
+    ) -> int:
+        if (
+            now.tzinfo is None
+            or not 1 <= len(current_password) <= 1024
+            or len(totp_secret) != 20
+            or len(totp) != 6
+            or not totp.isascii()
+            or not totp.isdigit()
+        ):
+            raise OidcLoginInvalid("local_operator_totp_enrollment_denied")
+        try:
+            TOTP(totp_secret, 6, hashes.SHA1(), 30).verify(
+                totp.encode("ascii"), int(now.timestamp())
+            )
+        except Exception:
+            raise OidcLoginInvalid("local_operator_totp_enrollment_denied") from None
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT a.enabled, a.authz_version, c.password_scrypt, "
+                            "c.totp_secret FROM operator_local_credentials c "
+                            "JOIN operator_accounts a ON a.id=c.account_id "
+                            "WHERE a.id=:account_id AND a.identity_source='local' "
+                            "FOR UPDATE OF a, c"
+                        ),
+                        {"account_id": account_id},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                credentials = LocalOperatorCredentials(
+                    password_scrypt=(
+                        self._dummy_password if row is None else bytes(row["password_scrypt"])
+                    )
+                )
+                rejected = (
+                    row is None
+                    or not bool(row["enabled"])
+                    or row["totp_secret"] is not None
+                    or not credentials.verifies_password(current_password)
+                )
+                if rejected:
+                    raise OidcLoginInvalid("local_operator_totp_enrollment_denied")
+                assert row is not None
+                previous_version = int(row["authz_version"])
+                if previous_version >= (1 << 63) - 1:
+                    raise OidcLoginInvalid("local_operator_totp_enrollment_denied")
+                authz_version = previous_version + 1
+                nonce = secrets.token_bytes(12)
+                encrypted_totp = nonce + AESGCM(self._key).encrypt(
+                    nonce, totp_secret, account_id.bytes
+                )
+                step = int(now.timestamp()) // 30
+                connection.execute(
+                    text(
+                        "UPDATE operator_local_credentials SET totp_secret=:totp_secret, "
+                        "last_totp_step=:step, updated_at=clock_timestamp() "
+                        "WHERE account_id=:account_id"
+                    ),
+                    {
+                        "account_id": account_id,
+                        "totp_secret": encrypted_totp,
+                        "step": step,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE operator_accounts SET authz_version=:authz_version, "
+                        "updated_at=clock_timestamp() WHERE id=:account_id"
+                    ),
+                    {"account_id": account_id, "authz_version": authz_version},
+                )
+                revoked_sessions = len(
+                    connection.execute(
+                        text(
+                            "UPDATE operator_sessions SET revoked_at=clock_timestamp() "
+                            "WHERE account_id=:account_id AND revoked_at IS NULL RETURNING id"
+                        ),
+                        {"account_id": account_id},
+                    ).all()
+                )
+                _record_local_totp_enrollment_event(
+                    connection,
+                    account_id=account_id,
+                    authz_version=authz_version,
+                    revoked_sessions=revoked_sessions,
+                    context=context,
+                )
+                return authz_version
+        except OidcLoginInvalid:
+            raise
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+
     def account_id_for_username(self, username: str) -> UUID | None:
         if not 1 <= len(username) <= 256 or any(character.isspace() for character in username):
             return None
@@ -2691,6 +2797,46 @@ def _record_local_password_change_event(
                 "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
                 "VALUES (:id, 'operator_account', :aggregate_id, "
                 "'operator.password_changed', :aggregate_revision, CAST(:payload AS jsonb))"
+            ),
+            parameters,
+        )
+
+
+def _record_local_totp_enrollment_event(
+    connection: Connection,
+    *,
+    account_id: UUID,
+    authz_version: int,
+    revoked_sessions: int,
+    context: OperatorRequestAuditContext,
+) -> None:
+    payload = json.dumps(
+        {
+            "account_id": str(account_id),
+            "action": "operator.local_totp_enroll",
+            "outcome": "enrolled",
+            "revoked_sessions": revoked_sessions,
+            "request_id": str(context.request_id),
+            "source_ip_sha256": context.source_ip_sha256,
+            "user_agent_sha256": context.user_agent_sha256,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    event_id = uuid4()
+    parameters = {
+        "id": event_id,
+        "aggregate_id": account_id,
+        "aggregate_revision": authz_version,
+        "payload": payload,
+    }
+    for table in ("audit_events", "outbox_messages"):
+        connection.execute(
+            text(
+                f"INSERT INTO {table} "
+                "(id, aggregate_type, aggregate_id, event_type, aggregate_revision, payload) "
+                "VALUES (:id, 'operator_account', :aggregate_id, "
+                "'operator.local_totp_enrolled', :aggregate_revision, CAST(:payload AS jsonb))"
             ),
             parameters,
         )

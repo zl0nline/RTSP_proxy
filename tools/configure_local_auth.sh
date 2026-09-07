@@ -6,6 +6,7 @@ environment_file=/etc/rtsp-proxy/control-plane/rtsp-proxy.env
 username=admin
 display_name="Local administrator"
 with_totp=0
+enroll_totp=0
 
 usage() {
   printf '%s\n' \
@@ -15,7 +16,8 @@ usage() {
     '  --environment-file PATH  active WEB environment file' \
     '  --username NAME          first local username (default: admin)' \
     '  --display-name NAME      dashboard display name' \
-    '  --with-totp              show a one-time TOTP enrollment URI'
+    '  --with-totp              show a one-time TOTP enrollment URI for a new account' \
+    '  --enroll-totp            enroll TOTP for an existing password-only account'
 }
 
 while [ "$#" -gt 0 ]; do
@@ -25,10 +27,16 @@ while [ "$#" -gt 0 ]; do
     --username) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; username=$2; shift 2 ;;
     --display-name) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; display_name=$2; shift 2 ;;
     --with-totp) with_totp=1; shift ;;
+    --enroll-totp) enroll_totp=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+[ "$with_totp" -eq 0 ] || [ "$enroll_totp" -eq 0 ] || {
+  printf '%s\n' '--with-totp and --enroll-totp are mutually exclusive' >&2
+  exit 2
+}
 
 [ "$(uname -s)" = Linux ] || { printf '%s\n' 'Linux host required' >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { printf '%s\n' 'run this command through sudo' >&2; exit 1; }
@@ -88,7 +96,12 @@ key_mode=$(stat -c '%a:%u:%g:%F' "$key_file")
   exit 1
 }
 
-set -- --username "$username" --display-name "$display_name"
+set -- --username "$username"
+if [ "$enroll_totp" -eq 1 ]; then
+  set -- "$@" --enroll-totp
+else
+  set -- "$@" --display-name "$display_name"
+fi
 if [ "$with_totp" -eq 1 ]; then
   set -- "$@" --with-totp
 fi

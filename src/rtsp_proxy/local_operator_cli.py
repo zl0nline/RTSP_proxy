@@ -46,11 +46,17 @@ def main(
         choices=("viewer", "operator", "admin", "auditor"),
     )
     parser.add_argument("--scope", action="append")
-    parser.add_argument("--with-totp", action="store_true")
-    parser.add_argument(
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--with-totp", action="store_true")
+    actions.add_argument(
         "--rotate-password",
         action="store_true",
         help="rotate an existing local operator password and revoke all web sessions",
+    )
+    actions.add_argument(
+        "--enroll-totp",
+        action="store_true",
+        help="enroll TOTP for an existing password-only operator and revoke all sessions",
     )
     parser.add_argument("--actor", default="system:local-bootstrap")
     parser.add_argument("--reason", default="initial local operator provisioning")
@@ -63,6 +69,17 @@ def main(
             )
             print(f"rotated local operator {account_id}; all web sessions revoked")
             return 0
+        if arguments.enroll_totp:
+            account_id, _secret = enroll_totp_from_environment(
+                username=arguments.username,
+                password_reader=password_reader,
+                secret_writer=lambda secret: print(
+                    f"TOTP enrollment URI (shown once): "
+                    f"{_totp_enrollment_uri(arguments.username, secret)}"
+                ),
+            )
+            print(f"enrolled TOTP for local operator {account_id}; all web sessions revoked")
+            return 0
         account_id, totp_secret = provision_from_environment(
             account_id=arguments.account_id or uuid4(),
             username=arguments.username,
@@ -74,11 +91,9 @@ def main(
             reason=arguments.reason,
             password_reader=password_reader,
         )
-    except OidcLoginInvalid:
-        print(
-            "local operator password change failed: local_operator_password_change_denied",
-            file=sys.stderr,
-        )
+    except OidcLoginInvalid as error:
+        operation = "TOTP enrollment" if arguments.enroll_totp else "password change"
+        print(f"local operator {operation} failed: {error}", file=sys.stderr)
         return 1
     except ValueError as error:
         if not isinstance(error, LocalOperatorProvisionError) and str(error) != (
@@ -92,10 +107,10 @@ def main(
         return 1
     print(f"provisioned local operator {account_id} at revision 1")
     if totp_secret is not None:
-        label = quote(f"RTSP Proxy:{arguments.username}")
-        issuer = quote("RTSP Proxy")
-        encoded = base64.b32encode(totp_secret).decode("ascii").rstrip("=")
-        print(f"TOTP enrollment URI (shown once): otpauth://totp/{label}?secret={encoded}&issuer={issuer}")
+        print(
+            "TOTP enrollment URI (shown once): "
+            f"{_totp_enrollment_uri(arguments.username, totp_secret)}"
+        )
     return 0
 
 
@@ -199,6 +214,53 @@ def rotate_password_from_environment(
     finally:
         store.close()
     return account_id
+
+
+def enroll_totp_from_environment(
+    *,
+    username: str,
+    password_reader: Callable[[str], str] = getpass.getpass,
+    secret_writer: Callable[[bytes], None] = lambda _secret: None,
+) -> tuple[UUID, bytes]:
+    database_url = os.environ.get("RTSP_PROXY_DATABASE_URL", "")
+    key_file_value = os.environ.get("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", "")
+    if not database_url or not key_file_value:
+        raise LocalOperatorProvisionError("local_operator_configuration_invalid")
+    current_password = password_reader("Current local operator password: ")
+    totp_secret = os.urandom(20)
+    secret_writer(totp_secret)
+    totp = password_reader("Current code from the authenticator: ")
+    store = PostgresLocalOperatorStore(
+        database_url,
+        encryption_key=_read_key(Path(key_file_value)),
+    )
+    try:
+        account_id = store.account_id_for_username(username)
+        if account_id is None:
+            raise LocalOperatorProvisionError("local_operator_account_not_found")
+        store.enroll_totp(
+            account_id=account_id,
+            current_password=current_password,
+            totp_secret=totp_secret,
+            totp=totp,
+            context=OperatorRequestAuditContext.internal(
+                action="operator.local_totp_enroll",
+                resource_scope="server:*",
+                resource_type="operator_account",
+                resource_id=str(account_id),
+            ),
+            now=datetime.now(UTC),
+        )
+    finally:
+        store.close()
+    return account_id, totp_secret
+
+
+def _totp_enrollment_uri(username: str, secret: bytes) -> str:
+    label = quote(f"RTSP Proxy:{username}")
+    issuer = quote("RTSP Proxy")
+    encoded = base64.b32encode(secret).decode("ascii").rstrip("=")
+    return f"otpauth://totp/{label}?secret={encoded}&issuer={issuer}"
 
 
 def _read_key(path: Path) -> bytes:

@@ -246,6 +246,7 @@ def render_camera_catalog(
     *,
     page: CameraCatalogPage,
     query: CameraCatalogQuery,
+    nodes: tuple[MediaNode, ...],
     next_url: str | None,
     principal: OperatorPrincipal,
 ) -> str:
@@ -255,6 +256,7 @@ def render_camera_catalog(
         .render(
             page=page,
             query=query,
+            nodes=nodes,
             next_url=next_url,
             principal=principal,
             can_create=principal.allows(OperatorPermission.CONTROL_MUTATE),

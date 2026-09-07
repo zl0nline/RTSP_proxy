@@ -267,6 +267,78 @@ def test_local_operator_cli_reports_failure_and_one_time_totp(
     assert "otpauth://totp/RTSP%20Proxy%3Apilot-admin" in output
 
 
+def test_local_operator_cli_enrolls_totp_for_existing_password_only_account(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed: dict[str, Any] = {}
+
+    def enroll(**kwargs: Any) -> tuple[UUID, bytes]:
+        observed.update(kwargs)
+        secret = b"T" * 20
+        kwargs["secret_writer"](secret)
+        return ACCOUNT_ID, secret
+
+    monkeypatch.setattr(local_operator_cli, "enroll_totp_from_environment", enroll)
+
+    result = local_operator_cli.main(["--enroll-totp", "--username", "pilot-admin"])
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert observed["username"] == "pilot-admin"
+    assert "otpauth://totp/RTSP%20Proxy%3Apilot-admin" in output
+    assert "shown once" in output
+
+
+def test_local_operator_totp_enrollment_keeps_secrets_out_of_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class FakeStore:
+        def __init__(self, database_url: str, *, encryption_key: bytes) -> None:
+            observed["database_url"] = database_url
+            observed["encryption_key"] = encryption_key
+
+        def account_id_for_username(self, username: str) -> UUID | None:
+            observed["username"] = username
+            return ACCOUNT_ID
+
+        def enroll_totp(self, **kwargs: Any) -> int:
+            observed.update(kwargs)
+            return 2
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setenv("RTSP_PROXY_DATABASE_URL", "postgresql+psycopg://unused")
+    monkeypatch.setenv("RTSP_PROXY_LOCAL_AUTH_ENCRYPTION_KEY_FILE", "/unused/key")
+    monkeypatch.setattr(local_operator_cli, "_read_key", lambda _path: b"K" * 32)
+    monkeypatch.setattr(local_operator_cli, "PostgresLocalOperatorStore", FakeStore)
+    real_urandom = local_operator_cli.os.urandom
+    monkeypatch.setattr(
+        local_operator_cli.os,
+        "urandom",
+        lambda size: b"T" * 20 if size == 20 else real_urandom(size),
+    )
+    answers = iter(("correct horse battery staple", "123456"))
+    shown: list[bytes] = []
+
+    account_id, secret = local_operator_cli.enroll_totp_from_environment(
+        username="pilot-admin",
+        password_reader=lambda _prompt: next(answers),
+        secret_writer=shown.append,
+    )
+
+    assert account_id == ACCOUNT_ID
+    assert secret == b"T" * 20
+    assert shown == [secret]
+    assert observed["current_password"] == "correct horse battery staple"
+    assert observed["totp"] == "123456"
+    assert observed["totp_secret"] == secret
+    assert observed["closed"] is True
+
+
 def test_local_operator_cli_rejects_password_mismatch_and_invalid_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -877,6 +949,114 @@ def test_postgres_password_change_requires_fresh_totp(
             )
     finally:
         store.close()
+
+
+def test_postgres_totp_enrollment_reauthenticates_revokes_and_is_single_use(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    password = "correct horse battery staple"
+    secret = b"T" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    store = PostgresLocalOperatorStore(postgres_database_url, encryption_key=b"K" * 32)
+    session_store = PostgresOperatorSessionStore(postgres_database_url)
+    sessions = OperatorSessionControl(store=session_store, token_factory=lambda: "A" * 43)
+    context = OperatorRequestAuditContext.internal(
+        action="operator.local_totp_enroll",
+        resource_scope="server:*",
+        resource_type="operator_account",
+        resource_id=str(ACCOUNT_ID),
+    )
+    code = TOTP(secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
+    try:
+        store.provision(
+            account=account,
+            credentials=LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(password, salt=b"P" * 16)
+            ),
+            context=TEST_MUTATION_CONTEXT,
+        )
+        issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+
+        with pytest.raises(OidcLoginInvalid, match="local_operator_totp_enrollment_denied"):
+            store.enroll_totp(
+                account_id=ACCOUNT_ID,
+                current_password="wrong password",
+                totp_secret=secret,
+                totp=code,
+                context=context,
+                now=NOW,
+            )
+        assert sessions.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.DASHBOARD_READ,
+            required_scope=None,
+        ).authz_version == 1
+
+        assert store.enroll_totp(
+            account_id=ACCOUNT_ID,
+            current_password=password,
+            totp_secret=secret,
+            totp=code,
+            context=context,
+            now=NOW,
+        ) == 2
+
+        with pytest.raises(Exception, match="operator_session_revoked"):
+            sessions.authenticate(
+                session_token=issued.session_token,
+                permission=OperatorPermission.DASHBOARD_READ,
+                required_scope=None,
+            )
+        with pytest.raises(OidcLoginInvalid, match="local_operator_totp_enrollment_denied"):
+            store.enroll_totp(
+                account_id=ACCOUNT_ID,
+                current_password=password,
+                totp_secret=b"U" * 20,
+                totp=TOTP(b"U" * 20, 6, hashes.SHA1(), 30)
+                .generate(int((NOW + timedelta(seconds=30)).timestamp()))
+                .decode("ascii"),
+                context=context,
+                now=NOW + timedelta(seconds=30),
+            )
+        next_now = NOW + timedelta(seconds=30)
+        next_code = TOTP(secret, 6, hashes.SHA1(), 30).generate(
+            int(next_now.timestamp())
+        ).decode("ascii")
+        authenticated = store.authenticate(
+            username="admin",
+            password=password,
+            totp=next_code,
+            source_ip="192.0.2.10",
+            now=next_now,
+        )
+        assert authenticated.authz_version == 2
+        assert authenticated.mfa_verified is True
+        engine = create_engine(postgres_database_url, hide_parameters=True)
+        with engine.connect() as connection:
+            payload = connection.scalar(
+                text(
+                    "SELECT payload::text FROM audit_events "
+                    "WHERE aggregate_id=:account_id "
+                    "AND event_type='operator.local_totp_enrolled'"
+                ),
+                {"account_id": ACCOUNT_ID},
+            )
+        engine.dispose()
+        assert payload is not None
+        assert base64.b32encode(secret).decode("ascii") not in payload
+    finally:
+        store.close()
+        session_store.close()
 
 
 def test_postgres_local_operator_provision_and_login_keep_secrets_out_of_rows(

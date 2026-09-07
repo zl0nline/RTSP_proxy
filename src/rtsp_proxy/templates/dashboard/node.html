@@ -15,7 +15,7 @@
   <p class="updated">Снимок сервера: <time datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
   {% set metrics_fresh = node.metrics and node.scrape_status.value in ['fresh', 'idle'] %}
   <section class="summary-grid" aria-label="Сводка ноды">
-    <article class="summary-card"><span>Камеры</span><strong>{{ node.registered_cameras }} / {{ node.camera_capacity }}</strong><small>зарегистрировано / максимум</small></article>
+    <a class="summary-card" href="/dashboard/cameras?node_id={{ node.node_id }}"><span>Камеры</span><strong>{{ node.registered_cameras }} / {{ node.camera_capacity }}</strong><small>зарегистрировано / максимум · открыть каталог</small></a>
     <article class="summary-card"><span>Активные источники</span><strong>{{ node.metrics.active_sources if metrics_fresh else '—' }}</strong><small>по свежим метрикам</small></article>
     <article class="summary-card"><span>Занятые потоки</span><strong>{{ node.metrics.occupied_streams if metrics_fresh else '—' }}</strong><small>один downstream на камеру</small></article>
   </section>

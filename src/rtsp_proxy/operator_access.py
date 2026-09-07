@@ -113,6 +113,7 @@ _AUDIT_ACTIONS = frozenset(
         "node.stop",
         "operator.admin",
         "operator.login",
+        "operator.local_totp_enroll",
         "operator.password_change",
         "operator.session_logout",
         "operator.session_read",

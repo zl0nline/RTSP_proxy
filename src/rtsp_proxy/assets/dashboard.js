@@ -1,6 +1,26 @@
 (() => {
   "use strict";
 
+  document.querySelectorAll("form[data-raw-source-credentials]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (!(form instanceof HTMLFormElement) || form.dataset.encodedCredentialConfirmed === "true") {
+        return;
+      }
+      const values = ["source_username", "source_password"].map((name) => {
+        const field = form.elements.namedItem(name);
+        return field instanceof HTMLInputElement ? field.value : "";
+      });
+      if (!values.some((value) => /%[0-9a-f]{2}/i.test(value))) {
+        return;
+      }
+      if (!window.confirm("Credentials должны быть исходными. Продолжить и сохранить %HH буквально?")) {
+        event.preventDefault();
+        return;
+      }
+      form.dataset.encodedCredentialConfirmed = "true";
+    });
+  });
+
   const boundedInterval = (raw) => {
     const value = Number.parseInt(raw || "", 10);
     return Number.isInteger(value) && value >= 5000 && value <= 30000 ? value : 10000;
@@ -347,11 +367,26 @@
     fallbackTimer = window.setTimeout(() => void pollOnce(), 0);
   };
 
+  const loadInitialSnapshot = async () => {
+    if (!snapshotUrl) {
+      return;
+    }
+    try {
+      const snapshot = await fetchSnapshot(snapshotUrl);
+      if (snapshot) {
+        applyState(snapshot);
+      }
+    } catch (_error) {
+      // SSE remains authoritative; its error path starts bounded polling.
+    }
+  };
+
   if (!streamUrl || !snapshotUrl || typeof window.EventSource !== "function") {
     startFallback();
     return;
   }
 
+  void loadInitialSnapshot();
   eventSource = new EventSource(streamUrl, { withCredentials: true });
   eventSource.addEventListener("state", (event) => {
     try {

@@ -348,8 +348,16 @@ class OperatorPasswordChangeRequest(BaseModel):
 class CameraSourceCredentialsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    username: str = Field(min_length=1, max_length=64)
-    password: str = Field(min_length=1, max_length=256)
+    username: str = Field(
+        min_length=1,
+        max_length=64,
+        description="Raw camera username; do not percent-encode reserved characters.",
+    )
+    password: str = Field(
+        min_length=1,
+        max_length=256,
+        description="Raw camera password; do not percent-encode reserved characters.",
+    )
 
 
 class CameraCreateRequest(BaseModel):

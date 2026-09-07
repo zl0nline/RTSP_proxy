@@ -131,12 +131,14 @@ def camera_dashboard_router(
             )
         try:
             page = camera_control.catalog(query)
+            nodes = camera_control.catalog_nodes()
         except CameraCatalogUnavailable:
             return _catalog_unavailable(principal)
         return _html_response(
             render_camera_catalog(
                 page=page,
                 query=query,
+                nodes=nodes,
                 next_url=_catalog_next_url(query, page.next_after),
                 principal=principal,
             )

@@ -369,6 +369,15 @@ class StaticCameraCatalog:
         assert item is not None
         return CameraCatalogPage(items=(item,), next_after=item.id)
 
+    def catalog_nodes(self) -> tuple[MediaNode, ...]:
+        return (
+            MediaNode(
+                id=NODE_ID,
+                name="edge <north>",
+                external_port=10543,
+            ),
+        )
+
     def detail(self, camera_id: UUID) -> CameraCatalogItem | None:
         if camera_id != CAMERA_ID:
             return None
@@ -1412,6 +1421,7 @@ def test_dashboard_distinguishes_confirmed_idle_zero_from_unknown_metrics() -> N
     assert "<td data-node-occupied>0</td>" in overview.text
     assert "running · idle" in overview.text
     assert detail.status_code == 200
+    assert f'href="/dashboard/cameras?node_id={NODE_ID}"' in detail.text
     assert detail.text.count("<strong>0</strong>") == 2
     assert "0 бит/с" in detail.text  # noqa: RUF001
 
@@ -2506,6 +2516,7 @@ def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None
     assert "data-live-probe-result" in script.text
     assert "setInterval" not in script.text
     assert "Math.min(30000" in script.text
+    assert "void loadInitialSnapshot();\n  eventSource = new EventSource" in script.text
     assert "innerHTML" not in script.text
     assert disabled_dashboard.status_code == 503
     assert disabled_dashboard.headers["content-type"].startswith("text/html")
@@ -2542,6 +2553,9 @@ def test_camera_catalog_is_authenticated_bounded_escaped_and_secret_free() -> No
     assert f"/dashboard/cameras/{CAMERA_ID}" in response.text
     assert f"after={CAMERA_ID}" in response.text
     assert "q=Front" in response.text
+    assert "<select name=\"node_id\">" in response.text
+    assert f'value="{NODE_ID}" selected' in response.text
+    assert "edge &lt;north&gt;" in response.text
 
     browser_form_response = client.get(
         "/dashboard/cameras?q=Front&node_id=&state=&limit=50",
@@ -2608,6 +2622,8 @@ def test_dashboard_camera_registration_supports_automatic_and_manual_placement()
     )
 
     form = client.get("/dashboard/cameras/new", headers=headers)
+    assert "в исходном (не percent-encoded) виде" in form.text
+    assert "%HH" in form.text
     automatic = client.post(
         "/dashboard/cameras",
         headers=headers,

@@ -10,7 +10,7 @@
   </div>
   <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="confirmation-title">
     <div class="panel-heading"><h2 id="confirmation-title">Будет отключён {{ preview.disconnect_readers }} downstream-клиент</h2></div>
-    <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/apply">
+    <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/apply" data-raw-source-credentials>
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="operation" value="{{ preview.operation.value }}">
       <input type="hidden" name="expected_revision" value="{{ preview.desired_revision }}">
