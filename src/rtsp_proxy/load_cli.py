@@ -15,6 +15,13 @@ from rtsp_proxy.load_catalog import (
     capture_cold_preflight,
     capture_warm_preflight,
 )
+from rtsp_proxy.load_control import (
+    load_control_events,
+    summarize_control_events,
+)
+from rtsp_proxy.load_control import (
+    sha256_file as control_sha256_file,
+)
 from rtsp_proxy.load_evidence import (
     load_observations,
     load_sut_observations,
@@ -160,6 +167,11 @@ def _parser() -> argparse.ArgumentParser:
     summarize_readers.add_argument("run_directory", type=Path)
     summarize_readers.add_argument("events", type=Path)
     summarize_readers.add_argument("output", type=Path)
+
+    summarize_control = commands.add_parser("summarize-control")
+    summarize_control.add_argument("run_directory", type=Path)
+    summarize_control.add_argument("events", type=Path)
+    summarize_control.add_argument("output", type=Path)
 
     merge_readers = commands.add_parser("merge-readers")
     merge_readers.add_argument("run_directory", type=Path)
@@ -610,6 +622,26 @@ def main(argv: list[str] | None = None) -> int:
             write_summary(arguments.output, reader_summary)
             print(f"SUMMARIZED_READERS output={arguments.output}")
             return 0 if reader_summary.valid else 3
+        if arguments.command == "summarize-control":
+            _require_run_path(run_directory, arguments.events)
+            _require_run_path(run_directory, arguments.output)
+            launch_plan = json.loads(
+                (run_directory / "launch-plan.json").read_text(encoding="utf-8")
+            )
+            coordinated_start_ms = launch_plan.get("coordinated_start_unix_ms")
+            if not isinstance(coordinated_start_ms, int) or isinstance(coordinated_start_ms, bool):
+                raise ValueError("launch_plan_start_invalid")
+            events = load_control_events(arguments.events)
+            control_summary = summarize_control_events(
+                profile,
+                events,
+                events_sha256=control_sha256_file(arguments.events),
+                measurement_start_unix_ms=measurement_start_unix_ms(profile, coordinated_start_ms),
+                workload_end_unix_ms=workload_end_unix_ms(profile, coordinated_start_ms),
+            )
+            write_summary(arguments.output, control_summary)
+            print(f"SUMMARIZED_CONTROL output={arguments.output}")
+            return 0 if control_summary.valid else 3
         if arguments.command == "merge-readers":
             _require_run_path(run_directory, arguments.output)
             for input_path in arguments.inputs:

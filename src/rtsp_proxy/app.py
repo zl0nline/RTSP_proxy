@@ -732,6 +732,7 @@ def create_app(
             reader=fleet_snapshots,
             probe_observations=probe_observations,
             resolve_targets=camera_control.live_targets,
+            resolve_accesses=camera_control.live_accesses,
             authorize_sessions=(
                 None
                 if operator_sessions is None

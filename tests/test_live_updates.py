@@ -110,6 +110,12 @@ class BlockingAuthorizationEpochs(MutableAuthorizationEpochs):
         return super().__call__(session_ids)
 
 
+class DelayedAuthorizationEpochs(MutableAuthorizationEpochs):
+    def __call__(self, session_ids: tuple[UUID, ...]) -> dict[UUID, int]:
+        threading.Event().wait(0.03)
+        return super().__call__(session_ids)
+
+
 class MutableLiveTargets:
     def __init__(self, targets: dict[UUID, tuple[PublicId, UUID]]) -> None:
         self.targets = targets
@@ -290,6 +296,7 @@ async def test_live_updates_project_and_coalesce_camera_runtime_state() -> None:
         "received_bitrate_bps": None,
         "scrape_status": "fresh",
         "sent_bitrate_bps": None,
+        "source_reason": None,
         "source_state": "ready",
     }
 
@@ -525,6 +532,34 @@ async def test_live_updates_revalidate_authz_and_bound_one_stream_per_session() 
 
 
 @async_case
+async def test_live_heartbeat_deadline_is_rebased_after_slow_authorization() -> None:
+    epochs = DelayedAuthorizationEpochs({SESSION_ID: 3})
+    updates = _updates(
+        MutableSnapshotReader(_snapshot()),
+        epochs=epochs,
+        heartbeat_seconds=0.01,
+        reauthorize_seconds=0.01,
+    )
+
+    async def authorize() -> int:
+        return 3
+
+    subscription = await updates.open(
+        target=_target(),
+        session_id=SESSION_ID,
+        authz_version=3,
+        authorize=authorize,
+    )
+    assert (await anext(subscription)).event_type is CameraLiveEventType.STATE
+    assert (await anext(subscription)).event_type is CameraLiveEventType.HEARTBEAT
+
+    epochs.versions[SESSION_ID] = 4
+    terminal = await anext(subscription)
+    assert terminal.event_type is CameraLiveEventType.AUTHZ_EPOCH
+    assert terminal.data == {"action": "reauthenticate"}
+
+
+@async_case
 async def test_live_updates_disconnect_a_subscriber_whose_bounded_queue_is_full() -> None:
     reader = MutableSnapshotReader(_snapshot())
     updates = _updates(reader, subscriber_queue_size=1)
@@ -586,6 +621,11 @@ def test_live_target_and_last_event_id_are_canonical_and_bounded() -> None:
         {"refresh_wait_timeout_seconds": 0},
         {"metric_interval_seconds": 0},
         {"channel_ttl_seconds": 0},
+        {"source_start_timeout_seconds": 0},
+        {
+            "source_start_timeout_seconds": 10,
+            "source_failure_visibility_seconds": 10,
+        },
     ],
 )
 def test_live_updates_reject_unbounded_runtime_settings(kwargs: dict[str, object]) -> None:
@@ -611,6 +651,71 @@ async def test_live_updates_preserve_exact_per_path_not_ready_state() -> None:
 
     assert event.data["source_state"] == "idle"
     assert event.data["occupied"] is False
+    await subscription.aclose()
+
+
+@async_case
+async def test_live_updates_distinguish_on_demand_start_and_failed_source_from_idle() -> None:
+    reader = MutableSnapshotReader(
+        _snapshot(ready=False, received_bytes=0, sent_bytes=0)
+    )
+    latest_access = {CAMERA_ID: NOW}
+    updates = _updates(
+        reader,
+        resolve_accesses=lambda camera_ids: {
+            camera_id: latest_access[camera_id]
+            for camera_id in camera_ids
+            if camera_id in latest_access
+        },
+        source_start_timeout_seconds=10,
+        source_failure_visibility_seconds=300,
+    )
+
+    async def authorize() -> int:
+        return 1
+
+    subscription = await updates.open(
+        target=_target(),
+        session_id=SESSION_ID,
+        authz_version=1,
+        authorize=authorize,
+    )
+    initial = await anext(subscription)
+    assert initial.data["source_state"] == "connecting"
+    assert initial.data["source_reason"] == "source_start_pending"
+
+    reader.snapshot = _snapshot(
+        generated_at=NOW + timedelta(seconds=5),
+        ready=False,
+        received_bytes=0,
+        sent_bytes=0,
+    )
+    await updates.refresh_once()
+    connecting = await anext(subscription)
+    assert connecting.data["source_state"] == "connecting"
+    assert connecting.data["source_reason"] == "source_start_pending"
+
+    reader.snapshot = _snapshot(
+        generated_at=NOW + timedelta(seconds=15),
+        ready=False,
+        received_bytes=0,
+        sent_bytes=0,
+    )
+    await updates.refresh_once()
+    failed = await anext(subscription)
+    assert failed.data["source_state"] == "unavailable"
+    assert failed.data["source_reason"] == "source_start_failed"
+
+    reader.snapshot = _snapshot(
+        generated_at=NOW + timedelta(seconds=20),
+        ready=False,
+        received_bytes=1_000,
+        sent_bytes=1_000,
+    )
+    await updates.refresh_once()
+    completed_then_idle = await anext(subscription)
+    assert completed_then_idle.data["source_state"] == "idle"
+    assert completed_then_idle.data["source_reason"] is None
     await subscription.aclose()
 
 

@@ -2505,6 +2505,34 @@ class PostgresNodeStore:
                 ).mappings()
             )
 
+    def latest_camera_accesses(
+        self, camera_ids: tuple[UUID, ...]
+    ) -> dict[UUID, datetime]:
+        if (
+            not 1 <= len(camera_ids) <= 256
+            or len(frozenset(camera_ids)) != len(camera_ids)
+        ):
+            raise ValueError("camera_live_target_batch_invalid")
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    camera_access_grants.c.camera_id,
+                    func.max(camera_access_grants.c.last_used_at).label("last_used_at"),
+                )
+                .where(
+                    camera_access_grants.c.camera_id.in_(camera_ids),
+                    camera_access_grants.c.last_used_at.is_not(None),
+                )
+                .group_by(camera_access_grants.c.camera_id)
+            ).mappings()
+            result: dict[UUID, datetime] = {}
+            for row in rows:
+                observed_at = row["last_used_at"]
+                if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+                    raise RuntimeError("camera_live_access_timestamp_invalid")
+                result[_uuid(row["camera_id"])] = observed_at
+            return result
+
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         statement = self._camera_catalog_query()
         if query.after is not None:

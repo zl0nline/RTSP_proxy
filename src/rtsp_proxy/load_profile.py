@@ -134,8 +134,8 @@ class WorkloadAxes(StrictModel):
     total_readers: Annotated[int, Field(ge=0)]
     connect_rate_per_second: Annotated[int, Field(ge=0, le=1000)]
     minimum_rtp_packets_per_second: Annotated[int, Field(ge=0)]
-    probe_rate_per_second: Annotated[float, Field(ge=0)]
-    crud_rate_per_second: Annotated[float, Field(ge=0)]
+    probe_rate_per_second: Annotated[float, Field(ge=0, le=10)]
+    crud_rate_per_second: Annotated[float, Field(ge=0, le=10)]
 
     @model_validator(mode="after")
     def keep_axes_physically_possible(self) -> Self:
@@ -155,8 +155,6 @@ class WorkloadAxes(StrictModel):
             raise ValueError("cold_requires_one_reader_per_active_source")
         if (self.total_readers == 0) != (self.minimum_rtp_packets_per_second == 0):
             raise ValueError("rtp_packet_rate_must_match_reader_presence")
-        if self.probe_rate_per_second != 0 or self.crud_rate_per_second != 0:
-            raise ValueError("probe_crud_drivers_not_implemented")
         return self
 
 
@@ -535,6 +533,11 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
         validate_cold_preflight_payload,
         validate_warm_preflight_payload,
     )
+    from rtsp_proxy.load_control import (
+        ControlWorkloadSummary,
+        load_control_events,
+        summarize_control_events,
+    )
     from rtsp_proxy.load_evidence import (
         GeneratorHeadroomSummary,
         SutCapacitySummary,
@@ -611,6 +614,12 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
     reader_events_path = destination / "raw" / "readers.jsonl"
     if profile.workload.total_readers > 0:
         expected_summary_names.add("summary/readers.json")
+    control_required = (
+        profile.workload.probe_rate_per_second > 0
+        or profile.workload.crud_rate_per_second > 0
+    )
+    if control_required:
+        expected_summary_names.add("summary/control.json")
     cold_required = (
         profile.workload.total_readers > 0
         and profile.workload.endpoint_mode == "proxy"
@@ -675,6 +684,32 @@ def finalize_run_directory(destination: Path) -> dict[str, object]:
             for item in completions
         ):
             raise ValueError("reader_completion_start_not_bound_to_launch")
+
+    if control_required:
+        control_raw_name = "raw/control.jsonl"
+        control_summary_name = "summary/control.json"
+        if control_raw_name not in files:
+            raise ValueError("control_workload_evidence_missing")
+        control_events = load_control_events(files[control_raw_name])
+        expected_control_summary = summarize_control_events(
+            profile,
+            control_events,
+            events_sha256=_hash_file(files[control_raw_name])[0],
+            measurement_start_unix_ms=prepared_launch[
+                "coordinated_measurement_start_unix_ms"
+            ],
+            workload_end_unix_ms=prepared_launch[
+                "coordinated_workload_end_unix_ms"
+            ],
+        )
+        stored_control_summary = ControlWorkloadSummary.model_validate_json(
+            files[control_summary_name].read_text(encoding="utf-8")
+        )
+        if (
+            stored_control_summary != expected_control_summary
+            or not stored_control_summary.valid
+        ):
+            raise ValueError("control_workload_summary_not_reproducible_or_invalid")
 
     generator_machine_ids: set[str] = set()
     generator_summaries: dict[str, GeneratorHeadroomSummary] = {}

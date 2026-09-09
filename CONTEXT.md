@@ -198,9 +198,19 @@ camera unhealthy. `source_probe` и `path_probe` имеют разные hard bu
 однократно и с bounded DNS timeout проверяет явно настроенную site/CIDR policy,
 затем атомарно сохраняет approved literal IP:port, policy digest и opaque
 endpoint generation; пустая policy означает deny-all. Probe job принимает
-только эту generation и hostname не резолвит. Source executor не является частью
-WEB/reconciler и требует отдельной
-принятой Linux execution boundary.
+только эту generation и hostname не резолвит. Source executor не является
+частью WEB/reconciler: отдельный unprivileged worker передаёт sealed request
+узкому root broker, который запускает transient unit внутри принятой Linux
+execution boundary с exact-tuple BPF policy.
+
+## Live ingest state
+
+Demand-aware camera state, независимый от deep probe health. `idle` означает
+нормальный `sourceOnDemand` без reader. После свежего успешного downstream
+admission путь кратко имеет `connecting`; отсутствие полученных bytes после
+bounded start window становится `unavailable`. Наличие media становится
+`ready`. Этот сигнал не открывает вторую upstream session и не меняет node
+health.
 
 ## Upstream session capacity
 

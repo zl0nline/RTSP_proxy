@@ -1,59 +1,72 @@
-# Initial SLI catalog
+# SLI catalog
 
-This catalog defines measurement intent. Exact signal names and queries are
-filled from the pinned MediaMTX and application inventory during Phase 0.
+These definitions are normative for one admitted direct-Linux server. Every
+report includes failures, sample count, window, release/commit, hardware,
+camera profile and workload axes. Averages never replace p99, success rate or
+resource peaks.
 
-| SLI | Measurement point | Initial target | Error attribution |
+## User and media SLIs
+
+| SLI | Measurement | Target | Attribution |
 |---|---|---:|---|
-| Warm RTSP handshake | external client, first DESCRIBE byte sent to successful PLAY response received | p99 ≤ 500 ms | platform/network vs camera |
-| Cold proxy overhead | external FFmpeg minus measured keyframe wait | p99 ≤ 1 s | platform only |
-| Cold end-to-end | external FFmpeg | informative ≤ 1 s + profile GOP max | platform + camera GOP |
-| Catalog read | HTTP ingress to response | p99 ≤ 200 ms | control plane |
-| CRUD mutation | HTTP ingress to desired accepted | p99 ≤ 1 s | control plane |
-| Deep observation freshness | scheduler projection by site/subnet | ≥ 95% within 2 × interval | scheduler vs camera |
-| Manual confirmation start | accepted command to probe start | ≥ 99% within queue-delay SLO | scheduler |
-| Control-plane availability | external management probe | ≥ 99.5% / month | platform |
-| Established media availability | external consumer | ≥ 99.0% / month | platform vs camera |
-| Camera CRUD isolation | unrelated active consumer | 0 interruptions | target node/path vs unrelated |
-| Node lifecycle isolation | active consumer on another node | 0 interruptions | selected node vs server |
-| Second-reader admission | simultaneous external clients | RTSP 453 for non-winner | media admission |
-| Node failure notification | incident outbox/email | one failure + one recovery | control/SMTP |
+| Warm RTSP handshake | external client, DESCRIBE sent through successful PLAY | p99 ≤500 ms; success ≥99.9% | proxy/network versus camera |
+| Cold proxy overhead | external cold start minus measured source keyframe wait | p99 ≤1 s | platform |
+| Cold end-to-end | external cold start | informational: ≤1 s plus profile GOP maximum | platform plus camera |
+| Established media availability | external reader with monotonic received bytes | ≥99.0% monthly; no unexplained resets in soak | platform versus camera/network |
+| Second-reader admission | concurrent external clients | winner continues; loser receives RTSP `453` | media admission |
+| Camera CRUD isolation | unrelated established readers | 0 interruptions | selected path/node |
+| Node lifecycle isolation | established reader on another node | 0 interruptions | selected node/server |
 
-Rules:
+## Control and operational SLIs
 
-- p50 and p95 remain diagnostics; normative latency pass/fail uses p99.
-- Failed attempts stay in the success-rate SLI and are not discarded from
-  reports.
-- Scheduler overload changes observation freshness, never camera health.
-- SLO weakening requires an ADR with baseline and evidence.
+| SLI | Measurement | Target | Attribution |
+|---|---|---:|---|
+| Catalog read | HTTPS ingress to complete response | p99 ≤200 ms; ≥99.9% | control plane |
+| Desired-state mutation | HTTPS ingress to committed accepted state | p99 ≤1 s; ≥99.9% | control plane |
+| Management readiness | external HTTPS `/health/ready` | ≥99.5% monthly | control plane/database |
+| Runtime observation freshness | latest generation-bound node sample | ≥95% within 2× configured interval; 100% before placement decision | collector/node |
+| Probe scheduling start | accepted manual confirmation to broker start | ≥99% within configured queue-delay SLO | worker/broker |
+| Incident notification | durable incident to terminal relay outcome | one failure and one recovery; within configured deadline | notifier/SMTP |
+| Backup freshness | last verified database plus control-assets backup | recovery point ≤5 min at admission | data/operations |
+| Restore time | declared incident to ready control plane | ≤30 min | data/operations |
 
-## Pinned MediaMTX v1.20.0 signal mapping
+## Resource gates
+
+During the final 24-hour production-equivalent soak, each hard resource stays
+below 70% of its effective limit (at least 30% headroom): CPU, RAM, NIC
+throughput/packet rate, file descriptors, processes/tasks, node/API ports,
+PostgreSQL connections/storage and generator capacity. No positive unbounded
+RSS/FD/connection slope is allowed. Any saturation, dropped sample or generator
+headroom violation invalidates the interval rather than lowering the workload.
+
+## State interpretation
+
+- Registered camera count is capacity admission; it is not source or reader
+  activity.
+- `idle` is normal for `sourceOnDemand` with no reader.
+- Recent authorized demand without received media is `connecting`, then
+  `unavailable` after the bounded start window; it does not mark the node
+  unhealthy.
+- Deep `SOURCE`/`PATH` observations and their freshness are separate from
+  live ingest. Scheduler overload changes freshness, never camera health.
+- Failed attempts remain in every success-rate denominator.
+- Weakening a target requires an ADR and new baseline evidence.
+
+## Pinned MediaMTX v1.20.0 mapping
 
 | Meaning | Source | Pinned signal |
 |---|---|---|
 | Registered path configs | management API | paginated `/v3/config/paths/list` `itemCount` |
 | Runtime path/source state | metrics | `paths{name,state}` |
-| Readers per runtime path | metrics | `paths_readers{name,state,readerType}` |
-| Path traffic/errors | metrics | `paths_inbound_bytes`, `paths_outbound_bytes`, `paths_inbound_frames_in_error` |
+| Readers | metrics | `paths_readers{name,state,readerType}` |
+| Traffic/errors | metrics | `paths_inbound_bytes`, `paths_outbound_bytes`, `paths_inbound_frames_in_error` |
 | RTSP sessions | metrics | `rtsp_sessions{id,path,remoteAddr,state}` |
-| RTSP transport traffic/loss | metrics | non-deprecated `rtsp_sessions_*` counters |
+| RTSP transport | metrics | non-deprecated `rtsp_sessions_*` counters |
 
-The complete emitted family/label compatibility contract is versioned in
+The exact family/label contract is
 [`evidence/mediamtx-v1.20.0-metrics-schema.json`](evidence/mediamtx-v1.20.0-metrics-schema.json).
-MediaMTX v1.20.0 does not emit Prometheus `HELP`/`TYPE` declarations, so every
-collector query must use the pinned family semantics rather than infer a type.
-
-The runtime `paths` metric is not catalog cardinality: an on-demand configured
-path can be registered while absent from runtime metrics. Dashboard and capacity
-reports therefore keep registered configs, ready sources and readers separate.
-The platform-owned canonical-ID fallback matcher used for no-oracle auth is
-excluded from camera counts and protected from reconciler deletion.
-Session `id` and `remoteAddr` are high-cardinality labels; the future collector
-must aggregate/drop them before long-retention storage while preserving bounded
-per-path signals. Deprecated `*_bytes_received/sent` metrics are not used for
-new queries. An enabled `rtsps_*` family is a startup-contract violation.
-
-All pinned signals are collected with stable `node_id`; port/PID reuse must not
-merge time series from different node generations. Server views aggregate
-bounded per-node series and keep registered, active and occupied counts
-separate.
+MediaMTX does not emit Prometheus `HELP`/`TYPE`; consumers use the pinned
+semantics. An on-demand registered path may be absent from runtime metrics.
+High-cardinality session labels are aggregated before retention, while all
+series retain stable node ID and process generation so port/PID reuse cannot
+merge observations.

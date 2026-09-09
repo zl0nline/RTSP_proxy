@@ -44,9 +44,10 @@ arbitrary path, unit name or command.
 ## Services
 
 - `rtsp-proxy-web.service` — management HTTPS/control application boundary.
-- `rtsp-proxy@reconciler.service` — background reconciliation. The generic
-  template deliberately skips every other instance: the standalone `probe`
-  role is not implemented in this release and must not be enabled.
+- `rtsp-proxy@reconciler.service` — background reconciliation.
+- `rtsp-proxy@probe.service` — singleton periodic probe producer/worker. It
+  is enabled only with the root broker socket/service and a validated camera
+  source policy; passive-only profiles never open another source session.
 - `rtsp-proxy-collector.service` — dedicated read-only fleet collector.
 - `rtsp-proxy-notifier.service` — dedicated SMTP incident dispatcher.
 - `rtsp-proxy-media@<node-id>.service` — one MediaMTX process per media node.
@@ -471,8 +472,9 @@ controlled source-probe ffprobe is a separate release artifact under
 `libexec/rtsp-proxy-probe/ffprobe`: its exact FFmpeg source, local no-redirect
 patch, Ubuntu snapshot/toolchain and reproducible amd64/arm64 digests are bound
 by both the deployment catalog and the packaged verifier trust catalog. It is
-not interchangeable with `bin/ffprobe`, and release verification does not yet
-enable the Phase G executor. MediaMTX is built
+not interchangeable with `bin/ffprobe`. Release verification admits the
+artifact, while `configure_camera_sources.sh` and the explicit broker/worker
+activation steps enable execution for one site policy. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
 two SHA-256-bound production patches, one deterministic race-regression patch,
 and Go `1.26.5`; resulting amd64/arm64 binary
@@ -778,7 +780,7 @@ once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.16.2 \
+  --release-id 0.17.0 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -827,6 +829,13 @@ two can reach the accepted root broker. The worker uses the durable health
 projection and read-only node-runtime observer; ownership/schema/helper failure
 makes its readiness fail without changing camera health or media service.
 
+Candidate `0.17.0` retains schema 0024 and the pinned media/probe binaries.
+It adds demand-aware on-demand ingest diagnostics, the packaged
+`rtsp-proxy-operations` database backup/isolated-restore verifier and the
+single production admission runbook. It also rebases SSE heartbeat deadlines
+after bounded authorization checks so a slow epoch lookup cannot emit an extra
+stale heartbeat.
+
 ### Operator authentication modes
 
 There are two independent normal login paths, and they may be enabled at the
@@ -840,11 +849,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.16.2 candidate, apply migration 0024 and run:
+For a first installation of the 0.17.0 candidate, apply migration 0024 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.16.2 \
+  --release-id 0.17.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

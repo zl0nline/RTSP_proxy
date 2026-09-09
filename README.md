@@ -11,10 +11,10 @@
 камер.
 
 > [!IMPORTANT]
-> Проект готов к контролируемой установке на pilot-сервер, но пока имеет статус
-> **Production NO-GO**. До промышленного развёртывания нужны испытания с реальными
-> камерами, замер ёмкости целевого сервера и 24-часовой soak test. Начинайте с
-> одной ноды и нескольких камер.
+> Код и direct-Linux tooling имеют статус **production-functional**. Конкретное
+> развёртывание получает Production GO только после site-specific recovery,
+> SMTP, game-day, 24-hour soak и capacity evidence. Испытание 100 камер на ноду
+> пока явно отложено, поэтому текущий admission status — **HOLD**, а не GO.
 
 ## Что даёт система
 
@@ -74,18 +74,22 @@ restart прерывает только потоки выбранной ноды
 | Dashboard, RBAC, local login, optional local OIDC, audit и email | Реализовано |
 | HTTPS management boundary | Реализовано |
 | Immutable install, update и rollback tooling | Реализовано |
-| Глубокие source probes | Изолированный broker, profile UI/API и периодический worker реализованы; production load/soak gates открыты |
-| Реальные камеры, capacity и 24h soak | Прямая диагностика начата; proxy acceptance и нагрузочные gates не закрыты |
-| Production admission | **NO-GO** |
+| Глубокие source probes | Изолированный broker, profile UI/API и периодический worker реализованы |
+| On-demand ingest diagnostics | Idle/connecting/unavailable/ready разделены; глубокая проверка даёт безопасный reason code, если профиль разрешает вторую source-сессию |
+| Backup/restore | Консистентный snapshot, custom archive, exact-schema manifest и изолированный restore verifier реализованы |
+| Production operations | Единый admission/game-day/SMTP/recovery runbook опубликован |
+| Hardware capacity и 24h soak | Выполняются отдельно для каждого server/camera profile; configured limits не считаются evidence |
+| Production admission | **HOLD до site evidence и отложенного 100-camera gate** |
 
 Подробная матрица реализованных фаз и оставшихся gates находится в
 [Production plan](docs/PRODUCTION_PLAN.md), а воспроизводимые результаты — в
 [`docs/evidence/`](docs/evidence/).
 
-Текущие результаты и очередь работ:
-[аудит pilot-контура от 5 сентября 2026](docs/evidence/production-audit-2026-09-05.md).
+Текущие результаты, открытые внешние зависимости и точная формулировка HOLD:
+[Production readiness](docs/PRODUCTION_READINESS.md). Пошаговая эксплуатация:
+[Production runbook](deploy/PRODUCTION_RUNBOOK.md).
 
-## Быстрый старт для pilot-сервера
+## Быстрый старт direct-Linux сервера
 
 Поддерживаемый контур: direct Linux без Docker, Ubuntu 24.04 (amd64 или arm64),
 Python 3.12, systemd, PostgreSQL и nftables. Ubuntu 26.04 допускается для pilot
@@ -93,48 +97,18 @@ mechanism testing с отдельно установленными Python 3.12 �
 
 Полная пошаговая инструкция: **[Pilot installation, update and rollback](deploy/PILOT_INSTALL.md)**.
 
-Примеры установки соответствуют кандидату `0.16.2`; используйте только bundle
-из полностью успешного CI для его точного коммита. Release `0.13.1`
-исправляет загрузку local-auth credentials, а `0.13.2` также убирает скрытую
-зависимость installer-а от development venv в source checkout. Release `0.13.3`
-нормализует release tree, `0.13.4` — и root-managed Python независимо от
-пользовательского `umask`, а `0.13.5` создаёт закрытые runtime socket
-directories с группами, которым разрешено обращаться к helper-процессам. Release
-`0.13.6` также не изменяет владельца `.git/index` при проверке checkout из-под
-`sudo`, поэтому последующие обновления остаются доступны обычному оператору.
-Release `0.13.7` ожидает readiness до 30 секунд после systemd restart и не
-откатывает исправный релиз только из-за обычного времени запуска процессов.
-Release `0.13.8` разрешает встроенным local operator accounts выполнять
-штатные мутации нод и камер с тем же аудитом, что OIDC и break-glass identities.
-Release `0.13.9` сохраняет закрытые каталоги отдельных media nodes, но даёт их
-DynamicUser право пройти через общие runtime/state/log parents.
-Release `0.13.10` разрешает runtime helper только необходимый `CAP_SYS_PTRACE`
-для проверки identity DynamicUser-процесса и принимает канонический формат
-management permissions из MediaMTX API.
-Release `0.14.0` устраняет блокеры пилотного добавления камер: явно показывает
-пустую source-CIDR policy, принимает credentials камеры только отдельными полями,
-хранит их в PostgreSQL в шифрованном виде, сохраняет безопасные поля формы при
-ошибке и добавляет смену пароля локального оператора через dashboard/API/CLI.
-Кандидат `0.15.0` добавляет отмену диагностических запросов, политику периодических
-проверок и атомарное хранение состояния в schema 0023. Ветка `0.15.x` не включала
-фоновый worker. `0.15.1` дополнительно запрещает специальные адреса независимо
-от ширины source CIDR и проверяет поддельные протоколы на входе broker, а
-`0.15.3` закрепляет пассивный контроль односессионных камер: отдельные проверки
-запрещены даже для свободной камеры. Эти исторические кандидаты не являются
-production-допуском; установленный pilot `0.14.0` автоматически не обновляется.
-Подробнее: [границы реализации](docs/evidence/phase-g-routine-health-state.md).
+Текущий immutable candidate указан в release manifest и в
+[Production readiness](docs/PRODUCTION_READINESS.md). Используйте только bundle
+из полностью успешного CI run для exact 40-character commit; не собирайте
+«эквивалентный» bundle вручную и не переиспользуйте release ID. История старых
+кандидатов и исправлений остаётся в [`docs/evidence/`](docs/evidence/), но не
+является инструкцией установки.
 
-Кандидат `0.16.2` добавляет schema 0024, явный revision-fenced monitoring profile
-в Dashboard/API и singleton periodic worker. Активные SOURCE probes допускаются
-только при включённом профиле и подтверждённой ёмкости источника не менее двух;
-при одном или неизвестном числе сессий сохраняется passive-only режим. Worker
-использует только принятый root-broker boundary, а его сбой делает readiness
-неуспешной, не меняя состояние камеры и не затрагивая медиапоток.
-Release
-`0.13.0` несовместим с фактическим mode системных credentials и после
-активации уходит в restart loop. Dashboard привязывается к конкретному IP
-management LAN; доступ с другого компьютера требует маршрута и разрешённого
-TCP 8000 до этого IP.
+Schema 0024 содержит revision-fenced camera monitoring profiles и singleton
+periodic worker. Активный SOURCE probe разрешён только для профиля с явно
+подтверждённой source-session capacity не менее двух; неизвестная или единичная
+ёмкость всегда passive-only. Dashboard привязывается к конкретному management
+LAN IP и работает только по HTTPS.
 
 Минимальный порядок действий:
 
@@ -203,7 +177,7 @@ keyring сразу для WEB, reconciler, probe worker и broker можно о�
 
 ```sh
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.16.2 \
+  --release-id 0.17.0 \
   --source-cidrs '10.180.5.0/24,192.168.50.0/24'
 ```
 
@@ -239,7 +213,7 @@ Media nodes не перезапускаются массово: смена Media
 downgrade в работающей системе не поддерживается; после несовместимой migration
 нужен fix-forward или восстановление заранее сделанного PostgreSQL backup.
 
-## Проверка pilot
+## Проверка site admission
 
 Перед увеличением числа камер зафиксируйте:
 
@@ -281,7 +255,9 @@ uv run pytest -m contract tests/contract
 
 | Документ | Назначение |
 |---|---|
-| [Pilot install](deploy/PILOT_INSTALL.md) | Первая установка, update, rollback и real-camera gate |
+| [Install/update](deploy/PILOT_INSTALL.md) | Первая установка, update, rollback и real-camera gate |
+| [Production runbook](deploy/PRODUCTION_RUNBOOK.md) | Admission, backup/restore, game days, SMTP, soak и recovery |
+| [Production readiness](docs/PRODUCTION_READINESS.md) | Текущий PASS/SITE REQUIRED/DEFERRED status |
 | [Deployment runbook](deploy/README.md) | Полный direct-Linux layout, security и operations |
 | [Production plan](docs/PRODUCTION_PLAN.md) | Нормативная архитектура, roadmap и Definition of Done |
 | [Engineering context](CONTEXT.md) | Инварианты и правила разработки |

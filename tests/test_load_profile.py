@@ -663,12 +663,18 @@ def test_impaired_network_requires_two_generator_hosts() -> None:
         LoadProfile.model_validate(raw)
 
 
-def test_unimplemented_workload_drivers_fail_closed() -> None:
+def test_control_workload_rates_are_bounded_and_supported() -> None:
     raw = valid_profile()
     workload = raw["workload"]
     assert isinstance(workload, dict)
     workload["probe_rate_per_second"] = 1
-    with pytest.raises(ValidationError, match="probe_crud_drivers_not_implemented"):
+    workload["crud_rate_per_second"] = 0.5
+    profile = LoadProfile.model_validate(raw)
+    assert profile.workload.probe_rate_per_second == 1
+    assert profile.workload.crud_rate_per_second == 0.5
+
+    workload["probe_rate_per_second"] = 10.1
+    with pytest.raises(ValidationError):
         LoadProfile.model_validate(raw)
 
 
@@ -1419,6 +1425,8 @@ def test_functional_proxy_finalization_recomputes_real_sut_evidence_seam(
         total_readers=0,
         connect_rate_per_second=0,
         minimum_rtp_packets_per_second=0,
+        probe_rate_per_second=1,
+        crud_rate_per_second=1,
         endpoint_mode="proxy",
         session_temperature="warm",
     )
@@ -1615,6 +1623,38 @@ def test_functional_proxy_finalization_recomputes_real_sut_evidence_seam(
             boot_id="11111111-1111-1111-1111-111111111111",
             observed_at_unix_ms=scheduled_start_ms - 1000,
         ),
+    )
+
+    control_events = [
+        {
+            "schema_version": 1,
+            "request_id": f"00000000-0000-4000-8000-{index:012d}",
+            "operation": operation,
+            "target_sha256": hashlib.sha256(operation.encode()).hexdigest(),
+            "scheduled_at_unix_ms": scheduled_start_ms + index * 100,
+            "started_at_unix_ms": scheduled_start_ms + index * 100 + 10,
+            "completed_at_unix_ms": scheduled_start_ms + index * 100 + 50,
+            "outcome": "success",
+            "status_code": 200,
+            "reason_code": None,
+        }
+        for index, operation in enumerate(("probe", "crud"), start=1)
+    ]
+    control_raw = run_directory / "raw/control.jsonl"
+    control_raw.write_text(
+        "".join(json.dumps(event) + "\n" for event in control_events),
+        encoding="utf-8",
+    )
+    assert (
+        load_cli_main(
+            [
+                "summarize-control",
+                str(run_directory),
+                str(control_raw),
+                str(run_directory / "summary/control.json"),
+            ]
+        )
+        == 0
     )
 
     finalize_run_directory(run_directory)

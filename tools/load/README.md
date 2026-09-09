@@ -7,11 +7,14 @@ capacity envelopes are measured and published separately for each architecture.
 
 The current product topology is bounded media nodes: one MediaMTX process and
 external port per node, at most 100 registered cameras and one downstream
-reader per camera. The current harness still models one SUT and does not yet
-enforce the bounded-node/RTSP-453 or multi-SUT contracts. Phase C/G will add
-those profiles and orchestration before product qualification at 1/10/50/80/100
-inside one node and 1/5/10/25/50 nodes on one server (100 nodes is optional).
-Generic larger reader/burst profiles remain harness stress modes only.
+reader per camera. One sealed harness run qualifies one media-node SUT. A
+server ladder coordinates concurrent per-node runs and records the complete
+process/port map plus aggregate host resources in
+[`CAPACITY_WORKSHEET.md`](../../docs/CAPACITY_WORKSHEET.md); it must not merge
+independent node results into a fictitious single port. Product qualification
+uses 1/10/50/80/(owner-deferred 100) registered cameras per node and
+1/5/10/25/50 nodes only where the target server remains inside its measured
+envelope. Generic larger reader/burst profiles remain stress modes only.
 
 The source side is pull-only. `rtsp-pull-server` exposes prepared H.264/H.265
 fixtures as camera-like RTSP endpoints and MediaMTX connects on demand. Every
@@ -498,6 +501,37 @@ at one second. Direct and proxy `PLAY→first-decodable` percentiles are publish
 separately as GOP/keyframe contributions; unsynchronized source GOP phases are
 never subtracted from one another.
 
+## Probe and CRUD workload evidence
+
+Non-zero `probe_rate_per_second` and `crud_rate_per_second` are supported
+evidence axes. Generate those operations only against explicitly disposable
+load cameras through the normal authenticated API/worker boundaries. Do not
+give the native media generator management credentials and do not encode a
+camera source URL or secret in evidence.
+
+The site-side driver writes `raw/control.jsonl`, one JSON object per completed
+operation. Each object contains schema version 1, a unique UUIDv4
+`request_id`, `operation` (`probe` or `crud`), a secret-free
+`target_sha256`, scheduled/started/completed Unix millisecond timestamps,
+`outcome`, HTTP-like `status_code` and an optional bounded `reason_code`.
+Rejected and failed attempts remain in the denominator. Times must fit entirely
+inside the measurement-through-soak window and one operation is capped at 60
+seconds.
+
+Create the typed summary:
+
+```sh
+rtsp-proxy-load summarize-control RUN_DIR RUN_DIR/raw/control.jsonl \
+  RUN_DIR/summary/control.json
+```
+
+Finalization independently reparses the raw events, checks the configured rate
+within a one-percent scheduling tolerance, requires at least 99.9% success,
+gates CRUD p99 at one second and probe start lateness at the profile's bound.
+If either configured rate is non-zero, missing, altered or invalid control
+evidence makes finalization fail. A zero rate remains explicit evidence scope,
+not proof that control workload was exercised.
+
 ## Finalization and evidence boundary
 
 ```sh
@@ -530,14 +564,14 @@ proves compilation,
 runtime-manifest capture against real procfs/cgroup v2/dpkg/mapped libraries,
 scoped Linux camera-ingress `clsact/flower→IFB→netem`, H.264/H.265/Opus
 decodability, independent paths, fan-out, timing events, interruption failure
-and TCP-only sockets on Linux amd64/arm64. This green run does not assert a
-final Phase 0B exit-review PASS or production capacity. Qualification
-still requires dedicated hardware, production-equivalent LAN and camera-side WAN A/B,
-typical and worst GOP, the 1/10/50/80/100 per-node and 1/5/10/25/50 node-server
-baselines, the full lifecycle/fault matrix and
-a 24-hour production-equivalent soak. Until typed non-zero probe/CRUD drivers
-land, profiles containing those axes fail closed instead of silently producing
-partial evidence.
+and TCP-only sockets on Linux amd64/arm64. This green run does not assert
+production capacity. Qualification still requires dedicated hardware,
+production-equivalent LAN and camera-side WAN A/B, typical and worst GOP, the
+non-deferred per-node checkpoints, the target-server node ladder, full
+lifecycle/fault matrix and a 24-hour production-equivalent soak. The 100-camera
+checkpoint remains visibly deferred; it is never inferred from a smaller run.
+Non-zero probe/CRUD axes require the typed control evidence above and fail
+closed if it is absent.
 
 Run durations are not one undifferentiated hold: `ramp_end`,
 `measurement_start`, `measurement_end` and `soak_end` are deterministic launch

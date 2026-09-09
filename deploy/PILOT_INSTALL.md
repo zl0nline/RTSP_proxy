@@ -1,10 +1,11 @@
-# Пилотная установка, обновление и откат
+# Установка, обновление и откат direct-Linux сервера
 
-Эта инструкция предназначена для первых испытаний на direct-Linux сервере. Она
-устанавливает ту же структуру неизменяемых релизов и те же systemd-компоненты,
-которые проверяются в CI, но **не является допуском к промышленной эксплуатации**:
-production scheduling для Phase G, испытания с реальными камерами, soak test и
-подтверждение ёмкости оборудования пока не завершены.
+Эта инструкция описывает одинаковый механизм для первого pilot и production
+candidate на direct-Linux сервере. Она устанавливает структуру неизменяемых
+релизов и systemd-компоненты, проверяемые в CI, но сама по себе **не выдаёт
+допуск к промышленной эксплуатации**. Site admission выполняется по
+[`PRODUCTION_RUNBOOK.md`](PRODUCTION_RUNBOOK.md) и текущей
+[`production-readiness matrix`](../docs/PRODUCTION_READINESS.md).
 
 Интерфейс развёртывания содержит шесть команд:
 
@@ -28,7 +29,7 @@ production scheduling для Phase G, испытания с реальными �
 drain/preview/confirmed reconfigure, описанной в
 [deploy/README.md](README.md).
 
-## 1. Требования к pilot-серверу
+## 1. Требования к серверу
 
 Используйте выделенный systemd-сервер с Ubuntu 24.04 на amd64 или arm64, где
 установлены:
@@ -94,7 +95,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.16.2-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.17.0-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -116,7 +117,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.16.2-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.17.0-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -216,7 +217,7 @@ source venv:
 sudo systemd-run --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.16.2/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.17.0/.venv/bin/rtsp-proxy-migrate
 sudo -u postgres psql --dbname rtsp_proxy --tuples-only --no-align \
   --command 'SELECT version_num FROM alembic_version;'
 ```
@@ -237,7 +238,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.16.2 \
+  --release-id 0.17.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -269,7 +270,7 @@ WEB environment file и запустите `rtsp-proxy-local-operator --rotate-p
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.16.2 \
+  --release-id 0.17.0 \
   --username admin \
   --enroll-totp
 ```
@@ -281,7 +282,7 @@ sudo ./tools/configure_local_auth.sh \
 
 ### 5.1. Разрешённые сети и credentials исходных камер
 
-Политика кандидата `0.16.2`: если камера допускает только одно подключение к
+Политика кандидата `0.17.0`: если камера допускает только одно подключение к
 источнику (или её ёмкость неизвестна), отдельные SOURCE/PATH проверки запрещены,
 включая ручные. Зритель не должен ждать ffprobe. Используются только пассивные
 сведения существующего потока; без свежей глубокой проверки нельзя объявлять
@@ -296,7 +297,7 @@ sudo ./tools/configure_local_auth.sh \
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.16.2 \
+  --release-id 0.17.0 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -328,8 +329,8 @@ percent-encoding вручную) и никогда не возвращаются
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.16.2/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.16.2 \
+sudo /opt/rtsp-proxy/releases/0.17.0/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.17.0 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -409,7 +410,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.16.2-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.17.0-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -435,7 +436,7 @@ Deploy tool не объединяет шаги 1 и 3, потому что migra
 сделать предыдущее приложение несовместимым. После migration rollback разрешён,
 только если manifest целевого релиза всё ещё содержит точную live revision.
 
-Для перехода `0.14.0` → `0.16.2` сначала активируйте новый код на schema 0022,
+Для перехода `0.14.0` → `0.17.0` сначала активируйте новый код на schema 0022,
 проверьте smoke, затем выполните migration нового релиза до 0024. Старый manifest
 `0.14.0` допускает максимум 0022: после migration обычный rollback на него
 будет отклонён. Возврат потребует отдельной процедуры восстановления из backup,
@@ -477,14 +478,16 @@ identity из catalog, а также node drain/confirmation workflow. Deploy to
   потоке;
 - обычное FFmpeg-воспроизведение через interleaved TCP для каждого профиля
   камеры;
-- success, refusal, timeout и cleanup для source/path probes при всё ещё ручном
-  управлении scheduling;
+- success, refusal, timeout и cleanup для source/path probes через отдельные
+  worker и root broker;
 - CPU, RSS, file descriptors, network, PostgreSQL и MediaMTX metrics;
 - update с health rollback и один явный schema-compatible rollback.
 
-Только после стабильной работы малого pilot-контура переходите к проверке
-лимита 100 камер на ноду или нескольких нод. Ёмкость сервера определяется
-измерениями и не должна выводиться из настроенного значения `max_nodes`.
+Только после стабильной работы малого контура переходите к node/server ladder
+и 24-часовому soak по production runbook. Испытание 100 камер может быть явно
+отложено владельцем, но тогда применяется измеренный меньший operational cap и
+сохраняется HOLD на полный capacity claim. Ёмкость сервера никогда не выводится
+из `max_nodes`.
 
 ## 10. Если установка остановилась
 

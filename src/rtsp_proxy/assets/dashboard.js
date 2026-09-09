@@ -210,6 +210,7 @@
 
   const connection = live.querySelector("[data-live-connection]");
   const sourceState = live.querySelector("[data-live-source]");
+  const sourceReason = live.querySelector("[data-live-source-reason]");
   const occupied = live.querySelector("[data-live-occupied]");
   const received = live.querySelector("[data-live-received]");
   const sent = live.querySelector("[data-live-sent]");
@@ -242,11 +243,19 @@
       const labels = {
         ready: "готов",
         idle: "ожидает клиента",
+        connecting: "подключается к источнику",
         stale: "данные устарели",
         unavailable: "недоступен",
         unknown: "нет per-path state",
       };
       sourceState.textContent = labels[state.source_state] || "—";
+    }
+    if (sourceReason instanceof HTMLElement) {
+      const reasons = {
+        source_start_pending: "Авторизованный клиент запустил on-demand подключение; ожидаем источник.",
+        source_start_failed: "Источник не стал доступен после авторизованной попытки. Проверьте endpoint, сеть и credentials; глубокая проверка ниже уточнит причину, если она разрешена профилем камеры.",
+      };
+      sourceReason.textContent = reasons[state.source_reason] || "—";
     }
     if (occupied instanceof HTMLElement) {
       occupied.textContent = state.occupied === true ? "занят" : state.occupied === false ? "свободен" : "—";

@@ -1,50 +1,72 @@
-# Camera profile contract
+# Camera profile admission contract
 
-A camera model/firmware profile is required before production admission and is
-complete before pilot 100.
+Create one versioned profile for every vendor/model/firmware/media combination.
+A camera is not production-admitted until its profile passes or a named owner
+accepts each unknown. Never put source credentials or private URLs in this file.
 
-## Identity
+## Identity and ownership
 
-| Field | Requirement |
+| Field | Required value |
 |---|---|
-| Vendor/model | Exact manufacturer and model |
-| Firmware | Exact tested version/range |
-| Profile owner | Person/team responsible for validation |
-| Evidence date | Date of the latest compatibility run |
+| Profile ID / revision | Stable identifier and monotonically updated revision |
+| Vendor / exact model | TBD |
+| Firmware version/range | TBD |
+| Evidence date / admission ID | TBD |
+| Site and profile owner | TBD |
 
-## Media contract
+## Media and source contract
 
-| Field | Requirement |
+| Field | Required value |
 |---|---|
-| Main/sub paths | Canonical paths, no guessed discovery outside allowlist |
-| Codec/audio | H264/H265 and audio layout |
-| Bitrate/packet rate | Typical and measured peak |
-| GOP/keyframe interval | Typical and worst supported value |
-| RTSP transport | TCP interleaved must pass |
-| Keepalive/timeouts | Observed camera behavior |
-| Maximum source RTSP sessions | Measured under current load |
-| Proxy downstream readers | Exactly one; second client must receive RTSP 453 |
+| Main/sub path shapes | Credential-free redacted patterns; no guessed discovery |
+| Codec / resolution / audio | H264/H265 and exact audio layout |
+| Typical and peak bitrate/packet rate | Measured |
+| Typical and maximum GOP/keyframe interval | Measured |
+| RTSP transport | Interleaved TCP passes |
+| Keepalive/timeouts/redirects | Observed; redirects are unsupported |
+| Maximum simultaneous upstream sessions | Measured at representative load |
+| Monitoring policy | Passive-only, or SOURCE enabled only when upstream capacity ≥2 |
+| Required media types / probe interval | Explicit profile settings |
+| Downstream readers | Exactly one; second receives `453` |
+
+Unknown or one-session upstream capacity is always passive-only, including
+while `sourceOnDemand` is idle. Deep observation may not create a competing
+source session. Normal idle, recent-demand connecting/start failure and deep
+probe health are independent dashboard signals.
 
 ## Required evidence
 
-- ordinary FFmpeg `rtsp://` DESCRIBE/SETUP/PLAY/TEARDOWN;
-- source outage and recovery;
-- main/sub path validation;
-- cold start at typical and worst GOP;
-- additional-session preflight under existing load;
-- credential encoding cases without log leakage.
+- ordinary FFmpeg `rtsp://` DESCRIBE/SETUP/PLAY/TEARDOWN with advancing bytes;
+- main/sub path validation and exact unsupported-media behavior;
+- cold start at typical and maximum GOP;
+- source outage, authentication rejection and recovery;
+- one existing source session plus the claimed additional-session capacity;
+- winner stream continuity and exact `453` for a second downstream reader;
+- source credentials containing `$`, `%`, `@` and `:` through separate
+  raw fields, with no secret in logs/API/audit;
+- camera update/move/grant revoke isolation with an unrelated witness stream;
+- contribution to the final 24-hour capacity soak.
 
-Register the source as a credential-free `rtsp://host/path` URL. When the camera
-requires authentication, supply username and password through the separate
-fields; the control plane stores a camera-bound encrypted envelope and never
-returns the secret through API, dashboard or audit. Empty
-`RTSP_PROXY_PROBE_SOURCE_CIDRS` is a source-registration deny-all, distinct from
-the downstream internet/local allow-all behavior described below.
+The catalog stores a credential-free `rtsp://host/path` plus separate raw
+username/password fields. Operators must not percent-encode those fields; the
+server encodes reserved characters exactly once and stores a camera-bound
+AES-256-GCM envelope. API, dashboard and audit never return the secret.
 
-Unknown GOP or session limit blocks migration unless the owner records an
-explicit risk acceptance.
+`RTSP_PROXY_PROBE_SOURCE_CIDRS` is an exact site allowlist for source
+registration; empty means deny-all. Source admission resolves once, persists a
+literal IP/port plus policy/source digest and is invalidated by policy change.
+This is separate from downstream `internet`/`local` CIDRs, where both empty
+means allow-all at the direct-peer IP stage.
 
-The camera record also carries placement-independent access policy: normalized
-`internet` and `local` CIDRs plus downstream credentials. Empty CIDR sets mean
-allow-all at IP stage. Moving a camera to another media node may change its
-external port/URL but does not change the source profile.
+## Decision
+
+| Item | Value |
+|---|---|
+| Highest measured cameras/node for this profile | TBD |
+| Maximum admitted operational cameras/node | TBD |
+| Residual risks accepted by | TBD |
+| Decision (`PASS`, `HOLD`, `REJECT`) | TBD |
+
+The operational cap cannot exceed either the measured profile envelope or the
+server envelope. The owner-deferred 100-camera test remains visible when a
+lower cap is used.

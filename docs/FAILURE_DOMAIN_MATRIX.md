@@ -1,17 +1,29 @@
-# Failure-domain matrix
+# Failure-domain and game-day matrix
 
-| Failure | Expected established sessions | New sessions | Detection | Recovery evidence | Owner |
-|---|---|---|---|---|---|
-| Control-plane process | Continue if pinned MediaMTX contract proves | Fail closed; no positive auth cache | role readiness + callback errors | systemd restart + admission smoke | operations |
-| PostgreSQL on the server | Continue if node stays alive | Fail closed | DB/readiness/outbox lag | manual restart or PITR restore; RPO ≤5 min, control RTO ≤30 min | data/operations |
-| Media node | Lost on that node only | Rejected; no automatic reroute | external RTSP + node signals | alert operator, restart/inventory restore | media/operations |
-| Camera/source | Other paths continue | Affected path fails | source/path observations | camera recovery | site owner |
-| Auth callback/backend | Established only if pinned contract proves | Fail closed; no positive cache | auth SLI | control service restart + admission smoke | security |
-| Metrics collector | Media continues | Continue | dead-man/freshness | bounded catch-up | observability |
-| Release activation | Old release remains available | Hold until smoke | readiness/smoke | atomic symlink rollback | operations |
-| Node external port conflict | Affected node cannot start | Rejected on that port | bind/preflight + node health | rollback/reserve another port | operations |
-| Node port range exhausted | Existing sessions continue | New node creation rejected with explicit error | allocator metrics | expand approved range or free node | operations |
-| SMTP delivery | Media continues | Continue | outbox age/delivery result | bounded retry; deduplicated recovery mail | operations |
-| Physical server | All nodes lost | Unavailable | server/remote probes | manual server recovery; no cluster failover | operations |
+Run every applicable row on the exact site before GO. Keep an established
+reader on an unrelated path whenever the expected blast radius says it must
+continue. Record UTC start/end, injected fault, affected IDs, byte/session
+counters, readiness, incident/outbox result and recovery duration.
 
-Unknown behavior is a gate. It must not be filled with an optimistic assumption.
+| Fault / operation | Expected established sessions | New sessions / mutations | Detection | Required recovery proof |
+|---|---|---|---|---|
+| WEB/auth/reconciler restart | Continue | Fail closed or retry while unavailable | HTTPS readiness, callback errors | service returns ready; same media PID/session/bytes advance |
+| PostgreSQL stop | Continue while MediaMTX lives | Auth and authoritative mutations fail closed | DB/readiness/outbox lag | DB returns; control ready within RTO; no false positive auth cache |
+| One media process kill | Lost only on target node | Target rejected; other nodes continue | external RTSP plus generation-bound metrics | one failure incident; controlled restart; one recovery; unrelated readers uninterrupted |
+| Camera/source outage | Other paths continue | Affected path fails | demand/live state and optional deep source result | camera recovers without node-wide restart |
+| Auth callback failure | Established session follows pinned runtime contract | new admissions fail closed | auth readiness and RTSP result | callback returns; valid admission works; invalid remains rejected |
+| Collector stop/stale metrics | Media and admissions continue under safe persisted state | automatic placement observes candidates before provisioning | dead-man/freshness | bounded catch-up; no false camera/node failure |
+| Probe worker/broker failure | Media continues | deep observations become stale; no unsafe fallback probe | worker readiness/freshness | worker/broker ready; bounded observation resumes; no residue |
+| Notifier/SMTP outage | Media/control continue | incidents stay durable with bounded terminal semantics | outbox age/result | accepted and rejected drills; exactly one failure/recovery notification |
+| Update health failure | Old compatible release remains active | activation held/rolled back | receipt/readiness/journal | atomic symlink rollback; previous control ready; media unchanged |
+| One-node port change/restart | Target readers interrupted only after confirmation | target admission fenced; other nodes continue | preview/blast radius and node state | new endpoint returned; target recovers; unrelated readers uninterrupted |
+| External port conflict | Affected node cannot start | rejected on exact port | bind preflight/node result | release conflict or choose approved free port; no leaked reservation |
+| Port range or `max_nodes` exhaustion | Existing sessions continue | new node fails with typed error | allocator/API metric/log | free capacity or approved configuration change; retry succeeds once |
+| Occupied camera update/move/delete | Current reader continues unless exact force confirmation | ordinary mutation rejected | preview/current reader count | rejection audited; forced path affects only confirmed reader |
+| Non-empty node delete | All sessions continue | delete rejected | node/camera inventory | cameras moved/deleted first; stopped empty node can then be deleted |
+| Server reboot | All local sessions lost | unavailable | external dead-man | PostgreSQL/control/nodes recover in declared order; inventory/config match |
+| Database plus control-assets restore | unavailable during declared recovery | admissions held | recovery timer/checksums | RPO ≤5 min, control RTO ≤30 min, exact invariant comparison and credentialed smoke |
+| Physical server loss | All nodes lost | unavailable | remote probe | restore on replacement host from off-host assets; no automatic failover claim |
+
+Unknown behavior is a HOLD. A test is invalid if the unrelated-reader witness,
+timestamps, release identity or recovery proof is missing.

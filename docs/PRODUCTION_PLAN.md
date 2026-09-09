@@ -1,10 +1,10 @@
 # Production-план RTSP Proxy
 
-> Актуализировано 13 августа 2026 года по owner consensus и текущим телам
-> [issues #1–#14](https://github.com/zl0nline/RTSP_proxy/issues).
+> Актуализировано 10 сентября 2026 года по реализованному release contract,
+> owner consensus и текущим production gates.
 >
-> **ARCHITECTURE: BOUNDED MEDIA NODES · IMPLEMENTATION: IN PROGRESS ·
-> PRODUCTION: NO-GO UNTIL EVIDENCE**
+> **ARCHITECTURE: BOUNDED MEDIA NODES · FUNCTIONAL IMPLEMENTATION: COMPLETE ·
+> PRODUCTION: HOLD UNTIL SITE EVIDENCE**
 
 Этот документ — нормативный план продукта и реализации. Он заменяет прежнюю
 гипотезу «один MediaMTX до 10k, затем gateway/L7». Текущая topology выбрана
@@ -975,7 +975,7 @@ green. The exact evidence boundary is recorded in
 
 ### Phase F — dashboard, metrics and notifications
 
-Status: **IN PROGRESS**. The bounded collector, generation-bound per-path
+Status: **COMPLETE (functional contract)**. The bounded collector, generation-bound per-path
 metrics, persisted fleet snapshot API, incident state machine, durable SMTP
 dispatcher, digest-only PostgreSQL operator sessions, authoritative
 `authz_version` fencing, CSRF/RBAC HTTP boundary, browser-bound OIDC Code+PKCE
@@ -1024,9 +1024,10 @@ The browser never reads a media-node API or metric endpoint. The completed
 probe event source is implemented by the independently reviewed Phase-G
 schema-0020 foundation and is green in all seven native/external jobs in
 [CI run 33273481381](https://github.com/zl0nline/RTSP_proxy/actions/runs/33273481381):
-it reads only generation-fenced, secret-free durable observations. No production
-source executor is enabled; privileged executor evidence plus production
-load/cardinality evidence remain open. Exact live-update scope is
+it reads only generation-fenced, secret-free durable observations. The
+production probe worker and isolated root broker are implemented and native
+amd64/arm64 tested; site policy and production load/capacity evidence remain
+admission gates. Exact live-update scope is
 recorded in
 [`docs/evidence/phase-f-dashboard-live-updates-contract.md`](evidence/phase-f-dashboard-live-updates-contract.md).
 The camera access-administration slice is also implemented locally: it renders
@@ -1212,7 +1213,8 @@ mutation. Exact review and direct-Linux evidence is tracked in
 all seven native amd64/arm64 and external-browser jobs passed at commit
 `466e72feb6c5401dd4b281baabc07095b7173669` in
 [CI run 32708863738](https://github.com/zl0nline/RTSP_proxy/actions/runs/32708863738).
-No Phase-F completion claim is made yet.
+Phase F's functional contract is complete. Real SMTP relay acceptance and site
+game days remain production-admission evidence, not missing Phase-F code.
 
 - [x] node/camera pages and actions (read-only server/node overview, bounded
   camera catalog/detail and update/enable/disable/delete CI-green; camera move
@@ -1274,12 +1276,12 @@ Exit: operator workflows complete without direct DB/systemctl/MediaMTX access.
 
 ### Phase G — probes and production evidence
 
-Актуальный промежуточный аудит Linux pilot, результатов прямой проверки
-12 источников и очереди оставшихся работ:
-[2026-09-05](evidence/production-audit-2026-09-05.md). Прямая диагностика
-источника не закрывает proxy acceptance, capacity или soak gates.
+Текущий единый статус и разделение product/site gates:
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md). Исторический аудит
+[2026-09-05](evidence/production-audit-2026-09-05.md) сохраняется только как
+снимок того дня.
 
-Status: **IN PROGRESS / PRODUCTION NO-GO**. The independently reviewed and
+Status: **FUNCTIONAL CONTRACT COMPLETE / SITE QUALIFICATION IN PROGRESS**. The independently reviewed and
 native-CI-green foundation implements a
 bounded single-flight scheduler, hard global/per-node/per-site and independent
 SOURCE/PATH caps with typed diagnostics, controlled
@@ -1334,7 +1336,7 @@ impact is measured.
   independent review and privileged amd64/arm64; final signal/PID/FD ownership
   hardening is green in all seven jobs of
   [CI run 33314959484](https://github.com/zl0nline/RTSP_proxy/actions/runs/33314959484);
-  executor still disabled);
+  the executor was subsequently promoted after integrated native evidence);
 - [x] anonymous canonical ffconcat input primitive with a 16 KiB cap,
   `CLOEXEC` and immutable sealed-memfd validation (direct-Linux amd64 green;
   independent review and native amd64/arm64
@@ -1416,26 +1418,32 @@ impact is measured.
   does not prove spare upstream capacity. No fresh deep observation means unknown
   or stale deep health, not a new camera failure. Admission enforces this at
   submission and claim; see [policy evidence](evidence/phase-g-passive-only-policy.md).
-  The `0.15.0` candidate at `f783dd8` passed both independent reviews and all
-  nine native CI jobs in [run 33963164548](https://github.com/zl0nline/RTSP_proxy/actions/runs/33963164548).
-  Its schema-0022 bridge preserves encrypted camera credentials and admitted
-  endpoints before additive migration to 0023. The installed pilot remains
-  0.14.0; see the [limited real-camera media smoke](evidence/phase-g-live-camera-media-smoke.md).
+  Historical bridge/release evidence remains under [`evidence/`](evidence/).
+  The current candidate and live admission decision are maintained only in
+  [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md).
 - [x] encrypted camera source credentials with separate API/dashboard fields,
   camera-bound AES-GCM envelopes and versioned local keyring;
-- [ ] per-node 100-camera matrix;
-- [ ] multi-node server ladder and 24h soak;
-- [ ] chaos/failure/email/restore game days;
-- [ ] publish architecture/hardware-specific capacity envelope.
+- [x] schema/release-bound database backup and isolated restore verifier plus
+  one ordered production admission/game-day/recovery runbook;
+- [ ] per-node 100-camera matrix — explicitly deferred by owner, not passed;
+- [ ] site multi-node server ladder and 24h soak;
+- [ ] site chaos/failure/real-SMTP/restore game days;
+- [ ] publish site architecture/hardware-specific capacity envelope.
 
-Exit: explicit GO/HOLD for pilot.
+Exit: functional code is release-ready; site decision remains explicit
+GO/HOLD/ROLLBACK. Current repository-wide decision is HOLD.
 
-### Phase H — pilot
+### Phase H — site admission
 
-Waves: one node 10 -> one node 50 -> one node 100 -> 5 -> 10 -> 25 -> 50
-nodes. Up to 100 nodes requires explicit config/evidence approval.
+Use [`deploy/PRODUCTION_RUNBOOK.md`](../deploy/PRODUCTION_RUNBOOK.md) and
+[`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md). Node occupancy and
+server node count are independent axes: 1/10/50/80/(deferred 100) registered
+cameras per node, then 1/5/10/25/50 nodes only where hardware permits.
+Up to 100 nodes requires explicit configuration and separate evidence approval.
 
-Every wave has soak, comparison, incident review and GO/HOLD/ROLLBACK.
+Every wave has soak, comparison, incident review and GO/HOLD/ROLLBACK. A site
+that omits the 100-camera test records a lower measured operational cap and
+cannot publish a product-wide 100-camera capacity claim.
 
 ## 22. Review and CI policy
 

@@ -1245,6 +1245,9 @@ def test_postgres_auth_role_has_only_callback_permissions(
     assert persisted is not None
     assert persisted.pepper_key_id == "current"
     assert persisted.last_used_at is not None
+    assert admin_store.latest_camera_accesses((camera.id,)) == {
+        camera.id: persisted.last_used_at
+    }
     auth_engine = create_engine(auth_url)
     with pytest.raises(ProgrammingError), auth_engine.begin() as connection:
         connection.execute(

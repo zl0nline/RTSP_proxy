@@ -41,6 +41,7 @@ class CameraLiveEventType(StrEnum):
 class CameraSourceState(StrEnum):
     READY = "ready"
     IDLE = "idle"
+    CONNECTING = "connecting"
     STALE = "stale"
     UNAVAILABLE = "unavailable"
     UNKNOWN = "unknown"
@@ -226,6 +227,7 @@ class _CameraChannel:
     latest_probe_event: CameraLiveEvent | None = None
     latest_probe_completed_at: datetime | None = None
     latest_probe_observation_id: UUID | None = None
+    latest_access_at: datetime | None = None
 
 
 class CameraLiveSubscription:
@@ -286,7 +288,11 @@ class CameraLiveSubscription:
                 if now >= self._next_heartbeat:
                     if not await self._authorization_current():
                         continue
-                    self._next_heartbeat = now + self._heartbeat_seconds
+                    # Authorization can block close to its full bounded
+                    # timeout. Rebase from completion so a now-overdue
+                    # heartbeat cannot outrun the next epoch check and expose
+                    # one stale event after session revocation.
+                    self._next_heartbeat = loop.time() + self._heartbeat_seconds
                     return CameraLiveEvent(
                         event_type=CameraLiveEventType.HEARTBEAT,
                         data={"authz_version": self._authz_version},
@@ -353,6 +359,7 @@ class CameraLiveUpdates:
         probe_observations: ProbeObservationReader | None = None,
         resolve_targets: Callable[[tuple[UUID, ...]], Mapping[UUID, tuple[PublicId, UUID]]]
         | None = None,
+        resolve_accesses: Callable[[tuple[UUID, ...]], Mapping[UUID, datetime]] | None = None,
         authorize_sessions: Callable[[tuple[UUID, ...]], Mapping[UUID, int]] | None = None,
         poll_interval_seconds: float = 5,
         heartbeat_seconds: float = 15,
@@ -366,6 +373,8 @@ class CameraLiveUpdates:
         refresh_wait_timeout_seconds: float = 2,
         metric_interval_seconds: float = 5,
         channel_ttl_seconds: float = 300,
+        source_start_timeout_seconds: float = 10,
+        source_failure_visibility_seconds: float = 300,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = lambda: asyncio.get_running_loop().time(),
     ) -> None:
@@ -396,9 +405,17 @@ class CameraLiveUpdates:
             raise ValueError("live_metric_interval_invalid")
         if not 1 <= channel_ttl_seconds <= 3600:
             raise ValueError("live_channel_ttl_invalid")
+        if (
+            not 1 <= source_start_timeout_seconds <= 60
+            or not source_start_timeout_seconds
+            < source_failure_visibility_seconds
+            <= 3600
+        ):
+            raise ValueError("live_source_demand_window_invalid")
         self._reader = reader
         self._probe_observations = probe_observations
         self._resolve_targets = resolve_targets
+        self._resolve_accesses = resolve_accesses
         self._authorize_sessions = authorize_sessions
         self._poll_interval_seconds = poll_interval_seconds
         self._heartbeat_seconds = heartbeat_seconds
@@ -412,6 +429,8 @@ class CameraLiveUpdates:
         self._refresh_wait_timeout_seconds = refresh_wait_timeout_seconds
         self._metric_interval_seconds = metric_interval_seconds
         self._channel_ttl_seconds = channel_ttl_seconds
+        self._source_start_timeout_seconds = source_start_timeout_seconds
+        self._source_failure_visibility_seconds = source_failure_visibility_seconds
         self._clock = clock
         self._monotonic = monotonic
         self._channels: dict[UUID, _CameraChannel] = {}
@@ -523,6 +542,7 @@ class CameraLiveUpdates:
             raise LiveUpdateUnavailable("live_authorization_unavailable") from None
         if current_authz_version != authz_version:
             raise LiveUpdateUnavailable("live_authorization_changed")
+        initial_access = await self._initial_access(target.camera_id)
         subscription: CameraLiveSubscription | None = None
         try:
             async with self._lock:
@@ -533,6 +553,8 @@ class CameraLiveUpdates:
                     self._rejected_subscriptions_total += 1
                     raise LiveStreamLimitReached("live_stream_capacity")
                 channel = self._get_or_create_channel(target)
+                if initial_access is not None:
+                    channel.latest_access_at = initial_access
                 self._observe_channel(channel, self._latest_index)
                 subscription = CameraLiveSubscription(
                     owner=self,
@@ -563,8 +585,11 @@ class CameraLiveUpdates:
 
     async def current(self, target: CameraLiveTarget) -> CameraLiveEvent:
         await self._ensure_recent_snapshot()
+        initial_access = await self._initial_access(target.camera_id)
         async with self._lock:
             channel = self._get_or_create_channel(target)
+            if initial_access is not None:
+                channel.latest_access_at = initial_access
             channel.last_access = self._monotonic()
             self._observe_channel(channel, self._latest_index)
             if not channel.history:
@@ -604,6 +629,7 @@ class CameraLiveUpdates:
 
     async def _refresh_from_reader(self) -> None:
         resolve_targets = self._resolve_targets
+        resolve_accesses = self._resolve_accesses
         probe_observations = self._probe_observations
         async with self._lock:
             active_camera_ids = tuple(
@@ -616,7 +642,7 @@ class CameraLiveUpdates:
                     key=lambda camera_id: camera_id.int,
                 )
             )
-        snapshot_result, targets_result, probes_result = await asyncio.gather(
+        snapshot_result, targets_result, probes_result, accesses_result = await asyncio.gather(
             self._run_owned_sync(self._reader.current_snapshot),
             self._run_owned_sync(
                 lambda: (
@@ -632,14 +658,26 @@ class CameraLiveUpdates:
                     else probe_observations.latest_for(active_camera_ids)
                 )
             ),
+            self._run_owned_sync(
+                lambda: (
+                    {}
+                    if not active_camera_ids or resolve_accesses is None
+                    else resolve_accesses(active_camera_ids)
+                )
+            ),
             return_exceptions=True,
         )
         snapshot = None if isinstance(snapshot_result, BaseException) else snapshot_result
         resolved_targets = None if isinstance(targets_result, BaseException) else targets_result
         latest_probes = None if isinstance(probes_result, BaseException) else probes_result
+        latest_accesses = (
+            None if isinstance(accesses_result, BaseException) else accesses_result
+        )
         async with self._lock:
             if active_camera_ids and resolve_targets is not None:
                 self._observe_authoritative_targets(active_camera_ids, resolved_targets)
+            if latest_accesses is not None:
+                self._observe_accesses(active_camera_ids, latest_accesses)
             self._observe(snapshot)
             if latest_probes is not None:
                 self._observe_probe_results(active_camera_ids, latest_probes)
@@ -713,6 +751,24 @@ class CameraLiveUpdates:
         worker.add_done_callback(self._worker_tasks.discard)
         return cast(_T, await asyncio.shield(worker))
 
+    async def _initial_access(self, camera_id: UUID) -> datetime | None:
+        resolver = self._resolve_accesses
+        if resolver is None:
+            return None
+        try:
+            accesses = await asyncio.wait_for(
+                self._run_owned_sync(lambda: resolver((camera_id,))),
+                timeout=self._refresh_wait_timeout_seconds,
+            )
+        except Exception:
+            return None
+        if set(accesses).difference({camera_id}):
+            return None
+        observed_at = accesses.get(camera_id)
+        if observed_at is None or observed_at.tzinfo is None:
+            return None
+        return observed_at
+
     def _observe_authoritative_targets(
         self,
         camera_ids: tuple[UUID, ...],
@@ -753,6 +809,7 @@ class CameraLiveUpdates:
         channel.latest_probe_event = None
         channel.latest_probe_completed_at = None
         channel.latest_probe_observation_id = None
+        channel.latest_access_at = None
         resync = _resync_event(reason=reason)
         for session_id, subscription in tuple(channel.subscribers.items()):
             self._resync_required_total += 1
@@ -798,6 +855,8 @@ class CameraLiveUpdates:
             channel,
             index,
             metric_interval_seconds=self._metric_interval_seconds,
+            source_start_timeout_seconds=self._source_start_timeout_seconds,
+            source_failure_visibility_seconds=self._source_failure_visibility_seconds,
         )
         if (
             channel.previous_projection is not None
@@ -861,6 +920,22 @@ class CameraLiveUpdates:
                     channel.subscribers.pop(session_id, None)
                     self._session_subscriptions.pop(session_id, None)
                     self._authorization_epochs.pop(session_id, None)
+
+    def _observe_accesses(
+        self,
+        camera_ids: tuple[UUID, ...],
+        accesses: Mapping[UUID, datetime],
+    ) -> None:
+        if set(accesses).difference(camera_ids):
+            return
+        for camera_id in camera_ids:
+            channel = self._channels.get(camera_id)
+            if channel is None:
+                continue
+            observed_at = accesses.get(camera_id)
+            if observed_at is not None and observed_at.tzinfo is None:
+                continue
+            channel.latest_access_at = observed_at
 
     def _clear_probe_result(self, channel: _CameraChannel) -> None:
         if channel.latest_probe_event is None:
@@ -1005,6 +1080,8 @@ def _project_camera(
     index: _SnapshotIndex | None,
     *,
     metric_interval_seconds: float,
+    source_start_timeout_seconds: float,
+    source_failure_visibility_seconds: float,
 ) -> _CameraProjection:
     target = channel.target
     if index is None or not channel.target_available:
@@ -1118,6 +1195,19 @@ def _project_camera(
         CameraSourceState.UNKNOWN,
     }:
         source_state = CameraSourceState.STALE
+    source_reason: str | None = None
+    if (
+        source_state is CameraSourceState.IDLE
+        and path.received_bytes_total == 0
+        and channel.latest_access_at is not None
+    ):
+        demand_age = (snapshot.generated_at - channel.latest_access_at).total_seconds()
+        if demand_age < source_start_timeout_seconds:
+            source_state = CameraSourceState.CONNECTING
+            source_reason = "source_start_pending"
+        elif demand_age <= source_failure_visibility_seconds:
+            source_state = CameraSourceState.UNAVAILABLE
+            source_reason = "source_start_failed"
     if source_state is not CameraSourceState.READY:
         received_rate = None
         sent_rate = None
@@ -1133,6 +1223,7 @@ def _project_camera(
             sent_bitrate_bps=sent_rate,
             counters_reset=counters_reset,
             metric_gap=metric_gap,
+            source_reason=source_reason,
         ),
         observed_at=observed_at,
         node_id=node.node_id,
@@ -1152,6 +1243,7 @@ def _state_data(
     sent_bitrate_bps: float | None,
     counters_reset: bool = False,
     metric_gap: bool = False,
+    source_reason: str | None = None,
 ) -> Mapping[str, object]:
     return {
         "camera_id": str(target.camera_id),
@@ -1164,6 +1256,7 @@ def _state_data(
         "scrape_status": scrape_status.value,
         "sent_bitrate_bps": sent_bitrate_bps,
         "source_state": source_state.value,
+        "source_reason": source_reason,
     }
 
 

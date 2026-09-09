@@ -1774,6 +1774,13 @@ class InMemoryNodeStore:
                 if camera.id in selected and camera.state is not CameraState.DELETED
             )
 
+    def latest_camera_accesses(
+        self, camera_ids: tuple[UUID, ...]
+    ) -> dict[UUID, datetime]:
+        if not 1 <= len(camera_ids) <= 256 or len(frozenset(camera_ids)) != len(camera_ids):
+            raise ValueError("camera_live_target_batch_invalid")
+        return {}
+
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         with self._lock:
             node_names = {node.id: node.name for node in self._nodes}
@@ -3607,12 +3614,7 @@ class CameraControl:
         self,
         camera_ids: tuple[UUID, ...],
     ) -> dict[UUID, tuple[PublicId, UUID]]:
-        if (
-            not 1 <= len(camera_ids) <= 256
-            or len(frozenset(camera_ids)) != len(camera_ids)
-            or any(camera_id.version != 4 for camera_id in camera_ids)
-        ):
-            raise ValueError("camera_live_target_batch_invalid")
+        _validate_camera_live_batch(camera_ids)
         try:
             placements = self._store.get_cameras(camera_ids)
         except Exception:
@@ -3621,6 +3623,13 @@ class CameraControl:
             camera.id: (camera.public_id, camera.node_id)
             for camera in placements
         }
+
+    def live_accesses(self, camera_ids: tuple[UUID, ...]) -> dict[UUID, datetime]:
+        _validate_camera_live_batch(camera_ids)
+        try:
+            return self._store.latest_camera_accesses(camera_ids)
+        except Exception:
+            raise CameraCatalogUnavailable("camera_live_accesses_unavailable") from None
 
     def catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage:
         try:
@@ -3929,6 +3938,10 @@ class CameraStore(Protocol):
 
     def get_cameras(self, camera_ids: tuple[UUID, ...]) -> tuple[CameraPlacement, ...]: ...
 
+    def latest_camera_accesses(
+        self, camera_ids: tuple[UUID, ...]
+    ) -> dict[UUID, datetime]: ...
+
     def camera_catalog(self, query: CameraCatalogQuery) -> CameraCatalogPage: ...
 
     def camera_detail(self, camera_id: UUID) -> CameraCatalogItem | None: ...
@@ -4190,6 +4203,15 @@ def is_node_eligible(
         and not node.maintenance
         and node.registered_cameras < node.camera_capacity
     )
+
+
+def _validate_camera_live_batch(camera_ids: tuple[UUID, ...]) -> None:
+    if (
+        not 1 <= len(camera_ids) <= 256
+        or len(frozenset(camera_ids)) != len(camera_ids)
+        or any(camera_id.version != 4 for camera_id in camera_ids)
+    ):
+        raise ValueError("camera_live_target_batch_invalid")
 
 
 def _require_node_command_fence(

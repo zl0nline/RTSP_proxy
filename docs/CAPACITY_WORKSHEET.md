@@ -1,52 +1,78 @@
-# Capacity worksheet
+# Capacity and soak worksheet
 
-Every run records independent workload axes. Blank cells mean unknown, not zero.
+Create one copy per hardware/workload envelope. Blank means unknown, never zero.
+A configured 100 cameras/node or 50 nodes/server is an admission ceiling, not a
+capacity result.
 
-## Manifest
+## Immutable manifest
 
 | Field | Value |
 |---|---|
-| Release ID / git commit | TBD |
-| MediaMTX version / binary SHA-256 | TBD |
-| Architecture (`amd64` or `arm64`) | TBD |
-| Linux distribution / kernel | TBD |
-| CPU / RAM / NIC / storage | TBD |
+| Admission ID / UTC window | TBD |
+| Release ID / 40-character commit / manifest SHA-256 | TBD |
+| Schema / MediaMTX identity and SHA-256 | TBD |
+| Architecture / distribution / kernel | TBD |
+| CPU model/count / RAM / NIC / storage | TBD |
 | sysctl / ulimit / systemd limits | TBD |
-| Generator hosts and headroom | TBD |
-| Network topology / netem | TBD |
-| Node count / node process map | TBD |
-| Configured max_nodes / port range | TBD |
+| PostgreSQL version/config/storage | TBD |
+| Generator A and B hardware/headroom | TBD |
+| Camera-side WAN/LAN topology and netem | TBD |
+| Camera profile evidence links | TBD |
+| `max_nodes`, node/API/RTSP port ranges | TBD |
 
-## Workload
+## Independent workload axes
 
 | Axis | Value |
 |---|---:|
+| Node count and per-node process map | TBD |
 | Registered/enabled paths per node | TBD |
-| Active sources per node | TBD |
-| Occupied readers per node | TBD |
-| Node occupancy distribution | TBD |
-| Bitrate / packet rate | TBD |
-| Codec / audio / GOP | TBD |
-| Connect/disconnect churn | TBD |
-| CRUD / probes / metrics load | TBD |
+| Concurrent source pulls per node | TBD |
+| Occupied downstream readers per node | TBD |
+| Occupancy distribution, including uneven nodes | TBD |
+| Codec/audio/GOP | TBD |
+| Typical/peak bitrate and packet rate | TBD |
+| Reader connect/disconnect rate | TBD |
+| Camera CRUD rate and operation mix | TBD |
+| SOURCE/PATH probe rate | TBD |
+| Metrics/dashboard poll rate | TBD |
+| Injected latency/loss/faults | TBD |
+
+Both generator hosts must be distinct from the system under test and each stay
+below 70% of CPU, RAM, NIC, FD and process limits. Any zero probe/CRUD rate must
+be explicitly justified; it cannot qualify the full production envelope.
+
+## Ladder
+
+Run node occupancy and server process count as independent dimensions. Standard
+node checkpoints are 1, 10, 50 and 80 registered cameras plus the owner-deferred
+100-camera checkpoint. Server checkpoints are 1, 5, 10, 25 and 50 nodes when
+hardware permits. Stop at the first failing checkpoint and publish the previous
+passing envelope; never extrapolate.
+
+| Run | Nodes | Registered/node | Sources/node | Readers/node | Churn | CRUD | Probe | Duration | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| baseline | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| ladder | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| final soak | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 24h | TBD |
 
 ## Results
 
 | Resource or SLI | p50 | p95 | p99 / peak | Gate | Pass |
 |---|---:|---:|---:|---:|---|
-| Warm DESCRIBE→PLAY | TBD | TBD | TBD | ≤500ms p99 | TBD |
-| Cold proxy overhead | TBD | TBD | TBD | ≤1s p99 | TBD |
-| CPU | TBD | TBD | TBD | <70% | TBD |
-| RAM | TBD | TBD | TBD | <70% | TBD |
-| NIC / packet rate | TBD | TBD | TBD | <70% | TBD |
-| File descriptors | TBD | TBD | TBD | <70% limit | TBD |
+| Warm DESCRIBE→PLAY | TBD | TBD | TBD | ≤500 ms p99 | TBD |
+| Cold proxy overhead | TBD | TBD | TBD | ≤1 s p99 | TBD |
 | Handshake success | TBD | TBD | TBD | ≥99.9% | TBD |
+| Established stream resets/loss | TBD | TBD | TBD | no unexplained reset | TBD |
+| Catalog read / mutation | TBD | TBD | TBD | ≤200 ms / ≤1 s p99 | TBD |
+| Observation freshness | TBD | TBD | TBD | ≥95% within 2× interval | TBD |
+| CPU | TBD | TBD | TBD | <70% | TBD |
+| RAM / RSS slope | TBD | TBD | TBD | <70%; no positive leak | TBD |
+| NIC throughput / packet rate | TBD | TBD | TBD | <70% | TBD |
+| File descriptors / tasks | TBD | TBD | TBD | <70%; no positive leak | TBD |
+| PostgreSQL connections/storage | TBD | TBD | TBD | <70%; no positive leak | TBD |
+| Generator A/B headroom | TBD | TBD | TBD | both <70% | TBD |
 
-Publish raw series, failures and slopes with this summary. An average aggregate
-cannot hide saturation of one workload axis.
-
-Qualification is two-level: first one node at 1/10/50/80/100 registered
-cameras, then one server at 1/5/10/25/50 nodes. Optional 100-node runs require
-an explicit config/port-range change. The worksheet must report both aggregate
-server usage and per-node process attribution. A configured node limit is not a
-capacity result.
+Attach raw timestamped series, event/failure rows, run manifest, verifier report
+and SHA-256 inventory. Report the highest passing node occupancy and server node
+count separately. If the 100-camera run is deferred, state that limitation in
+the decision and enforce a lower operational cap.
