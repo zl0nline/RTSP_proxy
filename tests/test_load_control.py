@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid1
 
 import pytest
 
 from rtsp_proxy.load_control import (
+    ControlOperationSummary,
     ControlWorkloadEvent,
+    ControlWorkloadSummary,
     load_control_events,
+    sha256_file,
     summarize_control_events,
 )
 from rtsp_proxy.load_profile import EvidenceSampling, LoadProfile, WorkloadAxes
@@ -144,3 +147,110 @@ def test_control_event_rejects_secret_shaped_or_inconsistent_result_fields() -> 
     payload["reason_code"] = "request_failed"
     with pytest.raises(ValueError, match="control_event_success_reason_present"):
         ControlWorkloadEvent.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("update", "reason"),
+    [
+        ({"request_id": uuid1()}, "control_event_request_id_not_uuid4"),
+        ({"started_at_unix_ms": START - 1}, "control_event_timing_invalid"),
+        ({"outcome": "failed", "status_code": 200, "reason_code": "failed"},
+         "control_event_status_outcome_mismatch"),
+        ({"outcome": "failed", "status_code": 503, "reason_code": None},
+         "control_event_failure_reason_missing"),
+    ],
+)
+def test_control_event_rejects_identity_timing_and_result_contradictions(
+    update: dict[str, object],
+    reason: str,
+) -> None:
+    payload = _event(1, operation="probe", scheduled_at=START).model_dump(mode="json")
+    payload.update(update)
+    with pytest.raises(ValueError, match=reason):
+        ControlWorkloadEvent.model_validate(payload)
+
+
+def test_control_loader_and_summary_reject_empty_or_unreproducible_evidence(
+    tmp_path: Path,
+) -> None:
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="control_events_empty"):
+        load_control_events(empty)
+
+    invalid = tmp_path / "invalid.jsonl"
+    invalid.write_text("not-json\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="control_event_invalid"):
+        load_control_events(invalid)
+    with pytest.raises(ValueError, match="control_events_file_invalid"):
+        load_control_events(tmp_path)
+
+    event = _event(1, operation="probe", scheduled_at=START + 1_000)
+    with pytest.raises(ValueError, match="control_summary_input_invalid"):
+        summarize_control_events(
+            _profile(),
+            (event,),
+            events_sha256="not-a-digest",
+            measurement_start_unix_ms=START,
+            workload_end_unix_ms=START + 10_000,
+        )
+    assert sha256_file(empty) == hashlib.sha256(b"").hexdigest()
+
+
+def test_control_summary_gates_probe_lateness_and_crud_completion() -> None:
+    probe = _event(1, operation="probe", scheduled_at=START + 1_000).model_copy(
+        update={
+            "started_at_unix_ms": START + 1_400,
+            "completed_at_unix_ms": START + 1_450,
+        }
+    )
+    crud = _event(2, operation="crud", scheduled_at=START + 2_000).model_copy(
+        update={"completed_at_unix_ms": START + 3_100}
+    )
+    summary = summarize_control_events(
+        _profile(probe_rate=0.1, crud_rate=0.1),
+        (probe, crud),
+        events_sha256="d" * 64,
+        measurement_start_unix_ms=START,
+        workload_end_unix_ms=START + 10_000,
+    )
+    assert summary.valid is False
+    assert summary.invalid_reasons == (
+        "control_crud_p99_above_one_second",
+        "control_probe_start_lateness_above_profile",
+    )
+
+
+def test_control_summary_models_reject_inconsistent_derived_values() -> None:
+    operation: dict[str, object] = {
+        "expected_rate_per_second": 0,
+        "expected_minimum_count": 0,
+        "expected_maximum_count": 0,
+        "observed_count": 1,
+        "success_count": 0,
+        "rejected_count": 0,
+        "failed_count": 0,
+        "observed_rate_per_second": 0,
+        "success_percent": 0,
+        "p99_start_lateness_ms": 0,
+        "p99_completion_ms": 0,
+    }
+    with pytest.raises(ValueError, match="control_summary_counts_invalid"):
+        ControlOperationSummary.model_validate(operation)
+
+    valid_operation = dict(operation)
+    valid_operation.update({"observed_count": 0, "p99_start_lateness_ms": None,
+                            "p99_completion_ms": None})
+    with pytest.raises(ValueError, match="control_summary_invalid"):
+        ControlWorkloadSummary.model_validate(
+            {
+                "schema_version": 1,
+                "events_sha256": "e" * 64,
+                "measurement_start_unix_ms": START,
+                "workload_end_unix_ms": START + 1_000,
+                "probe": valid_operation,
+                "crud": valid_operation,
+                "valid": True,
+                "invalid_reasons": ("failure",),
+            }
+        )
