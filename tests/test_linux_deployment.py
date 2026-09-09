@@ -152,6 +152,8 @@ def test_collector_has_a_dedicated_read_only_helper_boundary() -> None:
     assert metrics_socket["SocketMode"] == "0660"
     assert metrics_socket["DirectoryMode"] == "0750"
     assert metrics_helper["Service"]["Environment"] == ("RTSP_PROXY_NODE_HELPER_READ_ONLY=true")
+    assert metrics_helper["Service"]["CapabilityBoundingSet"] == "CAP_SYS_PTRACE"
+    assert metrics_helper["Service"]["AmbientCapabilities"] == ""
     assert metrics_helper["Service"]["ReadOnlyPaths"] == (
         "/etc/rtsp-proxy/nodes /etc/rtsp-proxy/control-plane/access-peppers.json"
     )

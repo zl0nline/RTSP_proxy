@@ -611,6 +611,11 @@ def test_linux_host_installs_only_static_assets_and_examples(
     assert (
         paths.root / "etc/rtsp-proxy/examples/rtsp-proxy-web-local-auth.conf.example"
     ).is_file()
+    assert (
+        "/usr/bin/systemd-tmpfiles",
+        "--create",
+        str(paths.root / "usr/lib/tmpfiles.d/rtsp-proxy-probe-broker.conf"),
+    ) in commands
     assert commands[-1] == ("/usr/bin/systemctl", "daemon-reload")
 
 

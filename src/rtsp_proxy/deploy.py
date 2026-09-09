@@ -232,6 +232,14 @@ class LinuxDeploymentHost:
             "--create",
             str(self._paths.root / "usr/lib/tmpfiles.d/rtsp-proxy.conf"),
         )
+        self._run(
+            Path("/usr/bin/systemd-tmpfiles"),
+            "--create",
+            str(
+                self._paths.root
+                / "usr/lib/tmpfiles.d/rtsp-proxy-probe-broker.conf"
+            ),
+        )
         self._run(Path("/usr/bin/systemctl"), "daemon-reload")
 
     def database_revision(self, release: Path, environment_file: Path) -> str:
