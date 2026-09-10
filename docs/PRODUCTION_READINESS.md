@@ -13,7 +13,7 @@ explicit owner decision, not an implicit pass.
 
 | Item | Value |
 |---|---|
-| Application candidate | `0.17.3` |
+| Application candidate | `0.17.4` |
 | Git commit | exact 40-character value from the immutable bundle manifest |
 | Database head | `0024_camera_probe_profiles` |
 | Media runtime | `v1.20.0-rtsp-proxy.3` |
@@ -35,7 +35,7 @@ file is being prepared as part of that same release change.
 | Camera CRUD, move, drain, forced operations and delete guards | PASS (contract); SITE REQUIRED game day | Automated transactional tests plus the site game-day record |
 | ACL, downstream grants, local login, TOTP, RBAC and audit | PASS | Native/unit security suites; admission still requires site operator-login and grant drills |
 | HTTPS management boundary and secret handling | PASS (contract); SITE REQUIRED certificate | Release verifier and deployment tests; CA-issued site certificate/SAN and secret inventory are local evidence |
-| Automatic placement with stale runtime state | PASS | Placement observes and persists candidate runtime state before deciding to provision |
+| Placement and move targets with stale runtime state | PASS | Both paths observe and persist plausible candidate runtime state through the guarded write-side helper before applying freshness filters |
 | Source credentials with reserved characters | PASS | Raw separate-field contract and exact encode-once regression; percent-encoded operator input is rejected by documented UI guidance |
 | On-demand ingest diagnosis | PASS | Idle, connecting, unavailable and ready are derived without opening an unsafe second upstream session; active probe reason remains independent |
 | Isolated source probe worker/broker | PASS | Native amd64/arm64 broker, BPF, cancellation, policy and worker suites |

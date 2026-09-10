@@ -374,6 +374,7 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
             ),
             new_move_id=uuid4,
             management_freshness_seconds=settings.node_management_freshness_seconds,
+            node_refresher=node_control,
         )
     )
     probe_endpoint_admission = ProbeEndpointAdmission(

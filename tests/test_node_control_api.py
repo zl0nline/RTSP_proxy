@@ -3617,6 +3617,73 @@ def test_automatic_camera_creation_refreshes_stale_capacity_before_provisioning(
     assert runtime.calls == [(NodeRuntimeAction.OBSERVE, existing_node_id)]
 
 
+def test_camera_move_targets_refresh_stale_healthy_nodes_before_filtering() -> None:
+    now = datetime.now(UTC)
+    source_node_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_node_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    store = InMemoryNodeStore(
+        nodes=(
+            MediaNode(
+                id=source_node_id,
+                name="source-edge",
+                external_port=12000,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now,
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+            MediaNode(
+                id=target_node_id,
+                name="stale-target",
+                external_port=12001,
+                state=NodeState.RUNNING,
+                runtime_state=NodeState.RUNNING,
+                health=NodeHealth.HEALTHY,
+                management_fresh=True,
+                management_observed_at=now - timedelta(minutes=1),
+                config_compatible=True,
+                desired_revision=1,
+                applied_revision=1,
+            ),
+        )
+    )
+    runtime = RecordingLifecycleRuntime()
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=lambda: UUID("00000000-0000-0000-0000-000000000003"),
+        node_runtime=runtime,
+    )
+    CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a234567a234567a234567a2344",
+    ).create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=source_node_id,
+    )
+    move_control = CameraMoveControl(
+        store=store,
+        runtime=cast(CameraRuntimeObserver, object()),
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+        new_move_id=lambda: UUID("30000000-0000-0000-0000-000000000001"),
+        management_freshness_seconds=30,
+        node_refresher=node_control,
+    )
+
+    assert [target.id for target in move_control.targets(camera_id)] == [target_node_id]
+    assert runtime.calls == [(NodeRuntimeAction.OBSERVE, target_node_id)]
+
+
 def test_failed_automatic_provisioning_commits_no_camera_or_placement() -> None:
     node_id = UUID("00000000-0000-0000-0000-000000000001")
     store = InMemoryNodeStore()
@@ -3835,6 +3902,80 @@ def test_postgresql_automatic_capacity_persists_refresh_before_provisioning(
         assert len(store.list_nodes()) == 1
         assert runtime.calls == [(NodeRuntimeAction.OBSERVE, node_id)]
         assert store.list_nodes()[0].management_observed_at is not None
+    finally:
+        store.close()
+
+
+def test_postgresql_camera_move_targets_persist_runtime_refresh(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    source_node_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_node_id = UUID("00000000-0000-0000-0000-000000000002")
+    camera_id = UUID("10000000-0000-0000-0000-000000000001")
+    runtime = RecordingLifecycleRuntime()
+    store = PostgresNodeStore(postgres_database_url)
+    for node_id, name, port, api_port, metrics_port in (
+        (source_node_id, "source-edge", 12000, 13000, 14000),
+        (target_node_id, "target-edge", 12001, 13001, 14001),
+    ):
+        reserved = store.register_automatically(
+            name=name,
+            allowed_ports=(port,),
+            max_nodes=2,
+            preferred_port=port,
+            choose_port=lambda available: available[0],
+            new_node_id=lambda selected=node_id: selected,
+            api_ports=(api_port,),
+            metrics_ports=(metrics_port,),
+        )
+        desired = store.request_desired_state(reserved.id, NodeState.RUNNING)
+        store.apply_runtime_observation(
+            reserved.id,
+            runtime.execute(NodeRuntimeAction.PROVISION_START, desired),
+        )
+    CameraControl(
+        store=store,
+        new_camera_id=lambda: camera_id,
+        new_public_id=lambda: "a234567a234567a234567a2344",
+    ).create_camera(
+        name="entrance",
+        source_url="rtsp://camera.local/main",
+        node_id=source_node_id,
+    )
+    engine = create_engine(postgres_database_url, hide_parameters=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE media_nodes SET management_observed_at="
+                "clock_timestamp() - interval '1 minute' WHERE id=:node_id"
+            ),
+            {"node_id": target_node_id},
+        )
+    engine.dispose()
+    runtime.calls.clear()
+    node_control = NodeControl(
+        store=store,
+        choose_port=lambda available: available[0],
+        new_node_id=uuid4,
+        node_runtime=runtime,
+        is_port_bindable=lambda _port: True,
+    )
+    move_control = CameraMoveControl(
+        store=store,
+        runtime=cast(CameraRuntimeObserver, object()),
+        confirmations=ConfirmationTokenService(
+            secret=b"test-confirmation-secret-that-is-at-least-32-bytes",
+            lifetime_seconds=30,
+        ),
+        new_move_id=uuid4,
+        management_freshness_seconds=30,
+        node_refresher=node_control,
+    )
+    try:
+        assert [target.id for target in move_control.targets(camera_id)] == [target_node_id]
+        assert runtime.calls == [(NodeRuntimeAction.OBSERVE, target_node_id)]
+        assert store.get_node(target_node_id).management_observed_at is not None
     finally:
         store.close()
 

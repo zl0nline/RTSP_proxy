@@ -2428,6 +2428,52 @@ class NodeControl:
     def list_nodes(self) -> tuple[MediaNode, ...]:
         return self._store.list_nodes()
 
+    def refresh_move_candidates(
+        self,
+        *,
+        source_node_id: UUID,
+        management_freshness_seconds: int,
+    ) -> None:
+        """Refresh plausible move targets through the write-side runtime boundary."""
+        if not 1 <= management_freshness_seconds <= 300:
+            raise ValueError("management_freshness_seconds_invalid")
+        if self._node_runtime is None:
+            raise NodeRuntimeUnavailable("node_runtime_unavailable")
+        now = self._clock()
+        candidates = tuple(
+            node
+            for node in self._store.list_nodes()
+            if node.id != source_node_id
+            and node.state is NodeState.RUNNING
+            and not node.maintenance
+            and node.registered_cameras < node.camera_capacity
+            and not is_node_eligible(
+                node,
+                management_freshness_seconds=management_freshness_seconds,
+                now=now,
+            )
+        )
+        for candidate in candidates:
+            try:
+                with self._store.lifecycle_guard(candidate.id):
+                    current = self._store.get_node(candidate.id)
+                    if (
+                        current is None
+                        or current.id == source_node_id
+                        or current.state is not NodeState.RUNNING
+                        or current.maintenance
+                        or current.registered_cameras >= current.camera_capacity
+                        or is_node_eligible(
+                            current,
+                            management_freshness_seconds=management_freshness_seconds,
+                            now=self._clock(),
+                        )
+                    ):
+                        continue
+                    self._observe_node_locked(current.id)
+            except (NodeLifecycleBusy, NodeNotFound, NodeRuntimeFailed):
+                continue
+
     def ensure_automatic_capacity(
         self,
         policy: NodeProvisioningPolicy,

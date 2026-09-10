@@ -780,7 +780,7 @@ once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.17.3 \
+  --release-id 0.17.4 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -829,15 +829,18 @@ two can reach the accepted root broker. The worker uses the durable health
 projection and read-only node-runtime observer; ownership/schema/helper failure
 makes its readiness fail without changing camera health or media service.
 
-Candidate `0.17.3` retains schema 0024 and the pinned media/probe binaries. It
+Candidate `0.17.4` retains schema 0024 and the pinned media/probe binaries. It
 also preserves the validated `pg_dump`/`pg_restore` invocation symlink so the
 Ubuntu `pg_wrapper` dispatch contract works during production backup drills.
 It treats an unexpectedly stopped runtime whose desired state is `RUNNING` as
 one failure incident, then emits one recovery after the runtime is healthy
 again. Application activation restarts only release-bound application roles;
 it never restarts the shared nftables boundary because media units require it
-and would otherwise be stopped by systemd dependency propagation. `0.17.0`,
-`0.17.1` and `0.17.2` must not be used as admission targets.
+and would otherwise be stopped by systemd dependency propagation. Move target
+discovery refreshes stale candidate runtime observations through the guarded
+write-side helper before applying the freshness filter; the read-only collector
+keeps no catalog-write privilege. `0.17.0`, `0.17.1`, `0.17.2` and `0.17.3`
+must not be used as admission targets.
 It adds demand-aware on-demand ingest diagnostics, the packaged
 `rtsp-proxy-operations` database backup/isolated-restore verifier and the
 single production admission runbook. It also rebases SSE heartbeat deadlines
@@ -857,11 +860,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.17.3 candidate, apply migration 0024 and run:
+For a first installation of the 0.17.4 candidate, apply migration 0024 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.17.3 \
+  --release-id 0.17.4 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

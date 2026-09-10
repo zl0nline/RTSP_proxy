@@ -65,6 +65,15 @@ class MediaNodeClientFactory(Protocol):
     def for_node(self, node: MediaNode) -> MediaNodeClient: ...
 
 
+class NodeManagementRefresher(Protocol):
+    def refresh_move_candidates(
+        self,
+        *,
+        source_node_id: UUID,
+        management_freshness_seconds: int,
+    ) -> None: ...
+
+
 class CameraMutationStore(CameraMoveStore, Protocol):
     def update_camera(
         self,
@@ -651,6 +660,7 @@ class CameraMoveControl:
         new_move_id: Callable[[], UUID],
         move_timeout_seconds: int = 300,
         management_freshness_seconds: int = 30,
+        node_refresher: NodeManagementRefresher | None = None,
     ) -> None:
         self._store = store
         self._runtime = runtime
@@ -662,6 +672,7 @@ class CameraMoveControl:
         if management_freshness_seconds < 1 or management_freshness_seconds > 300:
             raise ValueError("management_freshness_seconds_invalid")
         self._management_freshness_seconds = management_freshness_seconds
+        self._node_refresher = node_refresher
 
     def targets(
         self,
@@ -669,7 +680,8 @@ class CameraMoveControl:
         *,
         expected_revision: int | None = None,
     ) -> tuple[CameraMoveTarget, ...]:
-        self._camera(camera_id, expected_revision=expected_revision)
+        camera = self._camera(camera_id, expected_revision=expected_revision)
+        self._refresh_targets(camera)
         nodes = self._store.list_camera_move_targets(
             camera_id,
             management_freshness_seconds=self._management_freshness_seconds,
@@ -700,6 +712,7 @@ class CameraMoveControl:
         expected_revision: int | None = None,
     ) -> CameraMovePreview:
         camera = self._camera(camera_id, expected_revision=expected_revision)
+        self._refresh_targets(camera)
         target = next(
             (
                 node
@@ -787,6 +800,14 @@ class CameraMoveControl:
             force=force,
             confirmed_disconnect_readers=preview.disconnect_readers,
             timeout_seconds=self._move_timeout_seconds,
+            management_freshness_seconds=self._management_freshness_seconds,
+        )
+
+    def _refresh_targets(self, camera: CameraPlacement) -> None:
+        if self._node_refresher is None:
+            return
+        self._node_refresher.refresh_move_candidates(
+            source_node_id=camera.node_id,
             management_freshness_seconds=self._management_freshness_seconds,
         )
 
