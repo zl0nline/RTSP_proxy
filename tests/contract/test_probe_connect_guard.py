@@ -957,12 +957,14 @@ def test_production_guard_coexists_with_systemd_filter_and_cleans_after_collecti
         for descriptor in (run_gate_read_fd, sealed_input_fd, output_write_fd):
             resources.close_owned(f"descriptor {descriptor}")
         cgroup = _wait_for_transient_cgroup(unit_name)
-        # systemd may implement IPAddressDeny/Allow at an ancestor cgroup, or
-        # omit the defense-in-depth attachment when that facility is not
-        # available. The exact-port guard below remains the primary boundary;
-        # when leaf attachments exist it must coexist with them.
-        systemd_attachments = probe_connect_guard._kernel_cgroup_attachments(cgroup)
-        assert isinstance(systemd_attachments, set)
+        # `bpftool cgroup show` reports the effective hierarchy, unlike the
+        # direct BPF_PROG_QUERY used by the exact-port guard for its owned leaf
+        # attachments. systemd may attach IPAddressDeny/Allow at an ancestor,
+        # or omit this defense in depth when its facility is unavailable.
+        systemd_attachments = json.loads(
+            _run(str(bpftool_path), "-j", "cgroup", "show", str(cgroup))
+        )
+        assert isinstance(systemd_attachments, list)
         if _loopback_family_available(socket.AF_INET6):
             assert systemd_attachments
 
