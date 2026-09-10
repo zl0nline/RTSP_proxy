@@ -360,6 +360,26 @@ def test_operations_filesystem_and_subprocess_fail_closed(
         _run_postgres_tool("pg_restore", ("--version",), database_url=None)
 
 
+def test_postgres_tool_preserves_safe_dispatch_symlink_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatcher = tmp_path / "postgres-dispatcher"
+    dispatcher.write_text(
+        "#!/bin/sh\nprintf '%s' \"${0##*/}\" > \"$1\"\n",
+        encoding="utf-8",
+    )
+    dispatcher.chmod(0o755)
+    pg_dump = tmp_path / "pg_dump"
+    pg_dump.symlink_to(dispatcher)
+    observed = tmp_path / "invocation-name"
+    monkeypatch.setenv("RTSP_PROXY_PG_DUMP_BINARY", str(pg_dump))
+
+    _run_postgres_tool("pg_dump", (str(observed),), database_url=None)
+
+    assert observed.read_text(encoding="utf-8") == "pg_dump"
+
+
 def test_operations_rejects_missing_paths_database_and_manifest_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

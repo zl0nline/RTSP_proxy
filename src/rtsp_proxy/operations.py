@@ -529,7 +529,11 @@ def _trusted_tool(name: str) -> Path:
         raise OperationsError(f"{name}_unavailable") from None
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022:
         raise OperationsError(f"{name}_unsafe")
-    return resolved
+    # Invoke through the validated absolute candidate rather than its resolved
+    # target. Debian/Ubuntu PostgreSQL tools are safe symlinks to pg_wrapper,
+    # which selects pg_dump versus pg_restore from argv[0]. Resolving the link
+    # for execution silently changes that contract to `pg_wrapper`.
+    return candidate
 
 
 def _which(name: str) -> Path | None:
