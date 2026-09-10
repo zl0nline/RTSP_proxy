@@ -73,6 +73,15 @@ def test_capability_report_accepts_modern_arm_systemd_linux_without_distro_allow
     assert json.loads(report.as_json())["supported"] is True
 
 
+def test_ipv4_only_host_is_supported_with_an_explicit_ipv6_limitation() -> None:
+    report = evaluate_host(_facts(ipv6=False))
+
+    assert report.supported is True
+    assert report.blockers == ()
+    assert report.limitations == ("ipv6_unavailable",)
+    assert report.capabilities["ipv6"] is False
+
+
 @pytest.mark.parametrize(
     ("overrides", "blocker"),
     [
@@ -373,6 +382,7 @@ def test_host_doctor_json_uses_the_public_report_shape() -> None:
         "blockers",
         "capabilities",
         "distribution",
+        "limitations",
         "package_adapter",
         "profile",
         "supported",

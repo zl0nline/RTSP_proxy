@@ -52,6 +52,17 @@ and a behavioural canary passes. Missing, malformed, wrong-family and
 wrong-port state denies the connect. systemd `IPAddressDeny=any` plus one
 literal `IPAddressAllow=` remains defense in depth, not the exact-port control.
 
+The 2026-09-11 cross-kernel ARM validation clarified the artifact identity
+rule. A Linux BPF program tag covers instructions after CO-RE relocation, so an
+unchanged digest-pinned object produced different valid tags on the tested
+6.8 and 6.18 BTF layouts. Production therefore does not use a build-kernel tag
+as an admission allowlist. It reopens the root-owned tool and object by
+descriptor and digest for every operation, verifies the loaded
+`cgroup_sock_addr` program/map/attachment graph and exact map bytes, and opens
+the run gate only after the behavioural canary. Reference tags remain CI build
+evidence and are still enforced by injected deterministic adapters; accepting
+arbitrary object or tool digests remains forbidden.
+
 The throwaway mechanism proof is retained outside `main` at
 [`prototype/phase-g-connect-guard`](https://github.com/zl0nline/RTSP_proxy/tree/prototype/phase-g-connect-guard/tools/prototypes/phase_g_connect_guard)
 (`f984814`). On `grob`, systemd admitted two ports on each allowed loopback

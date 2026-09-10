@@ -9,6 +9,7 @@ import platform
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -67,6 +68,7 @@ class HostFacts:
     bpffs: bool
     btf: bool
     commands: frozenset[str]
+    ipv6: bool = True
     executable_paths: frozenset[str] = REQUIRED_PATHS
     kernel_name: str = "Linux"
     systemd_state: str = "running"
@@ -90,6 +92,7 @@ class HostReport:
     capabilities: dict[str, bool]
     package_adapter: str | None
     blockers: tuple[str, ...]
+    limitations: tuple[str, ...]
 
     def as_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -222,6 +225,7 @@ def evaluate_host(facts: HostFacts) -> HostReport:
         }.issubset(facts.cgroup_controllers),
         "kernel_btf": facts.btf,
         "linux": facts.kernel_name == "Linux",
+        "ipv6": facts.ipv6,
         "systemd_operational": facts.systemd_state == "running",
         "systemd_pid1": facts.pid1 == "systemd",
     }
@@ -284,6 +288,7 @@ def evaluate_host(facts: HostFacts) -> HostReport:
         capabilities=capabilities,
         package_adapter=adapter,
         blockers=tuple(blockers),
+        limitations=() if facts.ipv6 else ("ipv6_unavailable",),
     )
 
 
@@ -307,6 +312,7 @@ def collect_host_facts() -> HostFacts:
         cgroup2=_mounted_filesystem("/sys/fs/cgroup", "cgroup2"),
         bpffs=_mounted_filesystem("/sys/fs/bpf", "bpf"),
         btf=os.access("/sys/kernel/btf/vmlinux", os.R_OK),
+        ipv6=_loopback_family_available(socket.AF_INET6, "::1"),
         commands=commands,
         executable_paths=frozenset(
             path for path in REQUIRED_PATHS if os.access(path, os.X_OK)
@@ -336,6 +342,15 @@ def _mounted_filesystem(target: str, filesystem: str) -> bool:
         if len(left_fields) >= 5 and right_fields and left_fields[4] == target:
             return right_fields[0] == filesystem
     return False
+
+
+def _loopback_family_available(family: socket.AddressFamily, address: str) -> bool:
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as listener:
+            listener.bind((address, 0))
+    except OSError:
+        return False
+    return True
 
 
 def _systemd_version() -> int:
@@ -593,6 +608,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"BLOCKER: {blocker}")
         else:
             print("host capability check passed")
+        for limitation in report.limitations:
+            print(f"LIMITATION: {limitation}")
     return 0 if report.supported else 1
 
 

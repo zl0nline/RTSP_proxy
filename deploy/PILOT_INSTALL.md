@@ -96,7 +96,7 @@ installer через `sudo`. Installer передаёт Git одноразовы
 checkout не требуется.
 
 Распакуйте CI-артефакт в принадлежащий root staging-каталог, например
-`/srv/rtsp-proxy-bundles/0.17.5-amd64`. Не переименовывайте файлы внутри него.
+`/srv/rtsp-proxy-bundles/0.17.6-amd64`. Не переименовывайте файлы внутри него.
 Перед созданием целевого virtual environment installer требует точного
 совпадения исходного `HEAD`, digest файла `uv.lock` и commit из manifest.
 
@@ -118,7 +118,7 @@ Installer отвергает `uv`, принадлежащий не root или �
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/install_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.17.5-amd64
+  --bundle /srv/rtsp-proxy-bundles/0.17.6-amd64
 ```
 
 Команда выполняет следующие действия:
@@ -218,7 +218,7 @@ source venv:
 sudo systemd-run --wait --pipe --collect \
   --uid=rtsp-proxy --gid=rtsp-proxy \
   --property=EnvironmentFile=/etc/rtsp-proxy/control-plane/rtsp-proxy.env \
-  /opt/rtsp-proxy/releases/0.17.5/.venv/bin/rtsp-proxy-migrate
+  /opt/rtsp-proxy/releases/0.17.6/.venv/bin/rtsp-proxy-migrate
 sudo -u postgres psql --dbname rtsp_proxy --tuples-only --no-align \
   --command 'SELECT version_num FROM alembic_version;'
 ```
@@ -239,7 +239,7 @@ argv, ни в environment file, ни в журнал команд:
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.17.5 \
+  --release-id 0.17.6 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -271,7 +271,7 @@ WEB environment file и запустите `rtsp-proxy-local-operator --rotate-p
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_local_auth.sh \
-  --release-id 0.17.5 \
+  --release-id 0.17.6 \
   --username admin \
   --enroll-totp
 ```
@@ -283,7 +283,7 @@ sudo ./tools/configure_local_auth.sh \
 
 ### 5.1. Разрешённые сети и credentials исходных камер
 
-Политика кандидата `0.17.5`: если камера допускает только одно подключение к
+Политика кандидата `0.17.6`: если камера допускает только одно подключение к
 источнику (или её ёмкость неизвестна), отдельные SOURCE/PATH проверки запрещены,
 включая ручные. Зритель не должен ждать ffprobe. Используются только пассивные
 сведения существующего потока; без свежей глубокой проверки нельзя объявлять
@@ -298,7 +298,7 @@ sudo ./tools/configure_local_auth.sh \
 ```sh
 cd /srv/rtsp-proxy-source
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.17.5 \
+  --release-id 0.17.6 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -330,8 +330,8 @@ percent-encoding вручную) и никогда не возвращаются
 Активируйте релиз только после полной готовности конфигурации, TLS и базы данных:
 
 ```sh
-sudo /opt/rtsp-proxy/releases/0.17.5/.venv/bin/rtsp-proxy-deploy activate \
-  --release-id 0.17.5 \
+sudo /opt/rtsp-proxy/releases/0.17.6/.venv/bin/rtsp-proxy-deploy activate \
+  --release-id 0.17.6 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -411,7 +411,7 @@ venv для update не нужен: runtime-зависимости создаю�
 cd /srv/rtsp-proxy-source
 sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
   ./tools/update_rtsp_proxy.sh \
-  --bundle /srv/rtsp-proxy-bundles/0.17.5-amd64 \
+  --bundle /srv/rtsp-proxy-bundles/0.17.6-amd64 \
   --environment-file /etc/rtsp-proxy/control-plane/rtsp-proxy.env \
   --health-url https://management.example.net:8000/health/ready \
   --ca-file /etc/ssl/certs/ca-certificates.crt
@@ -437,7 +437,7 @@ Deploy tool не объединяет шаги 1 и 3, потому что migra
 сделать предыдущее приложение несовместимым. После migration rollback разрешён,
 только если manifest целевого релиза всё ещё содержит точную live revision.
 
-Для перехода `0.14.0` → `0.17.5` сначала активируйте новый код на schema 0022,
+Для перехода `0.14.0` → `0.17.6` сначала активируйте новый код на schema 0022,
 проверьте smoke, затем выполните migration нового релиза до 0024. Старый manifest
 `0.14.0` допускает максимум 0022: после migration обычный rollback на него
 будет отклонён. Возврат потребует отдельной процедуры восстановления из backup,

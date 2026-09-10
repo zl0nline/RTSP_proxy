@@ -199,6 +199,26 @@ def test_guard_manager_installs_verifies_and_releases_one_exact_scope(
         manager.release(lease, timeout_seconds=3.0)
 
 
+def test_kernel_relocated_program_tag_is_accepted_when_artifact_digest_is_bound() -> None:
+    inventory = {
+        "id": 41,
+        "map_ids": [17],
+        "tag": "a" * 16,
+        "type": "cgroup_sock_addr",
+    }
+    assert probe_connect_guard._program_inventory_id(
+        inventory,
+        expected_tag=None,
+        expected_map_id=17,
+    ) == 41
+    with pytest.raises(ProbeConnectGuardError, match="probe_guard_readback_invalid"):
+        probe_connect_guard._program_inventory_id(
+            inventory,
+            expected_tag="b" * 16,
+            expected_map_id=17,
+        )
+
+
 @pytest.mark.parametrize(
     ("interruption", "owns_lease", "remove_count"),
     [

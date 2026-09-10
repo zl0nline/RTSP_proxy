@@ -87,7 +87,12 @@ class ProbeConnectGuardInstallReconcileRequired(ProbeConnectGuardError):
 
 @dataclass(frozen=True, slots=True)
 class ProbeConnectGuardArtifactIdentity:
-    """Release-bound identities required before loading a guard object."""
+    """Release-bound identities required before loading a guard object.
+
+    Program tags are build-kernel references for injected test adapters. The
+    production path cannot pin them across CO-RE relocation and instead binds
+    the exact tool/object digests plus the loaded program graph and canary.
+    """
 
     bpftool_sha256: str
     object_sha256: str
@@ -612,14 +617,18 @@ class BpftoolProbeConnectGuardBackend:
             stage = "program4"
             ipv4_id = self._program_id(
                 paths.ipv4,
-                expected_tag=self._identity.ipv4_program_tag,
+                expected_tag=self._reference_program_tag(
+                    self._identity.ipv4_program_tag
+                ),
                 expected_map_id=map_id,
                 budget=budget,
             )
             stage = "program6"
             ipv6_id = self._program_id(
                 paths.ipv6,
-                expected_tag=self._identity.ipv6_program_tag,
+                expected_tag=self._reference_program_tag(
+                    self._identity.ipv6_program_tag
+                ),
                 expected_map_id=map_id,
                 budget=budget,
             )
@@ -738,7 +747,7 @@ class BpftoolProbeConnectGuardBackend:
             if program_path.exists():
                 program_ids[attach_type] = self._program_id(
                     program_path,
-                    expected_tag=(
+                    expected_tag=self._reference_program_tag(
                         ownership.artifact_release.ipv4_program_tag
                         if attach_type == self._IPV4_ATTACH
                         else ownership.artifact_release.ipv6_program_tag
@@ -1599,7 +1608,7 @@ class BpftoolProbeConnectGuardBackend:
         self,
         path: Path,
         *,
-        expected_tag: str,
+        expected_tag: str | None,
         expected_map_id: int | None,
         budget: _CommandBudget,
     ) -> int:
@@ -1612,20 +1621,20 @@ class BpftoolProbeConnectGuardBackend:
             budget=budget,
         )
         item = _one_json_object(raw)
-        program_id = item.get("id")
-        map_ids = item.get("map_ids")
-        if (
-            item.get("type") != "cgroup_sock_addr"
-            or item.get("tag") != expected_tag
-            or isinstance(program_id, bool)
-            or not isinstance(program_id, int)
-            or program_id < 1
-            or not isinstance(map_ids, list)
-            or any(isinstance(map_id, bool) or not isinstance(map_id, int) for map_id in map_ids)
-            or (expected_map_id is not None and map_ids != [expected_map_id])
-        ):
-            raise ProbeConnectGuardError("probe_guard_readback_invalid")
-        return program_id
+        return _program_inventory_id(
+            item,
+            expected_tag=expected_tag,
+            expected_map_id=expected_map_id,
+        )
+
+    def _reference_program_tag(self, tag: str) -> str | None:
+        # BPF program tags cover kernel-relocated instructions. CO-RE therefore
+        # produces different valid tags across BTF/kernel versions. The real
+        # root branch binds the exact object and bpftool by inode+digest for
+        # every load/readback command, validates the program/map/attachment
+        # graph below, and runs a behavioural canary before releasing the
+        # child. Injected unit-test adapters retain exact reference-tag checks.
+        return tag if self._run is not None or self._owner_uid != 0 else None
 
     def _require_artifact_identity(self) -> None:
         _trusted_path(
@@ -3510,6 +3519,34 @@ def _one_json_object(raw: object) -> dict[str, object]:
     else:
         raise ProbeConnectGuardError("probe_guard_readback_invalid")
     return cast(dict[str, object], item)
+
+
+def _program_inventory_id(
+    item: dict[str, object],
+    *,
+    expected_tag: str | None,
+    expected_map_id: int | None,
+) -> int:
+    program_id = item.get("id")
+    map_ids = item.get("map_ids")
+    program_tag = item.get("tag")
+    if (
+        item.get("type") != "cgroup_sock_addr"
+        or not isinstance(program_tag, str)
+        or re.fullmatch(r"[0-9a-f]{16}", program_tag) is None
+        or (expected_tag is not None and program_tag != expected_tag)
+        or isinstance(program_id, bool)
+        or not isinstance(program_id, int)
+        or program_id < 1
+        or not isinstance(map_ids, list)
+        or any(
+            isinstance(map_id, bool) or not isinstance(map_id, int)
+            for map_id in map_ids
+        )
+        or (expected_map_id is not None and map_ids != [expected_map_id])
+    ):
+        raise ProbeConnectGuardError("probe_guard_readback_invalid")
+    return program_id
 
 
 def _map_inventory_id(raw: object) -> int | None:

@@ -31,6 +31,15 @@ soak, recovery или capacity gates.
 дают стабильный `BLOCKER` code и ненулевой exit status. Bootstrap не пытается
 «починить» kernel, переключить cgroup hierarchy или смонтировать bpffs.
 
+IPv6 не является обязательным для IPv4-only site. Doctor проверяет bind на
+`::1` и при отключённом IPv6 оставляет `supported=true`, но публикует capability
+`ipv6=false` и `LIMITATION: ipv6_unavailable`. На таком хосте разрешены только
+IPv4 management/source/client адреса; IPv6 camera CIDR или endpoint нельзя
+допускать до включения IPv6 и повторной проверки. Exact-port BPF guard всё равно
+загружает обе программы и fail-closed защищает доступное семейство. Native
+contract проверяет доступные семейства, а полная dual-stack матрица остаётся
+обязательной в CI. Bootstrap сам IPv6 не включает и sysctl не меняет.
+
 ## Дистрибутивы и package adapters
 
 Автоматическая установка prerequisite-пакетов реализована для четырёх package
@@ -90,9 +99,10 @@ sudo ./tools/bootstrap_rtsp_proxy_host.sh --install
 ```
 
 JSON содержит `profile`, `supported`, `blockers`, normalised architecture,
-distribution metadata, versions, capability flags и выбранный package adapter.
-Не парсите человекочитаемый текст и не определяйте поддержку повторно в своих
-скриптах.
+distribution metadata, versions, capability flags, `limitations` и выбранный
+package adapter. Не парсите человекочитаемый текст и не определяйте поддержку
+повторно в своих скриптах. Admission automation должна отдельно отклонять
+IPv6 site configuration при наличии `ipv6_unavailable`.
 
 Для закрытого контура заранее зеркалируйте pinned `uv` archive и изменяйте URL
 только вместе с reviewed catalog/digest change. Существующий `uv` принимается
@@ -112,9 +122,20 @@ distribution metadata, versions, capability flags и выбранный package 
 встроенному trust catalog, исполнимость на текущем хосте и архитектуру до
 activation. Broker получает путь
 `/opt/rtsp-proxy/current/libexec/rtsp-proxy-probe/bpftool`; затем независимо
-проверяет root ownership, permissions, digest, BPF object digest, program tags,
-точный map value, cgroup attachments и behavioural canary. Обновление системного
-пакета не меняет исполняемый broker tool.
+проверяет root ownership, permissions, digest, BPF object digest, тип и map graph
+загруженных программ, точный map value, cgroup attachments и behavioural
+canary. Обновление системного пакета не меняет исполняемый broker tool.
+
+Загруженный BPF program tag намеренно не сравнивается со статическим значением
+из build-host catalog. Tag вычисляется по уже CO-RE-relocated инструкциям и на
+другом BTF/kernel может закономерно измениться при том же точном object digest.
+Статическая проверка сделала бы «широкую поддержку» скрытым allowlist одного
+kernel build. Подмена при этом не становится возможной: production branch при
+каждой операции открывает root-owned `bpftool` и object по descriptor, повторно
+сверяет их SHA-256, загружает object в новый owned pin scope, проверяет program
+type, единственный exact map ID/value и оба attachment ID, а gate открывается
+только после behavioural allow/deny canary. Runtime tag всё равно обязан иметь
+валидный kernel format; reference tags остаются воспроизводимым CI evidence.
 
 Если bundled tool не загружается из-за ABI/shared-library ошибки, release
 verification останавливает установку. Нельзя обходить это подстановкой stock
@@ -151,9 +172,10 @@ read-back и native probe-broker smoke до возврата production admissio
   Rocky Linux 10, openSUSE Tumbleweed и Arch containers. Контейнеры проверяют
   userspace/package names, но не считаются systemd PID1/BPF evidence.
 - Отдельный ARM hardware smoke выполняется на Armbian/Ubuntu 26.04 `arm64` с
-  systemd 259, kernel 6.18, glibc 2.43 и системным Python 3.14. Он проверяет
-  detection, clean-host bootstrap, isolated Python, native release artifacts и
-  systemd/BPF contracts; это не нагрузочный стенд.
+  systemd 259, kernel 6.18, glibc 2.43, системным Python 3.14 и отключённым
+  IPv6. Он проверяет detection/limitation, clean-host bootstrap, isolated
+  Python, native release artifacts и IPv4 systemd/BPF contracts; это не
+  нагрузочный стенд. Dual-stack BPF contract независимо проходит в native CI.
 
 Каждый новый distro family или снижение минимальных версий требует реального
 package-adapter job, native host evidence для kernel-facing частей и обновления
