@@ -176,6 +176,8 @@ read-back и native probe-broker smoke до возврата production admissio
   IPv6. Он проверяет detection/limitation, clean-host bootstrap, isolated
   Python, native release artifacts и IPv4 systemd/BPF contracts; это не
   нагрузочный стенд. Dual-stack BPF contract независимо проходит в native CI.
+  Точный sanitized результат для 0.17.6 записан в
+  [hardware evidence](evidence/host-compatibility-0.17.6-arm64-2026-09-11.md).
 
 Каждый новый distro family или снижение минимальных версий требует реального
 package-adapter job, native host evidence для kernel-facing частей и обновления

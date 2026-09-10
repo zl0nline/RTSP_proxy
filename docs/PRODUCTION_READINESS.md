@@ -1,6 +1,6 @@
 # Production readiness
 
-Last reviewed: 2026-09-10.
+Last reviewed: 2026-09-11.
 
 This is the single current admission record for the product. Historical CI and
 pilot reports remain under [`evidence/`](evidence/); they do not override this
@@ -13,14 +13,14 @@ explicit owner decision, not an implicit pass.
 
 | Item | Value |
 |---|---|
-| Application candidate | `0.17.4` |
-| Git commit | `32a29ad49a225e8a80ff747fa38fd0cabcab69f0` |
+| Application candidate | `0.17.6` |
+| Git commit | `36c317ff4f1efbf8c360d4088fae13ffa0398231` |
 | Database head | `0024_camera_probe_profiles` |
 | Media runtime | `v1.20.0-rtsp-proxy.3` |
-| Supported production OS | Ubuntu 24.04, native amd64 or arm64 |
-| Pilot mechanism only | Ubuntu 26.04 with pinned Python/tooling deviations |
-| Pilot execution | [0.17.4 admission record](evidence/production-admission-2026-09-10.md) |
-| Product status | **Pilot-verified and release-functional; Production HOLD pending site evidence** |
+| Host compatibility contract | [`modern-systemd-linux-v1`](HOST_COMPATIBILITY.md), native amd64 or arm64 |
+| Compatibility evidence | [0.17.6 CI and ARM hardware record](evidence/host-compatibility-0.17.6-arm64-2026-09-11.md) |
+| Production pilot | [0.17.4 admission record](evidence/production-admission-2026-09-10.md); it is historical site evidence, not the current release |
+| Product status | **Portable release-functional candidate; Production HOLD pending exact-site evidence** |
 
 The candidate values above are updated only after a fully successful release CI
 and immutable bundle verification. A later manifest is authoritative when this
@@ -30,6 +30,7 @@ file is being prepared as part of that same release change.
 
 | Gate | Status | Required evidence / reason |
 |---|---|---|
+| Capability-based Linux detection, bootstrap and package adapters | PASS (contract and compatibility hardware); SITE REQUIRED admitted host | Native Ubuntu 24.04 amd64/arm64 CI, real package installs on five distro families and the [0.17.6 ARM hardware smoke](evidence/host-compatibility-0.17.6-arm64-2026-09-11.md); doctor plus native contracts must pass again on the exact production host |
 | Node registry, placement, lifecycle and 100-camera hard admission limit | PASS | Unit, PostgreSQL race and native lifecycle suites; the hard limit is a safety constraint, not a throughput claim |
 | Per-node process/config/port isolation | PASS | Native amd64/arm64 media, namespace and load/isolation CI |
 | Ordinary RTSP/TCP, one-reader admission and exact `453` | PASS (contract); SITE REQUIRED per profile | Pinned MediaMTX native contracts; ordinary-reader smoke for every admitted camera profile |
@@ -42,7 +43,7 @@ file is being prepared as part of that same release change.
 | Isolated source probe worker/broker | PASS | Native amd64/arm64 broker, BPF, cancellation, policy and worker suites |
 | Collector and node metrics | PASS | Read-only collector plus least-privilege process identity observation |
 | Incident outbox/notifier semantics | PASS (contract); SITE REQUIRED relay | Deterministic accepted/rejected/ambiguous/recovery tests; a real configured SMTP relay drill is mandatory |
-| Immutable install/update/health rollback | PASS (contract and pilot continuity); SITE REQUIRED admitted host | Both-architecture release CI and exact-bundle pilot updates; `0.17.4` preserved every media PID and the established reader |
+| Immutable install/update/health rollback | PASS (contract and historical pilot continuity); SITE REQUIRED admitted host | Exact `0.17.6` both-architecture release CI plus exact arm64 bundle verification; historical `0.17.4` pilot updates preserved every media PID and the established reader, but 0.17.6 has not replaced that pilot |
 | PostgreSQL backup and isolated restore verification | PASS (tooling and pilot); SITE REQUIRED admitted host | Exact `0.17.4` archive restored all 32 tables and five invariants in 1.80 s; the site must retain its own checksum-bound report |
 | Control assets/keyring backup and off-host copy | SITE REQUIRED | Root-owned archive, checksum, encrypted off-host copy and restore-access proof cannot be supplied by source CI |
 | RPO/RTO recovery drill | SITE REQUIRED | Restore database and control assets within RPO ≤5 min / control RTO ≤30 min on site hardware |
