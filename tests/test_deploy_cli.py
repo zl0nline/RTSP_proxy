@@ -117,6 +117,54 @@ def test_update_switches_atomically_and_records_rollback_target(tmp_path: Path) 
     assert host.restarted == [("rtsp-proxy-web.service",)]
 
 
+def test_update_never_restarts_media_or_its_active_nftables_dependency(
+    tmp_path: Path,
+) -> None:
+    paths = DeploymentPaths.under(tmp_path / "host")
+    old = paths.releases / "0.11.0"
+    old.mkdir(parents=True)
+    (old / "release-manifest.json").write_text(
+        json.dumps(
+            {
+                "release_id": "0.11.0",
+                "schema_compatibility": {
+                    "minimum": "0012_operator_sessions",
+                    "maximum": "0020_probe_observations",
+                },
+            }
+        )
+    )
+    paths.opt_root.mkdir(parents=True, exist_ok=True)
+    paths.current.symlink_to(Path("releases/0.11.0"))
+    bundle = _bundle(
+        tmp_path,
+        "0.12.0",
+        "0012_operator_sessions",
+        "0020_probe_observations",
+    )
+    host = FakeHost()
+    host.active.add("rtsp-proxy-media@node-a.service")
+    host.active.add("rtsp-proxy-nftables.service")
+
+    result = main(
+        [
+            "update",
+            "--bundle",
+            str(bundle),
+            "--environment-file",
+            "/etc/rtsp-proxy/control-plane/rtsp-proxy.env",
+            "--health-url",
+            "https://management.example/health/ready",
+        ],
+        host=host,
+        paths=paths,
+        source_root=tmp_path,
+    )
+
+    assert result == 0
+    assert host.restarted == [("rtsp-proxy-web.service",)]
+
+
 def test_update_waits_for_transient_startup_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -524,7 +572,11 @@ def test_linux_host_reads_schema_and_manages_only_active_units(
             restarted.append(values[2:])
         return subprocess.CompletedProcess(values, 0, stdout="")
 
-    active = {"rtsp-proxy-web.service", "rtsp-proxy-probe-broker.socket"}
+    active = {
+        "rtsp-proxy-nftables.service",
+        "rtsp-proxy-web.service",
+        "rtsp-proxy-probe-broker.socket",
+    }
 
     def fake_subprocess(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(command, 0 if command[-1] in active else 3)

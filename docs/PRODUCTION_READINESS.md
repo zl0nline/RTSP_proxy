@@ -13,7 +13,7 @@ explicit owner decision, not an implicit pass.
 
 | Item | Value |
 |---|---|
-| Application candidate | `0.17.2` |
+| Application candidate | `0.17.3` |
 | Git commit | exact 40-character value from the immutable bundle manifest |
 | Database head | `0024_camera_probe_profiles` |
 | Media runtime | `v1.20.0-rtsp-proxy.3` |

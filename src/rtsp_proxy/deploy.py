@@ -24,8 +24,7 @@ _RELEASE_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 _REVISION = re.compile(r"^(\d{4})_[0-9a-z_]+$")
 _HEALTH_ATTEMPTS = 30
 _HEALTH_INTERVAL_SECONDS = 1.0
-_MANAGED_UNITS = (
-    "rtsp-proxy-nftables.service",
+_RESTARTABLE_APPLICATION_UNITS = (
     "rtsp-proxy-auth.service",
     "rtsp-proxy-node-runtime.socket",
     "rtsp-proxy-node-metrics.socket",
@@ -263,7 +262,7 @@ class LinuxDeploymentHost:
 
     def active_units(self) -> tuple[str, ...]:
         active: list[str] = []
-        for unit in _MANAGED_UNITS:
+        for unit in _RESTARTABLE_APPLICATION_UNITS:
             result = subprocess.run(
                 ["/usr/bin/systemctl", "is-active", "--quiet", unit], check=False
             )
@@ -504,7 +503,11 @@ def _activate(
     if not _schema_compatible(_manifest(release), revision):
         raise DeploymentError("database_schema_incompatible_with_release")
     previous = _current_release(paths)
-    units = host.active_units()
+    units = tuple(
+        unit
+        for unit in host.active_units()
+        if unit in _RESTARTABLE_APPLICATION_UNITS
+    )
     _switch(paths, release_id)
     try:
         host.restart_units(units)
