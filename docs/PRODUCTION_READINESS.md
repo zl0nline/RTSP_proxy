@@ -14,12 +14,13 @@ explicit owner decision, not an implicit pass.
 | Item | Value |
 |---|---|
 | Application candidate | `0.17.4` |
-| Git commit | exact 40-character value from the immutable bundle manifest |
+| Git commit | `32a29ad49a225e8a80ff747fa38fd0cabcab69f0` |
 | Database head | `0024_camera_probe_profiles` |
 | Media runtime | `v1.20.0-rtsp-proxy.3` |
 | Supported production OS | Ubuntu 24.04, native amd64 or arm64 |
 | Pilot mechanism only | Ubuntu 26.04 with pinned Python/tooling deviations |
-| Product status | **Release-functional; Production HOLD pending site evidence** |
+| Pilot execution | [0.17.4 admission record](evidence/production-admission-2026-09-10.md) |
+| Product status | **Pilot-verified and release-functional; Production HOLD pending site evidence** |
 
 The candidate values above are updated only after a fully successful release CI
 and immutable bundle verification. A later manifest is authoritative when this
@@ -32,21 +33,21 @@ file is being prepared as part of that same release change.
 | Node registry, placement, lifecycle and 100-camera hard admission limit | PASS | Unit, PostgreSQL race and native lifecycle suites; the hard limit is a safety constraint, not a throughput claim |
 | Per-node process/config/port isolation | PASS | Native amd64/arm64 media, namespace and load/isolation CI |
 | Ordinary RTSP/TCP, one-reader admission and exact `453` | PASS (contract); SITE REQUIRED per profile | Pinned MediaMTX native contracts; ordinary-reader smoke for every admitted camera profile |
-| Camera CRUD, move, drain, forced operations and delete guards | PASS (contract); SITE REQUIRED game day | Automated transactional tests plus the site game-day record |
-| ACL, downstream grants, local login, TOTP, RBAC and audit | PASS | Native/unit security suites; admission still requires site operator-login and grant drills |
+| Camera CRUD, move, drain, forced operations and delete guards | PASS (contract and pilot); SITE REQUIRED admitted host | Automated transactional tests and the [0.17.4 pilot game day](evidence/production-admission-2026-09-10.md); repeat on the supported admitted host |
+| ACL, downstream grants, local login, TOTP, RBAC and audit | PASS (contract and pilot) | Native/unit security suites plus audited pilot login, MFA step-up, grant use and final revocation |
 | HTTPS management boundary and secret handling | PASS (contract); SITE REQUIRED certificate | Release verifier and deployment tests; CA-issued site certificate/SAN and secret inventory are local evidence |
 | Placement and move targets with stale runtime state | PASS | Both paths observe and persist plausible candidate runtime state through the guarded write-side helper before applying freshness filters |
-| Source credentials with reserved characters | PASS | Raw separate-field contract and exact encode-once regression; percent-encoded operator input is rejected by documented UI guidance |
+| Source credentials with reserved characters | PASS | Raw separate-field contract and exact encode-once regression; percent-looking operator input triggers an explicit raw-value warning and confirmation |
 | On-demand ingest diagnosis | PASS | Idle, connecting, unavailable and ready are derived without opening an unsafe second upstream session; active probe reason remains independent |
 | Isolated source probe worker/broker | PASS | Native amd64/arm64 broker, BPF, cancellation, policy and worker suites |
 | Collector and node metrics | PASS | Read-only collector plus least-privilege process identity observation |
 | Incident outbox/notifier semantics | PASS (contract); SITE REQUIRED relay | Deterministic accepted/rejected/ambiguous/recovery tests; a real configured SMTP relay drill is mandatory |
-| Immutable install/update/health rollback | PASS (contract); SITE REQUIRED game day | Both-architecture release CI plus exact-bundle site update and deliberately non-ready test-release rollback |
-| PostgreSQL backup and isolated restore verification | PASS (tooling); SITE REQUIRED execution | `rtsp-proxy-operations` creates a schema/release-bound custom archive and compares a temporary restored database; site retains the signed report |
+| Immutable install/update/health rollback | PASS (contract and pilot continuity); SITE REQUIRED admitted host | Both-architecture release CI and exact-bundle pilot updates; `0.17.4` preserved every media PID and the established reader |
+| PostgreSQL backup and isolated restore verification | PASS (tooling and pilot); SITE REQUIRED admitted host | Exact `0.17.4` archive restored all 32 tables and five invariants in 1.80 s; the site must retain its own checksum-bound report |
 | Control assets/keyring backup and off-host copy | SITE REQUIRED | Root-owned archive, checksum, encrypted off-host copy and restore-access proof cannot be supplied by source CI |
 | RPO/RTO recovery drill | SITE REQUIRED | Restore database and control assets within RPO ≤5 min / control RTO ≤30 min on site hardware |
-| Control restart while media is established | SITE REQUIRED | Established reader PID/session/byte counters continue through the drill |
-| Failure-domain/game-day matrix | SITE REQUIRED | Run every row in [`FAILURE_DOMAIN_MATRIX.md`](FAILURE_DOMAIN_MATRIX.md) and retain timestamps, logs and recovery proof |
+| Control restart while media is established | PASS (pilot); SITE REQUIRED admitted host | Pilot web/auth/reconciler/collector restart preserved the media PID and reader; repeat on admitted hardware |
+| Failure-domain/game-day matrix | SITE REQUIRED (partial pilot evidence) | Database, collector, probe, media, limits, port rollback, move and control-restart rows have pilot evidence; real relay, network/power and supported-host rows remain open |
 | 24-hour production-equivalent soak | SITE REQUIRED | Exact hardware, network, camera profile, non-zero churn/probe/CRUD axes and ≥30% hard-resource headroom |
 | Sustainable node count per server | SITE REQUIRED | Publish the highest passing independent server ladder; configured `max_nodes` is not evidence |
 | 100 registered cameras on one node | **DEFERRED by owner** | Physical test explicitly excluded from this work; no production capacity claim may say it passed |
@@ -54,11 +55,12 @@ file is being prepared as part of that same release change.
 
 ## Honest admission decision
 
-The software may be packaged and installed as a production candidate, but the
-repository cannot grant Production GO to an arbitrary site. Current decision is
-**HOLD** until that site's backup/off-host recovery, real SMTP, game-day,
-24-hour soak and measured server envelope are attached to an admission record.
-The explicitly deferred 100-camera test remains a disclosed capacity
+The software is packaged and installed as an exact, pilot-verified production
+candidate, but the repository cannot grant Production GO to an arbitrary site.
+Current decision is **HOLD** until that site's supported-host certificate,
+backup/off-host recovery, real SMTP, remaining game-day rows, camera-profile
+matrix, 24-hour soak and measured server envelope are attached to an admission
+record. The explicitly deferred 100-camera test remains a disclosed capacity
 restriction even after those rows pass.
 
 A site may approve a narrower deployment only by recording all of the following:
