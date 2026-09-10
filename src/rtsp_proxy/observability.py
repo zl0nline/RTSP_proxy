@@ -546,6 +546,12 @@ class NodeMetricSource(Protocol):
     def scrape(self, node: MediaNode) -> NodeMetricSample | NodeMetricObservation: ...
 
 
+def _node_failed_for_incident(node: MediaNode) -> bool:
+    return node.runtime_state is NodeState.FAILED or (
+        node.state is NodeState.RUNNING and node.runtime_state is NodeState.STOPPED
+    )
+
+
 class IncidentControl:
     def __init__(
         self,
@@ -1007,7 +1013,7 @@ class InMemoryObservabilityStore:
                 (incident for incident in reversed(self._incidents) if incident.node_id == node.id),
                 None,
             )
-            failed = node.runtime_state is NodeState.FAILED
+            failed = _node_failed_for_incident(node)
             recovered = (
                 node.runtime_state is NodeState.RUNNING and node.health is NodeHealth.HEALTHY
             )
@@ -1374,7 +1380,7 @@ class PostgresObservabilityStore:
                     ),
                     {
                         "node_id": node.id,
-                        "failed": node.runtime_state is NodeState.FAILED,
+                        "failed": _node_failed_for_incident(node),
                         "recovered": (
                             node.runtime_state is NodeState.RUNNING
                             and node.health is NodeHealth.HEALTHY

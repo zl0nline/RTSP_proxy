@@ -231,6 +231,56 @@ def test_collector_observes_runtime_before_incident_and_snapshot() -> None:
     assert notifications[0].kind is NotificationKind.FAILURE
 
 
+def test_collector_opens_incident_for_unexpected_stopped_runtime() -> None:
+    node = _node(FIRST_NODE_ID, port=10000)
+    observations = InMemoryObservabilityStore()
+    stopped = replace(
+        node,
+        runtime_state=NodeState.STOPPED,
+        health=NodeHealth.UNKNOWN,
+        management_fresh=False,
+    )
+    collector = FleetCollector(
+        nodes=InMemoryNodeStore(nodes=(node,)),
+        runtime=SequencedRuntimeObserver([stopped, stopped, node]),
+        metrics=SequencedMetricSource([NodeMetricSample(0, 0, 0, 0)] * 3),
+        observations=observations,
+        incidents=IncidentControl(store=observations, clock=lambda: NOW),
+        max_nodes=50,
+        external_port_capacity=1000,
+        clock=lambda: NOW,
+    )
+
+    snapshot = collector.run_once()
+
+    assert snapshot.nodes[0].desired_state is NodeState.RUNNING
+    assert snapshot.nodes[0].runtime_state is NodeState.STOPPED
+    assert [message.kind for message in observations.list_notifications()] == [
+        NotificationKind.FAILURE
+    ]
+    collector.run_once()
+    collector.run_once()
+    assert [message.kind for message in observations.list_notifications()] == [
+        NotificationKind.FAILURE,
+        NotificationKind.RECOVERY,
+    ]
+
+
+def test_expected_stopped_runtime_does_not_open_incident() -> None:
+    observations = InMemoryObservabilityStore()
+    IncidentControl(store=observations, clock=lambda: NOW).observe(
+        replace(
+            _node(FIRST_NODE_ID, port=10000),
+            state=NodeState.STOPPED,
+            runtime_state=NodeState.STOPPED,
+            health=NodeHealth.UNKNOWN,
+            management_fresh=False,
+        )
+    )
+
+    assert observations.list_notifications() == ()
+
+
 def test_runtime_observation_failure_cannot_emit_a_false_recovery() -> None:
     class UnavailableRuntime:
         def observe_node(self, _node_id: UUID) -> MediaNode:
@@ -596,8 +646,8 @@ def test_postgres_incident_dedupe_survives_store_restart(
             _node(
                 node.id,
                 port=10000,
-                runtime_state=NodeState.FAILED,
-                health=NodeHealth.UNHEALTHY,
+                runtime_state=NodeState.STOPPED,
+                health=NodeHealth.UNKNOWN,
             )
         )
     finally:
@@ -610,8 +660,8 @@ def test_postgres_incident_dedupe_survives_store_restart(
             _node(
                 node.id,
                 port=10000,
-                runtime_state=NodeState.FAILED,
-                health=NodeHealth.UNHEALTHY,
+                runtime_state=NodeState.STOPPED,
+                health=NodeHealth.UNKNOWN,
             )
         )
         notifications = reopened.list_notifications()
