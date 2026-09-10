@@ -5,11 +5,12 @@ RTSP Proxy server. It complements the installation mechanics in
 [PILOT_INSTALL.md](PILOT_INSTALL.md) and the detailed component reference in
 [README.md](README.md). Passing CI is necessary but is not a capacity claim.
 
-The supported production shape is Ubuntu 24.04, Python 3.12, systemd,
-PostgreSQL and native `amd64` or `arm64` release artifacts. Ubuntu 26.04 can be
-used to exercise the pilot mechanics, but it is not a published production OS
-profile. Docker, Kubernetes, UDP media, RTSPS and multi-server failover are not
-part of this release.
+The supported production shape is a native `amd64` or `arm64` host passing the
+[`modern-systemd-linux-v1`](../docs/HOST_COMPATIBILITY.md) capability profile,
+with PostgreSQL and the architecture-matched release artifact. Distribution
+names are metadata rather than an allowlist; exact-host admission evidence is
+still mandatory. Docker, Kubernetes, UDP media, RTSPS and multi-server failover
+are not part of this release.
 
 ## 1. Admission record
 
@@ -46,9 +47,10 @@ private keys, session cookies, TOTP seeds and client IPs must not be published.
 Stop immediately if any command fails.
 
 ```sh
-sudo /srv/rtsp-proxy-source/tools/bootstrap_rtsp_proxy_host.sh --check
+/srv/rtsp-proxy-source/tools/bootstrap_rtsp_proxy_host.sh --check
 sudo /opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-verify-release \
   --manifest /opt/rtsp-proxy/current/release-manifest.json
+/opt/rtsp-proxy/current/.venv/bin/rtsp-proxy-host-doctor --json
 sudo systemctl --failed --no-pager
 sudo systemctl is-active \
   rtsp-proxy-web.service \

@@ -455,7 +455,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.17.4/bin/mediamtx"
+        "/opt/rtsp-proxy/releases/0.17.5/bin/mediamtx"
     )
 
 
@@ -473,6 +473,7 @@ def test_native_ci_runs_the_release_verifier_against_staged_real_binaries() -> N
         ".artifacts/release/libexec/rtsp-proxy-probe/"
         "rtsp_probe_connect_guard.bpf.o"
     ) in workflow
+    assert ".artifacts/release/libexec/rtsp-proxy-probe/bpftool" in workflow
     assert "Verify installed root broker transaction" in workflow
     assert "tests/contract/test_probe_broker_service.py" in workflow
     assert "Publish verified pilot release bundle (${{ matrix.arch }})" in workflow
@@ -715,8 +716,8 @@ def test_pilot_bootstrap_is_bounded_and_does_not_activate_services() -> None:
     content = script.read_text(encoding="utf-8")
 
     assert result.returncode == 0, result.stderr
-    assert "24.04|26.04" in content
-    assert "Acquire::Retries=10" in content
+    assert "host_platform.py" in content
+    assert "unsupported Ubuntu release" not in content
     assert "UV_PYTHON_INSTALL_DIR" in content
     assert '"$deploy_uv" python install 3.12' in content
     assert "systemctl enable" not in content

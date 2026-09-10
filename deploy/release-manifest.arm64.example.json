@@ -1,6 +1,6 @@
 {
-  "schema_version": 4,
-  "release_id": "0.17.4",
+  "schema_version": 5,
+  "release_id": "0.17.5",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",
@@ -33,7 +33,9 @@
     "release_id": "0.1.0",
     "linux_arch": "arm64",
     "object": "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o",
-    "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece"
+    "object_sha256": "cc30367d34573672788403a935dcced86513d019ae75bd05a87cfacbcf4b7ece",
+    "bpftool": "libexec/rtsp-proxy-probe/bpftool",
+    "bpftool_sha256": "b7f52227fcb546f62d30351ab69f9e651712e37fae09daea9c38f90638265243"
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",

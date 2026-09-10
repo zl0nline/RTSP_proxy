@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
 from rtsp_proxy.probe_connect_guard import (
     ProbeConnectGuardError,
+    trusted_probe_connect_guard_bpftool_identities,
     trusted_probe_connect_guard_release_identity,
 )
 
@@ -79,6 +80,8 @@ class ProbeConnectGuardArtifact(BaseModel):
     linux_arch: LinuxArch
     object: str = Field(min_length=1)
     object_sha256: Sha256
+    bpftool: str = Field(min_length=1)
+    bpftool_sha256: Sha256
 
 
 class SchemaCompatibility(BaseModel):
@@ -91,7 +94,7 @@ class SchemaCompatibility(BaseModel):
 class ReleaseManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(ge=4, le=4)
+    schema_version: int = Field(ge=5, le=5)
     release_id: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
     git_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     python: PythonArtifact
@@ -113,6 +116,7 @@ class VerifiedRelease:
     ffprobe_binary: Path
     probe_ffprobe_binary: Path
     probe_connect_guard_object: Path
+    probe_bpftool_binary: Path
 
 
 class ReleaseVerificationError(ValueError):
@@ -234,6 +238,18 @@ def trusted_probe_connect_guard_identity(machine: str) -> tuple[str, Sha256]:
     return _trusted_probe_connect_guard_identity(normalize_linux_arch(machine))
 
 
+def _trusted_probe_bpftool_identities(architecture: LinuxArch) -> frozenset[Sha256]:
+    try:
+        return frozenset(
+            Sha256.model_validate(digest)
+            for digest in trusted_probe_connect_guard_bpftool_identities(
+                architecture.value
+            )
+        )
+    except (ProbeConnectGuardError, ValidationError):
+        raise ReleaseVerificationError("trusted_artifact_catalog_invalid") from None
+
+
 def normalize_linux_arch(machine: str) -> LinuxArch:
     canonical = machine.strip().lower()
     aliases = {
@@ -298,6 +314,10 @@ def verify_release(
         or manifest.probe_connect_guard.object_sha256 != trusted_guard_digest
     ):
         raise ReleaseVerificationError("untrusted_probe_connect_guard_artifact")
+    if manifest.probe_connect_guard.bpftool_sha256 not in _trusted_probe_bpftool_identities(
+        manifest.probe_connect_guard.linux_arch
+    ):
+        raise ReleaseVerificationError("untrusted_probe_bpftool_artifact")
     if manifest.config_schema_version != CONFIG_SCHEMA_VERSION:
         raise ReleaseVerificationError("config_schema_mismatch")
     if (
@@ -321,6 +341,11 @@ def verify_release(
         manifest.probe_connect_guard.object,
         "probe_connect_guard.object",
     )
+    probe_bpftool = _artifact_path(
+        root,
+        manifest.probe_connect_guard.bpftool,
+        "probe_connect_guard.bpftool",
+    )
 
     _verify_checksum(lock, manifest.python.lock_sha256, "python.lock")
     _verify_checksum(wheel, manifest.python.wheel_sha256, "python.wheel")
@@ -336,6 +361,16 @@ def verify_release(
         probe_connect_guard,
         manifest.probe_connect_guard.object_sha256,
         "probe_connect_guard.object",
+    )
+    _verify_checksum(
+        probe_bpftool,
+        manifest.probe_connect_guard.bpftool_sha256,
+        "probe_connect_guard.bpftool",
+    )
+    _verify_invocable(
+        probe_bpftool,
+        ("version",),
+        "probe_connect_guard.bpftool",
     )
 
     _verify_version(mediamtx, ("--version",), manifest.mediamtx.version, "mediamtx.binary")
@@ -357,6 +392,7 @@ def verify_release(
         ffprobe_binary=ffprobe,
         probe_ffprobe_binary=probe_ffprobe,
         probe_connect_guard_object=probe_connect_guard,
+        probe_bpftool_binary=probe_bpftool,
     )
 
 
@@ -422,3 +458,19 @@ def _verify_version(path: Path, arguments: tuple[str, ...], expected: str, label
         version_matches = len(tokens) >= 3 and tokens[:3] == [path.name, "version", expected]
     if result.returncode != 0 or not version_matches:
         raise ReleaseVerificationError(f"version_mismatch:{label}")
+
+
+def _verify_invocable(path: Path, arguments: tuple[str, ...], label: str) -> None:
+    try:
+        result = subprocess.run(
+            [path, *arguments],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            env={"LC_ALL": "C", "PATH": os.defpath},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseVerificationError(f"version_probe_failed:{label}") from error
+    if result.returncode != 0:
+        raise ReleaseVerificationError(f"version_probe_failed:{label}")

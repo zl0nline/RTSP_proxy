@@ -40,6 +40,7 @@ rtsp-proxy-local-operator = "rtsp_proxy.local_operator_cli:main"
 rtsp-proxy-deploy = "rtsp_proxy.deploy:cli"
 rtsp-proxy-schema-revision = "rtsp_proxy.schema_cli:main"
 rtsp-proxy-operations = "rtsp_proxy.operations:main"
+rtsp-proxy-host-doctor = "rtsp_proxy.host_platform:main"
 
 [dependency-groups]
 dev = [

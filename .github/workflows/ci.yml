@@ -9,6 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  host-package-adapter:
+    name: host-package-adapter (${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - debian-13
+          - fedora-42
+          - rocky-10
+          - opensuse-tumbleweed
+          - arch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Validate real package adapter
+        run: tools/ci/test_host_package_adapter.sh "${{ matrix.profile }}"
+
   test:
     name: test (${{ matrix.arch }})
     strategy:
@@ -103,6 +123,7 @@ jobs:
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.probe_connect_guard import _load_packaged_artifact_catalog; catalog = _load_packaged_artifact_catalog(); assert catalog.current_release_id == "0.1.0"'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_ffprobe_identity; amd64 = trusted_probe_ffprobe_identity("amd64"); arm64 = trusted_probe_ffprobe_identity("arm64"); assert amd64[0] == arm64[0] == "9b6c896-rtsp-proxy.1"; assert amd64[1] != arm64[1]'
           .artifacts/clean-venv/bin/python -c 'from rtsp_proxy.release import trusted_probe_connect_guard_identity; amd64 = trusted_probe_connect_guard_identity("amd64"); arm64 = trusted_probe_connect_guard_identity("arm64"); assert amd64[0] == arm64[0] == "0.1.0"; assert amd64[1] == arm64[1]'
+          .artifacts/clean-venv/bin/rtsp-proxy-host-doctor --help >/dev/null
           launcher_stdout=$(mktemp)
           launcher_stderr=$(mktemp)
           if .artifacts/clean-venv/bin/rtsp-proxy-probe-launcher \
@@ -374,7 +395,7 @@ jobs:
 
   media-binaries-contract:
     name: media-binaries-contract (${{ matrix.arch }})
-    needs: [test, probe-ffprobe-contract]
+    needs: [host-package-adapter, test, probe-ffprobe-contract]
     strategy:
       fail-fast: false
       matrix:
@@ -478,6 +499,9 @@ jobs:
           install -m 0644 \
             .artifacts/probe-connect-guard/rtsp_probe_connect_guard.bpf.o \
             .artifacts/release/libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o
+          install -m 0755 \
+            /usr/lib/linux-tools-6.8.0-138/bpftool \
+            .artifacts/release/libexec/rtsp-proxy-probe/bpftool
           install -m 0644 uv.lock .artifacts/release/uv.lock
           install -m 0644 dist/rtsp_proxy-0.1.0-py3-none-any.whl .artifacts/release/dist/
           lock_sha256=$(sha256sum .artifacts/release/uv.lock | awk '{print $1}')

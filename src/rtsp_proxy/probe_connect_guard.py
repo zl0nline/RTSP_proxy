@@ -181,6 +181,23 @@ def trusted_probe_connect_guard_release_identity(
     return release.release_id, release.object_sha256
 
 
+def trusted_probe_connect_guard_bpftool_identities(machine: str) -> frozenset[str]:
+    """Return the admitted host-tool digests for the current release and arch."""
+
+    catalog = _load_packaged_artifact_catalog()
+    architecture = _linux_architecture(machine)
+    matches = tuple(
+        release
+        for release in catalog.releases
+        if release.release_id == catalog.current_release_id
+        and release.architecture == architecture
+        and release.activation_compatible
+    )
+    if len(matches) != 1:
+        raise ProbeConnectGuardError("probe_guard_artifact_identity_invalid")
+    return matches[0].bpftool_sha256
+
+
 def trusted_probe_connect_guard_artifact_identity(
     *,
     bpftool_path: Path,

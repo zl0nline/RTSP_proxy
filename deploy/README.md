@@ -6,10 +6,12 @@ see [PILOT_INSTALL.md](PILOT_INSTALL.md). The commands there automate release
 and host-asset installation without creating secrets, migrating a live database
 implicitly or restarting media nodes.
 
-Docker/container runtime не входит в deployment contract. Target —
-systemd-based Linux host с Python 3.12 и несколькими bounded MediaMTX nodes.
-Linux amd64/arm64 имеют одинаковые functional/security/release gates; capacity
-публикуется отдельно для конкретного hardware.
+Docker/container runtime не входит в deployment contract. Target — native
+`amd64`/`arm64` host, проходящий capability-based
+[`modern-systemd-linux-v1`](../docs/HOST_COMPATIBILITY.md), с несколькими
+bounded MediaMTX nodes. Distro package differences скрыты за
+apt/dnf/zypper/pacman adapters; functional/security/release gates одинаковы, а
+capacity публикуется отдельно для конкретного hardware.
 
 ## Desired immutable layout
 
@@ -19,7 +21,7 @@ Linux amd64/arm64 имеют одинаковые functional/security/release ga
 │   └── <release-id>/
 │       ├── .venv/
 │       ├── bin/{mediamtx,ffmpeg,ffprobe}
-│       ├── libexec/rtsp-proxy-probe/ffprobe
+│       ├── libexec/rtsp-proxy-probe/{ffprobe,bpftool,rtsp_probe_connect_guard.bpf.o}
 │       ├── dist/rtsp_proxy-<version>-py3-none-any.whl
 │       ├── release-manifest.json
 │       └── uv.lock
@@ -472,9 +474,13 @@ controlled source-probe ffprobe is a separate release artifact under
 `libexec/rtsp-proxy-probe/ffprobe`: its exact FFmpeg source, local no-redirect
 patch, Ubuntu snapshot/toolchain and reproducible amd64/arm64 digests are bound
 by both the deployment catalog and the packaged verifier trust catalog. It is
-not interchangeable with `bin/ffprobe`. Release verification admits the
-artifact, while `configure_camera_sources.sh` and the explicit broker/worker
-activation steps enable execution for one site policy. MediaMTX is built
+not interchangeable with `bin/ffprobe`. The same release directory contains
+the architecture-specific, digest-admitted `bpftool`; the broker never depends
+on the mutable distro binary. Release verification checks that bundled tool is
+executable on the current glibc host before activation. The system `bpftool` or
+`bpf` package remains diagnostic/package-adapter tooling, not the trusted
+execution path. `configure_camera_sources.sh` and the explicit broker/worker
+activation steps then enable execution for one site policy. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
 two SHA-256-bound production patches, one deterministic race-regression patch,
 and Go `1.26.5`; resulting amd64/arm64 binary
@@ -780,7 +786,7 @@ once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.17.4 \
+  --release-id 0.17.5 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -829,7 +835,7 @@ two can reach the accepted root broker. The worker uses the durable health
 projection and read-only node-runtime observer; ownership/schema/helper failure
 makes its readiness fail without changing camera health or media service.
 
-Candidate `0.17.4` retains schema 0024 and the pinned media/probe binaries. It
+Candidate `0.17.5` retains schema 0024 and the pinned media/probe binaries. It
 also preserves the validated `pg_dump`/`pg_restore` invocation symlink so the
 Ubuntu `pg_wrapper` dispatch contract works during production backup drills.
 It treats an unexpectedly stopped runtime whose desired state is `RUNNING` as
@@ -860,11 +866,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.17.4 candidate, apply migration 0024 and run:
+For a first installation of the 0.17.5 candidate, apply migration 0024 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.17.4 \
+  --release-id 0.17.5 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

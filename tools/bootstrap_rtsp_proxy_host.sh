@@ -1,34 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-test "$(id -u)" -eq 0 || {
-  printf 'bootstrap requires root\n' >&2
-  exit 1
-}
 umask 022
-test -r /etc/os-release || {
-  printf 'os-release unavailable\n' >&2
-  exit 1
-}
-. /etc/os-release
-test "${ID:-}" = ubuntu || {
-  printf 'unsupported distribution: %s\n' "${ID:-unknown}" >&2
-  exit 1
-}
-case "${VERSION_ID:-}" in
-  24.04|26.04) ;;
-  *)
-    printf 'unsupported Ubuntu release: %s\n' "${VERSION_ID:-unknown}" >&2
-    exit 1
-    ;;
-esac
-case "$(uname -m)" in
-  x86_64|aarch64) ;;
-  *)
-    printf 'unsupported architecture: %s\n' "$(uname -m)" >&2
-    exit 1
-    ;;
-esac
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+bootstrap_python=${RTSP_PROXY_BOOTSTRAP_PYTHON:-python3}
 
 bootstrap_mode=${1:---check}
 case "$bootstrap_mode" in
@@ -40,13 +15,20 @@ case "$bootstrap_mode" in
 esac
 
 deploy_uv=${RTSP_PROXY_DEPLOY_UV:-/usr/local/bin/uv}
-if [ "$bootstrap_mode" = --install ]; then
-  apt-get -o Acquire::Retries=10 -o Acquire::https::Timeout=30 update
-  DEBIAN_FRONTEND=noninteractive apt-get \
-    -o Acquire::Retries=10 -o Acquire::https::Timeout=30 install --yes \
-    bpftool ca-certificates curl git jq nftables openssl postgresql-client \
-    systemd systemd-container util-linux
-fi
+test "$bootstrap_mode" != --install || test "$(id -u)" -eq 0 || {
+  printf 'bootstrap install requires root\n' >&2
+  exit 1
+}
+host_doctor_arguments=(
+  --verify-uv
+  --uv "$deploy_uv"
+  --bootstrap-catalog "$repo_root/deploy/bootstrap-artifacts.json"
+)
+test "$bootstrap_mode" != --install || host_doctor_arguments+=(
+  --install
+)
+"$bootstrap_python" "$repo_root/src/rtsp_proxy/host_platform.py" \
+  "${host_doctor_arguments[@]}"
 
 test -x "$deploy_uv" || {
   printf 'trusted uv executable missing at %s\n' "$deploy_uv" >&2
@@ -59,13 +41,17 @@ test "$(stat -c '%F:%u:%a' "$deploy_uv")" = 'regular file:0:755' || {
 }
 
 python_root=/opt/rtsp-proxy/python
-install -d -o root -g root -m 0755 /opt/rtsp-proxy "$python_root"
 if [ "$bootstrap_mode" = --install ]; then
+  install -d -o root -g root -m 0755 /opt/rtsp-proxy "$python_root"
   UV_PYTHON_INSTALL_DIR="$python_root" "$deploy_uv" python install 3.12
   find "$python_root" -type d -exec chmod a+rx,go-w {} +
   find "$python_root" -type f -exec chmod a+r,go-w {} +
   find "$python_root" -type f -perm /111 -exec chmod a+x {} +
 fi
+[ -d "$python_root" ] || {
+  printf 'isolated Python runtime missing: %s\n' "$python_root" >&2
+  exit 1
+}
 python_executable=$(UV_PYTHON_INSTALL_DIR="$python_root" "$deploy_uv" python find 3.12)
 if find "$python_root" -type d ! -perm -0005 -print -quit | grep -q . \
   || find "$python_root" -type f ! -perm -0004 -print -quit | grep -q . \
@@ -80,7 +66,7 @@ test -x "$python_executable" || {
   exit 1
 }
 
-for command in bpftool curl git jq nft openssl psql systemctl systemd-run; do
+for command in curl git jq nft openssl psql systemctl systemd-run; do
   command -v "$command" >/dev/null || {
     printf 'required command missing: %s\n' "$command" >&2
     exit 1
@@ -90,4 +76,4 @@ test -d /sys/fs/bpf || {
   printf 'bpffs mountpoint missing: /sys/fs/bpf\n' >&2
   exit 1
 }
-printf 'host prerequisite check passed for Ubuntu %s %s\n' "$VERSION_ID" "$(uname -m)"
+printf 'isolated Python 3.12 runtime check passed\n'

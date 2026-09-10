@@ -91,9 +91,13 @@ restart прерывает только потоки выбранной ноды
 
 ## Быстрый старт direct-Linux сервера
 
-Поддерживаемый контур: direct Linux без Docker, Ubuntu 24.04 (amd64 или arm64),
-Python 3.12, systemd, PostgreSQL и nftables. Ubuntu 26.04 допускается для pilot
-mechanism testing с отдельно установленными Python 3.12 и проверенным `uv`.
+Поддерживаемый контур: direct `amd64`/`arm64` Linux без Docker, проходящий
+capability profile `modern-systemd-linux-v1`: kernel ≥6.8, systemd ≥255 как
+PID 1, cgroup v2, bpffs, BTF, glibc ≥2.39 и системный Python ≥3.12. Приложение
+не зависит от версии системного Python: bootstrap устанавливает отдельный
+runtime 3.12. Поддерживаются package adapters apt, dnf, zypper и pacman;
+точный контракт и distro-specific оговорки описаны в
+[Linux host compatibility](docs/HOST_COMPATIBILITY.md).
 
 Полная пошаговая инструкция: **[Pilot installation, update and rollback](deploy/PILOT_INSTALL.md)**.
 
@@ -117,8 +121,8 @@ LAN IP и работает только по HTTPS.
 3. Проверить или установить host prerequisites:
 
    ```sh
-   sudo --preserve-env=RTSP_PROXY_DEPLOY_UV \
-     ./tools/bootstrap_rtsp_proxy_host.sh --check
+   sudo ./tools/bootstrap_rtsp_proxy_host.sh --install
+   ./tools/bootstrap_rtsp_proxy_host.sh --check
    ```
 
 4. Установить immutable release и статические host assets без запуска сервисов:
@@ -177,7 +181,7 @@ keyring сразу для WEB, reconciler, probe worker и broker можно о�
 
 ```sh
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.17.4 \
+  --release-id 0.17.5 \
   --source-cidrs '10.180.5.0/24,192.168.50.0/24'
 ```
 

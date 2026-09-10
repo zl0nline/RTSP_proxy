@@ -712,10 +712,11 @@ Required runbooks:
 The executable pilot sequence is maintained in
 `deploy/PILOT_INSTALL.md`: host prerequisite check, immutable install, explicit
 first migration/activation, update health rollback, schema-compatible explicit
-rollback and a small real-camera trial gate. The bootstrap accepts Ubuntu 24.04
-and 26.04 for pilot testing, installs only reviewed OS prerequisites plus a
-dedicated Python 3.12 through an operator-provided trusted `uv`, and never
-enables services or mutates PostgreSQL/firewall state.
+rollback and a small real-camera trial gate. The bootstrap accepts any native
+amd64/arm64 host passing `modern-systemd-linux-v1`, selects an
+apt/dnf/zypper/pacman package adapter, verifies a pinned `uv`, installs a
+dedicated Python 3.12, and never enables services or mutates
+PostgreSQL/firewall state.
 
 Control-plane update must not restart media nodes. MediaMTX update proceeds one
 drained node at a time. Restore regenerates configs and validates current host

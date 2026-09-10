@@ -155,6 +155,13 @@ def trust_test_probe_connect_guard(monkeypatch: pytest.MonkeyPatch) -> None:
             Sha256.model_validate(sha256(payload)),
         ),
     )
+    tool_payload = b"#!/bin/sh\nprintf 'bpftool v7.4.0\\n'\n"
+    monkeypatch.setattr(
+        "rtsp_proxy.release._trusted_probe_bpftool_identities",
+        lambda _architecture: frozenset(
+            {Sha256.model_validate(sha256(tool_payload))}
+        ),
+    )
 
 
 def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
@@ -163,6 +170,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
     ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version test build\\n'\n"
     probe_ffprobe_payload = b"#!/bin/sh\nprintf 'ffprobe version probe-test\\n'\n"
     probe_guard_payload = b"test probe connect guard object"
+    probe_bpftool_payload = b"#!/bin/sh\nprintf 'bpftool v7.4.0\\n'\n"
     artifacts = {
         "uv.lock": b"lock",
         "dist/rtsp_proxy-0.1.0-py3-none-any.whl": wheel_payload,
@@ -171,6 +179,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
         "bin/ffprobe": ffprobe_payload,
         "libexec/rtsp-proxy-probe/ffprobe": probe_ffprobe_payload,
         "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o": probe_guard_payload,
+        "libexec/rtsp-proxy-probe/bpftool": probe_bpftool_payload,
     }
     for relative_path, payload in artifacts.items():
         path = tmp_path / relative_path
@@ -180,7 +189,7 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             path.chmod(0o750)
 
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "release_id": "0.5.0",
         "git_commit": "a" * 40,
         "python": {
@@ -215,6 +224,8 @@ def write_release(tmp_path: Path, *, wheel_payload: bytes = b"wheel") -> Path:
             "linux_arch": "amd64",
             "object": "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o",
             "object_sha256": sha256(probe_guard_payload),
+            "bpftool": "libexec/rtsp-proxy-probe/bpftool",
+            "bpftool_sha256": sha256(probe_bpftool_payload),
         },
         "schema_compatibility": {
             "minimum": "0012_operator_sessions",
@@ -241,6 +252,22 @@ def test_verified_release_exposes_only_validated_artifact_paths(tmp_path: Path) 
     assert release.probe_connect_guard_object == (
         tmp_path / "libexec/rtsp-proxy-probe/rtsp_probe_connect_guard.bpf.o"
     )
+    assert release.probe_bpftool_binary == (
+        tmp_path / "libexec/rtsp-proxy-probe/bpftool"
+    )
+
+
+def test_bundled_bpftool_is_bound_to_packaged_trust(tmp_path: Path) -> None:
+    manifest_path = write_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["probe_connect_guard"]["bpftool_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="untrusted_probe_bpftool_artifact",
+    ):
+        verify_release(manifest_path, expected_python="3.12", expected_arch="amd64")
 
 
 def test_controlled_probe_ffprobe_is_bound_to_packaged_trust(tmp_path: Path) -> None:
@@ -548,7 +575,7 @@ def test_example_manifests_cover_both_supported_linux_architectures() -> None:
         "amd64",
         "arm64",
     }
-    assert {manifest.release_id for manifest in manifests} == {"0.17.4"}
+    assert {manifest.release_id for manifest in manifests} == {"0.17.5"}
     assert {manifest.mediamtx.release_id for manifest in manifests} == {"0.2.1"}
     assert {manifest.probe_connect_guard.release_id for manifest in manifests} == {
         "0.1.0"
@@ -595,4 +622,10 @@ def test_example_manifests_are_derived_from_the_artifact_catalog() -> None:
         assert (
             manifest.probe_connect_guard.object_sha256.root
             == probe_guard_pin["object_sha256"]
+        )
+        assert manifest.probe_connect_guard.bpftool_sha256.root in (
+            probe_guard_pin["bpftool_sha256"]
+        )
+        assert manifest.probe_connect_guard.bpftool == (
+            "libexec/rtsp-proxy-probe/bpftool"
         )
