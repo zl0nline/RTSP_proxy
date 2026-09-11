@@ -759,6 +759,50 @@ def test_local_operator_can_refresh_recent_mfa_inside_dashboard() -> None:
     assert 'value="/dashboard"' in unsafe_return.text
 
 
+def test_oidc_operator_cannot_use_local_dashboard_mfa_refresh() -> None:
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.OIDC,
+        id=ACCOUNT_ID,
+        subject="oidc:operator@example.test",
+        display_name="OIDC operator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("S" * 43, "C" * 43)).__next__,
+    )
+    issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=True)
+    client = TestClient(
+        create_app(Settings(role=RuntimeRole.WEB), operator_sessions=sessions),
+        base_url="https://management.example.test",
+    )
+    headers = {
+        "Cookie": (
+            f"__Host-rtsp_proxy_session={issued.session_token}; "
+            f"__Host-rtsp_proxy_csrf={issued.csrf_token}"
+        )
+    }
+
+    page = client.get("/dashboard/mfa", headers=headers)
+    refreshed = client.post(
+        "/dashboard/mfa",
+        headers=headers,
+        data={
+            "_csrf": issued.csrf_token,
+            "totp": "123456",
+            "return_to": "/dashboard",
+        },
+    )
+
+    assert page.status_code == 409
+    assert "Повторное подтверждение TOTP доступно локальным операторам" in page.text
+    assert refreshed.status_code == 422
+    assert '<p class="form-error" role="alert">' in refreshed.text
+
+
 def test_local_operator_can_change_password_through_authenticated_api() -> None:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.LOCAL,

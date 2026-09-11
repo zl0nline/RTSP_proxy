@@ -679,6 +679,9 @@ def test_linux_host_installs_only_static_assets_and_examples(
     )
 
     host.install_assets(source, release)
+    # Reinstalling the same immutable media release and already-migrated
+    # environments must be an idempotent no-op at those boundaries.
+    host.install_assets(source, release)
 
     assert (paths.root / "etc/systemd/system/rtsp-proxy-web.service").is_file()
     assert (

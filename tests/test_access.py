@@ -330,6 +330,34 @@ def test_service_grant_can_be_permanent_and_temporary_secret_is_human_sized() ->
     assert permanent.grant.expires_at is None
     assert permanent.grant.active_at(NOW + timedelta(days=3650))
     assert rotated_permanent.grant.expires_at is None
+    with pytest.raises(ValueError, match="access_grant_lifetime_invalid"):
+        replace(permanent.grant, kind="temporary")
+
+
+@pytest.mark.parametrize(
+    ("lifetime", "kind", "secret", "reason"),
+    [
+        (None, "temporary", "A" * 43, "access_grant_lifetime_invalid"),
+        (timedelta(0), "service", "A" * 43, "access_grant_lifetime_invalid"),
+        (timedelta(hours=1), "temporary", "short", "access_grant_secret_invalid"),
+    ],
+)
+def test_access_grant_control_rejects_invalid_permanent_and_secret_inputs(
+    lifetime: timedelta | None,
+    kind: str,
+    secret: str,
+    reason: str,
+) -> None:
+    control = AccessGrantControl(
+        store=RecordingAccessStore(policy=policy(), grant=None),
+        verifier=verifier(),
+        new_grant_id=lambda: GRANT_ID,
+        clock=lambda: NOW,
+        new_secret=lambda: secret,
+    )
+
+    with pytest.raises(ValueError, match=reason):
+        control.create(camera_id=CAMERA_ID, lifetime=lifetime, kind=kind)
 
 
 def test_grant_rotation_replay_is_rejected_before_mutable_state_read() -> None:
