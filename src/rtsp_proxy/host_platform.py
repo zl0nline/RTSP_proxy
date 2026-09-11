@@ -209,7 +209,17 @@ def package_plan(available_commands: frozenset[str]) -> PackagePlan:
             ("zypper", "--non-interactive", "install", "--no-recommends", *packages),
         )
     else:
-        commands = (("pacman", "--sync", "--refresh", "--needed", "--noconfirm", *packages),)
+        commands = (
+            (
+                "pacman",
+                "--sync",
+                "--refresh",
+                "--sysupgrade",
+                "--needed",
+                "--noconfirm",
+                *packages,
+            ),
+        )
     return PackagePlan(manager=manager, packages=packages, commands=commands)
 
 

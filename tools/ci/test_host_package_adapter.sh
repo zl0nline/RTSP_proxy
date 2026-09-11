@@ -28,7 +28,7 @@ case "$profile" in
   arch)
     image=archlinux:base
     manager=pacman
-    prepare='pacman --sync --refresh --needed --noconfirm python'
+    prepare='pacman --sync --refresh --sysupgrade --needed --noconfirm python'
     ;;
   *)
     printf 'unknown host adapter profile: %s\n' "$profile" >&2

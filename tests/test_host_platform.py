@@ -144,6 +144,22 @@ def test_package_adapters_cover_major_modern_systemd_families(
     assert {"bpftool", "bpf"} & set(plan.packages)
 
 
+def test_pacman_adapter_performs_supported_full_system_upgrade() -> None:
+    plan = package_plan(frozenset({"pacman"}))
+
+    assert plan.commands == (
+        (
+            "pacman",
+            "--sync",
+            "--refresh",
+            "--sysupgrade",
+            "--needed",
+            "--noconfirm",
+            *plan.packages,
+        ),
+    )
+
+
 def test_os_release_parser_handles_quotes_comments_and_id_like() -> None:
     parsed = parse_os_release(
         '# generated\nID="armbian"\nID_LIKE="ubuntu debian"\nVERSION_ID=26.04\n'
