@@ -714,6 +714,137 @@ def test_linux_host_installs_only_static_assets_and_examples(
     assert commands[-1] == ("/usr/bin/systemctl", "daemon-reload")
 
 
+def test_media_runtime_install_rejects_invalid_or_unsafe_immutable_targets(
+    tmp_path: Path,
+) -> None:
+    paths = DeploymentPaths.under(tmp_path / "host")
+    host = LinuxDeploymentHost(paths)
+    release = tmp_path / "release"
+    binary = release / "bin/mediamtx"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"verified-media")
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+
+    with pytest.raises(DeploymentError, match="invalid_media_release_id"):
+        host._install_media_runtime(
+            release,
+            {
+                "mediamtx": {
+                    "release_id": "../escape",
+                    "binary": "bin/mediamtx",
+                    "binary_sha256": digest,
+                }
+            },
+        )
+    with pytest.raises(DeploymentError, match="invalid_release_manifest"):
+        host._install_media_runtime(
+            release,
+            {
+                "mediamtx": {
+                    "release_id": "1.2.3",
+                    "binary": "bin/mediamtx",
+                    "binary_sha256": "invalid",
+                }
+            },
+        )
+    manifest = {
+        "mediamtx": {
+            "release_id": "1.2.3",
+            "binary": "bin/mediamtx",
+            "binary_sha256": "0" * 64,
+        }
+    }
+    with pytest.raises(DeploymentError, match="media_runtime_digest_mismatch"):
+        host._install_media_runtime(release, manifest)
+
+    manifest["mediamtx"]["binary_sha256"] = digest
+    media_root = paths.opt_root / "media"
+    media_root.mkdir(parents=True)
+    media_root.chmod(0o775)
+    with pytest.raises(DeploymentError, match="unsafe_media_runtime_root"):
+        host._install_media_runtime(release, manifest)
+    media_root.chmod(0o755)
+    target = media_root / "1.2.3/mediamtx"
+    target.parent.mkdir()
+    target.write_bytes(b"different-media")
+    target.chmod(0o755)
+    with pytest.raises(DeploymentError, match="media_runtime_release_conflict"):
+        host._install_media_runtime(release, manifest)
+    manifest["mediamtx"]["release_id"] = "1.2.4"
+    (media_root / "1.2.4").mkdir()
+    with pytest.raises(DeploymentError, match="unsafe_media_runtime"):
+        host._install_media_runtime(release, manifest)
+
+    nodes_root = paths.root / "etc/rtsp-proxy/nodes"
+    nodes_root.parent.mkdir(parents=True)
+    nodes_root.symlink_to(tmp_path)
+    with pytest.raises(DeploymentError, match="unsafe_node_config_root"):
+        host._migrate_media_environment_paths(binary, expected_sha256=digest)
+
+
+def test_media_environment_migration_rejects_unsafe_inputs(tmp_path: Path) -> None:
+    media_binary = tmp_path / "shared/mediamtx"
+    media_binary.parent.mkdir()
+    media_binary.write_bytes(b"verified-media")
+    digest = hashlib.sha256(media_binary.read_bytes()).hexdigest()
+
+    deploy_module._rewrite_media_environment(
+        tmp_path / "missing.env",
+        variable="RTSP_PROXY_MEDIAMTX_BINARY",
+        media_binary=media_binary,
+        expected_sha256=digest,
+    )
+    invalid_environment = tmp_path / "invalid.env"
+    invalid_environment.write_text("OTHER=value\n")
+    with pytest.raises(DeploymentError, match="invalid_media_environment"):
+        deploy_module._rewrite_media_environment(
+            invalid_environment,
+            variable="RTSP_PROXY_MEDIAMTX_BINARY",
+            media_binary=media_binary,
+            expected_sha256=digest,
+        )
+    relative_environment = tmp_path / "relative.env"
+    relative_environment.write_text("RTSP_PROXY_MEDIAMTX_BINARY=relative/path\n")
+    with pytest.raises(DeploymentError, match="unsafe_media_environment_binary"):
+        deploy_module._rewrite_media_environment(
+            relative_environment,
+            variable="RTSP_PROXY_MEDIAMTX_BINARY",
+            media_binary=media_binary,
+            expected_sha256=digest,
+        )
+    old_binary = tmp_path / "old/mediamtx"
+    old_binary.parent.mkdir()
+    old_binary.write_bytes(b"verified-media")
+    old_binary.chmod(0o775)
+    unsafe_environment = tmp_path / "unsafe.env"
+    unsafe_environment.write_text(f"RTSP_PROXY_MEDIAMTX_BINARY={old_binary}\n")
+    with pytest.raises(DeploymentError, match="unsafe_media_environment_binary"):
+        deploy_module._rewrite_media_environment(
+            unsafe_environment,
+            variable="RTSP_PROXY_MEDIAMTX_BINARY",
+            media_binary=media_binary,
+            expected_sha256=digest,
+        )
+    symlinked_environment = tmp_path / "symlinked.env"
+    symlinked_environment.symlink_to(invalid_environment)
+    with pytest.raises(DeploymentError, match="unsafe_media_environment"):
+        deploy_module._rewrite_media_environment(
+            symlinked_environment,
+            variable="RTSP_PROXY_MEDIAMTX_BINARY",
+            media_binary=media_binary,
+            expected_sha256=digest,
+        )
+    undecodable_environment = tmp_path / "undecodable.env"
+    undecodable_environment.write_bytes(b"\xff")
+    with pytest.raises(DeploymentError, match="unsafe_media_environment"):
+        deploy_module._rewrite_media_environment(
+            undecodable_environment,
+            variable="RTSP_PROXY_MEDIAMTX_BINARY",
+            media_binary=media_binary,
+            expected_sha256=digest,
+        )
+
+
 @pytest.mark.parametrize(
     ("url", "reason"),
     [
