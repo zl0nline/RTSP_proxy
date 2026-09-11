@@ -1,0 +1,19 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Подтверждение MFA — RTSP Proxy{% endblock %}
+{% block content %}
+<main id="main-content">
+  <nav class="breadcrumbs" aria-label="Навигационная цепочка"><a href="{{ return_to }}">Назад</a><span aria-hidden="true">/</span><span>Подтверждение MFA</span></nav>
+  <div class="page-heading"><div><p class="eyebrow">Защищённое действие</p><h1>Подтвердите второй фактор</h1></div></div>
+  <section class="panel mutation-panel" aria-labelledby="mfa-title">
+    <div class="panel-heading"><h2 id="mfa-title">Код из приложения-аутентификатора</h2></div>
+    {% if error %}<p class="form-error" role="alert">Код неверен, уже использован или срок его действия истёк.</p>{% endif %}
+    <form class="mutation-form" method="post" action="/dashboard/mfa">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="return_to" value="{{ return_to }}">
+      <label>Одноразовый код<input name="totp" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code" required autofocus></label>
+      <p>Код действует 30 секунд. После подтверждения защищённые действия доступны ещё несколько минут.</p>
+      <div class="form-actions"><button type="submit">Подтвердить</button><a href="{{ return_to }}">Отмена</a></div>
+    </form>
+  </section>
+</main>
+{% endblock %}

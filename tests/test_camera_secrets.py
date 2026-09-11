@@ -17,6 +17,7 @@ from rtsp_proxy.camera_secrets import (
     parse_camera_source_keyring,
     split_source_credentials,
 )
+from rtsp_proxy.nodes import camera_source_summary
 
 CAMERA_ID = UUID("10000000-0000-4000-8000-000000000001")
 
@@ -96,6 +97,15 @@ def test_raw_source_credentials_round_trip_literal_reserved_characters_once() ->
         "rtsp://camera.local/live",
         credentials,
     )
+
+
+def test_camera_source_summary_omits_userinfo_query_and_fragment() -> None:
+    address, credentials_configured = camera_source_summary(
+        "rtsp://user:secret@[2001:db8::5]:8554/live/main?token=hidden#fragment"
+    )
+
+    assert address == "rtsp://[2001:db8::5]:8554/live/main"
+    assert credentials_configured is True
 
 
 def test_camera_source_key_file_requires_exact_private_ownership(

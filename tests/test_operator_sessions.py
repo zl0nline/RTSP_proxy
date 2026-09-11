@@ -1667,7 +1667,7 @@ def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -
         ),
     )
     route_methods = _protected_route_method_matrix(anonymous_app.routes)
-    assert len(route_methods) == 81
+    assert len(route_methods) == 83
 
     node_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     camera_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
@@ -1729,6 +1729,8 @@ def test_generated_protected_route_method_matrix_is_fail_closed_and_semantic() -
         ("POST", "/api/v1/operator/password"),
         ("GET", "/dashboard/logout"),
         ("POST", "/dashboard/logout"),
+        ("GET", "/dashboard/mfa"),
+        ("POST", "/dashboard/mfa"),
         ("GET", "/dashboard/password"),
         ("POST", "/dashboard/password"),
         ("GET", "/api/v1/operator/session"),

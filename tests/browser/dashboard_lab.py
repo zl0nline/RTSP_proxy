@@ -26,6 +26,7 @@ from rtsp_proxy.access import (
     PepperVerifier,
 )
 from rtsp_proxy.app import create_app
+from rtsp_proxy.camera_secrets import CameraSourceCredentials
 from rtsp_proxy.config import RuntimeRole, Settings
 from rtsp_proxy.identifiers import PublicId
 from rtsp_proxy.media import MediaPathConfig, MediaPathInventory
@@ -53,7 +54,10 @@ from rtsp_proxy.operator_access import (
     OperatorSessionControl,
 )
 from rtsp_proxy.operator_identity import (
+    InMemoryLocalOperatorStore,
     InMemoryOidcFlowStore,
+    LocalOperatorCredentials,
+    LocalOperatorLoginControl,
     OidcIdentity,
     OidcLoginControl,
     OidcProvider,
@@ -64,7 +68,7 @@ ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NODE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CAMERA_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 CREATED_CAMERA_ID = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
-SOURCE_SECRET_CANARY = "rtsp://source-secret-canary.invalid/private"
+SOURCE_SECRET_CANARY = "browser-source-password-canary-0123456789abcdef"
 DOWNSTREAM_SECRET_CANARY = "browser-downstream-secret-canary-0123456789abcdef"
 
 
@@ -217,7 +221,11 @@ def build_lab_app(*, origin: str) -> Any:
     )
     camera = cameras.create_camera(
         name="Front entrance",
-        source_url=SOURCE_SECRET_CANARY,
+        source_url="rtsp://source-camera.invalid/private",
+        source_credentials=CameraSourceCredentials(
+            username="browser-source-user",
+            password=SOURCE_SECRET_CANARY,
+        ),
         node_id=NODE_ID,
     )
     nodes = NodeControl(
@@ -291,9 +299,31 @@ def build_lab_app(*, origin: str) -> Any:
         authz_version=1,
         enabled=True,
     )
+    local_account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+        subject="local:browser-lab",
+        display_name="Local browser operator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
     sessions = OperatorSessionControl(
-        store=InMemoryOperatorSessionStore(accounts=(account,)),
+        store=InMemoryOperatorSessionStore(accounts=(account, local_account)),
         token_factory=lambda: secrets.token_urlsafe(32),
+    )
+    local_login = LocalOperatorLoginControl(
+        store=InMemoryLocalOperatorStore(
+            account=local_account,
+            credentials=LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(
+                    "browser-lab-password",
+                    salt=b"B" * 16,
+                ),
+            ),
+        ),
+        sessions=sessions,
     )
     login = OidcLoginControl(
         provider=OidcProvider(
@@ -322,6 +352,7 @@ def build_lab_app(*, origin: str) -> Any:
         fleet_snapshot_max_age_seconds=300,
         operator_sessions=sessions,
         operator_login=login,
+        local_operator_login=local_login,
         node_control=nodes,
         access_policy_control=AccessPolicyControl(store=access_store),
         access_grant_control=AccessGrantControl(

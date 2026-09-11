@@ -106,7 +106,7 @@ def test_database_backup_and_isolated_restore_are_exact_and_remove_temporary_dat
     )
     manifest = Path(f"{archive}.manifest.json")
     assert backup["status"] == "verified"
-    assert backup["database"]["revision"] == "0024_camera_probe_profiles"
+    assert backup["database"]["revision"] == "0025_permanent_service_grants"
     assert backup["database"]["invariants"] == {
         "access_policy_per_live_camera": True,
         "current_placement_present_in_history": True,

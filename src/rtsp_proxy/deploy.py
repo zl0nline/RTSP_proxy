@@ -26,7 +26,9 @@ _HEALTH_ATTEMPTS = 30
 _HEALTH_INTERVAL_SECONDS = 1.0
 _RESTARTABLE_APPLICATION_UNITS = (
     "rtsp-proxy-auth.service",
+    "rtsp-proxy-node-runtime.service",
     "rtsp-proxy-node-runtime.socket",
+    "rtsp-proxy-node-metrics.service",
     "rtsp-proxy-node-metrics.socket",
     "rtsp-proxy-probe-broker.socket",
     "rtsp-proxy-web.service",
@@ -171,7 +173,13 @@ class LinuxDeploymentHost:
 
     def install_assets(self, source_root: Path, release: Path) -> None:
         self.verify(release)
-        self._require_source_checkout(source_root, _manifest(release))
+        manifest = _manifest(release)
+        self._require_source_checkout(source_root, manifest)
+        media_binary = self._install_media_runtime(release, manifest)
+        self._migrate_media_environment_paths(
+            media_binary,
+            expected_sha256=_nested_string(manifest, "mediamtx", "binary_sha256"),
+        )
         assets: tuple[tuple[Path, Path, int], ...] = tuple(
             (path, Path("etc/systemd/system") / path.name, 0o644)
             for path in sorted((source_root / "deploy/systemd").glob("*.service"))
@@ -240,6 +248,95 @@ class LinuxDeploymentHost:
             ),
         )
         self._run(Path("/usr/bin/systemctl"), "daemon-reload")
+
+    def _install_media_runtime(
+        self,
+        release: Path,
+        manifest: dict[str, object],
+    ) -> Path:
+        media_release_id = _nested_string(manifest, "mediamtx", "release_id")
+        if not _RELEASE_ID.fullmatch(media_release_id):
+            raise DeploymentError("invalid_media_release_id")
+        expected_sha256 = _nested_string(manifest, "mediamtx", "binary_sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise DeploymentError("invalid_release_manifest")
+        source = _artifact_path(release, manifest, "mediamtx", "binary")
+        if _sha256(source) != expected_sha256:
+            raise DeploymentError("media_runtime_digest_mismatch")
+        media_root = self._paths.opt_root / "media"
+        media_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        media_root_stat = media_root.stat(follow_symlinks=False)
+        if (
+            media_root.is_symlink()
+            or not stat.S_ISDIR(media_root_stat.st_mode)
+            or media_root_stat.st_uid != os.geteuid()
+            or media_root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise DeploymentError("unsafe_media_runtime_root")
+        media_root.chmod(0o755)
+        target_dir = media_root / media_release_id
+        target = target_dir / "mediamtx"
+        if target_dir.exists() or target_dir.is_symlink():
+            target_dir_stat = target_dir.stat(follow_symlinks=False)
+            target_stat = target.stat(follow_symlinks=False) if target.exists() else None
+            if (
+                target_dir.is_symlink()
+                or not stat.S_ISDIR(target_dir_stat.st_mode)
+                or target_dir_stat.st_uid != os.geteuid()
+                or target_dir_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or target.is_symlink()
+                or target_stat is None
+                or not stat.S_ISREG(target_stat.st_mode)
+                or target_stat.st_uid != os.geteuid()
+                or target_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise DeploymentError("unsafe_media_runtime")
+            if _sha256(target) != expected_sha256:
+                raise DeploymentError("media_runtime_release_conflict")
+            return target
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{media_release_id}.staging-", dir=media_root)
+        )
+        try:
+            installed = staging / "mediamtx"
+            shutil.copyfile(source, installed)
+            installed.chmod(0o755)
+            staging.chmod(0o755)
+            if _sha256(installed) != expected_sha256:
+                raise DeploymentError("media_runtime_digest_mismatch")
+            os.replace(staging, target_dir)
+            _fsync_directory(media_root)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return target
+
+    def _migrate_media_environment_paths(
+        self,
+        media_binary: Path,
+        *,
+        expected_sha256: str,
+    ) -> None:
+        _rewrite_media_environment(
+            self._paths.root / "etc/rtsp-proxy/node-runtime.env",
+            variable="RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY",
+            media_binary=media_binary,
+            expected_sha256=expected_sha256,
+        )
+        nodes_root = self._paths.root / "etc/rtsp-proxy/nodes"
+        if not nodes_root.exists():
+            return
+        if nodes_root.is_symlink() or not nodes_root.is_dir():
+            raise DeploymentError("unsafe_node_config_root")
+        for node_root in sorted(nodes_root.iterdir()):
+            if node_root.is_symlink() or not node_root.is_dir():
+                raise DeploymentError("unsafe_node_config_directory")
+            _rewrite_media_environment(
+                node_root / "runtime.env",
+                variable="RTSP_PROXY_MEDIAMTX_BINARY",
+                media_binary=media_binary,
+                expected_sha256=expected_sha256,
+            )
 
     def database_revision(self, release: Path, environment_file: Path) -> str:
         _require_root_owned_file(environment_file, allowed_modes={0o600, 0o640})
@@ -675,6 +772,68 @@ def _install_file(source: Path, target: Path, mode: int) -> None:
     temporary.chmod(mode)
     os.replace(temporary, target)
     _fsync_directory(target.parent)
+
+
+def _rewrite_media_environment(
+    path: Path,
+    *,
+    variable: str,
+    media_binary: Path,
+    expected_sha256: str,
+) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        file_stat = path.stat(follow_symlinks=False)
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or file_stat.st_uid != os.geteuid()
+            or file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise DeploymentError("unsafe_media_environment")
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise DeploymentError("unsafe_media_environment") from error
+    prefix = f"{variable}="
+    lines = content.splitlines()
+    matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+    if len(matches) != 1:
+        raise DeploymentError("invalid_media_environment")
+    old_value = lines[matches[0]][len(prefix) :]
+    if old_value == str(media_binary):
+        return
+    old_binary = Path(old_value)
+    if (
+        not old_binary.is_absolute()
+        or any(character.isspace() or character in "'\"\\" for character in old_value)
+        or old_binary.is_symlink()
+        or not old_binary.is_file()
+    ):
+        raise DeploymentError("unsafe_media_environment_binary")
+    old_binary_stat = old_binary.stat(follow_symlinks=False)
+    if (
+        old_binary_stat.st_uid != os.geteuid()
+        or old_binary_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise DeploymentError("unsafe_media_environment_binary")
+    if _sha256(old_binary) != expected_sha256:
+        # A different MediaMTX release needs the explicit disruption-fenced
+        # node release workflow. An application update must not change it.
+        return
+    lines[matches[0]] = f"{prefix}{media_binary}"
+    payload = "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+    temporary = path.with_name(f".{path.name}.next.{os.getpid()}")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.chown(temporary, file_stat.st_uid, file_stat.st_gid)
+        temporary.chmod(stat.S_IMODE(file_stat.st_mode))
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise DeploymentError("media_environment_update_failed") from error
 
 
 def _fsync_directory(path: Path) -> None:

@@ -29,6 +29,8 @@
       <div><dt>Входящий bitrate</dt><dd>{{ node.received_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</dd></div>
       <div><dt>Исходящий bitrate</dt><dd>{{ node.sent_bitrate_bps | dashboard_bitrate if metrics_fresh else '—' }}</dd></div>
       <div><dt>Revision</dt><dd>{{ node.applied_revision }} / {{ node.desired_revision }}</dd></div>
+      <div><dt>MediaMTX release</dt><dd>{{ node.observed_release_id or '—' }}<small>observed</small></dd></div>
+      <div><dt>Ожидаемый release</dt><dd>{{ node.release_id or '—' }}{% if node.release_id and node.observed_release_id and node.observed_release_id != node.release_id %}<small class="runtime-drift">drift</small>{% else %}<small>desired</small>{% endif %}</dd></div>
     </dl>
   </section>
   {% if can_manage_nodes %}

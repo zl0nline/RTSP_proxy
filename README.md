@@ -39,9 +39,11 @@
 rtsp://<server>:<node_port>/<public_id>
 ```
 
-Поддерживается стандартный RTSP interleaved TCP. Адрес исходной камеры и её
-credentials остаются внутри платформы. Для доступа клиент использует отдельный
-выданный grant; секрет показывается только один раз.
+Поддерживается стандартный RTSP interleaved TCP. Dashboard показывает только
+очищенный host/port/path исходной камеры и признак сохранённых credentials;
+имя пользователя, пароль, query и fragment остаются внутри платформы. Для
+доступа клиент использует отдельный выданный grant; секрет показывается только
+один раз.
 
 ## Модель нод
 
@@ -154,6 +156,10 @@ RTSP Proxy не требует внешнего сервера авториза�
 паролю на `/auth/local/login`. TOTP можно добавить сразу, но он необязателен для
 обычного входа и нужен для действий, требующих недавнего MFA.
 
+Когда пятиминутное окно recent MFA истекает, локальному оператору не нужно
+выходить: dashboard запрашивает текущий шестизначный TOTP и возвращает к
+защищённому действию. Один код нельзя использовать повторно.
+
 Для существующей password-only учётной записи TOTP добавляется интерактивно:
 `sudo ./tools/configure_local_auth.sh --release-id VERSION --username admin
 --enroll-totp`. CLI требует текущий пароль, показывает одноразовый URI и
@@ -181,7 +187,7 @@ keyring сразу для WEB, reconciler, probe worker и broker можно о�
 
 ```sh
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.17.6 \
+  --release-id 0.17.7 \
   --source-cidrs '10.180.5.0/24,192.168.50.0/24'
 ```
 
@@ -192,6 +198,16 @@ sudo ./tools/configure_camera_sources.sh \
 привязанным к UUID камеры; API, dashboard, аудит и таблица `cameras` их не
 возвращают. Не удаляйте `camera-source-keys.json`: без него credentialed-камеры
 fail closed.
+
+Задайте `RTSP_PROXY_PUBLIC_RTSP_HOST` в WEB environment как доступный клиентам
+DNS-host или IP без scheme/port/path. Тогда карточка камеры показывает полный
+копируемый downstream endpoint. Без настройки она честно оставляет
+`<server-address>`, не выводя адрес management-интерфейса как предположение.
+
+Temporary downstream grant всегда имеет срок и получает удобный для ручного
+ввода 12-символьный секрет без неоднозначных знаков. Service grant для
+unattended-клиента можно сделать бессрочным; его длинный секрет по-прежнему
+показывается один раз и должен храниться в защищённом secret store клиента.
 
 ## Обновление и rollback
 

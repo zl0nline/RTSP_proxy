@@ -80,6 +80,25 @@ def render_password_change(
     )
 
 
+def render_mfa_refresh(
+    *,
+    principal: OperatorPrincipal,
+    csrf_token: str,
+    return_to: str,
+    error: bool = False,
+) -> str:
+    return (
+        _environment()
+        .get_template("dashboard/mfa_refresh.html")
+        .render(
+            principal=principal,
+            csrf_token=csrf_token,
+            return_to=return_to,
+            error=error,
+        )
+    )
+
+
 class FleetSnapshotFailureReason(StrEnum):
     UNAVAILABLE = "fleet_snapshot_unavailable"
     PENDING = "fleet_snapshot_pending"
@@ -303,7 +322,11 @@ def render_camera_detail(
     live_updates_enabled: bool = False,
     poll_interval_seconds: int = 10,
     probe_profile: StoredCameraProbeProfile | None = None,
+    public_rtsp_host: str | None = None,
 ) -> str:
+    rendered_host = public_rtsp_host
+    if rendered_host is not None and ":" in rendered_host:
+        rendered_host = f"[{rendered_host}]"
     return (
         _environment()
         .get_template("dashboard/camera.html")
@@ -317,6 +340,7 @@ def render_camera_detail(
             live_updates_enabled=live_updates_enabled,
             poll_interval_ms=poll_interval_seconds * 1000,
             probe_profile=probe_profile,
+            public_rtsp_host=rendered_host,
         )
     )
 

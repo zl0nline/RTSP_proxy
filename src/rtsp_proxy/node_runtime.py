@@ -19,6 +19,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import BoundedSemaphore, Lock
@@ -1473,11 +1474,24 @@ def _read_linux_process_identity(proc_root: Path, pid: int) -> NodeProcessSnapsh
         boot_id = UUID(
             (proc_root / "sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         )
-        executable = (process_root / "exe").resolve(strict=True)
-        digest = hashlib.sha256()
-        with executable.open("rb") as binary:
-            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
-                digest.update(chunk)
+        executable_link = process_root / "exe"
+        executable = executable_link.resolve(strict=True)
+        executable_stat = executable_link.stat()
+        executable_identity = (
+            executable_stat.st_dev,
+            executable_stat.st_ino,
+            executable_stat.st_size,
+            executable_stat.st_mtime_ns,
+            executable_stat.st_ctime_ns,
+        )
+        executable_sha256 = _cached_process_executable_sha256(
+            str(executable_link),
+            str(executable),
+            str(boot_id),
+            pid,
+            process_start_ticks,
+            executable_identity,
+        )
         repeated_stat_line = (process_root / "stat").read_text(encoding="ascii")
         repeated_closing_parenthesis = repeated_stat_line.rfind(")")
         repeated_fields = repeated_stat_line[repeated_closing_parenthesis + 2 :].split()
@@ -1485,7 +1499,8 @@ def _read_linux_process_identity(proc_root: Path, pid: int) -> NodeProcessSnapsh
             repeated_closing_parenthesis < 1
             or len(repeated_fields) <= 19
             or int(repeated_fields[19]) != process_start_ticks
-            or (process_root / "exe").resolve(strict=True) != executable
+            or executable_link.resolve(strict=True) != executable
+            or _file_identity(executable_link.stat()) != executable_identity
         ):
             raise ValueError
     except (OSError, UnicodeError, ValueError) as error:
@@ -1495,8 +1510,45 @@ def _read_linux_process_identity(proc_root: Path, pid: int) -> NodeProcessSnapsh
         pid=pid,
         process_start_ticks=process_start_ticks,
         boot_id=boot_id,
-        executable_sha256=digest.hexdigest(),
+        executable_sha256=executable_sha256,
     )
+
+
+def _file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+@lru_cache(maxsize=256)
+def _cached_process_executable_sha256(
+    executable_link: str,
+    executable: str,
+    boot_id: str,
+    pid: int,
+    process_start_ticks: int,
+    expected_identity: tuple[int, int, int, int, int],
+) -> str:
+    # The process identity fields are deliberately part of the cache key.  They
+    # prevent PID reuse or a reboot from reusing a digest even when the inode
+    # metadata happens to match.
+    del executable, boot_id, pid, process_start_ticks
+    digest = hashlib.sha256()
+    try:
+        with Path(executable_link).open("rb") as binary:
+            if _file_identity(os.fstat(binary.fileno())) != expected_identity:
+                raise ValueError
+            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if _file_identity(os.fstat(binary.fileno())) != expected_identity:
+                raise ValueError
+    except OSError as error:
+        raise ValueError from error
+    return digest.hexdigest()
 
 
 def _sha256_regular_file(path: Path) -> str:

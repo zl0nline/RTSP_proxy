@@ -392,6 +392,8 @@ class StaticCameraCatalog:
             state=CameraState.ENABLED,
             desired_revision=3,
             applied_revision=2,
+            source_address="rtsp://camera.internal/private",
+            source_credentials_configured=True,
         )
 
     def set_camera_enabled(
@@ -1184,6 +1186,8 @@ def _snapshot() -> FleetSnapshot:
                 metric_observed_at=NOW,
                 received_bitrate_bps=1_500_000.0,
                 sent_bitrate_bps=3_000_000.0,
+                release_id="0.2.1",
+                observed_release_id="0.2.0",
             ),
         ),
     )
@@ -1465,6 +1469,9 @@ def test_dashboard_node_detail_is_authenticated_escaped_and_snapshot_bound() -> 
     assert "edge <north>" not in response.text
     assert "14.08.2026 12:00:00 UTC" in response.text
     assert "1.50 Мбит/с" in response.text  # noqa: RUF001
+    assert "0.2.1" in response.text
+    assert "0.2.0" in response.text
+    assert "runtime-drift" in response.text
     assert missing.status_code == 404
     assert missing.headers["cache-control"] == "no-store"
     assert "Нода не найдена" in missing.text
@@ -3919,7 +3926,8 @@ def test_postgres_dashboard_catalog_and_detail_remain_available_on_rolling_schem
         assert live.json()["source_state"] == "ready"
         assert "Bridge camera" in detail.text
         assert "camera.internal" not in catalog.text
-        assert "camera.internal" not in detail.text
+        assert "rtsp://camera.internal/bridge" in detail.text
+        assert "admin:secret" not in detail.text
     finally:
         store.close()
 
@@ -3946,6 +3954,7 @@ def test_camera_detail_is_authenticated_escaped_and_secret_free() -> None:
     assert "edge &lt;north&gt;" in response.text
     assert "rtsp://&lt;server-address&gt;:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa" in (response.text)
     assert catalog.source_url not in response.text
+    assert "rtsp://camera.internal/private" in response.text
     assert "admin:secret" not in response.text
     assert missing.status_code == 404
     assert "Камера не найдена" in missing.text
@@ -5389,6 +5398,10 @@ def test_camera_dashboard_forms_require_bound_csrf_and_confirm_occupied_disable(
         camera_control=cast(CameraControl, catalog),
         camera_mutation_control=mutations,
         role=OperatorRole.OPERATOR,
+        settings=Settings(
+            role=RuntimeRole.WEB,
+            public_rtsp_host="stream.example.test",
+        ),
     )
     detail_path = f"/dashboard/cameras/{CAMERA_ID}"
     preview_path = f"{detail_path}/mutations/preview"
@@ -5429,7 +5442,11 @@ def test_camera_dashboard_forms_require_bound_csrf_and_confirm_occupied_disable(
     assert detail.status_code == 200
     assert f'action="{preview_path}"' in detail.text
     assert f'value="{CSRF_TOKEN}"' in detail.text
-    assert catalog.source_url not in detail.text
+    assert "rtsp://camera.internal/private" in detail.text
+    assert "Учётные данные сохранены" in detail.text
+    assert "admin:secret" not in detail.text
+    assert "rtsp://&lt;server-address&gt;:10543/" not in detail.text
+    assert "rtsp://stream.example.test:10543/" in detail.text
     assert missing_csrf.status_code == 401
     assert wrong_csrf.status_code == 401
     assert preview.status_code == 200

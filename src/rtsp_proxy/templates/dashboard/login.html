@@ -1,11 +1,25 @@
 {% extends "dashboard/base.html" %}
 {% block title %}Вход — RTSP Proxy{% endblock %}
+{% block body_class %}login-body{% endblock %}
+{% block chrome %}{% endblock %}
 {% block content %}
 <main id="main-content" class="login-page">
-  <section class="state-card login-card" aria-labelledby="login-title">
-    <p class="eyebrow">RTSP Proxy</p>
-    <h1 id="login-title">Вход оператора</h1>
-    <p class="login-intro">Введите локальные учётные данные этого сервера.</p>
+  <div class="login-shell">
+    <section class="login-context" aria-labelledby="login-context-title">
+      <div class="login-brand-mark" aria-hidden="true">RP</div>
+      <p class="eyebrow">RTSP Proxy</p>
+      <h1 id="login-context-title">Защищённый доступ к управлению потоками</h1>
+      <p>Единая точка контроля камер, медианод и клиентских доступов.</p>
+      <ul aria-label="Возможности панели">
+        <li>Состояние потоков в реальном времени</li>
+        <li>Управление без раскрытия секретов камер</li>
+        <li>Журналируемые операторские действия</li>
+      </ul>
+    </section>
+    <section class="login-card" aria-labelledby="login-title">
+      <p class="eyebrow">Панель управления</p>
+      <h2 id="login-title">Вход оператора</h2>
+      <p class="login-intro">Введите локальные учётные данные этого сервера.</p>
     {% if error %}<p id="login-error" class="form-error" role="alert" tabindex="-1" autofocus>Неверный логин, пароль или код TOTP.</p>{% endif %}
     <form class="login-form" method="post" action="/auth/local/login" autocomplete="on" data-login-form>
       <label for="username">Логин</label>
@@ -21,11 +35,13 @@
         <input id="totp" name="totp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000">
         <small>Заполните, если для этой учётной записи включена MFA.</small>
       </details>
-      <button class="login-submit" type="submit" data-login-submit><span data-login-label>Войти</span></button>
+      <button class="login-submit" type="submit" data-login-submit><span data-login-label>Войти в панель</span></button>
     </form>
     {% if oidc_enabled %}
-    <p><a class="button-link" href="/auth/oidc/login">Войти через локальный IdP</a></p>
+    <p class="login-alternate"><a class="button-link login-alternate-button" href="/auth/oidc/login">Войти через локальный IdP</a></p>
     {% endif %}
-  </section>
+      <p class="login-security-note">Соединение и сессия защищены. Не вводите данные камеры на этой странице.</p>
+    </section>
+  </div>
 </main>
 {% endblock %}

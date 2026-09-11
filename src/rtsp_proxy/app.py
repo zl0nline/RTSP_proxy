@@ -4,14 +4,14 @@ from datetime import UTC, datetime, timedelta
 from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Literal
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
 import anyio
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rtsp_proxy.access import (
@@ -40,6 +40,7 @@ from rtsp_proxy.dashboard import (
     FleetSnapshotReadFailure,
     render_local_login,
     render_logout,
+    render_mfa_refresh,
     render_node_detail,
     render_overview,
     render_password_change,
@@ -303,6 +304,8 @@ class FleetNodeResponse(BaseModel):
     received_bitrate_bps: float | None
     sent_bitrate_bps: float | None
     counters_reset: bool
+    release_id: str | None
+    observed_release_id: str | None
 
 
 class FleetSnapshotResponse(BaseModel):
@@ -500,12 +503,18 @@ class AccessPolicyResponse(BaseModel):
 
 class AccessGrantCreateRequest(BaseModel):
     kind: Literal["temporary", "service"]
-    lifetime_seconds: int = Field(ge=1, le=366 * 24 * 60 * 60)
+    lifetime_seconds: int | None = Field(default=None, ge=1, le=366 * 24 * 60 * 60)
+
+    @model_validator(mode="after")
+    def require_temporary_expiry(self) -> "AccessGrantCreateRequest":
+        if self.kind == "temporary" and self.lifetime_seconds is None:
+            raise ValueError("temporary_access_grant_expiry_required")
+        return self
 
 
 class AccessGrantRotateRequest(BaseModel):
     overlap_seconds: int = Field(default=30, ge=0, le=24 * 60 * 60)
-    lifetime_seconds: int = Field(ge=1, le=366 * 24 * 60 * 60)
+    lifetime_seconds: int | None = Field(default=None, ge=1, le=366 * 24 * 60 * 60)
     expected_revision: int = Field(ge=1)
 
 
@@ -515,7 +524,7 @@ class AccessGrantSecretResponse(BaseModel):
     username: str
     password: str
     not_before: datetime
-    expires_at: datetime
+    expires_at: datetime | None
     revision: int
     kind: str
     created_by: str
@@ -527,7 +536,7 @@ class AccessGrantResponse(BaseModel):
     camera_id: str
     username: str
     not_before: datetime
-    expires_at: datetime
+    expires_at: datetime | None
     revoked_at: datetime | None
     revision: int
     kind: str
@@ -1285,6 +1294,70 @@ def create_app(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
+    @app.get("/dashboard/mfa", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_mfa_page(request: Request, return_to: str = "/dashboard") -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        safe_return = _safe_dashboard_return(return_to)
+        if local_operator_login is None or principal.identity_source.value != "local":
+            return _dashboard_unavailable_response(
+                DashboardUnavailable(
+                    title="Локальная MFA недоступна",
+                    message="Повторное подтверждение TOTP доступно локальным операторам.",
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+                principal=principal,
+            )
+        return _dashboard_html_response(
+            render_mfa_refresh(
+                principal=principal,
+                csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
+                return_to=safe_return,
+            )
+        )
+
+    @app.post("/dashboard/mfa", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_mfa_refresh(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        csrf_token = request.cookies.get("__Host-rtsp_proxy_csrf", "")
+        safe_return = "/dashboard"
+        try:
+            form = request.state.dashboard_form
+            form.require_exact_fields(frozenset({"_csrf", "totp", "return_to"}))
+            totp = form.required("totp", max_length=6)
+            safe_return = _safe_dashboard_return(
+                form.required("return_to", max_length=2048)
+            )
+            if local_operator_login is None or principal.identity_source.value != "local":
+                raise OidcLoginInvalid("local_operator_mfa_refresh_denied")
+            local_operator_login.refresh_mfa(
+                account_id=principal.account_id,
+                session_id=principal.session_id,
+                session_token=request.cookies.get("__Host-rtsp_proxy_session", ""),
+                totp=totp,
+                audit_context=request.state.operator_audit_context,
+            )
+        except (OidcLoginInvalid, OperatorAuthenticationRequired, DashboardFormInvalid):
+            return _dashboard_html_response(
+                render_mfa_refresh(
+                    principal=principal,
+                    csrf_token=csrf_token,
+                    return_to=safe_return,
+                    error=True,
+                ),
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            )
+        except (OidcLoginUnavailable, OperatorSessionUnavailable):
+            return _operator_session_unavailable_response(request)
+        return RedirectResponse(
+            safe_return,
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Cache-Control": "no-store"},
+        )
+
     app.include_router(
         camera_dashboard_router(
             camera_probe_profiles=camera_probe_profiles,
@@ -1298,6 +1371,7 @@ def create_app(
             recent_mfa_seconds=settings.operator_recent_mfa_seconds,
             secret_reveal_seconds=access_secret_reveal_seconds,
             poll_interval_seconds=settings.dashboard_poll_interval_seconds,
+            public_rtsp_host=settings.public_rtsp_host,
         )
     )
     app.include_router(camera_probe_profile_router(camera_probe_profiles))
@@ -1456,6 +1530,8 @@ def create_app(
                     received_bitrate_bps=node.received_bitrate_bps,
                     sent_bitrate_bps=node.sent_bitrate_bps,
                     counters_reset=node.counters_reset,
+                    release_id=node.release_id,
+                    observed_release_id=node.observed_release_id,
                 )
                 for node in snapshot.nodes
             ],
@@ -2913,7 +2989,11 @@ def create_app(
             principal = getattr(request.state, "operator_principal", None)
             issued = access_grant_control.create(
                 camera_id=camera_id,
-                lifetime=timedelta(seconds=payload.lifetime_seconds),
+                lifetime=(
+                    None
+                    if payload.lifetime_seconds is None
+                    else timedelta(seconds=payload.lifetime_seconds)
+                ),
                 kind=payload.kind,
                 created_by=(
                     f"operator:{principal.account_id}"
@@ -2968,6 +3048,11 @@ def create_app(
                 detail={"code": "access_grant_schema_unavailable"},
                 headers={"Retry-After": "1"},
             ) from None
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": str(error)},
+            ) from None
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
         response.headers["Location"] = (
@@ -3006,7 +3091,11 @@ def create_app(
                 grant_id,
                 camera_id=camera_id,
                 overlap=timedelta(seconds=payload.overlap_seconds),
-                lifetime=timedelta(seconds=payload.lifetime_seconds),
+                lifetime=(
+                    None
+                    if payload.lifetime_seconds is None
+                    else timedelta(seconds=payload.lifetime_seconds)
+                ),
                 expected_revision=payload.expected_revision,
                 created_by=(
                     f"operator:{principal.account_id}"
@@ -3073,6 +3162,11 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "access_grant_schema_unavailable"},
                 headers={"Retry-After": "1"},
+            ) from None
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": str(error)},
             ) from None
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
@@ -3405,6 +3499,7 @@ def _operator_scope_for_request(request: Request) -> str | None:
         "/api/v1/operator/password",
         "/dashboard/logout",
         "/dashboard/password",
+        "/dashboard/mfa",
     }:
         return None
     for camera_resource_prefix in ("/dashboard/cameras/", "/api/v1/cameras/"):
@@ -3434,7 +3529,7 @@ def _operator_action_bucket(
         return OperatorActionBucket.DASHBOARD_READ
     if http_method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return None
-    if action in {"camera.grant_issue", "camera.grant_rotate"}:
+    if action in {"camera.grant_issue", "camera.grant_rotate", "operator.mfa_refresh"}:
         return OperatorActionBucket.SECRET_ISSUE
     if action in {"camera.create", "camera.probe_profile_update"}:
         return OperatorActionBucket.CAMERA_MUTATION
@@ -3460,9 +3555,12 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
         "/api/v1/operator/password",
         "/dashboard/logout",
         "/dashboard/password",
+        "/dashboard/mfa",
     }:
         if path.endswith("/password"):
             return "operator.password_change", "session", "self"
+        if path.endswith("/mfa"):
+            return "operator.mfa_refresh", "session", "self"
         action = (
             "operator.session_logout" if method in {"POST", "DELETE"} else "operator.session_read"
         )
@@ -3890,6 +3988,22 @@ def _operator_principal(request: Request) -> OperatorPrincipal:
             detail={"code": "operator_authentication_required"},
         )
     return principal
+
+
+def _safe_dashboard_return(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return "/dashboard"
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.fragment
+        or not (parsed.path == "/dashboard" or parsed.path.startswith("/dashboard/"))
+        or parsed.path.startswith("//")
+    ):
+        return "/dashboard"
+    return parsed.path + (f"?{parsed.query}" if parsed.query else "")
 
 
 def _external_node_mutation_context(

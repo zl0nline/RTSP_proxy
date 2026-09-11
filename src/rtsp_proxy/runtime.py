@@ -136,6 +136,7 @@ ENV_TO_FIELD = {
     "RTSP_PROXY_PROBE_EXECUTION_WORKERS": "probe_execution_workers",
     "RTSP_PROXY_PROBE_BROKER_SOCKET": "probe_broker_socket",
     "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "dashboard_poll_interval_seconds",
+    "RTSP_PROXY_PUBLIC_RTSP_HOST": "public_rtsp_host",
     "RTSP_PROXY_PROBE_SOURCE_CIDRS": "probe_source_cidrs",
     "RTSP_PROXY_CAMERA_SOURCE_KEYS_FILE": "camera_source_keys_file",
     "RTSP_PROXY_PROBE_SOURCE_SITE_KEY": "probe_source_site_key",

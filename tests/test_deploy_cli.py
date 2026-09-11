@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -642,8 +643,40 @@ def test_linux_host_installs_only_static_assets_and_examples(
 
     monkeypatch.setattr(host, "_run", record_command)
     release = tmp_path / "release"
-    release.mkdir()
-    (release / "release-manifest.json").write_text("{}")
+    (release / "bin").mkdir(parents=True)
+    media_content = b"pinned-media-runtime"
+    (release / "bin/mediamtx").write_bytes(media_content)
+    media_sha256 = hashlib.sha256(media_content).hexdigest()
+    (release / "release-manifest.json").write_text(
+        json.dumps(
+            {
+                "mediamtx": {
+                    "release_id": "0.2.1",
+                    "binary": "bin/mediamtx",
+                    "binary_sha256": media_sha256,
+                }
+            }
+        )
+    )
+    old_binary = paths.root / "opt/rtsp-proxy/releases/old/bin/mediamtx"
+    old_binary.parent.mkdir(parents=True)
+    old_binary.write_bytes(media_content)
+    helper_environment = paths.root / "etc/rtsp-proxy/node-runtime.env"
+    helper_environment.parent.mkdir(parents=True)
+    helper_environment.write_text(
+        f"RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY={old_binary}\n"
+    )
+    node_environment = paths.root / "etc/rtsp-proxy/nodes/node-a/runtime.env"
+    node_environment.parent.mkdir(parents=True)
+    node_environment.write_text(f"RTSP_PROXY_MEDIAMTX_BINARY={old_binary}\n")
+    different_binary = paths.root / "opt/rtsp-proxy/releases/other/bin/mediamtx"
+    different_binary.parent.mkdir(parents=True)
+    different_binary.write_bytes(b"different-media-runtime")
+    different_environment = paths.root / "etc/rtsp-proxy/nodes/node-b/runtime.env"
+    different_environment.parent.mkdir(parents=True)
+    different_environment.write_text(
+        f"RTSP_PROXY_MEDIAMTX_BINARY={different_binary}\n"
+    )
 
     host.install_assets(source, release)
 
@@ -654,6 +687,13 @@ def test_linux_host_installs_only_static_assets_and_examples(
     ).is_file()
     assert (paths.root / "etc/systemd/system/rtsp-proxy-probe-broker.socket").is_file()
     assert not (paths.root / "etc/systemd/system/mediamtx.service").exists()
+    shared_media = paths.root / "opt/rtsp-proxy/media/0.2.1/mediamtx"
+    assert shared_media.read_bytes() == media_content
+    assert str(shared_media) in helper_environment.read_text()
+    assert str(shared_media) in node_environment.read_text()
+    assert different_environment.read_text() == (
+        f"RTSP_PROXY_MEDIAMTX_BINARY={different_binary}\n"
+    )
     assert (paths.root / "etc/rtsp-proxy/examples/rtsp-proxy.env.example").is_file()
     assert (paths.root / "etc/rtsp-proxy/examples/probe-worker.env.example").is_file()
     assert (paths.root / "etc/rtsp-proxy/examples/rtsp-proxy.nft.example").is_file()

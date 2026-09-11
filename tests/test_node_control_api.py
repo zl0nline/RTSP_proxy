@@ -1517,7 +1517,7 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'camera_probe_profiles')"
             )
         )
-        assert revision == "0024_camera_probe_profiles"
+        assert revision == "0025_permanent_service_grants"
     assert table_count == 15
 
 
@@ -1755,7 +1755,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0024_camera_probe_profiles"
+            "0025_permanent_service_grants"
         )
 
 
@@ -1788,7 +1788,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0024_camera_probe_profiles"
+            "0025_permanent_service_grants"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})

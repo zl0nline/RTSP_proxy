@@ -26,6 +26,7 @@ from sqlalchemy import (
     Uuid,
     create_engine,
     delete,
+    exists,
     func,
     insert,
     literal,
@@ -107,6 +108,7 @@ from rtsp_proxy.nodes import (
     ProbeEndpointSchemaUnavailable,
     camera_move_is_terminal,
     camera_placement_fingerprint,
+    camera_source_summary,
     is_node_eligible,
     probe_endpoint_identity,
     select_port_with_bounded_recheck,
@@ -383,7 +385,7 @@ camera_access_grants = Table(
     Column("token_verifier", String(64), nullable=False),
     Column("pepper_key_id", String(64), nullable=False),
     Column("not_before", DateTime(timezone=True), nullable=False),
-    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
     Column("revoked_at", DateTime(timezone=True), nullable=True),
     Column("kind", String(16), nullable=False),
     Column("created_by", String(128), nullable=False),
@@ -392,7 +394,10 @@ camera_access_grants = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint("username ~ '^grant-[0-9a-f]{32}$'"),
     CheckConstraint("token_verifier ~ '^[0-9a-f]{64}$'"),
-    CheckConstraint("not_before < expires_at"),
+    CheckConstraint(
+        "(expires_at IS NOT NULL AND not_before < expires_at) "
+        "OR (expires_at IS NULL AND kind = 'service')"
+    ),
     CheckConstraint("revision >= 1"),
     CheckConstraint("kind IN ('temporary', 'service')"),
     CheckConstraint("length(created_by) BETWEEN 1 AND 128"),
@@ -2575,9 +2580,24 @@ class PostgresNodeStore:
         try:
             with self._engine.connect() as connection:
                 self._require_camera_catalog_projection(connection)
+                credentials_supported = self._schema_supports_camera_sources(connection)
+                credential_presence = (
+                    exists(
+                        select(camera_source_credentials.c.camera_id).where(
+                            camera_source_credentials.c.camera_id == cameras.c.id
+                        )
+                    )
+                    if credentials_supported
+                    else literal(False)
+                ).label("source_credentials_configured")
                 row = (
                     connection.execute(
-                        self._camera_catalog_query().where(cameras.c.id == camera_id)
+                        self._camera_catalog_query()
+                        .add_columns(
+                            cameras.c.source_url.label("source_address"),
+                            credential_presence,
+                        )
+                        .where(cameras.c.id == camera_id)
                     )
                     .mappings()
                     .one_or_none()
@@ -4289,7 +4309,9 @@ class PostgresNodeStore:
             current = self._lock_access_grant(connection, grant_id)
             if current.revision != expected_revision or current.revoked_at is not None:
                 raise CameraLifecycleConflict("access_grant_revision_conflict")
-            if replacement.camera_id != current.camera_id or old_expires_at > current.expires_at:
+            if replacement.camera_id != current.camera_id or (
+                current.expires_at is not None and old_expires_at > current.expires_at
+            ):
                 raise ValueError("access_grant_rotation_invalid")
             previous = replace(
                 current,
@@ -4481,6 +4503,15 @@ def _probe_endpoint_values(endpoint: ProbeEndpointIdentity | None) -> dict[str, 
 
 
 def _camera_catalog_item(row: RowMapping) -> CameraCatalogItem:
+    source_address: str | None = None
+    source_credentials_configured: bool | None = None
+    if "source_address" in row:
+        source_address, inline_credentials = camera_source_summary(
+            str(row["source_address"])
+        )
+        source_credentials_configured = bool(
+            row["source_credentials_configured"] or inline_credentials
+        )
     return CameraCatalogItem(
         id=_uuid(row["id"]),
         name=validate_camera_name(str(row["name"])),
@@ -4492,6 +4523,8 @@ def _camera_catalog_item(row: RowMapping) -> CameraCatalogItem:
         state=CameraState(str(row["state"])),
         desired_revision=int(row["desired_revision"]),
         applied_revision=int(row["applied_revision"]),
+        source_address=source_address,
+        source_credentials_configured=source_credentials_configured,
     )
 
 
@@ -4526,7 +4559,7 @@ def _access_grant_event_payload(grant: AccessGrant) -> dict[str, object]:
         "camera_id": str(grant.camera_id),
         "username": grant.username,
         "not_before": grant.not_before.isoformat(),
-        "expires_at": grant.expires_at.isoformat(),
+        "expires_at": None if grant.expires_at is None else grant.expires_at.isoformat(),
         "revoked_at": None if grant.revoked_at is None else grant.revoked_at.isoformat(),
         "revision": grant.revision,
         "kind": grant.kind,

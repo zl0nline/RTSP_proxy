@@ -786,7 +786,7 @@ once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.17.6 \
+  --release-id 0.17.7 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -857,6 +857,25 @@ single production admission runbook. It also rebases SSE heartbeat deadlines
 after bounded authorization checks so a slow epoch lookup cannot emit an extra
 stale heartbeat.
 
+Candidate `0.17.7` adds schema `0025_permanent_service_grants`. Only service
+grants may omit expiry; temporary grants remain bounded. Local TOTP operators
+can refresh recent MFA inside the current dashboard session instead of logging
+out, and human-entered temporary secrets use a 12-character ambiguity-free
+alphabet while unattended service secrets retain their high-entropy form.
+Camera detail shows a credential-free source host/port/path, whether source
+credentials are stored, and an exact downstream endpoint when
+`RTSP_PROXY_PUBLIC_RTSP_HOST` is configured.
+
+Application install now places the manifest-verified MediaMTX executable at
+`/opt/rtsp-proxy/media/<media-release-id>/mediamtx`. Existing helper and node
+environment files are repointed only when their old executable has the same
+verified digest. A different media digest is left untouched for the explicit
+drain/confirmation workflow, so an application update does not restart media
+nodes. Node detail reports desired and observed MediaMTX releases and marks
+their drift. The node runtime helper caches the executable digest by boot, PID,
+process start and immutable file identity, avoiding a full binary read on each
+observation without weakening identity checks.
+
 ### Operator authentication modes
 
 There are two independent normal login paths, and they may be enabled at the
@@ -870,11 +889,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.17.6 candidate, apply migration 0024 and run:
+For a first installation of the 0.17.7 candidate, apply migration 0025 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.17.6 \
+  --release-id 0.17.7 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp

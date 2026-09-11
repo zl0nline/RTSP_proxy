@@ -370,6 +370,7 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
             "RTSP_PROXY_HTTP_HOST": "127.0.0.2",
             "RTSP_PROXY_HTTP_PORT": "8080",
             "RTSP_PROXY_DASHBOARD_POLL_INTERVAL_SECONDS": "15",
+            "RTSP_PROXY_PUBLIC_RTSP_HOST": "Streams.Example.Test.",
             "RTSP_PROXY_PROBE_SOURCE_SITE_KEY": "moscow-a",
             "RTSP_PROXY_PROBE_SOURCE_CIDRS": "10.50.0.0/16,2001:db8:50::/48",
         }
@@ -378,6 +379,7 @@ def test_http_runtime_configuration_is_typed_and_environment_driven() -> None:
     assert str(settings.http_host) == "127.0.0.2"
     assert settings.http_port == 8080
     assert settings.dashboard_poll_interval_seconds == 15
+    assert settings.public_rtsp_host == "streams.example.test"
     assert settings.probe_source_site_key == "moscow-a"
     assert tuple(str(network) for network in settings.probe_source_cidrs) == (
         "10.50.0.0/16",
@@ -390,6 +392,15 @@ def test_probe_source_policy_defaults_to_explicit_deny_all() -> None:
 
     assert settings.probe_source_site_key == "local"
     assert settings.probe_source_cidrs == ()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("https://streams.example.test", "streams.example.test:10554", "bad host"),
+)
+def test_public_rtsp_host_rejects_urls_ports_and_whitespace(value: str) -> None:
+    with pytest.raises(ValidationError, match="public_rtsp_host_invalid"):
+        Settings(role=RuntimeRole.WEB, public_rtsp_host=value)
 
 
 def test_probe_source_cidrs_have_one_canonical_nested_order() -> None:

@@ -641,6 +641,9 @@ def test_local_operator_has_a_browser_login_form_without_oidc() -> None:
     assert "wrong password" not in rejected.text
     assert 'data-password-toggle' in login_page.text
     assert 'class="login-submit"' in login_page.text
+    assert 'class="login-shell"' in login_page.text
+    assert 'class="login-brand-mark"' in login_page.text
+    assert "Защищённый доступ к управлению потоками" in login_page.text
     assert accepted.status_code == 303
     assert accepted.headers["location"] == "/"
     assert accepted.cookies["__Host-rtsp_proxy_session"] == "S" * 43
@@ -672,6 +675,88 @@ def test_local_operator_has_a_browser_login_form_without_oidc() -> None:
     )
     assert changed.status_code == 200
     assert "Пароль изменён" in changed.text
+
+
+def test_local_operator_can_refresh_recent_mfa_inside_dashboard() -> None:
+    secret = b"M" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    local_store = InMemoryLocalOperatorStore(
+        account=account,
+        credentials=LocalOperatorCredentials(
+            password_scrypt=LocalOperatorCredentials.hash_password(
+                "correct horse battery staple",
+                salt=b"B" * 16,
+            ),
+            totp_secret=secret,
+        ),
+    )
+    session_store = InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW)
+    sessions = OperatorSessionControl(
+        store=session_store,
+        token_factory=iter(("S" * 43, "C" * 43)).__next__,
+        secret_issue_limit_per_minute=2,
+    )
+    login = LocalOperatorLoginControl(
+        store=local_store,
+        sessions=sessions,
+        clock=lambda: NOW,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            operator_sessions=sessions,
+            local_operator_login=login,
+        ),
+        base_url="https://management.example.test",
+    )
+    client.post(
+        "/auth/local/login",
+        data={
+            "username": "admin",
+            "password": "correct horse battery staple",
+            "totp": "",
+        },
+    )
+    return_to = "/dashboard/cameras/10000000-0000-0000-0000-000000000001/access"
+    page = client.get("/dashboard/mfa", params={"return_to": return_to})
+    code = TOTP(secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
+    confirmed = client.post(
+        "/dashboard/mfa",
+        data={"_csrf": "C" * 43, "totp": code, "return_to": return_to},
+        follow_redirects=False,
+    )
+    session = client.get("/api/v1/operator/session")
+    replayed = client.post(
+        "/dashboard/mfa",
+        data={"_csrf": "C" * 43, "totp": code, "return_to": return_to},
+    )
+    rate_limited = client.post(
+        "/dashboard/mfa",
+        data={"_csrf": "C" * 43, "totp": code, "return_to": return_to},
+    )
+    unsafe_return = client.get(
+        "/dashboard/mfa",
+        params={"return_to": "/dashboard-pretender"},
+    )
+
+    assert page.status_code == 200
+    assert 'action="/dashboard/mfa"' in page.text
+    assert "Код действует 30 секунд" in page.text
+    assert confirmed.status_code == 303
+    assert confirmed.headers["location"] == return_to
+    assert session.json()["mfa_verified_at"] == NOW.isoformat().replace("+00:00", "Z")
+    assert replayed.status_code == 422
+    assert rate_limited.status_code == 429
+    assert 'value="/dashboard"' in unsafe_return.text
 
 
 def test_local_operator_can_change_password_through_authenticated_api() -> None:
@@ -949,6 +1034,93 @@ def test_postgres_password_change_requires_fresh_totp(
             )
     finally:
         store.close()
+
+
+def test_postgres_local_operator_refreshes_only_current_session_mfa_once(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    secret = b"R" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    local_store = PostgresLocalOperatorStore(
+        postgres_database_url,
+        encryption_key=b"K" * 32,
+    )
+    session_store = PostgresOperatorSessionStore(postgres_database_url)
+    sessions = OperatorSessionControl(
+        store=session_store,
+        token_factory=iter(("S" * 43, "C" * 43)).__next__,
+        session_id_factory=lambda: UUID("70000000-0000-4000-8000-000000000007"),
+    )
+    login = LocalOperatorLoginControl(store=local_store, sessions=sessions, clock=lambda: NOW)
+    context = OperatorRequestAuditContext.internal(
+        action="operator.mfa_refresh",
+        resource_scope="session:self",
+        resource_type="session",
+        resource_id="self",
+    )
+    try:
+        local_store.provision(
+            account=account,
+            credentials=LocalOperatorCredentials(
+                password_scrypt=LocalOperatorCredentials.hash_password(
+                    "correct horse battery staple",
+                    salt=b"P" * 16,
+                ),
+                totp_secret=secret,
+            ),
+            context=TEST_MUTATION_CONTEXT,
+        )
+        issued = sessions.issue(account_id=ACCOUNT_ID, mfa_verified=False)
+        code = TOTP(secret, 6, hashes.SHA1(), 30).generate(
+            int(NOW.timestamp())
+        ).decode("ascii")
+
+        login.refresh_mfa(
+            account_id=ACCOUNT_ID,
+            session_id=issued.session.id,
+            session_token=issued.session_token,
+            totp=code,
+            audit_context=context,
+        )
+
+        principal = sessions.authenticate(
+            session_token=issued.session_token,
+            permission=OperatorPermission.DASHBOARD_READ,
+            required_scope=None,
+        )
+        assert principal.mfa_verified_at == NOW
+        with pytest.raises(OidcLoginInvalid, match="local_operator_mfa_refresh_denied"):
+            login.refresh_mfa(
+                account_id=ACCOUNT_ID,
+                session_id=issued.session.id,
+                session_token=issued.session_token,
+                totp=code,
+                audit_context=context,
+            )
+        engine = create_engine(postgres_database_url, hide_parameters=True)
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE aggregate_id=:account_id "
+                    "AND event_type='operator.mfa_refreshed'"
+                ),
+                {"account_id": ACCOUNT_ID},
+            ) == 1
+        engine.dispose()
+    finally:
+        local_store.close()
+        session_store.close()
 
 
 def test_postgres_totp_enrollment_reauthenticates_revokes_and_is_single_use(

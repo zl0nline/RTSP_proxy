@@ -732,7 +732,7 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
     restricted = create_engine(restricted_url)
     with restricted.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0024_camera_probe_profiles"
+            "0025_permanent_service_grants"
         )
         assert not connection.scalar(
             text("SELECT pg_has_role(current_user, 'rtsp_proxy_observability_hostile', 'MEMBER')")
@@ -1235,6 +1235,8 @@ def test_dashboard_snapshot_api_reads_only_the_persisted_collector_snapshot() ->
                 "received_bitrate_bps": None,
                 "sent_bitrate_bps": None,
                 "counters_reset": False,
+                "release_id": "0.1.0",
+                "observed_release_id": None,
             }
         ],
     }

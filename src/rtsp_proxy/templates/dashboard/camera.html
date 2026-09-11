@@ -16,11 +16,20 @@
   <section class="panel camera-detail-panel" aria-labelledby="camera-details-title">
     <div class="panel-heading"><h2 id="camera-details-title">Публичный поток</h2></div>
     <dl class="detail-list">
-      <div><dt>RTSP endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ camera.node_port }}/{{ camera.public_id }}</code></dd></div>
+      <div><dt>RTSP endpoint</dt><dd><code>rtsp://{% if public_rtsp_host %}{{ public_rtsp_host }}{% else %}&lt;server-address&gt;{% endif %}:{{ camera.node_port }}/{{ camera.public_id }}</code></dd></div>
       <div><dt>Public path</dt><dd><code>/{{ camera.public_id }}</code></dd></div>
       <div><dt>UUID камеры</dt><dd><small>{{ camera.id }}</small></dd></div>
     </dl>
-    <p class="detail-note">Подставьте внешний или локальный адрес сервера. Поток использует обычный RTSP поверх TCP; source URL и учётные данные камеры не раскрываются.</p>
+    {% if not public_rtsp_host %}<p class="detail-note">Администратор ещё не настроил публичный адрес сервера. Подставьте доступный клиенту DNS-адрес или IP.</p>{% endif %}
+  </section>
+
+  <section class="panel" aria-labelledby="source-title">
+    <div class="panel-heading"><h2 id="source-title">Источник камеры</h2></div>
+    <dl class="detail-list">
+      <div><dt>Адрес</dt><dd><code>{{ camera.source_address or "—" }}</code></dd></div>
+      <div><dt>Учётные данные</dt><dd>{% if camera.source_credentials_configured %}Учётные данные сохранены{% elif camera.source_credentials_configured is sameas false %}Не заданы{% else %}Недоступно{% endif %}</dd></div>
+    </dl>
+    <p class="detail-note">Пароль, имя пользователя, query-параметры и fragment никогда не показываются в dashboard.</p>
   </section>
 
   <section class="panel" aria-labelledby="placement-title">

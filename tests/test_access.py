@@ -290,6 +290,48 @@ def test_operator_grant_mutations_require_bound_idempotency() -> None:
         )
 
 
+def test_service_grant_can_be_permanent_and_temporary_secret_is_human_sized() -> None:
+    store = RecordingAccessStore(policy=policy(), grant=None)
+    grant_ids = iter(
+        (
+            UUID("90000000-0000-4000-8000-000000000009"),
+            UUID("a0000000-0000-4000-8000-00000000000a"),
+            UUID("b0000000-0000-4000-8000-00000000000b"),
+        )
+    )
+    control = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=grant_ids.__next__,
+        clock=lambda: NOW,
+    )
+
+    temporary = control.create(
+        camera_id=CAMERA_ID,
+        lifetime=timedelta(hours=1),
+        kind="temporary",
+    )
+    permanent = control.create(
+        camera_id=CAMERA_ID,
+        lifetime=None,
+        kind="service",
+    )
+    rotated_permanent = control.rotate(
+        permanent.grant.id,
+        overlap=timedelta(minutes=5),
+        lifetime=None,
+    )
+
+    assert len(temporary.secret) == 12
+    assert temporary.secret.isascii()
+    assert set(temporary.secret) <= set(
+        "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    )
+    assert permanent.grant.expires_at is None
+    assert permanent.grant.active_at(NOW + timedelta(days=3650))
+    assert rotated_permanent.grant.expires_at is None
+
+
 def test_grant_rotation_replay_is_rejected_before_mutable_state_read() -> None:
     key = UUID("80000000-0000-4000-8000-000000000008")
 
@@ -709,7 +751,7 @@ def test_grant_creation_stores_only_verifier_and_returns_url_safe_secret_once() 
 
     assert issued.grant == store.created[0]
     assert issued.secret not in repr(issued.grant)
-    assert len(issued.secret) >= 43
+    assert len(issued.secret) == 12
     assert all(character.isalnum() or character in "-_" for character in issued.secret)
     assert issued.grant.token_verifier == verifier().digest(issued.secret)
     assert issued.grant.expires_at == NOW + timedelta(days=30)
@@ -858,6 +900,47 @@ def test_postgres_access_policy_grant_rotation_and_authorization_are_durable(
         expected_revision=1,
     )
     assert configured.revision == 2
+
+    permanent = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=lambda: UUID("50000000-0000-4000-8000-000000000005"),
+        clock=lambda: NOW,
+        new_secret=lambda: "P" * 43,
+    ).create(camera_id=camera.id, lifetime=None, kind="service")
+    persisted_permanent = store.get_access_grant_by_id(permanent.grant.id)
+    assert persisted_permanent is not None
+    assert persisted_permanent.expires_at is None
+    assert AccessAuthorizer(
+        store=store,
+        verifier=verifier(),
+        clock=lambda: NOW + timedelta(days=3650),
+    ).authorize(
+        AuthorizeRequest(
+            node_id=node.id,
+            public_id=camera.public_id,
+            peer_ip="198.51.100.7",
+            username=permanent.grant.username,
+            password=permanent.secret,
+            action="read",
+            protocol="rtsp",
+        )
+    ).allowed
+    rotated_permanent = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=lambda: UUID("60000000-0000-4000-8000-000000000006"),
+        clock=lambda: NOW,
+        new_secret=lambda: "R" * 43,
+    ).rotate(
+        permanent.grant.id,
+        overlap=timedelta(seconds=30),
+        lifetime=None,
+    )
+    previous_permanent = store.get_access_grant_by_id(permanent.grant.id)
+    assert previous_permanent is not None
+    assert previous_permanent.expires_at == NOW + timedelta(seconds=30)
+    assert rotated_permanent.grant.expires_at is None
 
     control = AccessGrantControl(
         store=store,
@@ -1437,6 +1520,35 @@ def test_access_http_contract_reveals_secret_once_and_denials_have_one_shape() -
     )
     assert (malformed.status_code, malformed.content) == (401, b"")
     assert (oversized.status_code, oversized.content) == (401, b"")
+
+
+def test_access_http_contract_allows_only_service_grants_without_expiry() -> None:
+    store = RecordingAccessStore(policy=policy(), grant=None)
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB),
+            access_grant_control=AccessGrantControl(
+                store=store,
+                verifier=verifier(),
+                new_grant_id=lambda: GRANT_ID,
+                clock=lambda: NOW,
+                new_secret=lambda: "S" * 43,
+            ),
+        )
+    )
+
+    permanent = client.post(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants",
+        json={"kind": "service"},
+    )
+    invalid_temporary = client.post(
+        f"/api/v1/cameras/{CAMERA_ID}/access-grants",
+        json={"kind": "temporary"},
+    )
+
+    assert permanent.status_code == 201
+    assert permanent.json()["expires_at"] is None
+    assert invalid_temporary.status_code == 422
 
 
 def test_access_http_endpoints_fail_closed_when_controls_or_records_are_missing() -> None:

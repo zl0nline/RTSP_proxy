@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import platform
+import re
 from dataclasses import dataclass
 from enum import StrEnum
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, ip_address
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -86,6 +87,7 @@ class Settings(BaseSettings):
     probe_execution_workers: int = Field(default=4, ge=1, le=16)
     probe_broker_socket: Path | None = None
     dashboard_poll_interval_seconds: int = Field(default=10, ge=5, le=30)
+    public_rtsp_host: str | None = Field(default=None, min_length=1, max_length=253)
     probe_source_site_key: str = Field(
         default="local",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
@@ -148,6 +150,25 @@ class Settings(BaseSettings):
             except ValueError as error:
                 raise ValueError("node_port_reserved_invalid") from error
         return value
+
+    @field_validator("public_rtsp_host")
+    @classmethod
+    def validate_public_rtsp_host(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.rstrip(".").lower()
+        if not candidate or any(character.isspace() for character in candidate):
+            raise ValueError("public_rtsp_host_invalid")
+        try:
+            ip_address(candidate)
+        except ValueError:
+            labels = candidate.split(".")
+            if any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError("public_rtsp_host_invalid") from None
+        return candidate
 
     @field_validator("probe_source_cidrs", mode="before")
     @classmethod

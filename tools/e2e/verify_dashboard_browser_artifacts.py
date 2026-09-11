@@ -5,17 +5,22 @@ from pathlib import Path
 
 EXPECTED_TEXT_FILES = (
     "01-anonymous.snapshot.txt",
+    "01-login.snapshot.txt",
     "02-dashboard.snapshot.txt",
     "03-confirmation.snapshot.txt",
     "04-logged-out.snapshot.txt",
 )
 EXPECTED_PNG_FILES = (
+    "01-login.png",
     "02-dashboard.png",
     "03-confirmation.png",
     "04-logged-out.png",
 )
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-SOURCE_SECRET_CANARY = b"rtsp://source-secret-canary.invalid/private"
+SOURCE_SECRET_CANARIES = (
+    b"browser-source-password-canary-0123456789abcdef",
+    b"browser-new-source-password-canary-0123456789abcdef",
+)
 MAX_TEXT_BYTES = 1_048_576
 MAX_PNG_BYTES = 16_777_216
 
@@ -41,7 +46,8 @@ def verify_artifacts(root: Path) -> int:
         size = path.stat().st_size
         if size < 1 or size > MAX_TEXT_BYTES:
             return _fail("browser_evidence_text_invalid")
-        if SOURCE_SECRET_CANARY in path.read_bytes():
+        content = path.read_bytes()
+        if any(canary in content for canary in SOURCE_SECRET_CANARIES):
             return _fail("browser_evidence_secret_canary_present")
 
     for name in EXPECTED_PNG_FILES:
@@ -54,7 +60,7 @@ def verify_artifacts(root: Path) -> int:
         content = path.read_bytes()
         if not content.startswith(PNG_SIGNATURE):
             return _fail("browser_evidence_png_invalid")
-        if SOURCE_SECRET_CANARY in content:
+        if any(canary in content for canary in SOURCE_SECRET_CANARIES):
             return _fail("browser_evidence_secret_canary_present")
 
     return 0

@@ -204,6 +204,8 @@ class NodeSnapshot:
     received_bitrate_bps: float | None = None
     sent_bitrate_bps: float | None = None
     counters_reset: bool = False
+    release_id: str | None = None
+    observed_release_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -973,6 +975,8 @@ class FleetCollector:
             received_bitrate_bps=received_bitrate_bps,
             sent_bitrate_bps=sent_bitrate_bps,
             counters_reset=counters_reset,
+            release_id=node.release_id,
+            observed_release_id=node.observed_release_id,
         )
 
     def _unavailable_snapshot(self, node: MediaNode, *, reason: str) -> NodeSnapshot:
@@ -1528,6 +1532,8 @@ class PostgresObservabilityStore:
                     received_bitrate_bps=item.get("received_bitrate_bps"),
                     sent_bitrate_bps=item.get("sent_bitrate_bps"),
                     counters_reset=item.get("counters_reset", False),
+                    release_id=item.get("release_id"),
+                    observed_release_id=item.get("observed_release_id"),
                 )
                 for item in payload["nodes"]
             )

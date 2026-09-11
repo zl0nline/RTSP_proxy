@@ -114,6 +114,7 @@ _AUDIT_ACTIONS = frozenset(
         "operator.admin",
         "operator.login",
         "operator.local_totp_enroll",
+        "operator.mfa_refresh",
         "operator.password_change",
         "operator.session_logout",
         "operator.session_read",
@@ -479,6 +480,16 @@ class OperatorSessionStore(Protocol):
         idle_timeout: timedelta,
     ) -> AuthenticatedOperatorSession | OperatorSessionFailure: ...
 
+    def mark_mfa_verified(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        token_sha256: str,
+        verified_at: datetime,
+        audit_context: OperatorRequestAuditContext,
+    ) -> bool: ...
+
     def revoke_session(
         self,
         token_sha256: str,
@@ -729,6 +740,42 @@ class InMemoryOperatorSessionStore:
                     scopes=frozenset() if account is None else account.scopes,
                     audit_context=context,
                     identity_source=None if account is None else account.identity_source,
+                )
+            )
+            return True
+
+    def mark_mfa_verified(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        token_sha256: str,
+        verified_at: datetime,
+        audit_context: OperatorRequestAuditContext,
+    ) -> bool:
+        with self._lock:
+            current = self._sessions.get(session_id)
+            evaluated = self._evaluate(current, now=verified_at)
+            if (
+                current is None
+                or current.account_id != account_id
+                or not hmac.compare_digest(current.token_sha256, token_sha256)
+                or isinstance(evaluated, OperatorSessionFailure)
+            ):
+                return False
+            self._sessions[session_id] = replace(current, mfa_verified_at=verified_at)
+            account = evaluated.account
+            self._request_security_events.append(
+                OperatorRequestSecurityEvent(
+                    account_id=account_id,
+                    session_id=session_id,
+                    event_type="operator.mfa_refreshed",
+                    reason_code="totp_verified",
+                    outcome="accepted",
+                    roles=account.roles,
+                    scopes=account.scopes,
+                    audit_context=audit_context,
+                    identity_source=account.identity_source,
                 )
             )
             return True
@@ -1353,6 +1400,60 @@ class PostgresOperatorSessionStore:
         except SQLAlchemyError:
             raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
 
+    def mark_mfa_verified(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        token_sha256: str,
+        verified_at: datetime,
+        audit_context: OperatorRequestAuditContext,
+    ) -> bool:
+        if verified_at.tzinfo is None:
+            raise ValueError("operator_mfa_timestamp_invalid")
+        try:
+            with self._engine.begin() as connection:
+                row = (
+                    connection.execute(
+                    text(
+                        "UPDATE operator_sessions AS s SET mfa_verified_at=:verified_at "
+                        "FROM operator_accounts AS a WHERE s.id=:session_id "
+                        "AND s.account_id=:account_id AND s.account_id=a.id "
+                        "AND s.token_sha256=:token_sha256 AND s.revoked_at IS NULL "
+                        "AND clock_timestamp()<s.idle_expires_at "
+                        "AND clock_timestamp()<s.absolute_expires_at AND a.enabled "
+                        "AND a.authz_version=s.authz_version RETURNING "
+                        "s.id, s.account_id, s.authz_version, a.identity_source, "
+                        "a.roles, a.scopes"
+                    ),
+                    {
+                        "account_id": account_id,
+                        "session_id": session_id,
+                        "token_sha256": token_sha256,
+                        "verified_at": verified_at,
+                    },
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    return False
+                _record_request_security_event(
+                    connection,
+                    account_id=row["account_id"],
+                    session_id=row["id"],
+                    authz_version=int(row["authz_version"]),
+                    identity_source=OperatorIdentitySource(row["identity_source"]),
+                    event_type="operator.mfa_refreshed",
+                    reason_code="totp_verified",
+                    roles=frozenset(OperatorRole(value) for value in row["roles"]),
+                    scopes=frozenset(row["scopes"]),
+                    audit_context=audit_context,
+                )
+                return True
+        except SQLAlchemyError:
+            raise OperatorSessionUnavailable("operator_session_store_unavailable") from None
+
     def record_authentication_failure(
         self,
         *,
@@ -1639,6 +1740,26 @@ class OperatorSessionControl:
                 reason_code=OperatorSessionFailure.INVALID.value,
                 audit_context=context,
             )
+            raise OperatorAuthenticationRequired("operator_session_invalid")
+
+    def refresh_mfa(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        session_token: str,
+        verified_at: datetime,
+        audit_context: OperatorRequestAuditContext,
+    ) -> None:
+        if not session_token or len(session_token) > 1024 or verified_at.tzinfo is None:
+            raise OperatorAuthenticationRequired("operator_session_invalid")
+        if not self._store.mark_mfa_verified(
+            account_id=account_id,
+            session_id=session_id,
+            token_sha256=_digest(session_token),
+            verified_at=verified_at,
+            audit_context=audit_context,
+        ):
             raise OperatorAuthenticationRequired("operator_session_invalid")
 
     def record_sensitive_read(
@@ -1956,6 +2077,7 @@ def _record_request_security_event(
 ) -> None:
     accepted_reasons = {
         "operator.session_logout": {"operator_initiated"},
+        "operator.mfa_refreshed": {"totp_verified"},
         "operator.sensitive_read": {"operator_authorized"},
         "operator.authorization_denied": {
             "operator_csrf_invalid",
@@ -1992,7 +2114,12 @@ def _record_request_security_event(
             ),
             "outcome": (
                 "accepted"
-                if event_type in {"operator.session_logout", "operator.sensitive_read"}
+                if event_type
+                in {
+                    "operator.session_logout",
+                    "operator.sensitive_read",
+                    "operator.mfa_refreshed",
+                }
                 else "rejected"
             ),
             "reason_code": reason_code,

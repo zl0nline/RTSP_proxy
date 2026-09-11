@@ -531,6 +531,8 @@ class CameraCatalogItem:
     state: CameraState
     desired_revision: int
     applied_revision: int
+    source_address: str | None = None
+    source_credentials_configured: bool | None = None
 
     def __post_init__(self) -> None:
         validate_camera_name(self.name)
@@ -1829,7 +1831,7 @@ class InMemoryNodeStore:
             )
             if node is None:
                 raise CameraCatalogUnavailable("camera_catalog_unavailable")
-            return _camera_catalog_item(camera, node_name=node.name)
+            return _camera_catalog_item(camera, node_name=node.name, include_source=True)
 
     def get_camera(self, camera_id: UUID) -> CameraPlacement | None:
         with self._lock:
@@ -4141,6 +4143,19 @@ def validate_camera_source_url(value: str, *, allow_credentials: bool = False) -
     return value
 
 
+def camera_source_summary(source_url: str) -> tuple[str, bool]:
+    """Return the operator-safe source address and credential-presence flag."""
+
+    clean_source_url, credentials = split_source_credentials(source_url)
+    parsed = urlsplit(clean_source_url)
+    host = parsed.hostname
+    if host is None:
+        raise InvalidCameraSource("camera_source_url_invalid")
+    rendered_host = f"[{host}]" if ":" in host else host
+    authority = rendered_host if parsed.port is None else f"{rendered_host}:{parsed.port}"
+    return f"rtsp://{authority}{parsed.path}", credentials is not None
+
+
 def probe_endpoint_identity(
     source_url: str,
     endpoint: AdmittedProbeEndpoint | None,
@@ -4367,7 +4382,14 @@ def _camera_catalog_item(
     camera: CameraPlacement,
     *,
     node_name: str,
+    include_source: bool = False,
 ) -> CameraCatalogItem:
+    source_address: str | None = None
+    source_credentials_configured: bool | None = None
+    if include_source:
+        source_address, source_credentials_configured = camera_source_summary(
+            camera.source_url
+        )
     return CameraCatalogItem(
         id=camera.id,
         name=validate_camera_name(camera.name),
@@ -4379,6 +4401,8 @@ def _camera_catalog_item(
         state=camera.state,
         desired_revision=camera.desired_revision,
         applied_revision=camera.applied_revision,
+        source_address=source_address,
+        source_credentials_configured=source_credentials_configured,
     )
 
 

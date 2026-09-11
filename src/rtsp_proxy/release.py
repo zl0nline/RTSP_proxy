@@ -17,8 +17,8 @@ from rtsp_proxy.probe_connect_guard import (
     trusted_probe_connect_guard_release_identity,
 )
 
-APPLICATION_SCHEMA = "0024_camera_probe_profiles"
-PREVIOUS_APPLICATION_SCHEMA = "0023_probe_health_states"
+APPLICATION_SCHEMA = "0025_permanent_service_grants"
+PREVIOUS_APPLICATION_SCHEMA = "0024_camera_probe_profiles"
 MINIMUM_APPLICATION_SCHEMA = "0012_operator_sessions"
 CONFIG_SCHEMA_VERSION = 1
 

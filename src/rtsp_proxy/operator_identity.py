@@ -295,6 +295,31 @@ class InMemoryLocalOperatorStore:
             )
             return self._account.authz_version
 
+    def verify_totp(self, *, account_id: UUID, totp: str, now: datetime) -> None:
+        with self._lock:
+            secret = self._credentials.totp_secret
+            step = int(now.timestamp()) // 30
+            try:
+                if (
+                    account_id != self._account.id
+                    or not self._account.enabled
+                    or secret is None
+                    or len(totp) != 6
+                    or not totp.isascii()
+                    or not totp.isdigit()
+                    or (
+                        self._credentials.last_totp_step is not None
+                        and step <= self._credentials.last_totp_step
+                    )
+                ):
+                    raise ValueError
+                TOTP(secret, 6, hashes.SHA1(), 30).verify(
+                    totp.encode("ascii"), int(now.timestamp())
+                )
+            except Exception:
+                raise OidcLoginInvalid("local_operator_mfa_refresh_denied") from None
+            self._credentials = replace(self._credentials, last_totp_step=step)
+
 
 class PostgresLocalOperatorStore:
     def __init__(
@@ -661,6 +686,58 @@ class PostgresLocalOperatorStore:
         finally:
             self._admission.release()
 
+    def verify_totp(self, *, account_id: UUID, totp: str, now: datetime) -> None:
+        if (
+            now.tzinfo is None
+            or len(totp) != 6
+            or not totp.isascii()
+            or not totp.isdigit()
+        ):
+            raise OidcLoginInvalid("local_operator_mfa_refresh_denied")
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(text("SET LOCAL synchronous_commit = on"))
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT a.enabled, c.totp_secret, c.last_totp_step "
+                            "FROM operator_local_credentials c JOIN operator_accounts a "
+                            "ON a.id=c.account_id WHERE a.id=:account_id "
+                            "AND a.identity_source='local' FOR UPDATE OF c"
+                        ),
+                        {"account_id": account_id},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                try:
+                    if row is None or not bool(row["enabled"]) or row["totp_secret"] is None:
+                        raise ValueError
+                    encrypted = bytes(row["totp_secret"])
+                    secret = AESGCM(self._key).decrypt(
+                        encrypted[:12], encrypted[12:], account_id.bytes
+                    )
+                    step = int(now.timestamp()) // 30
+                    last_step = row["last_totp_step"]
+                    if last_step is not None and step <= int(last_step):
+                        raise ValueError
+                    TOTP(secret, 6, hashes.SHA1(), 30).verify(
+                        totp.encode("ascii"), int(now.timestamp())
+                    )
+                except Exception:
+                    raise OidcLoginInvalid("local_operator_mfa_refresh_denied") from None
+                connection.execute(
+                    text(
+                        "UPDATE operator_local_credentials SET last_totp_step=:step, "
+                        "updated_at=clock_timestamp() WHERE account_id=:account_id"
+                    ),
+                    {"account_id": account_id, "step": step},
+                )
+        except OidcLoginInvalid:
+            raise
+        except SQLAlchemyError:
+            raise OidcLoginUnavailable("local_operator_store_unavailable") from None
+
     def change_password(
         self,
         *,
@@ -846,6 +923,8 @@ class LocalOperatorAuthenticator(Protocol):
         now: datetime,
     ) -> LocalOperatorAuthentication: ...
 
+    def verify_totp(self, *, account_id: UUID, totp: str, now: datetime) -> None: ...
+
 
 class LocalOperatorLoginControl:
     def __init__(
@@ -887,6 +966,27 @@ class LocalOperatorLoginControl:
             )
         except OperatorAuthenticationRequired:
             raise OidcLoginInvalid("local_operator_login_failed") from None
+
+    def refresh_mfa(
+        self,
+        *,
+        account_id: UUID,
+        session_id: UUID,
+        session_token: str,
+        totp: str,
+        audit_context: OperatorRequestAuditContext,
+    ) -> None:
+        now = self._clock()
+        if now.tzinfo is None:
+            raise OidcLoginInvalid("local_operator_mfa_refresh_denied")
+        self._store.verify_totp(account_id=account_id, totp=totp, now=now)
+        self._sessions.refresh_mfa(
+            account_id=account_id,
+            session_id=session_id,
+            session_token=session_token,
+            verified_at=now,
+            audit_context=audit_context,
+        )
 
 
 class InMemoryBreakGlassStore:

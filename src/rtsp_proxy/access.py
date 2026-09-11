@@ -34,6 +34,7 @@ from rtsp_proxy.nodes import NodeMutationContext
 MAX_ACCESS_POLICY_CIDRS = 128
 MIN_GRANT_LIFETIME = timedelta(seconds=1)
 MAX_GRANT_LIFETIME = timedelta(days=366)
+_HUMAN_SECRET_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
 MAX_ROTATION_OVERLAP = timedelta(hours=24)
 MAX_ACCESS_PEPPER_KEYS = 2
 
@@ -103,7 +104,7 @@ class AccessGrant:
     token_verifier: str
     pepper_key_id: str
     not_before: datetime
-    expires_at: datetime
+    expires_at: datetime | None
     revoked_at: datetime | None
     revision: int
     kind: str = "temporary"
@@ -119,9 +120,11 @@ class AccessGrant:
             raise ValueError("access_grant_verifier_invalid")
         if not self.pepper_key_id or len(self.pepper_key_id) > 64:
             raise ValueError("access_grant_pepper_key_invalid")
-        if self.not_before.tzinfo is None or self.expires_at.tzinfo is None:
+        if self.not_before.tzinfo is None or (
+            self.expires_at is not None and self.expires_at.tzinfo is None
+        ):
             raise ValueError("access_grant_timezone_required")
-        if self.not_before >= self.expires_at:
+        if self.expires_at is not None and self.not_before >= self.expires_at:
             raise ValueError("access_grant_window_invalid")
         if self.revoked_at is not None and self.revoked_at.tzinfo is None:
             raise ValueError("access_grant_timezone_required")
@@ -129,6 +132,8 @@ class AccessGrant:
             raise ValueError("access_grant_revision_invalid")
         if self.kind not in {"temporary", "service"}:
             raise ValueError("access_grant_kind_invalid")
+        if self.expires_at is None and self.kind != "service":
+            raise ValueError("access_grant_lifetime_invalid")
         if not self.created_by or len(self.created_by) > 128:
             raise ValueError("access_grant_creator_invalid")
         if self.last_used_at is not None and self.last_used_at.tzinfo is None:
@@ -136,7 +141,8 @@ class AccessGrant:
 
     def active_at(self, moment: datetime) -> bool:
         return bool(
-            self.not_before <= moment < self.expires_at
+            self.not_before <= moment
+            and (self.expires_at is None or moment < self.expires_at)
             and (self.revoked_at is None or moment < self.revoked_at)
         )
 
@@ -149,7 +155,7 @@ class AccessGrantSummary:
     camera_id: UUID
     username: str
     not_before: datetime
-    expires_at: datetime
+    expires_at: datetime | None
     revoked_at: datetime | None
     revision: int
     kind: str
@@ -768,7 +774,7 @@ class AccessGrantControl:
         verifier: PepperVerifier,
         new_grant_id: Callable[[], UUID],
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        new_secret: Callable[[], str] = lambda: secrets.token_urlsafe(32),
+        new_secret: Callable[[], str] | None = None,
     ) -> None:
         self._store = store
         self._verifier = verifier
@@ -780,7 +786,7 @@ class AccessGrantControl:
         self,
         *,
         camera_id: UUID,
-        lifetime: timedelta,
+        lifetime: timedelta | None,
         kind: str = "temporary",
         created_by: str = "bootstrap-operator",
         mutation_context: NodeMutationContext | None = None,
@@ -798,7 +804,9 @@ class AccessGrantControl:
             request={
                 "camera_id": str(camera_id),
                 "kind": kind,
-                "lifetime_seconds": int(lifetime.total_seconds()),
+                "lifetime_seconds": (
+                    None if lifetime is None else int(lifetime.total_seconds())
+                ),
             },
         )
         if idempotency is not None:
@@ -874,7 +882,7 @@ class AccessGrantControl:
         grant_id: UUID,
         *,
         overlap: timedelta,
-        lifetime: timedelta,
+        lifetime: timedelta | None,
         camera_id: UUID | None = None,
         expected_revision: int | None = None,
         created_by: str | None = None,
@@ -900,7 +908,9 @@ class AccessGrantControl:
                 "grant_id": str(grant_id),
                 "expected_revision": expected_revision,
                 "overlap_seconds": int(overlap.total_seconds()),
-                "lifetime_seconds": int(lifetime.total_seconds()),
+                "lifetime_seconds": (
+                    None if lifetime is None else int(lifetime.total_seconds())
+                ),
             },
         )
         if idempotency is not None:
@@ -924,7 +934,11 @@ class AccessGrantControl:
             kind=current.kind,
             created_by=current.created_by if created_by is None else created_by,
         )
-        old_expires_at = min(current.expires_at, now + overlap)
+        old_expires_at = (
+            now + overlap
+            if current.expires_at is None
+            else min(current.expires_at, now + overlap)
+        )
         if mutation_context is None and idempotency is None:
             _old, replacement = self._store.rotate_access_grant(
                 grant_id,
@@ -985,14 +999,25 @@ class AccessGrantControl:
         camera_id: UUID,
         grant_id: UUID,
         now: datetime,
-        lifetime: timedelta,
+        lifetime: timedelta | None,
         kind: str,
         created_by: str,
     ) -> IssuedAccessGrant:
-        if lifetime < MIN_GRANT_LIFETIME or lifetime > MAX_GRANT_LIFETIME:
+        if lifetime is None and kind != "service":
             raise ValueError("access_grant_lifetime_invalid")
-        secret = self._new_secret()
-        if len(secret) < 43 or any(
+        if lifetime is not None and (
+            lifetime < MIN_GRANT_LIFETIME or lifetime > MAX_GRANT_LIFETIME
+        ):
+            raise ValueError("access_grant_lifetime_invalid")
+        secret = (
+            self._new_secret()
+            if self._new_secret is not None
+            else secrets.token_urlsafe(32)
+            if kind == "service"
+            else "".join(secrets.choice(_HUMAN_SECRET_ALPHABET) for _ in range(12))
+        )
+        minimum_secret_length = 43 if kind == "service" else 12
+        if len(secret) < minimum_secret_length or any(
             not (character.isalnum() or character in "-_") for character in secret
         ):
             raise ValueError("access_grant_secret_invalid")
@@ -1003,7 +1028,7 @@ class AccessGrantControl:
             token_verifier=self._verifier.digest(secret),
             pepper_key_id=self._verifier.primary_key_id,
             not_before=now,
-            expires_at=now + lifetime,
+            expires_at=None if lifetime is None else now + lifetime,
             revoked_at=None,
             revision=1,
             kind=kind,

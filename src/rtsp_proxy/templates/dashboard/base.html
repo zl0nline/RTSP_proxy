@@ -7,8 +7,9 @@
     <link rel="stylesheet" href="/assets/dashboard.css">
     <script src="/assets/dashboard.js" defer></script>
   </head>
-  <body>
+  <body class="{% block body_class %}{% endblock %}">
     <a class="skip-link" href="#main-content">К основному содержимому</a>
+    {% block chrome %}
     <header class="site-header">
       <a class="brand" href="/dashboard" aria-label="RTSP Proxy — обзор">RTSP Proxy</a>
       {% if principal %}
@@ -26,6 +27,7 @@
       </div>
       {% endif %}
     </header>
+    {% endblock %}
     {% block content %}{% endblock %}
   </body>
 </html>

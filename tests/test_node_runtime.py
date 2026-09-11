@@ -919,6 +919,62 @@ def test_systemd_adapter_binds_active_pid_start_boot_and_binary_identity(
     )
 
 
+def test_systemd_adapter_caches_unchanged_process_executable_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "mediamtx"
+    binary.write_bytes(b"verified-binary" * 1024)
+    expected_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    proc_root = tmp_path / "proc"
+    process_root = proc_root / "1234"
+    process_root.mkdir(parents=True)
+    (proc_root / "sys/kernel/random").mkdir(parents=True)
+    (proc_root / "sys/kernel/random/boot_id").write_text(
+        "10000000-0000-0000-0000-000000000001\n",
+        encoding="ascii",
+    )
+    stat_fields = ["S", *("0" for _ in range(18)), "5678"]
+    (process_root / "stat").write_text(
+        f"1234 (mediamtx worker) {' '.join(stat_fields)}\n",
+        encoding="ascii",
+    )
+    (process_root / "exe").symlink_to(binary)
+    digest_calls = 0
+    real_sha256 = hashlib.sha256
+
+    def counted_sha256(*args: object, **kwargs: object) -> object:
+        nonlocal digest_calls
+        digest_calls += 1
+        return real_sha256(*args, **kwargs)
+
+    monkeypatch.setattr("rtsp_proxy.node_runtime.hashlib.sha256", counted_sha256)
+
+    def run(arguments: tuple[str, ...], timeout: float) -> CompletedProcess[str]:
+        return CompletedProcess(
+            arguments,
+            0,
+            "ActiveState=active\nMainPID=1234\n",
+            "",
+        )
+
+    controller = SystemdNodeProcessController(
+        systemctl=Path("/usr/bin/systemctl"),
+        run=run,
+        proc_root=proc_root,
+    )
+
+    first = controller.execute(NodeRuntimeAction.OBSERVE, runtime_spec())
+    second = controller.execute(NodeRuntimeAction.OBSERVE, runtime_spec())
+    binary.write_bytes(b"new-verified-binary" * 1024)
+    third = controller.execute(NodeRuntimeAction.OBSERVE, runtime_spec())
+
+    assert first.executable_sha256 == expected_digest
+    assert second == first
+    assert third.executable_sha256 == real_sha256(binary.read_bytes()).hexdigest()
+    assert digest_calls == 2
+
+
 def test_systemd_start_waits_for_env_to_exec_the_pinned_media_binary(
     tmp_path: Path,
 ) -> None:

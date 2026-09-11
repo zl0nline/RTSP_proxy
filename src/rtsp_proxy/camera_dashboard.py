@@ -98,6 +98,7 @@ def camera_dashboard_router(
     recent_mfa_seconds: int,
     secret_reveal_seconds: int,
     poll_interval_seconds: int,
+    public_rtsp_host: str | None = None,
     camera_probe_profiles: CameraProbeProfiles | None = None,
 ) -> APIRouter:
     """Build the complete secret-free camera dashboard surface."""
@@ -314,6 +315,7 @@ def camera_dashboard_router(
                 ),
                 live_updates_enabled=live_updates is not None,
                 poll_interval_seconds=poll_interval_seconds,
+                public_rtsp_host=public_rtsp_host,
             )
         )
 
@@ -504,7 +506,11 @@ def camera_dashboard_router(
             return principal
         if access_grant_control is None:
             return _access_unavailable(principal)
-        recent_mfa = _require_recent_mfa(principal, recent_mfa_seconds)
+        recent_mfa = _require_recent_mfa(
+            principal,
+            recent_mfa_seconds,
+            return_to=f"/dashboard/cameras/{camera_id}/access",
+        )
         if recent_mfa is not None:
             return recent_mfa
         idempotency_key: UUID | None = None
@@ -518,14 +524,21 @@ def camera_dashboard_router(
             kind = form.required("kind", max_length=16)
             if kind not in {"temporary", "service"}:
                 raise DashboardFormInvalid("dashboard_form_invalid")
-            lifetime = timedelta(
-                seconds=_bounded_integer(
-                    form,
-                    "lifetime_seconds",
-                    minimum=1,
-                    maximum=366 * 24 * 60 * 60,
+            raw_lifetime = form.optional("lifetime_seconds", max_length=8)
+            lifetime = (
+                None
+                if raw_lifetime is None
+                else timedelta(
+                    seconds=_bounded_integer(
+                        form,
+                        "lifetime_seconds",
+                        minimum=1,
+                        maximum=366 * 24 * 60 * 60,
+                    )
                 )
             )
+            if kind == "temporary" and lifetime is None:
+                raise DashboardFormInvalid("dashboard_form_invalid")
             idempotency_key = _idempotency_key(form)
             camera = _camera_item(camera_control, camera_id, principal)
             if isinstance(camera, Response):
@@ -608,7 +621,11 @@ def camera_dashboard_router(
             return principal
         if access_grant_control is None:
             return _access_unavailable(principal)
-        recent_mfa = _require_recent_mfa(principal, recent_mfa_seconds)
+        recent_mfa = _require_recent_mfa(
+            principal,
+            recent_mfa_seconds,
+            return_to=f"/dashboard/cameras/{camera_id}/access",
+        )
         if recent_mfa is not None:
             return recent_mfa
         expected_revision: int | None = None
@@ -642,12 +659,16 @@ def camera_dashboard_router(
                         maximum=24 * 60 * 60,
                     )
                 ),
-                lifetime=timedelta(
-                    seconds=_bounded_integer(
-                        form,
-                        "lifetime_seconds",
-                        minimum=1,
-                        maximum=366 * 24 * 60 * 60,
+                lifetime=(
+                    None
+                    if form.optional("lifetime_seconds", max_length=8) is None
+                    else timedelta(
+                        seconds=_bounded_integer(
+                            form,
+                            "lifetime_seconds",
+                            minimum=1,
+                            maximum=366 * 24 * 60 * 60,
+                        )
                     )
                 ),
                 expected_revision=expected_revision,
@@ -752,7 +773,11 @@ def camera_dashboard_router(
             return principal
         if access_grant_control is None:
             return _access_unavailable(principal)
-        recent_mfa = _require_recent_mfa(principal, recent_mfa_seconds)
+        recent_mfa = _require_recent_mfa(
+            principal,
+            recent_mfa_seconds,
+            return_to=f"/dashboard/cameras/{camera_id}/access",
+        )
         if recent_mfa is not None:
             return recent_mfa
         expected_revision: int | None = None
@@ -1768,13 +1793,19 @@ def _fresh_session_required(principal: OperatorPrincipal) -> HTMLResponse:
 def _require_recent_mfa(
     principal: OperatorPrincipal,
     maximum_age_seconds: int,
+    *,
+    return_to: str,
 ) -> HTMLResponse | None:
     if principal.has_recent_mfa(max_age_seconds=maximum_age_seconds):
         return None
     return _unavailable_response(
         DashboardUnavailable(
             title="Требуется недавняя MFA",
-            message="Повторно подтвердите второй фактор и затем повторите действие.",
+            message=(
+                "Подтвердите второй фактор в текущей сессии и затем повторите действие. "
+                "Код TOTP обновляется каждые 30 секунд."
+            ),
+            login_href=f"/dashboard/mfa?{urlencode({'return_to': return_to})}",
         ),
         status_code=status.HTTP_401_UNAUTHORIZED,
         principal=principal,

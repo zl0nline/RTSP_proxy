@@ -23,14 +23,16 @@
 
   <section class="panel" aria-labelledby="issue-title">
     <div class="panel-heading"><h2 id="issue-title">Выдать доступ downstream-клиенту</h2></div>
-    <p class="detail-note">Секрет показывается один раз. Операция требует недавнюю MFA. Для unattended FFmpeg задайте явный срок service grant.</p>
+    <p class="detail-note">Секрет показывается один раз. Операция требует недавнюю MFA. Temporary grant всегда ограничен сроком; service grant может быть бессрочным.</p>
     <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="idempotency_key" value="{{ issue_idempotency_key }}">
       <label for="grant-kind">Режим</label>
       <select id="grant-kind" name="kind"><option value="temporary">temporary</option><option value="service">service</option></select>
-      <label for="grant-lifetime">Срок, секунд</label>
-      <input id="grant-lifetime" name="lifetime_seconds" type="number" min="1" max="31622400" required>
+      <label for="grant-lifetime">Срок</label>
+      <select id="grant-lifetime" name="lifetime_seconds">
+        <option value="3600">1 час</option><option value="86400">1 день</option><option value="604800">7 дней</option><option value="2592000">30 дней</option><option value="31536000">1 год</option><option value="">Бессрочно (только service)</option>
+      </select>
       <button type="submit">Выдать grant</button>
     </form>
   </section>
@@ -42,7 +44,7 @@
       {% for grant in grants.items %}<tr>
         <td><code>{{ grant.username }}</code><small>{{ grant.created_by }}</small></td>
         <td>{{ grant.kind }}{% if grant.revoked_at %}<small>revoked</small>{% endif %}</td>
-        <td>{{ grant.expires_at | dashboard_time }}</td>
+        <td>{% if grant.expires_at %}{{ grant.expires_at | dashboard_time }}{% else %}Бессрочно{% endif %}</td>
         <td>{% if grant.last_used_at %}{{ grant.last_used_at | dashboard_time }}{% else %}—{% endif %}</td>
         <td>{{ grant.revision }}</td>
         <td>{% if not grant.revoked_at %}
@@ -50,7 +52,7 @@
             <input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="expected_revision" value="{{ grant.revision }}">
             <input type="hidden" name="idempotency_key" value="{{ rotation_idempotency_keys[grant.id] }}">
             <input name="overlap_seconds" type="number" min="0" max="86400" value="30" aria-label="Overlap, секунд">
-            <input name="lifetime_seconds" type="number" min="1" max="31622400" required aria-label="Новый срок, секунд">
+            <select name="lifetime_seconds" aria-label="Новый срок"><option value="3600">1 час</option><option value="86400">1 день</option><option value="604800">7 дней</option><option value="2592000">30 дней</option><option value="31536000">1 год</option>{% if grant.kind == "service" %}<option value="">Бессрочно</option>{% endif %}</select>
             <button type="submit">Ротировать</button>
           </form>
           <a href="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/revoke">Отозвать</a>

@@ -455,7 +455,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/releases/0.17.6/bin/mediamtx"
+        "/opt/rtsp-proxy/media/0.2.1/mediamtx"
     )
 
 
@@ -749,11 +749,13 @@ def test_browser_e2e_evidence_verifier_requires_exact_nonempty_artifacts(
 ) -> None:
     expected_text = (
         "01-anonymous.snapshot.txt",
+        "01-login.snapshot.txt",
         "02-dashboard.snapshot.txt",
         "03-confirmation.snapshot.txt",
         "04-logged-out.snapshot.txt",
     )
     expected_png = (
+        "01-login.png",
         "02-dashboard.png",
         "03-confirmation.png",
         "04-logged-out.png",

@@ -205,6 +205,12 @@ fi
 require_body_text "Требуется вход оператора"
 require_contrast "body" 4.5
 browser snapshot -i -c >"$artifact_dir/01-anonymous.snapshot.txt"
+keyboard_activate 'a[href="/auth/local/login"]'
+require_url_contains "/auth/local/login"
+require_body_text "Вход оператора"
+require_contrast ".login-card" 4.5
+browser snapshot -i -c >"$artifact_dir/01-login.snapshot.txt"
+browser screenshot "$artifact_dir/01-login.png" >/dev/null
 keyboard_activate 'a[href="/auth/oidc/login"]'
 require_url_contains "/lab/idp/authorize"
 require_body_text "Тестовый IdP"
@@ -237,12 +243,15 @@ keyboard_activate 'a[href="/dashboard/cameras/new"]'
 require_url_contains "/dashboard/cameras/new"
 require_body_text "Зарегистрировать камеру"
 browser find label "Имя камеры" fill "Browser registered camera" >/dev/null
-browser find label "Source RTSP URL" fill "rtsp://new-source-secret-canary.invalid/private" >/dev/null
+browser find label "Source RTSP URL" fill "rtsp://new-source-camera.invalid/private" >/dev/null
+browser fill 'input[name="source_username"]' "browser-new-source-user" >/dev/null
+browser fill 'input[name="source_password"]' \
+  "browser-new-source-password-canary-0123456789abcdef" >/dev/null
 keyboard_activate 'form[action="/dashboard/cameras"] button'
 require_url_contains "/dashboard/cameras/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 require_body_text "Browser registered camera"
 require_body_text "rtsp://<server-address>:10543/bbbbbbbbbbbbbbbbbbbbbbbbbe"
-require_secret_absent "rtsp://new-source-secret-canary.invalid/private"
+require_secret_absent "browser-new-source-password-canary-0123456789abcdef"
 keyboard_activate 'a[href="/dashboard/cameras"]'
 require_url_contains "/dashboard/cameras"
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
@@ -263,16 +272,16 @@ if [[ "$live_ready" != "true" ]]; then
   printf 'camera live projection did not reach connected/occupied state\n' >&2
   exit 1
 fi
-require_secret_absent "rtsp://source-secret-canary.invalid/private"
+require_secret_absent "browser-source-password-canary-0123456789abcdef"
 keyboard_activate 'a[href$="/access"]'
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
 require_body_text "Два независимых уровня"
 require_body_text "Если оба списка пусты"
-browser find label "Срок, секунд" fill "3600" >/dev/null
+browser select 'select[name="lifetime_seconds"]' "3600" >/dev/null
 keyboard_activate 'form[action$="/access-grants"] button'
 require_body_text "Показывается только один раз"
 require_body_text "browser-downstream-secret-canary-0123456789abcdef"
-require_secret_absent "rtsp://source-secret-canary.invalid/private"
+require_secret_absent "browser-source-password-canary-0123456789abcdef"
 browser wait 3000 >/dev/null
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
 require_body_text "Зарегистрированные grant’ы"
@@ -293,7 +302,7 @@ if [[ "$confirmation_semantics" != "true" ]]; then
   exit 1
 fi
 require_contrast ".danger-button" 4.5
-require_secret_absent "rtsp://source-secret-canary.invalid/private"
+require_secret_absent "browser-source-password-canary-0123456789abcdef"
 browser snapshot -i -c >"$artifact_dir/03-confirmation.snapshot.txt"
 browser screenshot "$artifact_dir/03-confirmation.png" >/dev/null
 
@@ -303,7 +312,7 @@ require_active "h1[autofocus]"
 keyboard_activate 'form[action$="/mutations/apply"] button'
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 require_body_text "DISABLED"
-require_secret_absent "rtsp://source-secret-canary.invalid/private"
+require_secret_absent "browser-source-password-canary-0123456789abcdef"
 
 keyboard_activate 'a[href="/dashboard/logout"]'
 require_url_contains "/dashboard/logout"
@@ -311,7 +320,7 @@ require_body_text "Завершить сеанс?"
 keyboard_activate 'form[action="/dashboard/logout"] button'
 require_url_contains "/dashboard"
 require_body_text "Требуется вход оператора"
-require_secret_absent "rtsp://source-secret-canary.invalid/private"
+require_secret_absent "browser-source-password-canary-0123456789abcdef"
 browser snapshot -i -c >"$artifact_dir/04-logged-out.snapshot.txt"
 browser screenshot "$artifact_dir/04-logged-out.png" >/dev/null
 
@@ -352,12 +361,12 @@ if [[ -n "$page_errors" && "$page_errors" != *"No page errors"* ]]; then
   exit 1
 fi
 if grep -R -F --binary-files=text \
-  "rtsp://source-secret-canary.invalid/private" "$artifact_dir" >/dev/null; then
+  "browser-source-password-canary-0123456789abcdef" "$artifact_dir" >/dev/null; then
   printf 'source secret canary leaked into browser evidence artifacts\n' >&2
   exit 1
 fi
 if grep -R -F --binary-files=text \
-  "rtsp://new-source-secret-canary.invalid/private" "$artifact_dir" >/dev/null; then
+  "browser-new-source-password-canary-0123456789abcdef" "$artifact_dir" >/dev/null; then
   printf 'camera-registration source canary leaked into browser evidence artifacts\n' >&2
   exit 1
 fi
