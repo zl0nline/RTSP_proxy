@@ -225,6 +225,31 @@ require_contrast "body" 4.5
 require_contrast 'a[href="/dashboard/cameras"]' 4.5
 browser snapshot -i -c >"$artifact_dir/02-dashboard.snapshot.txt"
 browser screenshot "$artifact_dir/02-dashboard.png" >/dev/null
+browser set viewport 1440 1050 >/dev/null
+browser focus '#main-content' >/dev/null
+if [[ "$(browser eval "document.documentElement.dataset.theme === 'light'")" != "true" ]]; then
+  browser click '[data-theme-toggle]' >/dev/null
+fi
+browser screenshot "$artifact_dir/02-overview-1440-light.png" >/dev/null
+browser click '[data-theme-toggle]' >/dev/null
+if [[ "$(browser eval "document.documentElement.dataset.theme === 'dark'")" != "true" ]]; then
+  printf 'dashboard theme toggle did not activate dark mode\n' >&2
+  exit 1
+fi
+browser screenshot "$artifact_dir/02-overview-1440-dark.png" >/dev/null
+browser set viewport 390 844 >/dev/null
+browser screenshot --full "$artifact_dir/02-overview-390-dark.png" >/dev/null
+if [[ "$(browser eval "document.documentElement.scrollWidth === window.innerWidth")" != "true" ]]; then
+  printf 'dashboard document overflows the mobile viewport\n' >&2
+  exit 1
+fi
+browser click '[data-theme-toggle]' >/dev/null
+browser set viewport 1280 900 >/dev/null
+
+keyboard_activate 'a[href="/dashboard/nodes/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]'
+require_body_text "Runtime"
+browser screenshot --full "$artifact_dir/02-node.png" >/dev/null
+keyboard_activate 'a[href="/dashboard"]'
 
 keyboard_activate 'a[href="/dashboard/nodes/new"]'
 require_url_contains "/dashboard/nodes/new"
@@ -239,9 +264,17 @@ require_url_contains "/dashboard"
 
 keyboard_activate 'a[href="/dashboard/cameras"]'
 require_url_contains "/dashboard/cameras"
+browser set viewport 1024 900 >/dev/null
+browser screenshot --full "$artifact_dir/02-catalog-1024.png" >/dev/null
+if [[ "$(browser eval "document.documentElement.scrollWidth === window.innerWidth")" != "true" ]]; then
+  printf 'camera catalog document overflows the 1024px viewport\n' >&2
+  exit 1
+fi
+browser set viewport 1280 900 >/dev/null
 keyboard_activate 'a[href="/dashboard/cameras/new"]'
 require_url_contains "/dashboard/cameras/new"
 require_body_text "Зарегистрировать камеру"
+browser screenshot --full "$artifact_dir/02-camera-create.png" >/dev/null
 browser find label "Имя камеры" fill "Browser registered camera" >/dev/null
 browser find label "Source RTSP URL" fill "rtsp://new-source-camera.invalid/private" >/dev/null
 browser fill 'input[name="source_username"]' "browser-new-source-user" >/dev/null
@@ -258,6 +291,16 @@ keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccc
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 require_body_text "rtsp://<server-address>:10543/aaaaaaaaaaaaaaaaaaaaaaaaaa"
 require_body_text "Текущее состояние потока"
+browser screenshot --full "$artifact_dir/02-camera-status.png" >/dev/null
+browser set viewport 768 900 >/dev/null
+browser screenshot --full "$artifact_dir/02-camera-768.png" >/dev/null
+browser set viewport 390 844 >/dev/null
+browser screenshot --full "$artifact_dir/02-camera-390.png" >/dev/null
+if [[ "$(browser eval "document.documentElement.scrollWidth === window.innerWidth")" != "true" ]]; then
+  printf 'camera detail document overflows the mobile viewport\n' >&2
+  exit 1
+fi
+browser set viewport 1280 900 >/dev/null
 for _attempt in $(seq 1 40); do
   live_ready=$(browser eval "(() =>
     document.querySelector('[data-live-connection]')?.textContent.trim() === 'Live'
@@ -273,10 +316,15 @@ if [[ "$live_ready" != "true" ]]; then
   exit 1
 fi
 require_secret_absent "browser-source-password-canary-0123456789abcdef"
-keyboard_activate 'a[href$="/access"]'
+browser focus 'a[data-camera-tab="status"]' >/dev/null
+browser press ArrowRight >/dev/null
+browser screenshot --full "$artifact_dir/02-camera-monitoring.png" >/dev/null
+browser press ArrowRight >/dev/null
+browser press Enter >/dev/null
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
 require_body_text "Два независимых уровня"
 require_body_text "Если оба списка пусты"
+browser screenshot --full "$artifact_dir/02-camera-access.png" >/dev/null
 browser select 'select[name="lifetime_seconds"]' "3600" >/dev/null
 keyboard_activate 'form[action$="/access-grants"] button'
 require_body_text "Показывается только один раз"
@@ -288,6 +336,9 @@ require_body_text "Зарегистрированные grant’ы"
 require_secret_absent "browser-downstream-secret-canary-0123456789abcdef"
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+browser focus 'a[data-camera-tab="status"]' >/dev/null
+browser press End >/dev/null
+browser screenshot --full "$artifact_dir/02-camera-management.png" >/dev/null
 keyboard_activate 'form[action$="/mutations/preview"] button'
 require_body_text "Будет отключён 1 downstream-клиент"
 require_active "h1[autofocus]"
@@ -307,6 +358,8 @@ browser snapshot -i -c >"$artifact_dir/03-confirmation.snapshot.txt"
 browser screenshot "$artifact_dir/03-confirmation.png" >/dev/null
 
 keyboard_activate 'a[href="/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc"]'
+browser focus 'a[data-camera-tab="status"]' >/dev/null
+browser press End >/dev/null
 keyboard_activate 'form[action$="/mutations/preview"] button'
 require_active "h1[autofocus]"
 keyboard_activate 'form[action$="/mutations/apply"] button'

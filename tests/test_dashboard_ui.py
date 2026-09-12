@@ -1301,6 +1301,9 @@ def test_dashboard_renders_bounded_fleet_snapshot_with_semantic_security_contrac
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert '<main id="main-content"' in response.text
+    assert 'class="app-sidebar"' in response.text
+    assert 'class="nav-overview" href="/dashboard"' in response.text
+    assert "data-theme-toggle" in response.text
     assert '<table aria-label="Ноды сервера">' in response.text
     assert "1 / 50" in response.text
     assert "80 / 100" in response.text
@@ -5444,6 +5447,11 @@ def test_camera_dashboard_forms_require_bound_csrf_and_confirm_occupied_disable(
     assert f'value="{CSRF_TOKEN}"' in detail.text
     assert "rtsp://camera.internal/private" in detail.text
     assert "Учётные данные сохранены" in detail.text
+    assert 'role="tablist" data-camera-tabs' in detail.text
+    assert 'data-camera-panel="status"' in detail.text
+    assert 'data-camera-panel="monitoring"' in detail.text
+    assert 'data-camera-panel="management"' in detail.text
+    assert f'href="{detail_path}/access" role="tab"' in detail.text
     assert "admin:secret" not in detail.text
     assert "rtsp://&lt;server-address&gt;:10543/" not in detail.text
     assert "rtsp://stream.example.test:10543/" in detail.text

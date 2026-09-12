@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% block top_crumb %}Ноды / Создание{% endblock %}
 {% block title %}Новая нода — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -11,6 +12,7 @@
       <h1>Создать ноду</h1>
     </div>
   </div>
+  <div class="form-layout">
   <section class="panel mutation-panel" aria-labelledby="node-create-title">
     <div class="panel-heading"><h2 id="node-create-title">Регистрация и порт</h2></div>
     <form method="post" action="/dashboard/nodes" class="mutation-form">
@@ -29,5 +31,7 @@
       </div>
     </form>
   </section>
+  <aside class="form-help" aria-label="Помощь по созданию ноды"><section><h2>Нода — отдельный RTSP-процесс</h2><p>У каждой ноды собственный внешний порт и ограниченная сервером ёмкость камер.</p></section><section><h2>Безопасный выбор порта</h2><p>Диапазон приходит из конфигурации сервера. Пустое поле позволяет control plane выбрать свободный порт.</p></section></aside>
+  </div>
 </main>
 {% endblock %}

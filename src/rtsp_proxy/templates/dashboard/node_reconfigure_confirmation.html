@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% block top_crumb %}Ноды / Подтверждение reconfigure{% endblock %}
 {% block title %}Подтвердить reconfigure — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -8,7 +9,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1 tabindex="-1" autofocus>Подтвердите reconfigure/restart</h1></div>
   </div>
-  <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="reconfigure-confirmation-title">
+  <section class="panel mutation-panel confirmation-panel" role="alert" aria-live="assertive" aria-labelledby="reconfigure-confirmation-title">
     <div class="panel-heading"><h2 id="reconfigure-confirmation-title">Все активные потоки ноды будут отключены</h2></div>
     <dl class="detail-list">
       <div><dt>Зарегистрировано</dt><dd>{{ preview.registered_cameras }} зарегистрированных камер</dd></div>

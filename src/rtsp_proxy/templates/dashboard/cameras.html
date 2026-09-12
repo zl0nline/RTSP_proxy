@@ -1,11 +1,14 @@
 {% extends "dashboard/base.html" %}
+{% block body_class %}dashboard-body dashboard-cameras{% endblock %}
+{% block top_crumb %}Рабочая область / Камеры{% endblock %}
 {% block title %}Каталог камер — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
   <div class="page-heading">
     <div>
-      <p class="eyebrow">До 100 камер на ноду</p>
+      <p class="eyebrow">Каталог</p>
       <h1>Каталог камер</h1>
+      <p class="updated">Все зарегистрированные камеры и их размещение.</p>
     </div>
     <div>
       <p class="updated">Показано: {{ page.items | length }}</p>
@@ -87,7 +90,7 @@
       </table>
     </div>
     {% else %}
-    <p class="empty-state">По выбранным фильтрам камер нет.</p>
+    <div class="empty-state"><h3>Камеры не найдены</h3><p>Измените запрос или сбросьте фильтры.</p><a class="button-link" href="/dashboard/cameras">Сбросить фильтры</a></div>
     {% endif %}
   </section>
 
@@ -95,5 +98,6 @@
     <span>Для возврата используйте кнопку браузера «Назад».</span>
     {% if next_url %}<a class="button-link" href="{{ next_url }}">Следующая страница</a>{% endif %}
   </nav>
+  <section class="notice" aria-label="Пояснение состояния камеры"><span aria-hidden="true">ⓘ</span><div><strong>Статус регистрации — не состояние видео</strong><p>«Enabled» означает, что камера разрешена в конфигурации. Текущее состояние источника и downstream-клиента показано в карточке.</p></div></section>
 </main>
 {% endblock %}

@@ -13,6 +13,18 @@ EXPECTED_TEXT_FILES = (
 EXPECTED_PNG_FILES = (
     "01-login.png",
     "02-dashboard.png",
+    "02-overview-1440-light.png",
+    "02-overview-1440-dark.png",
+    "02-overview-390-dark.png",
+    "02-camera-create.png",
+    "02-camera-status.png",
+    "02-catalog-1024.png",
+    "02-camera-768.png",
+    "02-camera-390.png",
+    "02-node.png",
+    "02-camera-monitoring.png",
+    "02-camera-access.png",
+    "02-camera-management.png",
     "03-confirmation.png",
     "04-logged-out.png",
 )

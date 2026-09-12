@@ -1,4 +1,6 @@
 {% extends "dashboard/base.html" %}
+{% block body_class %}dashboard-body dashboard-cameras{% endblock %}
+{% block top_crumb %}Камеры / Подтверждение перемещения{% endblock %}
 {% block title %}Подтвердить перемещение {{ camera.name }} — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -8,7 +10,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1 tabindex="-1" autofocus>Подтвердите перемещение</h1></div>
   </div>
-  <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="move-confirmation-title">
+  <section class="panel mutation-panel confirmation-panel" role="alert" aria-live="assertive" aria-labelledby="move-confirmation-title">
     <div class="panel-heading"><h2 id="move-confirmation-title">Будет отключён {{ preview.disconnect_readers }} downstream-клиент</h2></div>
     <dl class="detail-list">
       <div><dt>Старый endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ preview.source_port }}/{{ camera.public_id }}</code></dd></div>

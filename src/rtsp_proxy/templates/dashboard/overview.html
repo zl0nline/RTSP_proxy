@@ -4,8 +4,9 @@
 <main id="main-content" data-dashboard-poll-ms="{{ poll_interval_ms }}" data-dashboard-snapshot-url="/api/v1/dashboard/snapshot" data-dashboard-generated-at="{{ snapshot.generated_at.isoformat() }}">
   <div class="page-heading">
     <div>
-      <p class="eyebrow">Один Linux-сервер</p>
-      <h1>Состояние RTSP-нод</h1>
+      <p class="eyebrow">Управление трансляциями</p>
+      <h1>Обзор нод</h1>
+      <p class="updated">Нагрузка, доступность и размещение камер — в одном месте.</p>
     </div>
     <div>
       <p class="updated">Снимок: <time data-dashboard-updated datetime="{{ snapshot.generated_at.isoformat() }}">{{ snapshot.generated_at | dashboard_time }}</time></p>
@@ -66,7 +67,7 @@
           <tr data-node-id="{{ node.node_id }}">
             <th scope="row">
               <a href="/dashboard/nodes/{{ node.node_id }}">{{ node.name }}</a>
-              <small class="node-id">{{ node.node_id }}</small>
+              <details class="table-technical"><summary>Идентификатор</summary><code>{{ node.node_id }}</code></details>
             </th>
             <td><code>{{ node.external_port }}</code></td>
             <td>
@@ -90,8 +91,9 @@
       </table>
     </div>
     {% else %}
-    <p class="empty-state">Ноды пока не зарегистрированы.</p>
+    <div class="empty-state"><h3>Ноды пока не зарегистрированы</h3>{% if can_manage_nodes %}<a class="button-link" href="/dashboard/nodes/new">Создать ноду</a>{% endif %}</div>
     {% endif %}
   </section>
+  <section class="notice" aria-label="Пояснение состояния источников"><span aria-hidden="true">ⓘ</span><div><strong>Нет активных клиентов — не ошибка</strong><p>Источник камеры подключается по запросу клиента. Отсутствие трафика само по себе не означает неисправность ноды.</p></div></section>
 </main>
 {% endblock %}

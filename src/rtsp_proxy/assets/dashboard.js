@@ -1,6 +1,159 @@
 (() => {
   "use strict";
 
+  const root = document.documentElement;
+  const themeToggle = document.querySelector("[data-theme-toggle]");
+  const themeLabel = document.querySelector("[data-theme-label]");
+  const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+  const savedTheme = (() => {
+    try {
+      return window.localStorage.getItem("rtsp-proxy-theme");
+    } catch (_error) {
+      return null;
+    }
+  })();
+  const applyTheme = (theme) => {
+    const dark = theme === "dark";
+    root.dataset.theme = theme;
+    if (themeToggle instanceof HTMLButtonElement) {
+      themeToggle.setAttribute("aria-pressed", String(dark));
+    }
+    if (themeLabel instanceof HTMLElement) {
+      themeLabel.textContent = dark ? "Светлая тема" : "Тёмная тема";
+    }
+  };
+  applyTheme(savedTheme === "dark" || savedTheme === "light"
+    ? savedTheme
+    : systemTheme.matches ? "dark" : "light");
+  if (themeToggle instanceof HTMLButtonElement) {
+    themeToggle.addEventListener("click", () => {
+      const nextTheme = root.dataset.theme === "dark" ? "light" : "dark";
+      applyTheme(nextTheme);
+      try {
+        window.localStorage.setItem("rtsp-proxy-theme", nextTheme);
+      } catch (_error) {
+        // Theme persistence is optional in locked-down browsers.
+      }
+    });
+  }
+
+  const activeNavigation = document.querySelector(
+    document.body.classList.contains("dashboard-cameras") ? ".nav-cameras" : ".nav-overview",
+  );
+  if (activeNavigation instanceof HTMLAnchorElement) {
+    activeNavigation.setAttribute("aria-current", "page");
+  }
+
+  const placementInputs = Array.from(document.querySelectorAll('input[name="placement_mode"]'));
+  const manualPlacement = document.querySelector("[data-manual-placement]");
+  if (placementInputs.length > 0 && manualPlacement instanceof HTMLElement) {
+    const updatePlacement = () => {
+      const selected = placementInputs.find((input) => input instanceof HTMLInputElement && input.checked);
+      manualPlacement.hidden = selected instanceof HTMLInputElement && selected.value !== "manual";
+    };
+    placementInputs.forEach((input) => input.addEventListener("change", updatePlacement));
+    updatePlacement();
+  }
+
+  document.querySelectorAll("form.mutation-form").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      const submit = form.querySelector('button[type="submit"]');
+      if (submit instanceof HTMLButtonElement) {
+        window.setTimeout(() => {
+          if (event.defaultPrevented) {
+            return;
+          }
+          form.setAttribute("aria-busy", "true");
+          submit.disabled = true;
+          submit.textContent = "Выполняем…";
+        }, 0);
+      }
+    });
+  });
+
+  const tabList = document.querySelector("[data-camera-tabs]");
+  if (tabList instanceof HTMLElement) {
+    const tabs = Array.from(tabList.querySelectorAll("[role=tab]"));
+    const panels = Array.from(document.querySelectorAll("[data-camera-panel]"));
+    const panelNames = new Set(panels.map((panel) => panel.getAttribute("data-camera-panel")));
+    const activateTab = (tab, moveFocus = false) => {
+      const name = tab.getAttribute("data-camera-tab");
+      if (!name || !panelNames.has(name)) {
+        return;
+      }
+      tabs.forEach((candidate) => {
+        const active = candidate === tab;
+        candidate.setAttribute("aria-selected", String(active));
+        candidate.setAttribute("tabindex", active ? "0" : "-1");
+        candidate.classList.toggle("active", active);
+      });
+      panels.forEach((panel) => {
+        panel.hidden = panel.getAttribute("data-camera-panel") !== name;
+      });
+      if (moveFocus) {
+        tab.focus();
+      }
+    };
+    document.body.classList.add("tabs-ready");
+    const requestedName = window.location.hash.slice(1);
+    const initial = tabs.find((tab) => tab.getAttribute("data-camera-tab") === requestedName)
+      || tabs.find((tab) => tab.getAttribute("aria-selected") === "true")
+      || tabs[0];
+    if (initial instanceof HTMLElement) {
+      activateTab(initial);
+    }
+    tabs.forEach((tab, index) => {
+      tab.addEventListener("click", (event) => {
+        const name = tab.getAttribute("data-camera-tab");
+        if (!name || !panelNames.has(name)) {
+          return;
+        }
+        event.preventDefault();
+        window.history.replaceState(null, "", `#${name}`);
+        activateTab(tab);
+      });
+      tab.addEventListener("keydown", (event) => {
+        let nextIndex = index;
+        if (event.key === "ArrowRight") {
+          nextIndex = (index + 1) % tabs.length;
+        } else if (event.key === "ArrowLeft") {
+          nextIndex = (index - 1 + tabs.length) % tabs.length;
+        } else if (event.key === "Home") {
+          nextIndex = 0;
+        } else if (event.key === "End") {
+          nextIndex = tabs.length - 1;
+        } else {
+          return;
+        }
+        event.preventDefault();
+        const next = tabs[nextIndex];
+        if (next instanceof HTMLElement && panelNames.has(next.getAttribute("data-camera-tab"))) {
+          const name = next.getAttribute("data-camera-tab");
+          window.history.replaceState(null, "", `#${name}`);
+          activateTab(next, true);
+        } else if (next instanceof HTMLAnchorElement) {
+          next.focus();
+        }
+      });
+    });
+  }
+
+  document.querySelectorAll("[data-copy-target]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const targetId = button.getAttribute("data-copy-target");
+      const target = targetId ? document.getElementById(targetId) : null;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(target.textContent || "");
+        button.textContent = "Скопировано";
+      } catch (_error) {
+        button.textContent = "Выделите адрес вручную";
+      }
+    });
+  });
+
   document.querySelectorAll("form[data-raw-source-credentials]").forEach((form) => {
     form.addEventListener("submit", (event) => {
       if (!(form instanceof HTMLFormElement) || form.dataset.encodedCredentialConfirmed === "true") {
@@ -211,6 +364,7 @@
   const connection = live.querySelector("[data-live-connection]");
   const sourceState = live.querySelector("[data-live-source]");
   const sourceReason = live.querySelector("[data-live-source-reason]");
+  const sourceIcon = live.querySelector("[data-live-icon]");
   const occupied = live.querySelector("[data-live-occupied]");
   const received = live.querySelector("[data-live-received]");
   const sent = live.querySelector("[data-live-sent]");
@@ -241,21 +395,33 @@
     }
     if (sourceState instanceof HTMLElement) {
       const labels = {
-        ready: "готов",
-        idle: "ожидает клиента",
-        connecting: "подключается к источнику",
-        stale: "данные устарели",
-        unavailable: "недоступен",
-        unknown: "нет per-path state",
+        ready: "Готов",
+        idle: "Ожидает клиента",
+        connecting: "Подключается к источнику",
+        stale: "Данные устарели",
+        unavailable: "Недоступен",
+        unknown: "Нет per-path state",
       };
       sourceState.textContent = labels[state.source_state] || "—";
+    }
+    if (sourceIcon instanceof HTMLElement) {
+      const icons = { ready: "●", idle: "Ⅱ", connecting: "…", stale: "!", unavailable: "!", unknown: "?" };
+      sourceIcon.textContent = icons[state.source_state] || "?";
     }
     if (sourceReason instanceof HTMLElement) {
       const reasons = {
         source_start_pending: "Авторизованный клиент запустил on-demand подключение; ожидаем источник.",
         source_start_failed: "Источник не стал доступен после авторизованной попытки. Проверьте endpoint, сеть и credentials; глубокая проверка ниже уточнит причину, если она разрешена профилем камеры.",
       };
-      sourceReason.textContent = reasons[state.source_reason] || "—";
+      const stateReasons = {
+        ready: "Источник подключён и готов к передаче.",
+        idle: "Источник подключится по запросу downstream-клиента.",
+        connecting: "Нода устанавливает соединение с источником.",
+        stale: "Показано последнее известное состояние; данные устарели.",
+        unavailable: "Collector не смог получить состояние источника.",
+        unknown: "Per-path состояние источника пока недоступно.",
+      };
+      sourceReason.textContent = reasons[state.source_reason] || stateReasons[state.source_state] || "—";
     }
     if (occupied instanceof HTMLElement) {
       occupied.textContent = state.occupied === true ? "занят" : state.occupied === false ? "свободен" : "—";

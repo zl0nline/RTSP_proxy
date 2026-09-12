@@ -7,27 +7,56 @@
     <link rel="stylesheet" href="/assets/dashboard.css">
     <script src="/assets/dashboard.js" defer></script>
   </head>
-  <body class="{% block body_class %}{% endblock %}">
+  <body class="{% block body_class %}{% if principal %}dashboard-body dashboard-overview{% endif %}{% endblock %}">
     <a class="skip-link" href="#main-content">К основному содержимому</a>
     {% block chrome %}
-    <header class="site-header">
-      <a class="brand" href="/dashboard" aria-label="RTSP Proxy — обзор">RTSP Proxy</a>
-      {% if principal %}
-      <nav class="primary-nav" aria-label="Основная навигация">
-        <a href="/dashboard">Ноды</a>
-        <a href="/dashboard/cameras">Камеры</a>
-      </nav>
-      {% endif %}
-      {% if principal %}
-      <div class="operator" aria-label="Текущий оператор">
-        <span>{{ principal.display_name }}</span>
-        <span class="operator-role">{{ principal.roles | map(attribute='value') | sort | join(', ') }}</span>
-        {% if principal.identity_source.value == "local" %}<a href="/dashboard/password">Сменить пароль</a>{% endif %}
-        <a href="/dashboard/logout">Выйти</a>
+    {% if principal %}
+    <aside class="app-sidebar" aria-label="Навигация RTSP Proxy">
+      <a class="sidebar-brand" href="/dashboard" aria-label="RTSP Proxy — обзор">
+        <span class="brand-mark" aria-hidden="true">↗</span>
+        <span>RTSP <span class="brand-muted">Proxy</span></span>
+      </a>
+      <div class="workspace-card">
+        <span class="server-dot" aria-hidden="true"></span>
+        <span>Основной сервер<small>Управление трансляциями</small></span>
       </div>
-      {% endif %}
-    </header>
+      <p class="nav-label">Рабочая область</p>
+      <nav class="primary-nav" aria-label="Основная навигация">
+        <a class="nav-overview" href="/dashboard">
+          <span class="nav-icon" aria-hidden="true">▦</span><span>Обзор нод</span>
+        </a>
+        <a class="nav-cameras" href="/dashboard/cameras">
+          <span class="nav-icon" aria-hidden="true">▣</span><span>Камеры</span>
+        </a>
+      </nav>
+      <div class="sidebar-bottom">
+        <button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">
+          <span aria-hidden="true">◐</span><span data-theme-label>Тёмная тема</span>
+        </button>
+        <div class="operator" aria-label="Текущий оператор">
+          <span class="operator-avatar" aria-hidden="true">{{ principal.display_name[:1] | upper }}</span>
+          <span class="operator-copy">
+            <strong>{{ principal.display_name }}</strong>
+            <small>{{ principal.roles | map(attribute='value') | sort | join(', ') }}</small>
+          </span>
+        </div>
+        <div class="account-links">
+          {% if principal.identity_source.value == "local" %}<a href="/dashboard/password">Сменить пароль</a>{% endif %}
+          <a href="/dashboard/logout">Выйти</a>
+        </div>
+      </div>
+    </aside>
+    <div class="app-frame">
+      <header class="site-header">
+        <span class="top-crumb">{% block top_crumb %}Рабочая область / Обзор нод{% endblock %}</span>
+        <span class="top-meta">Защищённая операторская сессия</span>
+      </header>
+    {% endif %}
     {% endblock %}
     {% block content %}{% endblock %}
+    {% if principal %}
+      <footer class="site-footer"><span>RTSP Proxy</span><span>Локальная панель управления трансляциями</span></footer>
+    </div>
+    {% endif %}
   </body>
 </html>

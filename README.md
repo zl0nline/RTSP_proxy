@@ -187,7 +187,7 @@ keyring сразу для WEB, reconciler, probe worker и broker можно о�
 
 ```sh
 sudo ./tools/configure_camera_sources.sh \
-  --release-id 0.17.7 \
+  --release-id 0.17.8 \
   --source-cidrs '10.180.5.0/24,192.168.50.0/24'
 ```
 

@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% block top_crumb %}Ноды / Подтверждение смены порта{% endblock %}
 {% block title %}Подтвердить смену порта — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -8,7 +9,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1 tabindex="-1" autofocus>Подтвердите смену порта</h1></div>
   </div>
-  <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="port-confirmation-title">
+  <section class="panel mutation-panel confirmation-panel" role="alert" aria-live="assertive" aria-labelledby="port-confirmation-title">
     <div class="panel-heading"><h2 id="port-confirmation-title">Будут затронуты {{ preview.registered_cameras }} зарегистрированных камер</h2></div>
     <dl class="detail-list">
       <div><dt>Старый endpoint</dt><dd><code>rtsp://&lt;server-address&gt;:{{ preview.old_port }}/&lt;public_id&gt;</code></dd></div>

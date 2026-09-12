@@ -1,4 +1,6 @@
 {% extends "dashboard/base.html" %}
+{% block body_class %}dashboard-body dashboard-cameras{% endblock %}
+{% block top_crumb %}Камеры / Редактирование{% endblock %}
 {% block title %}Изменить {{ camera.name }} — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -8,19 +10,22 @@
   <div class="page-heading">
     <div><p class="eyebrow">Без раскрытия текущих credentials</p><h1>Изменить камеру</h1></div>
   </div>
+  <div class="form-layout">
   <section class="panel mutation-panel" aria-labelledby="camera-edit-title">
     <div class="panel-heading"><h2 id="camera-edit-title">Новая конфигурация</h2></div>
-    <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/preview" data-raw-source-credentials>
+    <form class="mutation-form fields" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/preview" data-raw-source-credentials>
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="operation" value="update_source">
       <input type="hidden" name="expected_revision" value="{{ camera.desired_revision }}">
-      <label>Имя камеры<input name="name" required maxlength="128" value="{{ camera.name }}"></label>
-      <label>Новый source URL<input name="source_url" type="password" required maxlength="8192" autocomplete="new-password" spellcheck="false" placeholder="rtsp://camera-host/path"></label>
+      <label class="full">Имя камеры<input name="name" required maxlength="128" value="{{ camera.name }}"></label>
+      <label class="full">Новый source URL<input name="source_url" type="password" required maxlength="8192" autocomplete="new-password" spellcheck="false" placeholder="rtsp://camera-host/path"></label>
       <label>Логин камеры (необязательно)<input name="source_username" maxlength="64" autocomplete="off" spellcheck="false"></label>
       <label>Пароль камеры (необязательно)<input name="source_password" type="password" maxlength="256" autocomplete="new-password"><small>Введите credentials в исходном (не percent-encoded) виде. %HH сохраняется буквально; сервер кодирует значение ровно один раз.</small></label>
-      <p>Текущий source URL и credentials никогда не возвращаются в dashboard. Введите URL без логина и пароля. Если поля credentials оставить пустыми, сохранённые credentials останутся без изменений.</p>
-      <div class="form-actions"><button type="submit">Проверить изменение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
+      <p class="full">Текущий source URL и credentials никогда не возвращаются в dashboard. Введите URL без логина и пароля. Если поля credentials оставить пустыми, сохранённые credentials останутся без изменений.</p>
+      <div class="form-actions full"><button type="submit">Проверить изменение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
     </form>
   </section>
+  <aside class="form-help" aria-label="Помощь по редактированию камеры"><section><h2>Без раскрытия секретов</h2><p>Для безопасности текущий source URL не подставляется в форму. Изменение сначала проходит серверный preflight, затем отдельное подтверждение.</p></section><section><h2>Credentials</h2><p>Пустые поля сохраняют действующие учётные данные без изменений.</p></section></aside>
+  </div>
 </main>
 {% endblock %}

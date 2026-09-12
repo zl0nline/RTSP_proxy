@@ -1,4 +1,6 @@
 {% extends "dashboard/base.html" %}
+{% block body_class %}dashboard-body dashboard-cameras{% endblock %}
+{% block top_crumb %}Камеры / Подтверждение операции{% endblock %}
 {% block title %}Подтвердить изменение {{ camera.name }} — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -8,7 +10,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">Disruption fence · revision {{ preview.desired_revision }}</p><h1 tabindex="-1" autofocus>Подтвердите действие</h1></div>
   </div>
-  <section class="panel mutation-panel" role="alert" aria-live="assertive" aria-labelledby="confirmation-title">
+  <section class="panel mutation-panel confirmation-panel" role="alert" aria-live="assertive" aria-labelledby="confirmation-title">
     <div class="panel-heading"><h2 id="confirmation-title">Будет отключён {{ preview.disconnect_readers }} downstream-клиент</h2></div>
     <form class="mutation-form" method="post" action="/dashboard/cameras/{{ camera.id }}/mutations/apply" data-raw-source-credentials>
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">

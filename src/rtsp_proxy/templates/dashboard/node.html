@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% block top_crumb %}Ноды / {{ node.name }}{% endblock %}
 {% block title %}{{ node.name }} — RTSP Proxy{% endblock %}
 {% block content %}
 <main id="main-content">
@@ -60,7 +61,7 @@
           <input name="new_port" type="number" required inputmode="numeric" min="{{ port_range_start }}" max="{{ port_range_end }}">
         </label>
         <small>Разрешённый диапазон: {{ port_range_start }}–{{ port_range_end }}</small>
-        <button class="danger-button" type="submit">Показать последствия смены порта</button>
+        <button class="secondary-action" type="submit">Показать последствия смены порта</button>
       </form>
       {% endif %}
       {% if node.desired_state.value == 'draining' %}
@@ -74,7 +75,7 @@
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <input type="hidden" name="expected_revision" value="{{ node.desired_revision }}">
         <input type="hidden" name="expected_state" value="{{ node.desired_state.value }}">
-        <button class="danger-button" type="submit">Показать последствия reconfigure/restart</button>
+        <button class="secondary-action" type="submit">Показать последствия reconfigure/restart</button>
       </form>
       {% endif %}
       {% if node.desired_state.value in ['draining', 'maintenance'] %}
