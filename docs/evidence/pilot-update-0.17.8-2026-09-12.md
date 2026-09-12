@@ -60,6 +60,25 @@ restarted. A single immediate readiness request raced the WEB listener restart;
 the subsequent bounded verification found every required unit active, zero
 failed units, readiness passing and no warning-or-higher entries.
 
+The control-plane activation intentionally did not restart media units. A
+follow-up process inspection then showed that their environment files already
+selected the shared immutable binary, but the four processes themselves still
+held the legacy `0.17.4` application-release executable. All four management
+APIs reported zero readers, so the operator activated the shared binary with a
+one-node-at-a-time rolling restart. Each node had to become active under
+`/opt/rtsp-proxy/media/0.2.1/mediamtx` and answer its authenticated management
+API before the next restart began. The PID transition was:
+
+- `498728` -> `1360110`;
+- `498751` -> `1362685`;
+- `498752` -> `1363258`;
+- `498738` -> `1363835`.
+
+The final process-level check found all four executables at the shared path and
+zero MediaMTX processes under `/opt/rtsp-proxy/releases/0.17.4`. HTTPS readiness
+remained green, no service was failed, and no warning-or-higher media journal
+entry appeared during the rolling activation window.
+
 ## Dashboard verification
 
 An authenticated browser session reached the pilot through a temporary SSH
@@ -78,7 +97,7 @@ The HTTP asset bytes matched the installed wheel exactly:
   `01c434600010d90c8e1aa4bd7ce0d07ce205c7c187c097c6374071cef71ebb04`.
 
 The final pilot state is application `0.17.8`, exact commit `539efcc`, schema
-0025, four unchanged media processes, green readiness and a verified
-pre-migration backup. This update did not repeat an established-reader smoke,
-an isolated database restore, SMTP delivery, the 24-hour soak or supported-host
-admission; those gates remain open.
+0025, four MediaMTX processes executing the shared immutable `0.2.1` binary,
+green readiness and a verified pre-migration backup. This update did not repeat
+an established-reader smoke, an isolated database restore, SMTP delivery, the
+24-hour soak or supported-host admission; those gates remain open.
