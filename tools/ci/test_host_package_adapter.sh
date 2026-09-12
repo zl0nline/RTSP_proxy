@@ -23,7 +23,7 @@ case "$profile" in
   opensuse-tumbleweed)
     image=opensuse/tumbleweed:latest
     manager=zypper
-    prepare='zypper --non-interactive install --no-recommends python3'
+    prepare='sed -i "s|http://|https://|g" /etc/zypp/repos.d/*.repo && zypper --non-interactive install --no-recommends python3'
     ;;
   arch)
     image=archlinux:base
