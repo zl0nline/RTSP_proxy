@@ -150,11 +150,13 @@ Camera-specific username/password, которыми consumer авторизуе�
 ## Downstream grant
 
 Revisioned camera-specific credential metadata with explicit `temporary` or
-`service` kind and expiry. The raw URL-safe secret is shown only in the first
-no-store response and is automatically removed from the dashboard after at
-most 30 seconds; PostgreSQL keeps only its versioned-pepper verifier and safe
-metadata. Authenticated issue/rotation is recent-MFA protected and uses a
-session-bound UUIDv4 idempotency key. Replay never reproduces the secret.
+`service` kind. A temporary grant always has an expiry; a service grant may
+have an expiry or be explicitly permanent. The raw URL-safe secret is shown
+only in the first no-store response and is automatically removed from the
+dashboard after at most 30 seconds; PostgreSQL keeps only its versioned-pepper
+verifier and safe metadata. Authenticated issue/rotation is recent-MFA
+protected and uses a session-bound UUIDv4 idempotency key. Replay never
+reproduces the secret.
 Secret issue/rotation and ACL/revoke mutations use separate durable per-account
 rate buckets. A successful secret-free grant-list read is durably audited.
 Rejected replay, idempotency, not-found and stale-revision mutations append a

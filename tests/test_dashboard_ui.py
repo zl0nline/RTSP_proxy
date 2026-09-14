@@ -4339,6 +4339,7 @@ def test_camera_access_dashboard_is_bounded_secret_free_and_explains_two_level_a
     )[1].split("</form>", 1)[0]
     assert 'name="idempotency_key"' not in policy_form
     assert 'name="idempotency_key"' in issue_form
+    assert 'value="permanent">Бессрочно (только service)</option>' in issue_form
 
 
 @pytest.mark.parametrize(
@@ -4725,6 +4726,62 @@ def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revis
     )
     assert stale_issue.status_code == 401
     assert "Требуется недавняя MFA" in stale_issue.text
+
+
+def test_dashboard_empty_service_grant_lifetime_means_permanent() -> None:
+    grants = RecordingAccessGrants()
+    client, headers = _authenticated_dashboard(
+        observations=None,
+        camera_control=cast(CameraControl, StaticCameraCatalog()),
+        access_policy_control=RecordingAccessPolicies(),
+        access_grant_control=grants,
+        role=OperatorRole.ADMIN,
+    )
+    root = f"/dashboard/cameras/{CAMERA_ID}/access-grants"
+
+    issued = client.post(
+        root,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "kind": "service",
+            "lifetime_seconds": "",
+            "idempotency_key": IDEMPOTENCY_KEY,
+        },
+    )
+    rotated = client.post(
+        f"{root}/{GRANT_ID}/rotate",
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "expected_revision": "3",
+            "overlap_seconds": "30",
+            "lifetime_seconds": "",
+            "idempotency_key": "22222222-2222-4222-8222-222222222222",
+        },
+    )
+    temporary = client.post(
+        root,
+        headers=headers,
+        data={
+            "_csrf": CSRF_TOKEN,
+            "kind": "temporary",
+            "lifetime_seconds": "",
+            "idempotency_key": "33333333-3333-4333-8333-333333333333",
+        },
+    )
+
+    assert issued.status_code == 201
+    assert rotated.status_code == 201
+    assert temporary.status_code == 422
+    assert grants.calls[0][0:4] == ("create", CAMERA_ID, None, "service")
+    assert grants.calls[1][0:5] == (
+        "rotate",
+        GRANT_ID,
+        CAMERA_ID,
+        timedelta(seconds=30),
+        None,
+    )
 
 
 def test_operator_access_api_requires_mfa_idempotency_and_uses_authenticated_actor() -> None:

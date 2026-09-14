@@ -930,11 +930,13 @@ the reserved matcher and reach the same empty-401 path. Policy lookup checks
 camera placement plus RUNNING/non-maintenance node state, evaluates observed
 peer IP before reading a grant, and verifies a generated high-entropy token by
 constant-time HMAC-SHA-256. Creation explicitly chooses `temporary` or
-`service` and expiry; rotation also requires an explicit replacement lifetime,
-so there is no implicit unattended-client TTL. Authenticated Phase-F writes
-derive creator from the operator account; the compatibility seam uses the
-fixed server-side `bootstrap-control-plane` principal, never caller input. The
-raw token is a one-time API response and is never stored
+`service`; temporary grants require an expiry, while service grants accept
+either a bounded lifetime or the permanent choice added by schema 0025.
+Rotation preserves the grant kind and applies the same lifetime rule to its
+replacement. Authenticated Phase-F writes derive creator from the operator
+account; the compatibility seam uses the fixed server-side
+`bootstrap-control-plane` principal, never caller input. The raw token is a
+one-time API response and is never stored
 or emitted to audit/outbox. Safe creator/last-use fields remain queryable;
 failed last-use persistence is visible at the auth service's loopback-only
 `/internal/v1/metrics` endpoint; its labels are limited to bounded

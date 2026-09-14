@@ -1,4 +1,6 @@
 {% extends "dashboard/base.html" %}
+{% set grant_lifetimes = (("3600", "1 час"), ("86400", "1 день"), ("604800", "7 дней"), ("2592000", "30 дней"), ("31536000", "1 год")) %}
+{% set permanent_grant_lifetime = "permanent" %}
 {% block body_class %}dashboard-body dashboard-cameras{% endblock %}
 {% block top_crumb %}Камеры / {{ camera.name }} / Доступ{% endblock %}
 {% block title %}Доступ · {{ camera.name }} — RTSP Proxy{% endblock %}
@@ -37,7 +39,7 @@
       <input type="hidden" name="idempotency_key" value="{{ issue_idempotency_key }}">
       <label for="grant-kind">Режим<select id="grant-kind" name="kind"><option value="temporary">temporary</option><option value="service">service</option></select></label>
       <label for="grant-lifetime">Срок<select id="grant-lifetime" name="lifetime_seconds">
-        <option value="3600">1 час</option><option value="86400">1 день</option><option value="604800">7 дней</option><option value="2592000">30 дней</option><option value="31536000">1 год</option><option value="">Бессрочно (только service)</option>
+        {% for value, label in grant_lifetimes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}<option value="{{ permanent_grant_lifetime }}">Бессрочно (только service)</option>
       </select></label>
       <div class="form-actions"><button type="submit">Выдать grant</button></div>
     </form>
@@ -58,7 +60,7 @@
             <input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="expected_revision" value="{{ grant.revision }}">
             <input type="hidden" name="idempotency_key" value="{{ rotation_idempotency_keys[grant.id] }}">
             <input name="overlap_seconds" type="number" min="0" max="86400" value="30" aria-label="Overlap, секунд">
-            <select name="lifetime_seconds" aria-label="Новый срок"><option value="3600">1 час</option><option value="86400">1 день</option><option value="604800">7 дней</option><option value="2592000">30 дней</option><option value="31536000">1 год</option>{% if grant.kind == "service" %}<option value="">Бессрочно</option>{% endif %}</select>
+            <select name="lifetime_seconds" aria-label="Новый срок">{% for value, label in grant_lifetimes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}{% if grant.kind == "service" %}<option value="{{ permanent_grant_lifetime }}">Бессрочно</option>{% endif %}</select>
             <button type="submit">Ротировать</button>
           </form>
           <a href="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/revoke">Отозвать</a>

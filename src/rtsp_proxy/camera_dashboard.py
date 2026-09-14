@@ -85,6 +85,8 @@ from rtsp_proxy.reconcile import (
     ReconcileRetry,
 )
 
+_PERMANENT_GRANT_LIFETIME = "permanent"
+
 
 def camera_dashboard_router(
     *,
@@ -524,19 +526,7 @@ def camera_dashboard_router(
             kind = form.required("kind", max_length=16)
             if kind not in {"temporary", "service"}:
                 raise DashboardFormInvalid("dashboard_form_invalid")
-            raw_lifetime = form.optional("lifetime_seconds", max_length=8)
-            lifetime = (
-                None
-                if raw_lifetime is None
-                else timedelta(
-                    seconds=_bounded_integer(
-                        form,
-                        "lifetime_seconds",
-                        minimum=1,
-                        maximum=366 * 24 * 60 * 60,
-                    )
-                )
-            )
+            lifetime = _optional_grant_lifetime(form)
             if kind == "temporary" and lifetime is None:
                 raise DashboardFormInvalid("dashboard_form_invalid")
             idempotency_key = _idempotency_key(form)
@@ -659,18 +649,7 @@ def camera_dashboard_router(
                         maximum=24 * 60 * 60,
                     )
                 ),
-                lifetime=(
-                    None
-                    if form.optional("lifetime_seconds", max_length=8) is None
-                    else timedelta(
-                        seconds=_bounded_integer(
-                            form,
-                            "lifetime_seconds",
-                            minimum=1,
-                            maximum=366 * 24 * 60 * 60,
-                        )
-                    )
-                ),
+                lifetime=_optional_grant_lifetime(form),
                 expected_revision=expected_revision,
                 created_by=f"operator:{principal.account_id}",
                 idempotency_key=idempotency_key,
@@ -1185,6 +1164,21 @@ def _bounded_integer(
     if not minimum <= value <= maximum:
         raise DashboardFormInvalid("dashboard_form_invalid")
     return value
+
+
+def _optional_grant_lifetime(form: DashboardForm) -> timedelta | None:
+    raw_lifetime = form.optional("lifetime_seconds", max_length=9)
+    if raw_lifetime in {None, "", _PERMANENT_GRANT_LIFETIME}:
+        # The empty value keeps forms rendered by 0.17.8 valid across an update.
+        return None
+    return timedelta(
+        seconds=_bounded_integer(
+            form,
+            "lifetime_seconds",
+            minimum=1,
+            maximum=366 * 24 * 60 * 60,
+        )
+    )
 
 
 def _cidr_lines(form: DashboardForm, name: str) -> tuple[str, ...]:

@@ -325,9 +325,11 @@ require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/ac
 require_body_text "Два независимых уровня"
 require_body_text "Если оба списка пусты"
 browser screenshot --full "$artifact_dir/02-camera-access.png" >/dev/null
-browser select 'select[name="lifetime_seconds"]' "3600" >/dev/null
+browser select '#grant-kind' "service" >/dev/null
+browser select 'select[name="lifetime_seconds"]' "permanent" >/dev/null
 keyboard_activate 'form[action$="/access-grants"] button'
 require_body_text "Показывается только один раз"
+require_body_text "Бессрочно"
 require_body_text "browser-downstream-secret-canary-0123456789abcdef"
 require_secret_absent "browser-source-password-canary-0123456789abcdef"
 browser wait 3000 >/dev/null
