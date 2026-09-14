@@ -3693,10 +3693,10 @@ def test_bpftool_backend_bounds_command_exit_encoding_and_deadline(
     failure_body = {
         "nonzero": "raise SystemExit(7)",
         "invalid_utf8": "os.write(1, b'\\xff')",
-        "timeout": "time.sleep(2)",
+        "timeout": "time.sleep(10)",
     }[failure]
     bpftool.write_text(
-        "#!/usr/bin/python3\n"
+        f"#!{sys.executable}\n"
         "import os, sys, time\n"
         "if sys.argv[1:3] == ['prog', 'loadall']:\n"
         f"    {failure_body}\n"
@@ -3736,7 +3736,7 @@ def test_bpftool_backend_bounds_command_exit_encoding_and_deadline(
             unit_name=scope.unit_name,
             cgroup_path=scope.cgroup_path,
             target=scope.target,
-            timeout_seconds=0.2 if failure == "timeout" else 1.0,
+            timeout_seconds=3.0,
         )
 
     assert list(pin_root.iterdir()) == []
