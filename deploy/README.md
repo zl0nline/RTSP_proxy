@@ -786,7 +786,7 @@ once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.17.8 \
+  --release-id 0.17.9 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -889,11 +889,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.17.8 candidate, apply migration 0025 and run:
+For a first installation of the 0.17.9 candidate, apply migration 0025 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.17.8 \
+  --release-id 0.17.9 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
