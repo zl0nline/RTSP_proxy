@@ -829,6 +829,42 @@ def test_operator_can_allow_one_source_network_inside_the_static_envelope() -> N
     assert str(camera.probe_endpoint.address) == "10.40.12.19"
     assert tuple(map(str, store.list_probe_source_networks())) == ("10.40.12.19/32",)
 
+    with pytest.raises(InvalidCameraSource, match="probe_network_prefix_invalid"):
+        control.allow_source_network(
+            "rtsp://camera.example/main",
+            prefix_length=16,
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+
+    unconfigured = CameraControl(
+        store=InMemoryNodeStore(),
+        new_camera_id=uuid4,
+        new_public_id=lambda: "b234567b234567b234567b2344",
+    )
+    with pytest.raises(InvalidCameraSource, match="probe_source_policy_not_configured"):
+        unconfigured.allow_source_network(
+            "rtsp://camera.example/main",
+            prefix_length=32,
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+
+    unavailable = CameraControl(
+        store=InMemoryNodeStore(),
+        new_camera_id=uuid4,
+        new_public_id=lambda: "c234567c234567c234567c2344",
+        probe_endpoint_admission=ProbeEndpointAdmission(
+            site_key="site-a",
+            allowed_networks=(ip_network("10.40.0.0/16"),),
+            resolve=lambda _hostname: (_ for _ in ()).throw(RuntimeError("dns unavailable")),
+        ),
+    )
+    with pytest.raises(InvalidCameraSource, match="probe_destination_unavailable"):
+        unavailable.allow_source_network(
+            "rtsp://camera.example/main",
+            prefix_length=32,
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+
 
 @pytest.mark.parametrize(
     ("error", "expected_status", "expected_code"),
@@ -2409,6 +2445,96 @@ def test_previous_schema_bridge_keeps_static_source_envelope_and_blocks_dynamic_
             mutation_context=NODE_MUTATION_CONTEXT,
         )
     store.close()
+
+
+def test_current_schema_persists_and_audits_dynamic_source_networks(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    engine = create_engine(postgres_database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO operator_accounts "
+                "(id, identity_source, subject, display_name, roles, scopes, "
+                "authz_version, enabled) VALUES "
+                "(:id, 'oidc', :subject, 'Source policy operator', "
+                "ARRAY['operator'], ARRAY['server:*'], 3, true)"
+            ),
+            {
+                "id": NODE_MUTATION_CONTEXT.actor_account_id,
+                "subject": NODE_MUTATION_CONTEXT.actor_subject,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO operator_sessions "
+                "(id, account_id, token_sha256, csrf_sha256, authz_version, issued_at, "
+                "last_seen_at, idle_expires_at, absolute_expires_at, mfa_verified_at) "
+                "VALUES (:id, :account_id, :token, :csrf, 3, clock_timestamp(), "
+                "clock_timestamp(), clock_timestamp() + interval '30 minutes', "
+                "clock_timestamp() + interval '12 hours', clock_timestamp())"
+            ),
+            {
+                "id": NODE_MUTATION_CONTEXT.actor_session_id,
+                "account_id": NODE_MUTATION_CONTEXT.actor_account_id,
+                "token": "a" * 64,
+                "csrf": "b" * 64,
+            },
+        )
+
+    store = PostgresNodeStore(postgres_database_url)
+    host = ip_network("10.40.1.11/32")
+    subnet = ip_network("10.40.1.0/24")
+    ipv6_host = ip_network("2001:db8::1/128")
+
+    assert store.add_probe_source_network(
+        host,
+        mutation_context=NODE_MUTATION_CONTEXT,
+    )
+    assert not store.add_probe_source_network(
+        host,
+        mutation_context=NODE_MUTATION_CONTEXT,
+    )
+    assert store.add_probe_source_network(
+        subnet,
+        mutation_context=NODE_MUTATION_CONTEXT,
+    )
+    assert store.add_probe_source_network(
+        ipv6_host,
+        mutation_context=NODE_MUTATION_CONTEXT,
+    )
+    assert tuple(map(str, store.list_probe_source_networks())) == (
+        "10.40.1.0/24",
+        "10.40.1.11/32",
+        "2001:db8::1/128",
+    )
+    with pytest.raises(ValueError, match="probe_network_prefix_invalid"):
+        store.add_probe_source_network(
+            ip_network("10.40.0.0/16"),
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+    with pytest.raises(ValueError, match="probe_network_prefix_invalid"):
+        store.add_probe_source_network(
+            ip_network("2001:db8::/64"),
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+
+    with engine.connect() as connection:
+        events = connection.execute(
+            text(
+                "SELECT event_type, payload->>'network' AS network "
+                "FROM audit_events WHERE aggregate_type='probe_source_network' "
+                "ORDER BY payload->>'network'"
+            )
+        ).all()
+    assert events == [
+        ("probe.source_network_allowed", "10.40.1.0/24"),
+        ("probe.source_network_allowed", "10.40.1.11/32"),
+        ("probe.source_network_allowed", "2001:db8::1/128"),
+    ]
+    store.close()
+    engine.dispose()
 
 
 def test_schema_check_sanitizes_database_connection_failures() -> None:

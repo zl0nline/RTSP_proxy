@@ -3191,9 +3191,20 @@ def test_dashboard_camera_registration_explains_placement_failures(
 @pytest.mark.parametrize(
     ("overrides", "expected_message"),
     (
+        ({"unexpected": "value"}, "Некорректная форма"),
+        ({"placement_mode": "automatic", "node_id": str(NODE_ID)}, "Некорректная форма"),
+        ({"placement_mode": "manual", "node_id": ""}, "Некорректная форма"),
         ({"placement_mode": "manual", "node_id": "not-a-uuid"}, "Некорректная форма"),
         ({"placement_mode": "invalid"}, "Некорректная форма"),
+        ({"allow_source_network": "16"}, "Некорректная форма"),
         ({"source_auth_mode": "credentials"}, "Некорректная форма"),
+        (
+            {
+                "source_username": "operator\ninvalid",
+                "source_password": "secret-password",
+            },
+            "Некорректная форма",
+        ),
         (
             {
                 "source_auth_mode": "none",

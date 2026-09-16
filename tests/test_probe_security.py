@@ -216,6 +216,18 @@ def test_operator_selected_source_network_must_be_unambiguous_and_inside_envelop
     with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
         admission.source_network("rtsp://outside.example/live", prefix_length=32)
 
+    ipv6 = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("2001:4860::/32"),),
+        resolve=lambda _hostname: (),
+    )
+    assert str(
+        ipv6.source_network(
+            "rtsp://[2001:4860:4860::8888]/live",
+            prefix_length=128,
+        )
+    ) == "2001:4860:4860::8888/128"
+
 
 def test_each_readmission_creates_a_new_immutable_endpoint_generation() -> None:
     generations = iter(

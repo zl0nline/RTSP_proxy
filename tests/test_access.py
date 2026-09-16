@@ -399,6 +399,30 @@ def test_access_grant_purge_removes_only_inactive_grants_at_the_control_clock() 
     assert store.grant is None
 
 
+def test_postgres_access_grant_purge_rejects_naive_time_and_allows_empty_result(
+    postgres_database_url: str,
+) -> None:
+    upgrade_database(postgres_database_url)
+    store = PostgresNodeStore(postgres_database_url)
+    context = mutation_context(UUID("80000000-0000-4000-8000-000000000008"))
+
+    with pytest.raises(ValueError, match="access_grant_timezone_required"):
+        store.purge_inactive_access_grants(
+            CAMERA_ID,
+            inactive_before=datetime(2026, 8, 1),
+            mutation_context=context,
+        )
+    assert (
+        store.purge_inactive_access_grants(
+            CAMERA_ID,
+            inactive_before=NOW,
+            mutation_context=context,
+        )
+        == ()
+    )
+    store.close()
+
+
 def test_grant_rotation_replay_is_rejected_before_mutable_state_read() -> None:
     key = UUID("80000000-0000-4000-8000-000000000008")
 
