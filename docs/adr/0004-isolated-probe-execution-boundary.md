@@ -4,6 +4,7 @@
 - Date: 2026-08-10
 - Accepted: 2026-09-06
 - Decision owners: technical owner, security owner, operations owner
+- Related issues: #38
 
 ## Context
 
@@ -21,7 +22,9 @@ only synthetic credentials and is not a deployable dependency provider.
 Production source probes run behind a dedicated execution boundary, not inside
 the web, scheduler or reconciler process:
 
-- a target-admission component resolves once, applies IPv4/IPv6 CIDR policy,
+- a target-admission component resolves once, applies a two-layer IPv4/IPv6
+  CIDR policy (root-owned static maximum envelope plus audited PostgreSQL
+  `/32`, IPv4 `/24`, or IPv6 `/128` operator admission inside it),
   rejects metadata/link-local/loopback/management ranges unless explicitly
   assigned to a controlled camera network, and emits an immutable target with a
   pinned literal address;

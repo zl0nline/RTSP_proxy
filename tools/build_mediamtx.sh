@@ -26,6 +26,8 @@ source_repository=$(jq --raw-output '.mediamtx.source_repository' "$catalog")
 source_commit=$(jq --raw-output '.mediamtx.source_commit' "$catalog")
 patch_path=$(jq --raw-output '.mediamtx.patch' "$catalog")
 patch_sha256=$(jq --raw-output '.mediamtx.patch_sha256' "$catalog")
+source_unavailable_patch_path=$(jq --raw-output '.mediamtx.source_unavailable_patch' "$catalog")
+source_unavailable_patch_sha256=$(jq --raw-output '.mediamtx.source_unavailable_patch_sha256' "$catalog")
 gortsplib_version=$(jq --raw-output '.mediamtx.gortsplib.version' "$catalog")
 gortsplib_race_test_patch_path=$(jq --raw-output '.mediamtx.gortsplib.race_test_patch' "$catalog")
 gortsplib_race_test_patch_sha256=$(jq --raw-output '.mediamtx.gortsplib.race_test_patch_sha256' "$catalog")
@@ -57,6 +59,7 @@ if [ "$(go version | awk '{print $3}')" != "$expected_go_version" ]; then
     exit 1
 fi
 sha256_check "$patch_sha256" "$repo_root/$patch_path"
+sha256_check "$source_unavailable_patch_sha256" "$repo_root/$source_unavailable_patch_path"
 sha256_check "$gortsplib_race_test_patch_sha256" "$repo_root/$gortsplib_race_test_patch_path"
 sha256_check "$gortsplib_patch_sha256" "$repo_root/$gortsplib_patch_path"
 
@@ -71,6 +74,8 @@ git -C "$source_root" checkout --quiet --detach FETCH_HEAD
 test "$(git -C "$source_root" rev-parse HEAD)" = "$source_commit"
 git -C "$source_root" apply --check "$repo_root/$patch_path"
 git -C "$source_root" apply "$repo_root/$patch_path"
+git -C "$source_root" apply --check "$repo_root/$source_unavailable_patch_path"
+git -C "$source_root" apply "$repo_root/$source_unavailable_patch_path"
 
 gortsplib_source="$source_root/third_party/gortsplib"
 mkdir -p "$source_root/third_party"

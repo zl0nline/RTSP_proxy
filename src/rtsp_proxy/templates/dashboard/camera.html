@@ -38,6 +38,9 @@
 
     <div class="split-layout">
       {% if live_updates_enabled %}
+      {% if camera.source_credentials_configured is sameas false %}
+      <div class="notice notice-warning" role="status"><span aria-hidden="true">!</span><div><strong>Credentials источника не заданы</strong><p>Это корректно только для камеры без авторизации. Если ingest не запускается, сохраните логин и пароль источника; downstream-клиент теперь получит 503 вместо ошибки гранта.</p></div></div>
+      {% endif %}
       <section class="panel" aria-labelledby="camera-live-title" data-camera-live data-live-url="/dashboard/cameras/{{ camera.id }}/events" data-snapshot-url="/dashboard/cameras/{{ camera.id }}/live" data-poll-interval-ms="{{ poll_interval_ms }}">
         <div class="panel-heading">
           <h2 id="camera-live-title">Текущее состояние потока</h2>
@@ -48,7 +51,7 @@
           <div><h3 data-live-source>Получаем данные</h3><p data-live-source-reason>Состояние источника загружается из агрегированного снимка.</p></div>
         </div>
         <dl class="detail-list" aria-live="polite">
-          <div><dt>Downstream</dt><dd data-live-occupied>—</dd></div>
+          <div><dt>Downstream-читатели</dt><dd data-live-occupied>—</dd></div>
           <div><dt>Входящий bitrate</dt><dd data-live-received>—</dd></div>
           <div><dt>Исходящий bitrate</dt><dd data-live-sent>—</dd></div>
           <div><dt>Последняя глубокая проверка</dt><dd data-live-probe-result>—</dd></div>

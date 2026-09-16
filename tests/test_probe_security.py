@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 from dataclasses import replace
-from ipaddress import ip_address, ip_network
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from threading import Event, Thread
 from uuid import UUID
 
@@ -157,6 +157,64 @@ def test_literal_endpoint_never_uses_dns_and_must_be_in_the_site_policy() -> Non
 
     with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
         admission.admit("rtsp://10.41.0.1/live")
+
+
+def test_dynamic_source_policy_can_only_narrow_the_static_site_envelope() -> None:
+    effective = (ip_network("10.40.1.0/24"),)
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/16"),),
+        resolve=lambda hostname: {
+            "allowed.example": ("10.40.1.11",),
+            "not-approved.example": ("10.40.2.11",),
+            "outside.example": ("10.41.1.11",),
+        }[hostname],
+        effective_networks=lambda: effective,
+    )
+
+    assert admission.admit("rtsp://allowed.example/live").literal_host == "10.40.1.11"
+    with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
+        admission.admit("rtsp://not-approved.example/live")
+    with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
+        admission.admit("rtsp://outside.example/live")
+
+
+def test_dynamic_source_policy_fails_closed_when_it_cannot_be_loaded() -> None:
+    def unavailable() -> tuple[IPv4Network | IPv6Network, ...]:
+        raise RuntimeError("database unavailable")
+
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/16"),),
+        resolve=lambda _hostname: ("10.40.1.11",),
+        effective_networks=unavailable,
+    )
+
+    with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
+        admission.admit("rtsp://camera.example/live")
+
+
+def test_operator_selected_source_network_must_be_unambiguous_and_inside_envelope() -> None:
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/16"),),
+        resolve=lambda hostname: {
+            "camera.example": ("10.40.2.19",),
+            "ambiguous.example": ("10.40.2.19", "10.40.2.20"),
+            "outside.example": ("10.41.2.19",),
+        }[hostname],
+    )
+
+    assert str(
+        admission.source_network("rtsp://camera.example/live", prefix_length=24)
+    ) == "10.40.2.0/24"
+    assert str(
+        admission.source_network("rtsp://camera.example/live", prefix_length=32)
+    ) == "10.40.2.19/32"
+    with pytest.raises(ProbeEndpointRejected, match="probe_destination_unavailable"):
+        admission.source_network("rtsp://ambiguous.example/live", prefix_length=32)
+    with pytest.raises(ProbeEndpointRejected, match="probe_destination_not_allowed"):
+        admission.source_network("rtsp://outside.example/live", prefix_length=32)
 
 
 def test_each_readmission_creates_a_new_immutable_endpoint_generation() -> None:

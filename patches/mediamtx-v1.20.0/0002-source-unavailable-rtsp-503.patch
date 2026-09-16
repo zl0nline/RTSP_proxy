@@ -1,0 +1,115 @@
+diff --git a/internal/core/path.go b/internal/core/path.go
+index 7daf4e80..e2a0523b 100644
+--- a/internal/core/path.go
++++ b/internal/core/path.go
+@@ -396,12 +396,12 @@ func (pa *path) runInner() error {
+ 
+ func (pa *path) doOnDemandStaticSourceReadyTimer() {
+ 	for _, req := range pa.describeRequestsOnHold {
+-		req.Res <- defs.PathDescribeRes{Err: fmt.Errorf("source of path '%s' has timed out", pa.name)}
++		req.Res <- defs.PathDescribeRes{Err: &defs.PathSourceUnavailableError{PathName: pa.name}}
+ 	}
+ 	pa.describeRequestsOnHold = nil
+ 
+ 	for _, req := range pa.readerAddRequestsOnHold {
+-		req.Res <- defs.PathAddReaderRes{Err: fmt.Errorf("source of path '%s' has timed out", pa.name)}
++		req.Res <- defs.PathAddReaderRes{Err: &defs.PathSourceUnavailableError{PathName: pa.name}}
+ 	}
+ 	pa.readerAddRequestsOnHold = nil
+ 
+diff --git a/internal/defs/path.go b/internal/defs/path.go
+index 201d5dfa..83a6fd12 100644
+--- a/internal/defs/path.go
++++ b/internal/defs/path.go
+@@ -16,6 +16,16 @@ type PathMaxReadersReachedError struct {
+ 	PathName string
+ }
+ 
++// PathSourceUnavailableError is returned when an on-demand source did not
++// become available within its configured startup window.
++type PathSourceUnavailableError struct {
++	PathName string
++}
++
++func (e *PathSourceUnavailableError) Error() string {
++	return "source of path '" + e.PathName + "' is unavailable"
++}
++
+ func (e *PathMaxReadersReachedError) Error() string {
+ 	return "maximum reader count reached on path '" + e.PathName + "'"
+ }
+diff --git a/internal/servers/rtsp/conn.go b/internal/servers/rtsp/conn.go
+index 7b6ad072..a11a8e33 100644
+--- a/internal/servers/rtsp/conn.go
++++ b/internal/servers/rtsp/conn.go
+@@ -176,6 +176,12 @@ func (c *conn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
+ 			}, nil, err
+ 		}
+ 
++		if _, ok := errors.AsType[*defs.PathSourceUnavailableError](err); ok {
++			return &base.Response{
++				StatusCode: base.StatusServiceUnavailable,
++			}, nil, err
++		}
++
+ 		return &base.Response{
+ 			StatusCode: base.StatusBadRequest,
+ 		}, nil, err
+diff --git a/internal/servers/rtsp/server_test.go b/internal/servers/rtsp/server_test.go
+index 1001ec1c..74d35d6c 100644
+--- a/internal/servers/rtsp/server_test.go
++++ b/internal/servers/rtsp/server_test.go
+@@ -50,6 +50,36 @@ func (p *dummyPath) RemovePublisher(_ defs.PathRemovePublisherReq) {
+ func (p *dummyPath) RemoveReader(_ defs.PathRemoveReaderReq) {
+ }
+ 
++func TestServerSourceUnavailable(t *testing.T) {
++	pathManager := &test.PathManager{
++		DescribeImpl: func(req defs.PathDescribeReq) (*defs.PathDescribeRes, error) {
++			return nil, &defs.PathSourceUnavailableError{PathName: req.AccessRequest.Name}
++		},
++	}
++
++	s := &Server{
++		Address:        "127.0.0.1:8557",
++		ReadTimeout:    conf.Duration(10 * time.Second),
++		WriteTimeout:   conf.Duration(10 * time.Second),
++		WriteQueueSize: 512,
++		Transports:     conf.RTSPTransports{gortsplib.ProtocolTCP: {}},
++		PathManager:    pathManager,
++		Parent:         test.NilLogger,
++	}
++	require.NoError(t, s.Initialize())
++	defer s.Close()
++
++	conn, err := net.Dial("tcp", "127.0.0.1:8557")
++	require.NoError(t, err)
++	defer conn.Close()
++
++	_, err = conn.Write([]byte("DESCRIBE rtsp://127.0.0.1:8557/camera RTSP/1.0\r\nCSeq: 1\r\n\r\n"))
++	require.NoError(t, err)
++	var res base.Response
++	require.NoError(t, res.Unmarshal(bufio.NewReader(conn)))
++	require.Equal(t, base.StatusServiceUnavailable, res.StatusCode)
++}
++
+ func TestServerPublish(t *testing.T) {
+ 	for _, ca := range []string{"basic", "digest", "basic+digest"} {
+ 		for _, encrypt := range []string{"plain", "tls"} {
+diff --git a/internal/servers/rtsp/session.go b/internal/servers/rtsp/session.go
+index 9eedbf0a..f581e89c 100644
+--- a/internal/servers/rtsp/session.go
++++ b/internal/servers/rtsp/session.go
+@@ -302,6 +302,12 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
+ 				}, nil, err
+ 			}
+ 
++			if _, ok := errors.AsType[*defs.PathSourceUnavailableError](err); ok {
++				return &base.Response{
++					StatusCode: base.StatusServiceUnavailable,
++				}, nil, err
++			}
++
+ 			if _, ok := errors.AsType[*defs.PathMaxReadersReachedError](err); ok {
+ 				return &base.Response{
+ 					StatusCode: base.StatusNotEnoughBandwidth,

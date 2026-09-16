@@ -1,6 +1,6 @@
 {
   "schema_version": 5,
-  "release_id": "0.17.9",
+  "release_id": "0.18.0",
   "git_commit": "0000000000000000000000000000000000000000",
   "python": {
     "version": "3.12",
@@ -10,11 +10,11 @@
     "wheel_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "mediamtx": {
-    "release_id": "0.2.1",
-    "version": "v1.20.0-rtsp-proxy.3",
+    "release_id": "0.2.2",
+    "version": "v1.20.0-rtsp-proxy.4",
     "linux_arch": "amd64",
     "binary": "bin/mediamtx",
-    "binary_sha256": "e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f"
+    "binary_sha256": "fe0aab850ac24fa409f9ab3520b138bad97500048d032b2b7713c7f44ba4775c"
   },
   "ffmpeg": {
     "version": "n8.1.2-34-g9b6c8969e0-20260731",
@@ -39,7 +39,7 @@
   },
   "schema_compatibility": {
     "minimum": "0012_operator_sessions",
-    "maximum": "0025_permanent_service_grants"
+    "maximum": "0026_probe_source_networks"
   },
   "config_schema_version": 1
 }

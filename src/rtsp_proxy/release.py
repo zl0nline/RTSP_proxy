@@ -17,8 +17,8 @@ from rtsp_proxy.probe_connect_guard import (
     trusted_probe_connect_guard_release_identity,
 )
 
-APPLICATION_SCHEMA = "0025_permanent_service_grants"
-PREVIOUS_APPLICATION_SCHEMA = "0024_camera_probe_profiles"
+APPLICATION_SCHEMA = "0026_probe_source_networks"
+PREVIOUS_APPLICATION_SCHEMA = "0025_permanent_service_grants"
 MINIMUM_APPLICATION_SCHEMA = "0012_operator_sessions"
 CONFIG_SCHEMA_VERSION = 1
 
@@ -153,7 +153,7 @@ def _trusted_mediamtx_identity(
 
 def trusted_mediamtx_activation_identity(
     machine: str,
-    release_id: str = "0.2.1",
+    release_id: str = "0.2.2",
 ) -> tuple[str, Sha256]:
     """Return an identity only when the packaged catalog permits activation."""
 
@@ -181,7 +181,7 @@ def trusted_mediamtx_activation_identity(
 
 def trusted_mediamtx_identity(
     machine: str,
-    release_id: str = "0.2.1",
+    release_id: str = "0.2.2",
 ) -> tuple[str, Sha256]:
     """Return one release's packaged MediaMTX identity for a Linux architecture."""
 

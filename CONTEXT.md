@@ -69,7 +69,10 @@ admission._
 ## Source
 
 Private camera RTSP endpoint, который MediaMTX pulls on demand. Source address и
-credentials никогда не раскрываются downstream consumer.
+credentials никогда не раскрываются downstream consumer. Root-owned static
+CIDR envelope задаёт абсолютную границу, а audited dynamic source policy в
+PostgreSQL разрешает оператору только `/32`, IPv4 `/24` или IPv6 `/128` внутри
+неё.
 
 ## Public ID
 
@@ -163,6 +166,8 @@ Rejected replay, idempotency, not-found and stale-revision mutations append a
 separate sanitized durable audit/outbox pair after the failed mutation rolls
 back; an unavailable security journal fails the request closed.
 Revoke and ACL changes affect the next admission, not an established stream.
+Expired and revoked grants may be physically purged by a recent-MFA operation;
+each deleted grant retains a normative audit event.
 
 ## Drain
 
@@ -197,7 +202,8 @@ Bounded observation source/path/node health. Probe не должен заним�
 Scheduler overload делает observation stale/overdue, но сам по себе не делает
 camera unhealthy. `source_probe` и `path_probe` имеют разные hard budgets;
 `path_probe` запрещён, пока source pull активен. Camera source create/update
-однократно и с bounded DNS timeout проверяет явно настроенную site/CIDR policy,
+однократно и с bounded DNS timeout проверяет root-owned site/CIDR envelope и
+динамическую audited policy,
 затем атомарно сохраняет approved literal IP:port, policy digest и opaque
 endpoint generation; пустая policy означает deny-all. Probe job принимает
 только эту generation и hostname не резолвит. Source executor не является

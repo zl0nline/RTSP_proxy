@@ -759,6 +759,74 @@ def test_local_operator_can_refresh_recent_mfa_inside_dashboard() -> None:
     assert 'value="/dashboard"' in unsafe_return.text
 
 
+def test_local_operator_can_refresh_mfa_inline_without_losing_form_state() -> None:
+    secret = b"I" * 20
+    account = OperatorAccount(
+        identity_source=OperatorIdentitySource.LOCAL,
+        id=ACCOUNT_ID,
+        subject="local:admin",
+        display_name="Local administrator",
+        roles=frozenset({OperatorRole.ADMIN}),
+        scopes=frozenset({"server:*"}),
+        authz_version=1,
+        enabled=True,
+    )
+    local_store = InMemoryLocalOperatorStore(
+        account=account,
+        credentials=LocalOperatorCredentials(
+            password_scrypt=LocalOperatorCredentials.hash_password(
+                "correct horse battery staple",
+                salt=b"I" * 16,
+            ),
+            totp_secret=secret,
+        ),
+    )
+    sessions = OperatorSessionControl(
+        store=InMemoryOperatorSessionStore(accounts=(account,), clock=lambda: NOW),
+        token_factory=iter(("S" * 43, "C" * 43)).__next__,
+    )
+    login = LocalOperatorLoginControl(
+        store=local_store,
+        sessions=sessions,
+        clock=lambda: NOW,
+    )
+    client = TestClient(
+        create_app(
+            Settings(role=RuntimeRole.WEB, operator_recent_mfa_seconds=1800),
+            operator_sessions=sessions,
+            local_operator_login=login,
+            clock=lambda: NOW,
+        ),
+        base_url="https://management.example.test",
+    )
+    client.post(
+        "/auth/local/login",
+        data={
+            "username": "admin",
+            "password": "correct horse battery staple",
+            "totp": "",
+        },
+    )
+    code = TOTP(secret, 6, hashes.SHA1(), 30).generate(int(NOW.timestamp())).decode("ascii")
+
+    refreshed = client.post(
+        "/dashboard/mfa/inline",
+        data={"_csrf": "C" * 43, "totp": code},
+    )
+    replayed = client.post(
+        "/dashboard/mfa/inline",
+        data={"_csrf": "C" * 43, "totp": code},
+    )
+
+    assert refreshed.status_code == 204
+    assert refreshed.headers["cache-control"] == "no-store"
+    assert refreshed.headers["x-mfa-expires-at"] == (
+        NOW + timedelta(seconds=1800)
+    ).isoformat()
+    assert replayed.status_code == 422
+    assert replayed.json() == {"detail": {"code": "operator_mfa_invalid"}}
+
+
 def test_oidc_operator_cannot_use_local_dashboard_mfa_refresh() -> None:
     account = OperatorAccount(
         identity_source=OperatorIdentitySource.OIDC,

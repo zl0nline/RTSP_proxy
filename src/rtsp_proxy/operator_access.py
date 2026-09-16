@@ -81,6 +81,7 @@ _AUDIT_ACTIONS = frozenset(
         "camera.enable",
         "camera.grant_issue",
         "camera.grant_list",
+        "camera.grant_purge",
         "camera.grant_revoke",
         "camera.grant_rotate",
         "camera.list",

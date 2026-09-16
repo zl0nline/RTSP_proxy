@@ -174,6 +174,8 @@ def render_node_detail(
     port_range_start: int,
     port_range_end: int,
     target_release_id: str,
+    poll_interval_seconds: int = 10,
+    recent_mfa_seconds: int = 1800,
 ) -> str:
     return (
         _environment()
@@ -187,6 +189,12 @@ def render_node_detail(
             port_range_start=port_range_start,
             port_range_end=port_range_end,
             target_release_id=target_release_id,
+            poll_interval_ms=poll_interval_seconds * 1000,
+            mfa_expires_at=(
+                None
+                if principal.mfa_verified_at is None
+                else principal.mfa_verified_at + timedelta(seconds=recent_mfa_seconds)
+            ),
         )
     )
 
@@ -294,6 +302,7 @@ def render_camera_create(
     entered_name: str = "",
     placement_mode: str = "automatic",
     selected_node_id: str = "",
+    source_policy_envelope: tuple[str, ...] = (),
 ) -> str:
     return (
         _environment()
@@ -307,6 +316,7 @@ def render_camera_create(
             entered_name=entered_name,
             placement_mode=placement_mode,
             selected_node_id=selected_node_id,
+            source_policy_envelope=source_policy_envelope,
         )
     )
 
@@ -354,6 +364,7 @@ def render_camera_access(
     csrf_token: str,
     issue_idempotency_key: UUID,
     rotation_idempotency_keys: dict[UUID, UUID],
+    recent_mfa_seconds: int = 1800,
 ) -> str:
     return (
         _environment()
@@ -366,6 +377,11 @@ def render_camera_access(
             csrf_token=csrf_token,
             issue_idempotency_key=issue_idempotency_key,
             rotation_idempotency_keys=rotation_idempotency_keys,
+            mfa_expires_at=(
+                None
+                if principal.mfa_verified_at is None
+                else principal.mfa_verified_at + timedelta(seconds=recent_mfa_seconds)
+            ),
         )
     )
 

@@ -7,7 +7,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
-from ipaddress import ip_address
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -370,6 +370,30 @@ camera_access_policies = Table(
     CheckConstraint("cardinality(local_cidrs) <= 128"),
 )
 
+probe_source_networks = Table(
+    "probe_source_networks",
+    metadata,
+    Column("id", Uuid(as_uuid=True), primary_key=True),
+    Column("network", CIDR(), nullable=False, unique=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column(
+        "created_by_account_id",
+        Uuid(as_uuid=True),
+        ForeignKey("operator_accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "created_by_session_id",
+        Uuid(as_uuid=True),
+        ForeignKey("operator_sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    CheckConstraint(
+        "family(network) = 4 AND masklen(network) IN (24, 32) OR "
+        "family(network) = 6 AND masklen(network) = 128"
+    ),
+)
+
 camera_access_grants = Table(
     "camera_access_grants",
     metadata,
@@ -718,6 +742,90 @@ class PostgresNodeStore:
         )
         self._lifecycle_lock_timeout_seconds = lifecycle_lock_timeout_seconds
         self._camera_source_cipher = camera_source_cipher
+
+    def list_probe_source_networks(self) -> tuple[IPv4Network | IPv6Network, ...]:
+        with self._engine.connect() as connection:
+            configured = tuple(
+                ip_network(str(value), strict=True)
+                for value in connection.scalars(
+                    select(probe_source_networks.c.network).order_by(
+                        probe_source_networks.c.network
+                    )
+                )
+            )
+            admitted_addresses = tuple(
+                ip_address(str(value))
+                for value in connection.scalars(
+                    select(camera_probe_endpoints.c.endpoint_address)
+                )
+            )
+        networks = {
+            *configured,
+            *(
+                ip_network(f"{address}/{address.max_prefixlen}", strict=True)
+                for address in admitted_addresses
+            ),
+        }
+        return tuple(
+            sorted(
+                networks,
+                key=lambda network: (
+                    network.version,
+                    int(network.network_address),
+                    network.prefixlen,
+                ),
+            )
+        )
+
+    def add_probe_source_network(
+        self,
+        network: IPv4Network | IPv6Network,
+        *,
+        mutation_context: NodeMutationContext,
+    ) -> bool:
+        if not self.schema_is_current():
+            raise ProbeEndpointSchemaUnavailable("probe_endpoint_schema_unavailable")
+        if (network.version == 4 and network.prefixlen not in {24, 32}) or (
+            network.version == 6 and network.prefixlen != 128
+        ):
+            raise ValueError("probe_network_prefix_invalid")
+        network_id = uuid4()
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            connection.execute(
+                text("LOCK TABLE probe_source_networks IN SHARE ROW EXCLUSIVE MODE")
+            )
+            existing = connection.scalar(
+                select(probe_source_networks.c.id).where(
+                    probe_source_networks.c.network == str(network)
+                )
+            )
+            if existing is not None:
+                return False
+            network_count = int(
+                connection.scalar(select(func.count()).select_from(probe_source_networks)) or 0
+            )
+            if network_count >= 128:
+                raise ValueError("probe_network_policy_full")
+            connection.execute(
+                insert(probe_source_networks).values(
+                    id=network_id,
+                    network=str(network),
+                    created_at=func.clock_timestamp(),
+                    created_by_account_id=mutation_context.actor_account_id,
+                    created_by_session_id=mutation_context.actor_session_id,
+                )
+            )
+            _record_normative_event(
+                connection,
+                aggregate_type="probe_source_network",
+                aggregate_id=network_id,
+                event_type="probe.source_network_allowed",
+                payload={"network": str(network)},
+                aggregate_revision=1,
+                mutation_context=mutation_context,
+            )
+        return True
 
     def assert_schema_compatible(self) -> None:
         try:
@@ -4290,6 +4398,64 @@ class PostgresNodeStore:
                 mutation_context=mutation_context,
             )
             return _access_grant(row)
+
+    def purge_inactive_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        inactive_before: datetime,
+        mutation_context: NodeMutationContext,
+    ) -> tuple[UUID, ...]:
+        if inactive_before.tzinfo is None:
+            raise ValueError("access_grant_timezone_required")
+        with self._engine.begin() as connection:
+            _require_synchronous_commit(connection)
+            rows = (
+                connection.execute(
+                    select(camera_access_grants)
+                    .where(
+                        camera_access_grants.c.camera_id == camera_id,
+                        or_(
+                            camera_access_grants.c.revoked_at <= inactive_before,
+                            camera_access_grants.c.expires_at <= inactive_before,
+                        ),
+                    )
+                    .order_by(camera_access_grants.c.id)
+                    .with_for_update()
+                )
+                .mappings()
+                .all()
+            )
+            grants = tuple(_access_grant(row) for row in rows)
+            if not grants:
+                return ()
+            grant_ids = tuple(grant.id for grant in grants)
+            connection.execute(
+                delete(access_grant_issue_requests).where(
+                    or_(
+                        access_grant_issue_requests.c.source_grant_id.in_(grant_ids),
+                        access_grant_issue_requests.c.replacement_grant_id.in_(grant_ids),
+                    )
+                )
+            )
+            for grant in grants:
+                _record_normative_event(
+                    connection,
+                    aggregate_type="camera_access_grant",
+                    aggregate_id=grant.id,
+                    event_type="camera.access_grant_purged",
+                    payload={
+                        "camera_id": str(camera_id),
+                        "inactive_before": inactive_before.isoformat(),
+                        "previous_revision": grant.revision,
+                    },
+                    aggregate_revision=grant.revision + 1,
+                    mutation_context=mutation_context,
+                )
+            connection.execute(
+                delete(camera_access_grants).where(camera_access_grants.c.id.in_(grant_ids))
+            )
+            return grant_ids
 
     def rotate_access_grant(
         self,

@@ -11,6 +11,7 @@ from ipaddress import (
     IPv6Address,
     IPv6Network,
     ip_address,
+    ip_network,
 )
 from threading import BoundedSemaphore
 from urllib.parse import unquote, urlsplit
@@ -167,6 +168,7 @@ class ProbeEndpointAdmission:
         allowed_networks: tuple[_IpNetwork, ...],
         resolve: Callable[[str], tuple[str, ...]],
         new_generation: Callable[[], UUID] = uuid4,
+        effective_networks: Callable[[], tuple[_IpNetwork, ...]] | None = None,
     ) -> None:
         if (
             _SITE_KEY.fullmatch(site_key) is None
@@ -194,6 +196,7 @@ class ProbeEndpointAdmission:
         ).hexdigest()
         self._resolve = resolve
         self._new_generation = new_generation
+        self._effective_networks = effective_networks
 
     @property
     def policy_sha256(self) -> str:
@@ -245,6 +248,48 @@ class ProbeEndpointAdmission:
             _credential=credential,
         )
 
+    def source_network(self, source_url: str, *, prefix_length: int) -> _IpNetwork:
+        """Resolve one source into an operator-selectable network inside the site envelope."""
+
+        hostname, _port, _path, _credential, _source_sha256 = _parse_source_url(source_url)
+        literal = _literal_address(hostname)
+        if literal is None:
+            try:
+                raw_addresses = self._resolve(_canonical_hostname(hostname))
+                addresses = tuple(
+                    sorted(
+                        {_normalize_address(ip_address(value)) for value in raw_addresses},
+                        key=_address_sort_key,
+                    )
+                )
+            except Exception:
+                raise ProbeEndpointRejected("probe_destination_unavailable") from None
+        else:
+            addresses = (_normalize_address(literal),)
+        if len(addresses) != 1:
+            raise ProbeEndpointRejected("probe_destination_unavailable")
+        address = addresses[0]
+        allowed_prefixes = {32, 24} if isinstance(address, IPv4Address) else {128}
+        if prefix_length not in allowed_prefixes:
+            raise ProbeEndpointRejected("probe_network_prefix_invalid")
+        network = ip_network(f"{address}/{prefix_length}", strict=False)
+        inside_envelope = any(
+            (
+                isinstance(network, IPv4Network)
+                and isinstance(ceiling, IPv4Network)
+                and network.subnet_of(ceiling)
+            )
+            or (
+                isinstance(network, IPv6Network)
+                and isinstance(ceiling, IPv6Network)
+                and network.subnet_of(ceiling)
+            )
+            for ceiling in self._allowed_networks
+        )
+        if probe_destination_is_forbidden(address) or not inside_envelope:
+            raise ProbeEndpointRejected("probe_destination_not_allowed")
+        return network
+
     def restore(
         self,
         source_url: str,
@@ -278,9 +323,19 @@ class ProbeEndpointAdmission:
         )
 
     def _allowed(self, address: _IpAddress) -> bool:
-        return any(
+        inside_envelope = any(
             address.version == network.version and address in network
             for network in self._allowed_networks
+        )
+        if not inside_envelope or self._effective_networks is None:
+            return inside_envelope
+        try:
+            effective = self._effective_networks()
+        except Exception:
+            return False
+        return any(
+            address.version == network.version and address in network
+            for network in effective
         )
 
 

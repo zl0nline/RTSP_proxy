@@ -382,6 +382,9 @@ def _create_runtime_app(settings: Settings) -> FastAPI:
         site_key=settings.probe_source_site_key,
         allowed_networks=settings.probe_source_cidrs,
         resolve=BoundedGetentResolver(),
+        effective_networks=(
+            store.list_probe_source_networks if store.schema_is_current() else None
+        ),
     )
     mutation_control = (
         None
@@ -817,6 +820,9 @@ def create_background_app(
             site_key=settings.probe_source_site_key,
             allowed_networks=settings.probe_source_cidrs,
             resolve=BoundedGetentResolver(),
+            effective_networks=(
+                store.list_probe_source_networks if store.schema_is_current() else None
+            ),
         )
         observations = PostgresProbeObservationStore(
             settings.database_url,

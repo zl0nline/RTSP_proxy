@@ -127,8 +127,8 @@ def authenticated_describe_response(
         "Accept: application/sdp\r\n"
         "\r\n"
     ).encode()
-    with socket.create_connection((host, port), timeout=10) as connection:
-        connection.settimeout(10)
+    with socket.create_connection((host, port), timeout=15) as connection:
+        connection.settimeout(15)
         connection.sendall(request)
         response = bytearray()
         while b"\r\n\r\n" not in response:
@@ -1111,15 +1111,14 @@ paths: {{}}
             )
         )
 
-        failing_source_probe = run_lab_ffprobe(
-            binary=FFPROBE_BINARY,
+        failing_source_response = authenticated_describe_response(
             host="127.0.0.1",
             port=proxy_rtsp_port,
             path=failing_source_public_id,
             username="external",
             password="lab-secret",
         )
-        assert failing_source_probe.returncode != 0
+        assert failing_source_response.startswith(b"RTSP/1.0 503 Service Unavailable")
 
         metrics_url = f"http://127.0.0.1:{proxy_metrics_port}/metrics"
 

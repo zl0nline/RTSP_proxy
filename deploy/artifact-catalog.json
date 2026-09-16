@@ -1,12 +1,14 @@
 {
   "schema_version": 1,
   "mediamtx": {
-    "version": "v1.20.0-rtsp-proxy.3",
+    "version": "v1.20.0-rtsp-proxy.4",
     "source_repository": "https://github.com/bluenviron/mediamtx",
     "source_commit": "1b943637a4b5778bb929a7af7687b048fecaa03f",
     "go_version": "go1.26.5",
     "patch": "patches/mediamtx-v1.20.0/0001-hot-reader-limit-and-rtsp-453.patch",
     "patch_sha256": "f9297d7123b7ad99ae2099dcb3af83738fbdde5dd689d9362b86a6049530fa64",
+    "source_unavailable_patch": "patches/mediamtx-v1.20.0/0002-source-unavailable-rtsp-503.patch",
+    "source_unavailable_patch_sha256": "82fda6644cce15b24c98f7251cde747406eba4d665011fa1301fbaa3e1efe3cc",
     "gortsplib": {
       "version": "v5.6.3",
       "race_test_patch": "patches/gortsplib-v5.6.3/0001-record-state-race-regression.patch",
@@ -17,10 +19,10 @@
     "provenance": "reproducible source build from exact upstream commit plus reviewed local patches",
     "architectures": {
       "amd64": {
-        "binary_sha256": "e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f"
+        "binary_sha256": "fe0aab850ac24fa409f9ab3520b138bad97500048d032b2b7713c7f44ba4775c"
       },
       "arm64": {
-        "binary_sha256": "3637b2e96e24428d35dadbe2578ed9b3be6943b71c4f898ea8feab33577c87c3"
+        "binary_sha256": "f066133209f7751c12d9a8e221e59aea6756cf3ca76a6dff517bac765d4f8a51"
       }
     }
   },

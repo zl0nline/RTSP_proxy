@@ -65,6 +65,7 @@ from rtsp_proxy.nodes import (
     NodePortRangeExhausted,
     NodeRuntimeFailed,
     NodeRuntimeUnavailable,
+    ProbeEndpointSchemaUnavailable,
 )
 from rtsp_proxy.operator_access import (
     OperatorPermission,
@@ -102,6 +103,7 @@ def camera_dashboard_router(
     poll_interval_seconds: int,
     public_rtsp_host: str | None = None,
     camera_probe_profiles: CameraProbeProfiles | None = None,
+    source_policy_envelope: tuple[str, ...] = (),
 ) -> APIRouter:
     """Build the complete secret-free camera dashboard surface."""
 
@@ -170,6 +172,7 @@ def camera_dashboard_router(
                 principal=principal,
                 csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
                 idempotency_key=uuid4(),
+                source_policy_envelope=source_policy_envelope,
             )
         )
 
@@ -196,9 +199,15 @@ def camera_dashboard_router(
                     "idempotency_key",
                 }
             )
+            auth_fields = frozenset({"source_auth_mode"})
+            network_fields = frozenset({"allow_source_network"})
             credential_fields = frozenset({"source_username", "source_password"})
             provided_fields = frozenset(form.values)
-            if provided_fields not in {base_fields, base_fields | credential_fields}:
+            core_fields = provided_fields - auth_fields - network_fields
+            if core_fields not in {
+                base_fields,
+                base_fields | credential_fields,
+            }:
                 raise DashboardFormInvalid("dashboard_form_invalid")
             idempotency_key = _idempotency_key(form)
             entered_name = form.required("name", max_length=MAX_CAMERA_NAME_LENGTH)
@@ -233,19 +242,37 @@ def camera_dashboard_router(
                         )
                     except ValueError:
                         raise DashboardFormInvalid("dashboard_form_invalid") from None
+            source_auth_mode = form.optional("source_auth_mode", max_length=16)
+            if source_auth_mode is not None and (
+                source_auth_mode not in {"credentials", "none"}
+                or (source_auth_mode == "credentials") != (source_credentials is not None)
+            ):
+                raise DashboardFormInvalid("dashboard_form_invalid")
+            mutation_context = _access_mutation_context(
+                request,
+                principal,
+                idempotency_key=idempotency_key,
+            )
+            requested_network = form.optional("allow_source_network", max_length=4) or ""
+            if requested_network:
+                if requested_network not in {"32", "24"}:
+                    raise DashboardFormInvalid("dashboard_form_invalid")
+                camera_control.allow_source_network(
+                    form.required("source_url", max_length=8192),
+                    prefix_length=int(requested_network),
+                    mutation_context=mutation_context,
+                )
             camera = camera_control.create_camera(
                 name=entered_name,
                 source_url=form.required("source_url", max_length=8192),
                 source_credentials=source_credentials,
                 node_id=node_id,
-                mutation_context=_access_mutation_context(
-                    request,
-                    principal,
-                    idempotency_key=idempotency_key,
-                ),
+                mutation_context=mutation_context,
             )
         except DashboardFormInvalid:
             return _form_invalid(principal)
+        except ProbeEndpointSchemaUnavailable:
+            return _creation_unavailable(principal)
         except Exception as error:
             if (
                 isinstance(error, CameraLifecycleConflict)
@@ -270,6 +297,7 @@ def camera_dashboard_router(
                 entered_name=entered_name,
                 placement_mode=placement_mode,
                 selected_node_id=raw_node_id or "",
+                source_policy_envelope=source_policy_envelope,
             )
             if expected is not None:
                 return expected
@@ -446,6 +474,7 @@ def camera_dashboard_router(
                 csrf_token=request.cookies.get("__Host-rtsp_proxy_csrf", ""),
                 issue_idempotency_key=uuid4(),
                 rotation_idempotency_keys={grant.id: uuid4() for grant in grants.items},
+                recent_mfa_seconds=recent_mfa_seconds,
             )
         )
 
@@ -791,6 +820,39 @@ def camera_dashboard_router(
             raise
         return _access_redirect(camera_id)
 
+    @router.post(
+        "/dashboard/cameras/{camera_id}/access-grants/purge-inactive",
+        include_in_schema=False,
+    )
+    def purge_inactive_access_grants(request: Request, camera_id: UUID) -> Response:
+        principal = _principal(request)
+        if isinstance(principal, Response):
+            return principal
+        if access_grant_control is None:
+            return _access_unavailable(principal)
+        recent_mfa = _require_recent_mfa(
+            principal,
+            recent_mfa_seconds,
+            return_to=f"/dashboard/cameras/{camera_id}/access",
+        )
+        if recent_mfa is not None:
+            return recent_mfa
+        try:
+            form = _form(request)
+            form.require_exact_fields(frozenset({"_csrf"}))
+            access_grant_control.purge_inactive(
+                camera_id,
+                mutation_context=_access_mutation_context(request, principal),
+            )
+        except DashboardFormInvalid:
+            return _form_invalid(principal)
+        except Exception as error:
+            expected = _access_error(error, principal)
+            if expected is not None:
+                return expected
+            raise
+        return _access_redirect(camera_id)
+
     @router.get(
         "/dashboard/cameras/{camera_id}/edit",
         response_class=HTMLResponse,
@@ -991,16 +1053,31 @@ def camera_dashboard_router(
             return principal
         if camera_mutation_control is None:
             return _mutation_unavailable(principal)
+        camera = _camera_item(camera_control, camera_id, principal)
+        if isinstance(camera, Response):
+            return camera
         try:
             form = _form(request)
             operation, expected_revision, name, source_url, source_credentials = (
                 _mutation_fields(form)
             )
+            requested_network = form.optional("allow_source_network", max_length=4) or ""
+            if requested_network:
+                if (
+                    requested_network not in {"32", "24"}
+                    or source_url is None
+                    or camera_control is None
+                ):
+                    raise DashboardFormInvalid("dashboard_form_invalid")
+                camera_control.allow_source_network(
+                    source_url,
+                    prefix_length=int(requested_network),
+                    mutation_context=_access_mutation_context(request, principal),
+                )
         except DashboardFormInvalid:
             return _form_invalid(principal)
-        camera = _camera_item(camera_control, camera_id, principal)
-        if isinstance(camera, Response):
-            return camera
+        except ProbeEndpointSchemaUnavailable:
+            return _mutation_unavailable(principal)
         try:
             if source_credentials is None:
                 preview = camera_mutation_control.preview(
@@ -1241,10 +1318,11 @@ def _mutation_fields(
         fields_with_credentials = frozenset(
             {*fields_without_credentials, "source_username", "source_password"}
         )
-        if form.values.keys() == fields_without_credentials:
-            form.require_exact_fields(fields_without_credentials)
-        else:
-            form.require_exact_fields(fields_with_credentials)
+        provided_fields = frozenset(form.values)
+        core_fields = provided_fields - {"allow_source_network"}
+        if core_fields not in {fields_without_credentials, fields_with_credentials}:
+            raise DashboardFormInvalid("dashboard_form_invalid")
+        form.require_exact_fields(provided_fields)
         source_username = form.optional("source_username", max_length=64) or ""
         source_password = form.optional("source_password", max_length=256) or ""
         if bool(source_username) != bool(source_password):
@@ -1610,6 +1688,7 @@ def _creation_error(
     entered_name: str,
     placement_mode: str,
     selected_node_id: str,
+    source_policy_envelope: tuple[str, ...] = (),
 ) -> HTMLResponse | None:
     if isinstance(error, InvalidCameraName):
         return _unavailable_response(
@@ -1627,7 +1706,9 @@ def _creation_error(
                 "в конфигурации control plane и перезапустите web-сервис."
             ),
             "probe_destination_not_allowed": (
-                "Сеть камеры не входит в разрешённые сети источника."
+                "Сеть камеры не входит в разрешённые сети источника. Выберите /32 или /24 "
+                "в форме. Максимальный site envelope: "
+                + (", ".join(source_policy_envelope) if source_policy_envelope else "не настроен")
             ),
             "camera_source_url_invalid": "Source URL имеет некорректный формат.",
             "camera_source_url_too_long": "Source URL превышает допустимый размер.",
@@ -1652,6 +1733,7 @@ def _creation_error(
                 entered_name=entered_name,
                 placement_mode=placement_mode,
                 selected_node_id=selected_node_id,
+                source_policy_envelope=source_policy_envelope,
             ),
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )

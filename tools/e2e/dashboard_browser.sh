@@ -248,6 +248,16 @@ browser set viewport 1280 900 >/dev/null
 
 keyboard_activate 'a[href="/dashboard/nodes/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]'
 require_body_text "Runtime"
+node_detail_live=$(browser eval "(() => {
+  const main = document.querySelector('[data-node-detail-id]');
+  return main?.dataset.nodeDetailId === 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    && main?.dataset.dashboardSnapshotUrl === '/api/v1/dashboard/snapshot'
+    && document.querySelector('[data-node-readers] strong')?.textContent.trim() === '1';
+})()")
+if [[ "$node_detail_live" != "true" ]]; then
+  printf 'node detail is missing its live snapshot projection\n' >&2
+  exit 1
+fi
 browser screenshot --full "$artifact_dir/02-node.png" >/dev/null
 keyboard_activate 'a[href="/dashboard"]'
 
@@ -274,6 +284,18 @@ browser set viewport 1280 900 >/dev/null
 keyboard_activate 'a[href="/dashboard/cameras/new"]'
 require_url_contains "/dashboard/cameras/new"
 require_body_text "Зарегистрировать камеру"
+camera_source_controls=$(browser eval "(() => {
+  const auth = document.querySelector('select[name=\"source_auth_mode\"]');
+  const network = document.querySelector('select[name=\"allow_source_network\"]');
+  return auth?.value === 'credentials'
+    && Array.from(auth?.options ?? []).some((option) => option.value === 'none')
+    && Array.from(network?.options ?? []).some((option) => option.value === '32')
+    && Array.from(network?.options ?? []).some((option) => option.value === '24');
+})()")
+if [[ "$camera_source_controls" != "true" ]]; then
+  printf 'camera registration is missing explicit source auth/network controls\n' >&2
+  exit 1
+fi
 browser screenshot --full "$artifact_dir/02-camera-create.png" >/dev/null
 browser find label "Имя камеры" fill "Browser registered camera" >/dev/null
 browser find label "Source RTSP URL" fill "rtsp://new-source-camera.invalid/private" >/dev/null
@@ -304,7 +326,7 @@ browser set viewport 1280 900 >/dev/null
 for _attempt in $(seq 1 40); do
   live_ready=$(browser eval "(() =>
     document.querySelector('[data-live-connection]')?.textContent.trim() === 'Live'
-      && document.querySelector('[data-live-occupied]')?.textContent.trim() === 'занят'
+      && document.querySelector('[data-live-occupied]')?.textContent.trim() === '1'
   )()")
   if [[ "$live_ready" == "true" ]]; then
     break
@@ -324,6 +346,17 @@ browser press Enter >/dev/null
 require_url_contains "/dashboard/cameras/cccccccc-cccc-4ccc-8ccc-cccccccccccc/access"
 require_body_text "Два независимых уровня"
 require_body_text "Если оба списка пусты"
+mfa_controls=$(browser eval "(() => {
+  const grant = document.querySelector('form[action$=\"/access-grants\"]');
+  const purge = document.querySelector('form[action$=\"/access-grants/purge-inactive\"]');
+  return grant?.dataset.mfaInlineSupported === 'false'
+    && purge?.dataset.mfaInlineSupported === 'false'
+    && purge?.querySelector('button')?.textContent.includes('Удалить отозванные и истёкшие');
+})()")
+if [[ "$mfa_controls" != "true" ]]; then
+  printf 'access page is missing OIDC-safe MFA status or inactive-grant purge controls\n' >&2
+  exit 1
+fi
 browser screenshot --full "$artifact_dir/02-camera-access.png" >/dev/null
 browser select '#grant-kind' "service" >/dev/null
 browser select 'select[name="lifetime_seconds"]' "permanent" >/dev/null

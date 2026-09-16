@@ -128,7 +128,7 @@ def test_background_role_example_contains_required_startup_identity() -> None:
     environment = Path("deploy/rtsp-proxy-role.env.example").read_text(encoding="utf-8")
 
     assert "RTSP_PROXY_DATABASE_URL=postgresql+psycopg://rtsp_proxy@" in environment
-    assert "RTSP_PROXY_NODE_RELEASE_ID=0.2.1" in environment
+    assert "RTSP_PROXY_NODE_RELEASE_ID=0.2.2" in environment
     assert "RTSP_PROXY_NODE_MEDIAMTX_BINARY_SHA256=replace-with-64-lowercase-hex" in environment
 
 
@@ -455,7 +455,7 @@ def test_control_and_helper_examples_define_one_identical_runtime_policy() -> No
             == (helper[f"RTSP_PROXY_NODE_HELPER_{helper_name}"])
         )
     assert helper["RTSP_PROXY_NODE_HELPER_MEDIAMTX_BINARY"] == (
-        "/opt/rtsp-proxy/media/0.2.1/mediamtx"
+        "/opt/rtsp-proxy/media/0.2.2/mediamtx"
     )
 
 
@@ -555,8 +555,14 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
 
     assert media["source_commit"] == "1b943637a4b5778bb929a7af7687b048fecaa03f"
     assert media["go_version"] == "go1.26.5"
-    assert media["version"] == "v1.20.0-rtsp-proxy.3"
+    assert media["version"] == "v1.20.0-rtsp-proxy.4"
     assert hashlib.sha256(patch_path.read_bytes()).hexdigest() == media["patch_sha256"]
+    source_unavailable_patch = Path(media["source_unavailable_patch"])
+    assert source_unavailable_patch.is_file()
+    assert (
+        hashlib.sha256(source_unavailable_patch.read_bytes()).hexdigest()
+        == media["source_unavailable_patch_sha256"]
+    )
     gortsplib = media["gortsplib"]
     assert gortsplib["version"] == "v5.6.3"
     race_test_patch = Path(gortsplib["race_test_patch"])
@@ -573,7 +579,7 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
     assert build_script.count("TestServerSessionRecordStateMetricsRace") == 2
     assert "unpatched gortsplib unexpectedly passed" in build_script
     assert trusted["schema_version"] == 2
-    assert trusted["releases"]["0.2.1"] == {
+    assert trusted["releases"]["0.2.2"] == {
         "version": media["version"],
         "activation_compatible": True,
         "architectures": media["architectures"],
@@ -592,7 +598,8 @@ def test_mediamtx_patch_build_has_immutable_source_and_patch_provenance() -> Non
 def test_current_and_previous_patched_releases_have_distinct_trust_entries() -> None:
     previous_version, previous = trusted_mediamtx_identity("amd64", "0.1.0")
     previous_callback_version, previous_callback = trusted_mediamtx_identity("amd64", "0.2.0")
-    current_version, current = trusted_mediamtx_identity("amd64", "0.2.1")
+    previous_race_version, previous_race = trusted_mediamtx_identity("amd64", "0.2.1")
+    current_version, current = trusted_mediamtx_identity("amd64", "0.2.2")
 
     assert previous_version == "v1.20.0-rtsp-proxy.1"
     assert previous.root == ("29694cbfed07896d6d47ac19a1cb450e627569b9052ad0909c1b1c0594898cc6")
@@ -600,8 +607,12 @@ def test_current_and_previous_patched_releases_have_distinct_trust_entries() -> 
     assert previous_callback.root == (
         "3ca0e018599b2768a1965144aa56d55fedcc71ba1c8d4cfa279635e9e99b9198"
     )
-    assert current_version == "v1.20.0-rtsp-proxy.3"
-    assert current.root == ("e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f")
+    assert previous_race_version == "v1.20.0-rtsp-proxy.3"
+    assert previous_race.root == (
+        "e9cd3733549c378af566802d82980e161b957c658c27d87d5e21ddf3e4ede27f"
+    )
+    assert current_version == "v1.20.0-rtsp-proxy.4"
+    assert current.root == ("fe0aab850ac24fa409f9ab3520b138bad97500048d032b2b7713c7f44ba4775c")
     assert current != previous
 
 

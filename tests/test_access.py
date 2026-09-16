@@ -185,6 +185,25 @@ class RecordingAccessStore:
         )
         return self.grant
 
+    def purge_inactive_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        inactive_before: datetime,
+        mutation_context: NodeMutationContext,
+    ) -> tuple[UUID, ...]:
+        del mutation_context
+        grant = self.grant
+        if grant is None or grant.camera_id != camera_id:
+            return ()
+        inactive = (
+            grant.revoked_at is not None and grant.revoked_at <= inactive_before
+        ) or (grant.expires_at is not None and grant.expires_at <= inactive_before)
+        if not inactive:
+            return ()
+        self.grant = None
+        return (grant.id,)
+
     def rotate_access_grant(
         self,
         grant_id: UUID,
@@ -358,6 +377,26 @@ def test_access_grant_control_rejects_invalid_permanent_and_secret_inputs(
 
     with pytest.raises(ValueError, match=reason):
         control.create(camera_id=CAMERA_ID, lifetime=lifetime, kind=kind)
+
+
+def test_access_grant_purge_removes_only_inactive_grants_at_the_control_clock() -> None:
+    key = UUID("80000000-0000-4000-8000-000000000008")
+    store = RecordingAccessStore(
+        policy=policy(),
+        grant=replace(grant_for(), revoked_at=NOW - timedelta(seconds=1)),
+    )
+    control = AccessGrantControl(
+        store=store,
+        verifier=verifier(),
+        new_grant_id=lambda: GRANT_ID,
+        clock=lambda: NOW,
+    )
+
+    assert control.purge_inactive(
+        CAMERA_ID,
+        mutation_context=mutation_context(key),
+    ) == (GRANT_ID,)
+    assert store.grant is None
 
 
 def test_grant_rotation_replay_is_rejected_before_mutable_state_read() -> None:
@@ -1049,6 +1088,30 @@ def test_postgres_access_policy_grant_rotation_and_authorization_are_durable(
         )
     )
     assert denied.reason is AccessDecisionReason.GRANT_INACTIVE
+    purged = control.purge_inactive(
+        camera.id,
+        mutation_context=replace(
+            mutation_context(UUID("80000000-0000-4000-8000-000000000008")),
+            action="camera.grant_purge",
+            idempotency_key=None,
+        ),
+    )
+    engine = create_engine(postgres_database_url)
+    with engine.connect() as connection:
+        purge_event = connection.scalar(
+            text(
+                "SELECT payload FROM audit_events "
+                "WHERE aggregate_id=:grant_id "
+                "AND event_type='camera.access_grant_purged'"
+            ),
+            {"grant_id": replacement_id},
+        )
+    engine.dispose()
+
+    assert purged == (replacement_id,)
+    assert store.get_access_grant_by_id(replacement_id) is None
+    assert purge_event["camera_id"] == str(camera.id)
+    assert purge_event["operator"]["action"] == "camera.grant_purge"
     store.close()
 
 

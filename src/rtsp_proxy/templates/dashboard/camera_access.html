@@ -34,19 +34,25 @@
   <section class="panel" aria-labelledby="issue-title">
     <div class="panel-heading"><h2 id="issue-title">Выдать доступ downstream-клиенту</h2></div>
     <p class="detail-note">Секрет показывается один раз. Операция требует недавнюю MFA. Temporary grant всегда ограничен сроком; service grant может быть бессрочным.</p>
-    <form class="mutation-form grant-form" method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants">
+    <form class="mutation-form grant-form" method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants" data-requires-mfa data-mfa-inline-supported="{{ 'true' if principal.identity_source.value == 'local' else 'false' }}" data-mfa-expires-at="{{ mfa_expires_at.isoformat() if mfa_expires_at else '' }}">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="idempotency_key" value="{{ issue_idempotency_key }}">
       <label for="grant-kind">Режим<select id="grant-kind" name="kind"><option value="temporary">temporary</option><option value="service">service</option></select></label>
       <label for="grant-lifetime">Срок<select id="grant-lifetime" name="lifetime_seconds">
         {% for value, label in grant_lifetimes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}<option value="{{ permanent_grant_lifetime }}">Бессрочно (только service)</option>
       </select></label>
-      <div class="form-actions"><button type="submit">Выдать grant</button></div>
+      <div class="form-actions"><button type="submit">Выдать grant</button><span data-mfa-status></span></div>
+      <div class="mfa-inline" data-mfa-inline hidden><label>Свежий код TOTP<input data-mfa-code inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code"></label><button type="button" data-mfa-verify>Подтвердить и выполнить</button><small data-mfa-error></small></div>
     </form>
   </section>
 
   <section class="panel" aria-labelledby="grants-title">
     <div class="panel-heading"><h2 id="grants-title">Зарегистрированные grant’ы</h2><span>{{ grants.items | length }}{% if grants.truncated %}+{% endif %}</span></div>
+    <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants/purge-inactive" data-requires-mfa data-mfa-inline-supported="{{ 'true' if principal.identity_source.value == 'local' else 'false' }}" data-mfa-expires-at="{{ mfa_expires_at.isoformat() if mfa_expires_at else '' }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="secondary-action" type="submit">Удалить отозванные и истёкшие</button><span data-mfa-status></span>
+      <div class="mfa-inline" data-mfa-inline hidden><label>Свежий код TOTP<input data-mfa-code inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code"></label><button type="button" data-mfa-verify>Подтвердить и выполнить</button><small data-mfa-error></small></div>
+    </form>
     {% if grants.items %}
     <div class="table-wrap" tabindex="0" aria-label="Прокручиваемая таблица выданных доступов"><table><thead><tr><th>Username</th><th>Режим</th><th>Истекает</th><th>Последнее использование</th><th>Revision</th><th>Действия</th></tr></thead><tbody>
       {% for grant in grants.items %}<tr>
@@ -56,12 +62,14 @@
         <td>{% if grant.last_used_at %}{{ grant.last_used_at | dashboard_time }}{% else %}—{% endif %}</td>
         <td>{{ grant.revision }}</td>
         <td>{% if not grant.revoked_at %}
-          <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/rotate">
+          <form method="post" action="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/rotate" data-requires-mfa data-mfa-inline-supported="{{ 'true' if principal.identity_source.value == 'local' else 'false' }}" data-mfa-expires-at="{{ mfa_expires_at.isoformat() if mfa_expires_at else '' }}">
             <input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="expected_revision" value="{{ grant.revision }}">
             <input type="hidden" name="idempotency_key" value="{{ rotation_idempotency_keys[grant.id] }}">
             <input name="overlap_seconds" type="number" min="0" max="86400" value="30" aria-label="Overlap, секунд">
             <select name="lifetime_seconds" aria-label="Новый срок">{% for value, label in grant_lifetimes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}{% if grant.kind == "service" %}<option value="{{ permanent_grant_lifetime }}">Бессрочно</option>{% endif %}</select>
             <button type="submit">Ротировать</button>
+            <span data-mfa-status></span>
+            <div class="mfa-inline" data-mfa-inline hidden><label>Свежий код TOTP<input data-mfa-code inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code"></label><button type="button" data-mfa-verify>Подтвердить и выполнить</button><small data-mfa-error></small></div>
           </form>
           <a href="/dashboard/cameras/{{ camera.id }}/access-grants/{{ grant.id }}/revoke">Отозвать</a>
         {% endif %}</td>

@@ -230,6 +230,10 @@ fieldset > label:has(input:checked) { border-color: var(--accent); background: v
 .login-alternate { margin: .75rem 0 0; }
 .login-alternate-button { width: 100%; }
 .login-security-note { margin: 1.5rem 0 0; font-size: .78rem; }
+.mfa-inline { display: flex; align-items: end; gap: .6rem; grid-column: 1 / -1; padding: .75rem; border: 1px solid var(--warning); border-radius: .6rem; background: var(--warning-surface); }
+.mfa-inline[hidden] { display: none; }
+.mfa-inline label { flex: 1; }
+.mfa-inline small { color: var(--danger); }
 
 @media (max-width: 71.875rem) {
   .app-sidebar { width: 13.125rem; padding-inline: .95rem; }

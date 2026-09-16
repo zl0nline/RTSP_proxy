@@ -129,6 +129,27 @@ class _LabAccessStore:
     def check_access_grant_request(self, request: AccessGrantIdempotency) -> None:
         del request
 
+    def purge_inactive_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        inactive_before: datetime,
+        mutation_context: object,
+    ) -> tuple[UUID, ...]:
+        del mutation_context
+        removed = tuple(
+            grant_id
+            for grant_id, grant in self.grants.items()
+            if grant.camera_id == camera_id
+            and (
+                (grant.revoked_at is not None and grant.revoked_at <= inactive_before)
+                or (grant.expires_at is not None and grant.expires_at <= inactive_before)
+            )
+        )
+        for grant_id in removed:
+            del self.grants[grant_id]
+        return removed
+
 
 class _LabTokenEndpoint:
     def exchange(self, *, code: str, code_verifier: str) -> str:

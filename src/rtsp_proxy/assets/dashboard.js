@@ -71,6 +71,121 @@
     });
   });
 
+  const mfaForms = Array.from(document.querySelectorAll("form[data-requires-mfa]"));
+  const mfaRemainingSeconds = (form) => {
+    const expiresAt = Date.parse(form.dataset.mfaExpiresAt || "");
+    return Number.isFinite(expiresAt) ? Math.max(0, Math.floor((expiresAt - Date.now()) / 1000)) : 0;
+  };
+  const updateMfaStatus = (form) => {
+    const status = form.querySelector("[data-mfa-status]");
+    if (!(status instanceof HTMLElement)) {
+      return;
+    }
+    const remaining = mfaRemainingSeconds(form);
+    if (remaining <= 0) {
+      status.textContent = "MFA истекла";
+      status.className = "status status-failed";
+      return;
+    }
+    const minutes = Math.floor(remaining / 60);
+    const seconds = String(remaining % 60).padStart(2, "0");
+    status.textContent = `MFA активна ещё ${minutes}:${seconds}`;
+    status.className = "status status-healthy";
+  };
+  mfaForms.forEach((form) => {
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+    const inline = form.querySelector("[data-mfa-inline]");
+    const code = form.querySelector("[data-mfa-code]");
+    const verify = form.querySelector("[data-mfa-verify]");
+    const error = form.querySelector("[data-mfa-error]");
+    let pendingSubmitter = null;
+    const showInline = () => {
+      if (inline instanceof HTMLElement) {
+        inline.hidden = false;
+      }
+      if (code instanceof HTMLInputElement) {
+        code.required = true;
+        code.focus();
+      }
+    };
+    form.addEventListener("submit", (event) => {
+      if (form.dataset.mfaInlineSupported !== "true") {
+        return;
+      }
+      // Keep a safety margin so MFA cannot expire while the mutation is in flight.
+      if (mfaRemainingSeconds(form) > 30) {
+        return;
+      }
+      event.preventDefault();
+      pendingSubmitter = event.submitter instanceof HTMLElement ? event.submitter : null;
+      showInline();
+    });
+    if (verify instanceof HTMLButtonElement) {
+      verify.addEventListener("click", async () => {
+        if (!(code instanceof HTMLInputElement) || !/^[0-9]{6}$/.test(code.value)) {
+          if (error instanceof HTMLElement) {
+            error.textContent = "Введите шестизначный код.";
+          }
+          showInline();
+          return;
+        }
+        const csrf = form.elements.namedItem("_csrf");
+        if (!(csrf instanceof HTMLInputElement)) {
+          return;
+        }
+        verify.disabled = true;
+        if (error instanceof HTMLElement) {
+          error.textContent = "";
+        }
+        try {
+          const payload = new FormData();
+          payload.set("_csrf", csrf.value);
+          payload.set("totp", code.value);
+          const response = await fetch("/dashboard/mfa/inline", {
+            method: "POST",
+            body: payload,
+            credentials: "same-origin",
+            headers: { Accept: "application/json" },
+          });
+          if (!response.ok) {
+            throw new Error("mfa_invalid");
+          }
+          form.dataset.mfaExpiresAt = response.headers.get("X-MFA-Expires-At") || "";
+          code.value = "";
+          code.required = false;
+          if (inline instanceof HTMLElement) {
+            inline.hidden = true;
+          }
+          updateMfaStatus(form);
+          form.requestSubmit(pendingSubmitter instanceof HTMLButtonElement ? pendingSubmitter : undefined);
+        } catch (_error) {
+          if (error instanceof HTMLElement) {
+            error.textContent = "Код неверен, уже использован или истёк.";
+          }
+          showInline();
+        } finally {
+          verify.disabled = false;
+        }
+      });
+    }
+    updateMfaStatus(form);
+  });
+  if (mfaForms.length > 0) {
+    let mfaTimer = null;
+    const tickMfaStatus = () => {
+      mfaForms.forEach(updateMfaStatus);
+      mfaTimer = window.setTimeout(tickMfaStatus, 1000);
+    };
+    mfaTimer = window.setTimeout(tickMfaStatus, 1000);
+    window.addEventListener("pagehide", () => {
+      if (mfaTimer !== null) {
+        window.clearTimeout(mfaTimer);
+      }
+    });
+  }
+
   const tabList = document.querySelector("[data-camera-tabs]");
   if (tabList instanceof HTMLElement) {
     const tabs = Array.from(tabList.querySelectorAll("[role=tab]"));
@@ -235,10 +350,47 @@
           if (!snapshot || !Array.isArray(snapshot.nodes)) {
             return;
           }
-          const rows = Array.from(overview.querySelectorAll("[data-node-id]"));
+          const detailNodeId = overview.dataset.nodeDetailId;
+          if (detailNodeId) {
+            const node = snapshot.nodes.find((candidate) => candidate.node_id === detailNodeId);
+            if (!node) {
+              window.location.reload();
+              return;
+            }
+            const metricsFresh =
+              node.metrics && (node.scrape_status === "fresh" || node.scrape_status === "idle");
+            const health = overview.querySelector("[data-node-health]");
+            if (health instanceof HTMLElement && typeof node.health === "string") {
+              health.textContent = node.health;
+              health.className = /^[a-z_]+$/.test(node.health)
+                ? `status status-${node.health}`
+                : "status status-unknown";
+            }
+            setText(overview, "[data-node-cameras] strong", `${node.registered_cameras} / ${node.camera_capacity}`);
+            setText(overview, "[data-node-sources] strong", metricsFresh ? node.metrics.active_sources : "—");
+            setText(overview, "[data-node-readers] strong", metricsFresh ? node.metrics.occupied_streams : "—");
+            setText(overview, "[data-node-runtime-state]", node.runtime_state);
+            setText(overview, "[data-node-scrape-status]", node.scrape_status);
+            setText(overview, "[data-node-received]", metricsFresh ? bitrate(node.received_bitrate_bps) : "—");
+            setText(overview, "[data-node-sent]", metricsFresh ? bitrate(node.sent_bitrate_bps) : "—");
+            const observed = overview.querySelector("[data-node-metric-observed]");
+            if (observed instanceof HTMLTimeElement) {
+              if (typeof node.metric_observed_at === "string") {
+                const timestamp = new Date(node.metric_observed_at);
+                observed.dateTime = node.metric_observed_at;
+                observed.textContent = Number.isNaN(timestamp.valueOf())
+                  ? "—"
+                  : timestamp.toLocaleString("ru-RU", { timeZone: "UTC" }) + " UTC";
+              } else {
+                observed.removeAttribute("datetime");
+                observed.textContent = "—";
+              }
+            }
+          }
+          const rows = detailNodeId ? [] : Array.from(overview.querySelectorAll("[data-node-id]"));
           const currentIds = rows.map((row) => row.getAttribute("data-node-id"));
           const nextIds = snapshot.nodes.map((node) => node.node_id);
-          if (currentIds.join(",") !== nextIds.join(",")) {
+          if (!detailNodeId && currentIds.join(",") !== nextIds.join(",")) {
             window.location.reload();
             return;
           }
@@ -424,7 +576,7 @@
       sourceReason.textContent = reasons[state.source_reason] || stateReasons[state.source_state] || "—";
     }
     if (occupied instanceof HTMLElement) {
-      occupied.textContent = state.occupied === true ? "занят" : state.occupied === false ? "свободен" : "—";
+      occupied.textContent = state.occupied === true ? "1" : state.occupied === false ? "0" : "—";
     }
     if (received instanceof HTMLElement) {
       received.textContent = bitrate(state.received_bitrate_bps);

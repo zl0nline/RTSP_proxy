@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from ipaddress import IPv4Network, IPv6Network
 from threading import BoundedSemaphore, Lock, RLock
 from typing import Protocol, cast
 from urllib.parse import urlsplit
@@ -784,6 +785,7 @@ class InMemoryNodeStore:
         self._camera_registration_requests: dict[
             tuple[UUID, UUID], tuple[UUID, str, UUID | None]
         ] = {}
+        self._probe_source_networks: set[IPv4Network | IPv6Network] = set()
         self._lock = RLock()
         self._lifecycle_locks = {node.id: Lock() for node in nodes}
         self._clock = clock
@@ -792,6 +794,31 @@ class InMemoryNodeStore:
     def provisioning_guard(self) -> Iterator[None]:
         with self._lock:
             yield
+
+    def list_probe_source_networks(self) -> tuple[IPv4Network | IPv6Network, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    self._probe_source_networks,
+                    key=lambda network: (
+                        network.version,
+                        int(network.network_address),
+                        network.prefixlen,
+                    ),
+                )
+            )
+
+    def add_probe_source_network(
+        self,
+        network: IPv4Network | IPv6Network,
+        *,
+        mutation_context: NodeMutationContext,
+    ) -> bool:
+        del mutation_context
+        with self._lock:
+            before = len(self._probe_source_networks)
+            self._probe_source_networks.add(network)
+            return len(self._probe_source_networks) != before
 
     @contextmanager
     def lifecycle_guard(self, node_id: UUID) -> Iterator[None]:
@@ -3555,6 +3582,29 @@ class CameraControl:
         self._ensure_automatic_capacity = ensure_automatic_capacity
         self._probe_endpoint_admission = probe_endpoint_admission
 
+    def allow_source_network(
+        self,
+        source_url: str,
+        *,
+        prefix_length: int,
+        mutation_context: NodeMutationContext,
+    ) -> IPv4Network | IPv6Network:
+        admission = self._probe_endpoint_admission
+        if admission is None:
+            raise InvalidCameraSource("probe_source_policy_not_configured")
+        try:
+            network = admission.source_network(
+                validate_camera_source_url(source_url),
+                prefix_length=prefix_length,
+            )
+            self._store.add_probe_source_network(
+                network,
+                mutation_context=mutation_context,
+            )
+        except ProbeEndpointRejected as error:
+            raise InvalidCameraSource(str(error)) from None
+        return network
+
     def create_camera(
         self,
         *,
@@ -3925,6 +3975,15 @@ class NodeStore(Protocol):
 
 
 class CameraStore(Protocol):
+    def list_probe_source_networks(self) -> tuple[IPv4Network | IPv6Network, ...]: ...
+
+    def add_probe_source_network(
+        self,
+        network: IPv4Network | IPv6Network,
+        *,
+        mutation_context: NodeMutationContext,
+    ) -> bool: ...
+
     def list_nodes(self) -> tuple[MediaNode, ...]: ...
 
     def reserve_camera_registration(

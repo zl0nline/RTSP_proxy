@@ -444,7 +444,7 @@ Ordinary stop requires an empty node. An empty RUNNING node can be restarted
 directly. A non-empty DRAINING node uses the reconfigure/restart confirmation
 workflow, while a RUNNING port change has its own confirmation workflow and
 restarts every stream on that node. Both previews and applies require recent
-MFA (`RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS=300` by default), exact rendered
+MFA (`RTSP_PROXY_OPERATOR_RECENT_MFA_SECONDS=1800` by default), exact rendered
 revision/state, and the complete displayed camera/reader blast radius. Only the
 selected instance is touched. Delete requires zero camera placements and
 stopped/failed state. Port is released only after listener/process cleanup
@@ -482,11 +482,12 @@ executable on the current glibc host before activation. The system `bpftool` or
 execution path. `configure_camera_sources.sh` and the explicit broker/worker
 activation steps then enable execution for one site policy. MediaMTX is built
 directly on Linux by `tools/build_mediamtx.sh` from one exact upstream commit,
-two SHA-256-bound production patches, one deterministic race-regression patch,
+three SHA-256-bound production patches, one deterministic race-regression patch,
 and Go `1.26.5`; resulting amd64/arm64 binary
-digests and the distinct `v1.20.0-rtsp-proxy.3` identity are pinned in the same
-catalog. The MediaMTX patch makes `maxReaders` a synchronous non-disruptive hot
-update and maps a rejected late SETUP to RTSP 453. The gortsplib v5.6.3 patch
+digests and the distinct `v1.20.0-rtsp-proxy.4` identity are pinned in the same
+catalog. The MediaMTX patches make `maxReaders` a synchronous non-disruptive hot
+update, map a rejected late SETUP to RTSP 453, and map failed on-demand upstream
+startup to downstream RTSP 503. The gortsplib v5.6.3 patch
 locks the RECORD state transition that concurrent metrics collection reads.
 The build first proves the regression fails on stock v5.6.3, then proves it and
 the MediaMTX race suites pass after patching. Example release
@@ -504,7 +505,7 @@ Verifier reads actual Linux architecture, validates artifact paths/digests and
 version/schema compatibility. Missing/mutable/symlink-escaped artifacts abort
 activation.
 
-MediaMTX release `0.2.1` remains the race-safe native node target. Application
+MediaMTX release `0.2.2` is the source-error-aware native node target. Application
 release `0.5.0` is the additive operator-login schema bridge: its manifest and
 startup gate accept both `0012_operator_sessions` and `0013_operator_login`,
 while release `0.4.0` remains on 0012. Deploy and smoke 0.5.0 on every
@@ -719,8 +720,11 @@ approved endpoint can never be silently discarded. Name-only/admin operations
 remain available. After every process is on 0.12.0, apply
 migration 0020 once and restart the probe and WEB roles one instance at a time.
 Set `RTSP_PROXY_PROBE_SOURCE_SITE_KEY` and `RTSP_PROXY_PROBE_SOURCE_CIDRS` to the
-one site identity and its exact comma-separated camera/source networks before
-restart. Empty CIDRs are deny-all. New camera create/source-update resolves the
+one site identity and its root-owned maximum comma-separated camera/source
+network envelope before restart. Empty CIDRs are deny-all. From schema 0026,
+operators admit a resolved source as `/32` or its IPv4 subnet as `/24` in the
+dashboard; the audited PostgreSQL policy can narrow but never widen this
+envelope. New camera create/source-update resolves the
 hostname once through a bounded four-slot/two-second Linux NSS boundary, requires
 every A/AAAA answer inside that site policy and writes the chosen literal address,
 port, site/policy digest, URL digest and opaque generation in the same synchronous
@@ -786,7 +790,7 @@ once. Before adding the first camera run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_camera_sources.sh \
-  --release-id 0.17.9 \
+  --release-id 0.18.0 \
   --source-cidrs '10.180.5.0/24'
 ```
 
@@ -795,7 +799,9 @@ root:rtsp-proxy-access` keyring only when absent, and atomically replaces the
 shared `camera-source.env` loaded by WEB, reconciler, probe worker and broker.
 Empty `RTSP_PROXY_PROBE_SOURCE_CIDRS` remains an intentional
 deny-all (`probe_source_policy_not_configured`); a source outside a non-empty
-policy is `probe_destination_not_allowed`.
+envelope or outside the audited effective policy is
+`probe_destination_not_allowed`. Dashboard and JSON errors include the maximum
+envelope and an actionable `/32`/`/24` hint without exposing credentials.
 
 The `0.15.2` setup script serialized all invocations with one server-wide
 nonblocking `flock`, including callers with different custom key paths. If setup
@@ -876,6 +882,15 @@ their drift. The node runtime helper caches the executable digest by boot, PID,
 process start and immutable file identity, avoiding a full binary read on each
 observation without weakening identity checks.
 
+Candidate `0.18.0` adds schema `0026_probe_source_networks`, audited dynamic
+source-network admission inside the static broker envelope, and MediaMTX
+release `0.2.2`. Failed on-demand upstream starts now return RTSP 503. Node
+detail joins the bounded snapshot polling used by overview, and node/camera
+surfaces label active downstream reader counts explicitly. Recent MFA defaults
+to 30 minutes; protected forms show the remaining window and local operators
+can refresh TOTP inline without losing entered values. Revoked and expired
+grants can be purged with recent MFA while retaining one audit event per grant.
+
 ### Operator authentication modes
 
 There are two independent normal login paths, and they may be enabled at the
@@ -889,11 +904,11 @@ No external or cloud IdP is required or contacted by the built-in path. OIDC is
 an optional integration, not a prerequisite. Break-glass remains a third,
 emergency-only identity with separate audit and alert semantics.
 
-For a first installation of the 0.17.9 candidate, apply migration 0025 and run:
+For a first installation of the 0.18.0 candidate, apply migration 0026 and run:
 
 ```sh
 sudo /srv/rtsp-proxy-source/tools/configure_local_auth.sh \
-  --release-id 0.17.9 \
+  --release-id 0.18.0 \
   --username admin \
   --display-name 'Administrator' \
   --with-totp
@@ -1079,15 +1094,16 @@ null endpoint snapshots when its deleted node no longer makes the old port
 reconstructible; all new and active moves require exact endpoint snapshots.
 
 Activation atomically switches `current`, reloads systemd and updates control
-roles. The packaged trust catalog records current race-safe `0.2.1`, previous
-callback-compatible `0.2.0`, and historical patched `0.1.0` with distinct
+roles. The packaged trust catalog records current source-error-aware `0.2.2`,
+previous race-safe `0.2.1`, callback-compatible `0.2.0`, and historical patched
+`0.1.0` with distinct
 architecture-specific digests; stock v1.20.0 is never trusted. Phase-E
 `.1 → .2` uses the later documented drained,
 blast-radius-confirmed reconfigure because the ordinary release endpoint
 remains intentionally limited to empty stopped nodes. `.1` is not configured
 as a rollback target: it lacks callback-compatible management auth. The
-`0.2.0 → 0.2.1` race-only transition is the first pair for which `PREVIOUS_*`
-may be set after both architecture artifacts are verified.
+`0.2.1 → 0.2.2` is a typed source-error mapping transition; `PREVIOUS_*` may be
+set only after both architecture artifacts are verified.
 
 ## Security
 

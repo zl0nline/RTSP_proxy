@@ -645,6 +645,15 @@ class RecordingAccessGrants:
         )
         return self.grant
 
+    def purge_inactive(
+        self,
+        camera_id: UUID,
+        *,
+        mutation_context: NodeMutationContext,
+    ) -> tuple[UUID, ...]:
+        self.calls.append(("purge", camera_id, mutation_context))
+        return (self.grant.id,)
+
 
 class RejectingAccessGrants(RecordingAccessGrants):
     def __init__(self, *, operation: str, error: Exception) -> None:
@@ -1475,6 +1484,11 @@ def test_dashboard_node_detail_is_authenticated_escaped_and_snapshot_bound() -> 
     assert "0.2.1" in response.text
     assert "0.2.0" in response.text
     assert "runtime-drift" in response.text
+    assert f'data-node-detail-id="{NODE_ID}"' in response.text
+    assert 'data-dashboard-snapshot-url="/api/v1/dashboard/snapshot"' in response.text
+    assert "data-node-health" in response.text
+    assert "data-node-runtime-state" in response.text
+    assert "data-node-readers" in response.text
     assert missing.status_code == 404
     assert missing.headers["cache-control"] == "no-store"
     assert "Нода не найдена" in missing.text
@@ -2489,7 +2503,7 @@ def test_dashboard_empty_node_restart_and_trusted_release_update_use_fences() ->
     )
     assert release_call[0] == "release"
     release_args = cast(tuple[object, ...], release_call[1])
-    assert release_args[0:2] == (NODE_ID, "0.2.1")
+    assert release_args[0:2] == (NODE_ID, "0.2.2")
     assert isinstance(release_args[2], str) and len(release_args[2]) == 64
     assert release_args[3] == NodeCommandFence(7, NodeState.STOPPED)
     assert cast(NodeMutationContext, release_args[4]).action == "node.release_update"
@@ -2520,6 +2534,12 @@ def test_dashboard_stylesheet_is_local_and_root_redirects_to_dashboard() -> None
     assert "data-node-metric-observed" in script.text
     assert "data-node-metric-state" in script.text
     assert "data-node-counter-state" in script.text
+    assert "data-node-detail-id" not in script.text
+    assert "dataset.nodeDetailId" in script.text
+    assert "data-mfa-expires-at" not in script.text
+    assert "mfaExpiresAt" in script.text
+    assert 'fetch("/dashboard/mfa/inline"' in script.text
+    assert "form.requestSubmit" in script.text
     assert 'addEventListener("probe_completed"' in script.text
     assert 'addEventListener("probe_cleared"' in script.text
     assert 'probe.outcome === "inconclusive"' in script.text
@@ -2678,6 +2698,8 @@ def test_dashboard_camera_registration_supports_automatic_and_manual_placement()
     assert form.headers["cache-control"] == "no-store"
     assert 'action="/dashboard/cameras"' in form.text
     assert 'name="idempotency_key"' in form.text
+    assert 'name="source_auth_mode"' in form.text
+    assert 'name="allow_source_network"' in form.text
     assert 'value="automatic" checked' in form.text
     assert str(manual_node_id) in form.text
     assert str(automatic_node_id) in form.text
@@ -3171,6 +3193,15 @@ def test_dashboard_camera_registration_explains_placement_failures(
     (
         ({"placement_mode": "manual", "node_id": "not-a-uuid"}, "Некорректная форма"),
         ({"placement_mode": "invalid"}, "Некорректная форма"),
+        ({"source_auth_mode": "credentials"}, "Некорректная форма"),
+        (
+            {
+                "source_auth_mode": "none",
+                "source_username": "operator",
+                "source_password": "secret-password",
+            },
+            "Некорректная форма",
+        ),
         (
             {"source_url": "rtsp://operator:never-render@camera.internal/main"},
             "Логин и пароль нельзя помещать в URL",
@@ -4308,6 +4339,7 @@ def test_camera_access_dashboard_is_bounded_secret_free_and_explains_two_level_a
         access_policy_control=policies,
         access_grant_control=grants,
         role=OperatorRole.ADMIN,
+        identity_source=OperatorIdentitySource.LOCAL,
     )
     path = f"/dashboard/cameras/{CAMERA_ID}/access"
 
@@ -4340,6 +4372,13 @@ def test_camera_access_dashboard_is_bounded_secret_free_and_explains_two_level_a
     assert 'name="idempotency_key"' not in policy_form
     assert 'name="idempotency_key"' in issue_form
     assert 'value="permanent">Бессрочно (только service)</option>' in issue_form
+    assert (
+        f'action="/dashboard/cameras/{CAMERA_ID}/access-grants/purge-inactive"'
+        in response.text
+    )
+    assert response.text.count("data-requires-mfa") >= 3
+    assert 'data-mfa-inline-supported="true"' in response.text
+    assert "data-mfa-status" in response.text
 
 
 @pytest.mark.parametrize(
@@ -4549,6 +4588,7 @@ def test_camera_access_dashboard_mutations_fail_closed_on_missing_prerequisites(
         access_grant_control=RecordingAccessGrants(),
         role=OperatorRole.ADMIN,
         authenticated_at=NOW + timedelta(minutes=6),
+        settings=Settings(role=RuntimeRole.WEB, operator_recent_mfa_seconds=300),
     )
     stale_rotate = stale.post(
         f"{root}/access-grants/{GRANT_ID}/rotate",
@@ -4653,6 +4693,12 @@ def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revis
         data={"_csrf": CSRF_TOKEN, "expected_revision": "3"},
         follow_redirects=False,
     )
+    purged = client.post(
+        f"{root}/purge-inactive",
+        headers=headers,
+        data={"_csrf": CSRF_TOKEN},
+        follow_redirects=False,
+    )
 
     assert issued.status_code == 201
     assert issued.headers["cache-control"] == "no-store"
@@ -4674,7 +4720,9 @@ def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revis
     assert "Уже установленный RTSP-сеанс продолжит работу" in confirmation.text
     assert revoked.status_code == 303
     assert revoked.headers["location"] == f"/dashboard/cameras/{CAMERA_ID}/access"
-    create_call, replay_call, rotate_call, revoke_call = grants.calls
+    assert purged.status_code == 303
+    assert purged.headers["location"] == f"/dashboard/cameras/{CAMERA_ID}/access"
+    create_call, replay_call, rotate_call, revoke_call, purge_call = grants.calls
     assert create_call[4] == f"operator:{ACCOUNT_ID}"
     assert create_call[5] == UUID(IDEMPOTENCY_KEY)
     assert cast(NodeMutationContext, create_call[6]).action == "camera.grant_issue"
@@ -4694,6 +4742,8 @@ def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revis
     assert cast(NodeMutationContext, rotate_call[8]).action == "camera.grant_rotate"
     assert revoke_call[1:4] == (GRANT_ID, CAMERA_ID, 3)
     assert cast(NodeMutationContext, revoke_call[4]).action == "camera.grant_revoke"
+    assert purge_call[1] == CAMERA_ID
+    assert cast(NodeMutationContext, purge_call[2]).action == "camera.grant_purge"
     rejected = [
         event
         for event in session_store.request_security_events()
@@ -4713,6 +4763,7 @@ def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revis
         access_grant_control=RecordingAccessGrants(),
         role=OperatorRole.ADMIN,
         authenticated_at=NOW + timedelta(minutes=6),
+        settings=Settings(role=RuntimeRole.WEB, operator_recent_mfa_seconds=300),
     )
     stale_issue = stale.post(
         root,
@@ -4724,8 +4775,13 @@ def test_camera_grant_issue_rotate_and_revoke_require_recent_mfa_and_exact_revis
             "idempotency_key": IDEMPOTENCY_KEY,
         },
     )
-    assert stale_issue.status_code == 401
-    assert "Требуется недавняя MFA" in stale_issue.text
+    stale_purge = stale.post(
+        f"{root}/purge-inactive",
+        headers=stale_headers,
+        data={"_csrf": CSRF_TOKEN},
+    )
+    assert stale_issue.status_code == stale_purge.status_code == 401
+    assert "Требуется недавняя MFA" in stale_issue.text + stale_purge.text
 
 
 def test_dashboard_empty_service_grant_lifetime_means_permanent() -> None:

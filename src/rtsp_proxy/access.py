@@ -383,6 +383,14 @@ class AccessGrantStore(Protocol):
         mutation_context: NodeMutationContext | None = None,
     ) -> AccessGrant: ...
 
+    def purge_inactive_access_grants(
+        self,
+        camera_id: UUID,
+        *,
+        inactive_before: datetime,
+        mutation_context: NodeMutationContext,
+    ) -> tuple[UUID, ...]: ...
+
     def rotate_access_grant(
         self,
         grant_id: UUID,
@@ -874,6 +882,18 @@ class AccessGrantControl:
             grant_id,
             revoked_at=self._clock(),
             expected_revision=revision,
+            mutation_context=mutation_context,
+        )
+
+    def purge_inactive(
+        self,
+        camera_id: UUID,
+        *,
+        mutation_context: NodeMutationContext,
+    ) -> tuple[UUID, ...]:
+        return self._store.purge_inactive_access_grants(
+            camera_id,
+            inactive_before=self._clock(),
             mutation_context=mutation_context,
         )
 

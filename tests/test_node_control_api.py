@@ -767,9 +767,67 @@ def test_camera_create_reports_an_unconfigured_source_policy() -> None:
 
     assert response.status_code == 422
     assert response.json() == {
-        "detail": {"code": "probe_source_policy_not_configured"}
+        "detail": {
+            "code": "probe_source_policy_not_configured",
+            "allowed_cidrs": [],
+            "hint": (
+                "Добавьте IP источника как /32 или его IPv4-подсеть как /24 "  # noqa: RUF001
+                "через dashboard; сеть должна входить в site envelope."
+            ),
+        }
     }
     assert store.list_cameras() == ()
+
+
+def test_operator_can_allow_one_source_network_inside_the_static_envelope() -> None:
+    node = MediaNode(
+        id=UUID("00000000-0000-0000-0000-000000000001"),
+        name="media-a",
+        external_port=12000,
+        state=NodeState.RUNNING,
+        runtime_state=NodeState.RUNNING,
+        health=NodeHealth.HEALTHY,
+        management_fresh=True,
+        management_observed_at=datetime.now(UTC),
+        config_compatible=True,
+        applied_revision=1,
+    )
+    store = InMemoryNodeStore(nodes=(node,))
+    admission = ProbeEndpointAdmission(
+        site_key="site-a",
+        allowed_networks=(ip_network("10.40.0.0/16"),),
+        resolve=lambda _hostname: ("10.40.12.19",),
+        effective_networks=store.list_probe_source_networks,
+    )
+    control = CameraControl(
+        store=store,
+        new_camera_id=lambda: UUID("10000000-0000-0000-0000-000000000001"),
+        new_public_id=lambda: "a234567a234567a234567a2344",
+        probe_endpoint_admission=admission,
+    )
+
+    with pytest.raises(InvalidCameraSource, match="probe_destination_not_allowed"):
+        control.create_camera(
+            name="entrance",
+            source_url="rtsp://camera.example/main",
+            node_id=node.id,
+        )
+    assert str(
+        control.allow_source_network(
+            "rtsp://camera.example/main",
+            prefix_length=32,
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+    ) == "10.40.12.19/32"
+    camera = control.create_camera(
+        name="entrance",
+        source_url="rtsp://camera.example/main",
+        node_id=node.id,
+    )
+
+    assert camera.probe_endpoint is not None
+    assert str(camera.probe_endpoint.address) == "10.40.12.19"
+    assert tuple(map(str, store.list_probe_source_networks())) == ("10.40.12.19/32",)
 
 
 @pytest.mark.parametrize(
@@ -1514,11 +1572,11 @@ def test_packaged_migration_runner_upgrades_an_empty_database(
                 "'operator_action_rate_limits', 'camera_registration_requests', "
                 "'probe_observations', 'camera_probe_endpoints', "
                 "'camera_source_credentials', 'probe_health_states', "
-                "'camera_probe_profiles')"
+                "'camera_probe_profiles', 'probe_source_networks')"
             )
         )
-        assert revision == "0025_permanent_service_grants"
-    assert table_count == 15
+        assert revision == "0026_probe_source_networks"
+    assert table_count == 16
 
 
 def test_postgresql_node_registration_idempotency_is_atomic_and_survives_deletion(
@@ -1755,7 +1813,7 @@ def test_camera_name_migration_rejects_legacy_rows_before_strict_reads(
     command.upgrade(migration, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0025_permanent_service_grants"
+            "0026_probe_source_networks"
         )
 
 
@@ -1788,7 +1846,7 @@ def test_camera_name_migration_preserves_an_invalid_deleted_legacy_tombstone(
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0025_permanent_service_grants"
+            "0026_probe_source_networks"
         )
         assert (
             connection.scalar(text("SELECT name FROM cameras WHERE id=:id"), {"id": camera_id})
@@ -2325,6 +2383,34 @@ def test_new_control_plane_is_a_compatibility_bridge_for_previous_schema(
     assert response.json()["detail"]["code"] == "fleet_snapshot_unavailable"
 
 
+def test_previous_schema_bridge_keeps_static_source_envelope_and_blocks_dynamic_write(
+    postgres_database_url: str,
+) -> None:
+    migration = Config("alembic.ini")
+    migration.set_main_option("sqlalchemy.url", postgres_database_url)
+    command.upgrade(migration, "0025_permanent_service_grants")
+    store = PostgresNodeStore(postgres_database_url)
+    admission = ProbeEndpointAdmission(
+        site_key="bridge",
+        allowed_networks=(ip_network("10.40.0.0/24"),),
+        resolve=lambda _hostname: ("10.40.0.11",),
+        effective_networks=(
+            store.list_probe_source_networks if store.schema_is_current() else None
+        ),
+    )
+
+    assert admission.admit("rtsp://camera.example/main").literal_host == "10.40.0.11"
+    with pytest.raises(
+        ProbeEndpointSchemaUnavailable,
+        match="probe_endpoint_schema_unavailable",
+    ):
+        store.add_probe_source_network(
+            ip_network("10.40.0.11/32"),
+            mutation_context=NODE_MUTATION_CONTEXT,
+        )
+    store.close()
+
+
 def test_schema_check_sanitizes_database_connection_failures() -> None:
     store = PostgresNodeStore(
         "postgresql+psycopg://postgres@127.0.0.1:1/unavailable",
@@ -2426,7 +2512,7 @@ def test_node_creation_commits_desired_audit_and_outbox_in_one_transaction(
             "external_port": 12000,
             "api_port": 20000,
             "metrics_port": 20100,
-            "release_id": "0.2.1",
+            "release_id": "0.2.2",
             "creation_mode": "operator",
             "camera_capacity": 100,
             "desired_revision": 1,
@@ -3312,7 +3398,7 @@ def test_node_create_can_complete_provision_start_and_persist_applied_revision()
     assert runtime.calls == [(NodeRuntimeAction.PROVISION_START, node_id)]
     persisted = control.list_nodes()[0]
     assert persisted.process_id == 3001
-    assert persisted.observed_release_id == "0.2.1"
+    assert persisted.observed_release_id == "0.2.2"
 
 
 def test_stop_and_restart_only_execute_the_selected_node_identity() -> None:
@@ -5498,7 +5584,7 @@ def test_reconfigure_requires_drain_and_exact_confirmation_then_preserves_endpoi
     assert preview.status_code == 200
     assert preview.json()["external_port"] == 12000
     assert preview.json()["registered_cameras"] == 1
-    assert preview.json()["target_release_id"] == "0.2.1"
+    assert preview.json()["target_release_id"] == "0.2.2"
     assert preview.json()["target_mediamtx_binary_sha256"] == "0" * 64
     assert reconfigured.status_code == 200
     assert reconfigured.json()["state"] == "draining"

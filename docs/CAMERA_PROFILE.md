@@ -52,9 +52,13 @@ username/password fields. Operators must not percent-encode those fields; the
 server encodes reserved characters exactly once and stores a camera-bound
 AES-256-GCM envelope. API, dashboard and audit never return the secret.
 
-`RTSP_PROXY_PROBE_SOURCE_CIDRS` is an exact site allowlist for source
-registration; empty means deny-all. Source admission resolves once, persists a
-literal IP/port plus policy/source digest and is invalidated by policy change.
+`RTSP_PROXY_PROBE_SOURCE_CIDRS` is the root-owned maximum site envelope; empty
+means deny-all. Inside it, an operator explicitly admits the resolved camera
+address as `/32` or its IPv4 subnet as `/24` through the dashboard. The dynamic
+policy is stored and audited in PostgreSQL and cannot widen the envelope used by
+the root broker. Source admission resolves once, persists a literal IP/port plus
+policy/source digest and is invalidated when the effective policy no longer
+allows it.
 This is separate from downstream `internet`/`local` CIDRs, where both empty
 means allow-all at the direct-peer IP stage.
 

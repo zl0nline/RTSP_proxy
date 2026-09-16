@@ -1358,6 +1358,40 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.post("/dashboard/mfa/inline", include_in_schema=False)
+    def dashboard_mfa_inline(request: Request) -> Response:
+        principal = _dashboard_principal(request, operator_sessions)
+        if isinstance(principal, Response):
+            return principal
+        try:
+            form = request.state.dashboard_form
+            form.require_exact_fields(frozenset({"_csrf", "totp"}))
+            if local_operator_login is None or principal.identity_source.value != "local":
+                raise OidcLoginInvalid("local_operator_mfa_refresh_denied")
+            local_operator_login.refresh_mfa(
+                account_id=principal.account_id,
+                session_id=principal.session_id,
+                session_token=request.cookies.get("__Host-rtsp_proxy_session", ""),
+                totp=form.required("totp", max_length=6),
+                audit_context=request.state.operator_audit_context,
+            )
+        except (OidcLoginInvalid, OperatorAuthenticationRequired, DashboardFormInvalid):
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                content={"detail": {"code": "operator_mfa_invalid"}},
+                headers={"Cache-Control": "no-store"},
+            )
+        except (OidcLoginUnavailable, OperatorSessionUnavailable):
+            return _operator_session_unavailable_response(request)
+        expires_at = clock() + timedelta(seconds=settings.operator_recent_mfa_seconds)
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT,
+            headers={
+                "Cache-Control": "no-store",
+                "X-MFA-Expires-At": expires_at.isoformat(),
+            },
+        )
+
     app.include_router(
         camera_dashboard_router(
             camera_probe_profiles=camera_probe_profiles,
@@ -1372,6 +1406,9 @@ def create_app(
             secret_reveal_seconds=access_secret_reveal_seconds,
             poll_interval_seconds=settings.dashboard_poll_interval_seconds,
             public_rtsp_host=settings.public_rtsp_host,
+            source_policy_envelope=tuple(
+                str(network) for network in settings.probe_source_cidrs
+            ),
         )
     )
     app.include_router(camera_probe_profile_router(camera_probe_profiles))
@@ -1420,6 +1457,8 @@ def create_app(
                 port_range_start=settings.node_port_range_start,
                 port_range_end=settings.node_port_range_end,
                 target_release_id=settings.node_release_id,
+                poll_interval_seconds=settings.dashboard_poll_interval_seconds,
+                recent_mfa_seconds=settings.operator_recent_mfa_seconds,
             )
         )
 
@@ -2435,7 +2474,7 @@ def create_app(
         except (InvalidCameraName, InvalidCameraSource) as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": str(error)},
+                detail=_camera_input_error_detail(error, settings),
             ) from None
         except CameraLifecycleConflict as error:
             if str(error).startswith("camera_idempotency_"):
@@ -2497,7 +2536,7 @@ def create_app(
         except (InvalidCameraName, InvalidCameraSource) as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": str(error)},
+                detail=_camera_input_error_detail(error, settings),
             ) from None
         except ProbeEndpointSchemaUnavailable:
             raise HTTPException(
@@ -2672,7 +2711,7 @@ def create_app(
         except (InvalidCameraName, InvalidCameraSource) as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": str(error)},
+                detail=_camera_input_error_detail(error, settings),
             ) from None
         return CameraMutationPreviewResponse(
             camera_id=str(preview.camera_id),
@@ -3500,6 +3539,7 @@ def _operator_scope_for_request(request: Request) -> str | None:
         "/dashboard/logout",
         "/dashboard/password",
         "/dashboard/mfa",
+        "/dashboard/mfa/inline",
     }:
         return None
     for camera_resource_prefix in ("/dashboard/cameras/", "/api/v1/cameras/"):
@@ -3533,7 +3573,7 @@ def _operator_action_bucket(
         return OperatorActionBucket.SECRET_ISSUE
     if action in {"camera.create", "camera.probe_profile_update"}:
         return OperatorActionBucket.CAMERA_MUTATION
-    if action in {"camera.access_policy_update", "camera.grant_revoke"}:
+    if action in {"camera.access_policy_update", "camera.grant_revoke", "camera.grant_purge"}:
         return OperatorActionBucket.ACCESS_MUTATION
     return None
 
@@ -3543,6 +3583,22 @@ def _operator_audit_http_method(method: str) -> str:
     if normalized in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
         return normalized
     return "OTHER"
+
+
+def _camera_input_error_detail(error: Exception, settings: Settings) -> dict[str, object]:
+    detail: dict[str, object] = {"code": str(error)}
+    if isinstance(error, InvalidCameraSource) and str(error) in {
+        "probe_destination_not_allowed",
+        "probe_source_policy_not_configured",
+    }:
+        detail.update(
+            allowed_cidrs=[str(network) for network in settings.probe_source_cidrs],
+            hint=(
+                "Добавьте IP источника как /32 или его IPv4-подсеть как /24 "  # noqa: RUF001
+                "через dashboard; сеть должна входить в site envelope."
+            ),
+        )
+    return detail
 
 
 def _operator_audit_target(request: Request) -> tuple[str, str, str]:
@@ -3556,10 +3612,11 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
         "/dashboard/logout",
         "/dashboard/password",
         "/dashboard/mfa",
+        "/dashboard/mfa/inline",
     }:
         if path.endswith("/password"):
             return "operator.password_change", "session", "self"
-        if path.endswith("/mfa"):
+        if path.endswith("/mfa") or path.endswith("/mfa/inline"):
             return "operator.mfa_refresh", "session", "self"
         action = (
             "operator.session_logout" if method in {"POST", "DELETE"} else "operator.session_read"
@@ -3676,7 +3733,9 @@ def _operator_audit_target(request: Request) -> tuple[str, str, str]:
                 action = "camera.grant_list" if method == "GET" else "camera.grant_issue"
             elif suffix.startswith("access-grants/"):
                 action = (
-                    "camera.grant_revoke"
+                    "camera.grant_purge"
+                    if suffix == "access-grants/purge-inactive"
+                    else "camera.grant_revoke"
                     if suffix.endswith("/revoke")
                     else "camera.grant_rotate"
                 )

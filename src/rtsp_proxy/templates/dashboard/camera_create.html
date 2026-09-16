@@ -36,6 +36,23 @@
         <input type="text" name="name" required minlength="1" maxlength="128" autocomplete="off" value="{{ entered_name }}">
       </label>
       <label class="full">
+        <span>Авторизация источника</span>
+        <select name="source_auth_mode" required>
+          <option value="credentials" selected>Камера требует логин и пароль</option>
+          <option value="none">Камера подтверждённо работает без авторизации</option>
+        </select>
+        <small>Камеру без credentials можно зарегистрировать только после явного выбора режима без авторизации.</small>
+      </label>
+      <label class="full">
+        <span>Политика сети источника</span>
+        <select name="allow_source_network">
+          <option value="">Использовать уже разрешённые сети</option>
+          <option value="32">Добавить только IP камеры (/32, безопасный вариант)</option>
+          <option value="24">Добавить подсеть камеры (/24)</option>
+        </select>
+        <small>Изменение сохраняется без рестарта, попадает в audit_events и ограничено site envelope: {{ source_policy_envelope | join(', ') if source_policy_envelope else 'не настроен' }}.</small>
+      </label>
+      <label class="full">
         <span>Source RTSP URL</span>
         <input type="url" name="source_url" required maxlength="8192" autocomplete="off" placeholder="rtsp://camera.local/path">
         <small>URL указывается без логина, пароля и query. После ошибки введённый URL не возвращается в HTML.</small>

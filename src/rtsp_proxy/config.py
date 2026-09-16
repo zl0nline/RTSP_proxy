@@ -95,9 +95,9 @@ class Settings(BaseSettings):
     probe_source_cidrs: Annotated[tuple[IPvAnyNetwork, ...], NoDecode] = ()
     camera_source_keys_file: Path | None = None
     confirmation_secret: str | None = Field(default=None, min_length=43, max_length=256)
-    operator_recent_mfa_seconds: int = Field(default=300, ge=30, le=900)
+    operator_recent_mfa_seconds: int = Field(default=1800, ge=30, le=3600)
     node_release_id: str = Field(
-        default="0.2.1",
+        default="0.2.2",
         pattern=r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$",
     )
     node_mediamtx_binary_sha256: str = Field(

@@ -21,6 +21,7 @@
       <label class="full">Новый source URL<input name="source_url" type="password" required maxlength="8192" autocomplete="new-password" spellcheck="false" placeholder="rtsp://camera-host/path"></label>
       <label>Логин камеры (необязательно)<input name="source_username" maxlength="64" autocomplete="off" spellcheck="false"></label>
       <label>Пароль камеры (необязательно)<input name="source_password" type="password" maxlength="256" autocomplete="new-password"><small>Введите credentials в исходном (не percent-encoded) виде. %HH сохраняется буквально; сервер кодирует значение ровно один раз.</small></label>
+      <label class="full">Политика новой сети<select name="allow_source_network"><option value="">Использовать уже разрешённые сети</option><option value="32">Добавить IP источника (/32)</option><option value="24">Добавить подсеть источника (/24)</option></select></label>
       <p class="full">Текущий source URL и credentials никогда не возвращаются в dashboard. Введите URL без логина и пароля. Если поля credentials оставить пустыми, сохранённые credentials останутся без изменений.</p>
       <div class="form-actions full"><button type="submit">Проверить изменение</button><a href="/dashboard/cameras/{{ camera.id }}">Отмена</a></div>
     </form>

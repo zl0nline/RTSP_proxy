@@ -732,13 +732,15 @@ def test_observability_database_roles_cannot_read_secrets_or_mutate_control_plan
     restricted = create_engine(restricted_url)
     with restricted.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0025_permanent_service_grants"
+            "0026_probe_source_networks"
         )
         assert not connection.scalar(
             text("SELECT pg_has_role(current_user, 'rtsp_proxy_observability_hostile', 'MEMBER')")
         )
     with pytest.raises(ProgrammingError), restricted.begin() as connection:
         connection.execute(text("SELECT source_url FROM cameras"))
+    with pytest.raises(ProgrammingError), restricted.begin() as connection:
+        connection.execute(text("SELECT network FROM probe_source_networks"))
     with pytest.raises(ProgrammingError), restricted.begin() as connection:
         connection.execute(text("UPDATE media_nodes SET state='failed'"))
     with pytest.raises(ProgrammingError), restricted.begin() as connection:
