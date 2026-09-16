@@ -1,6 +1,6 @@
 # Production readiness
 
-Last reviewed: 2026-09-14.
+Last reviewed: 2026-09-16.
 
 This is the single current admission record for the product. Historical CI and
 pilot reports remain under [`evidence/`](evidence/); they do not override this
@@ -13,14 +13,14 @@ explicit owner decision, not an implicit pass.
 
 | Item | Value |
 |---|---|
-| Application candidate | `0.17.9` |
-| Git commit | `985c93d25e1af4ad459e713c3c60af25506de86e` |
-| Database head | `0025_permanent_service_grants` |
-| Media runtime | `v1.20.0-rtsp-proxy.3` |
+| Application candidate | `0.18.0` |
+| Git commit | `20f79cdeceac8bec37b0196b121c15d88bd462d8` |
+| Database head | `0026_probe_source_networks` |
+| Media runtime | `v1.20.0-rtsp-proxy.4` |
 | Host compatibility contract | [`modern-systemd-linux-v1`](HOST_COMPATIBILITY.md), native amd64 or arm64 |
-| Release CI | [0.17.9 exact-commit run: all 14 jobs passed](https://github.com/zl0nline/RTSP_proxy/actions/runs/34884167970) |
+| Release CI | [0.18.0 exact-commit run: all 14 jobs passed](https://github.com/zl0nline/RTSP_proxy/actions/runs/35067011035) |
 | Compatibility evidence | [0.17.6 ARM hardware record](evidence/host-compatibility-0.17.6-arm64-2026-09-11.md); retained as historical hardware evidence |
-| Production pilot | [0.17.9 update record](evidence/pilot-update-0.17.9-2026-09-14.md); release/continuity and permanent-grant evidence on an unadmitted host |
+| Production pilot | [0.18.0 update record](evidence/pilot-update-0.18.0-2026-09-16.md); bridge/migration, explicit MediaMTX transition and operator-workflow evidence on an unadmitted host |
 | Product status | **Portable release-functional candidate; Production HOLD pending exact-site evidence** |
 
 The candidate values above are updated only after a fully successful release CI
@@ -31,22 +31,22 @@ file is being prepared as part of that same release change.
 
 | Gate | Status | Required evidence / reason |
 |---|---|---|
-| Capability-based Linux detection, bootstrap and package adapters | PASS (contract and compatibility hardware); SITE REQUIRED admitted host | Exact 0.17.9 native Ubuntu 24.04 amd64/arm64 CI, real package installs on five distro families over HTTPS (including a full supported Arch sync-upgrade) and the [0.17.6 ARM hardware smoke](evidence/host-compatibility-0.17.6-arm64-2026-09-11.md); doctor plus native contracts must pass again on the exact production host |
+| Capability-based Linux detection, bootstrap and package adapters | PASS (contract and compatibility hardware); SITE REQUIRED admitted host | Exact 0.18.0 native Ubuntu 24.04 amd64/arm64 CI, real package installs on five distro families over HTTPS (including a full supported Arch sync-upgrade) and the [0.17.6 ARM hardware smoke](evidence/host-compatibility-0.17.6-arm64-2026-09-11.md); doctor plus native contracts must pass again on the exact production host |
 | Node registry, placement, lifecycle and 100-camera hard admission limit | PASS | Unit, PostgreSQL race and native lifecycle suites; the hard limit is a safety constraint, not a throughput claim |
 | Per-node process/config/port isolation | PASS | Native amd64/arm64 media, namespace and load/isolation CI |
-| Ordinary RTSP/TCP, one-reader admission and exact `453` | PASS (contract); SITE REQUIRED per profile | Pinned MediaMTX native contracts; ordinary-reader smoke for every admitted camera profile |
+| Ordinary RTSP/TCP, one-reader admission, exact `453` and upstream-unavailable `503` | PASS (contract); SITE REQUIRED per profile/failure path | Pinned MediaMTX native contracts on both architectures; the pilot passed ordinary DESCRIBE for both currently operational cameras, but did not reproduce an unavailable source |
 | Camera CRUD, move, drain, forced operations and delete guards | PASS (contract and pilot); SITE REQUIRED admitted host | Automated transactional tests and the [0.17.4 pilot game day](evidence/production-admission-2026-09-10.md); repeat on the supported admitted host |
-| ACL, downstream grants, local login, TOTP, RBAC and audit | PASS (contract and pilot) | Native/unit security suites plus audited pilot login, MFA step-up, grant use and final revocation; 0.17.9 fixes dashboard issuance of permanent service grants, retains replay-safe in-session local TOTP refresh and keeps temporary secrets time-bounded |
-| Albedo dashboard shell, responsive forms and camera tabs | PASS (contract and pilot) | Exact-commit browser E2E plus authenticated pilot smoke at 1440/1024/390 px in both themes; camera hash/deep-link and keyboard tab navigation passed with no browser errors |
+| ACL, downstream grants, local login, TOTP, RBAC and audit | PASS (contract and pilot) | Native/unit security suites plus audited pilot login, 30-minute recent-MFA projection, grant use/revocation and purge; 0.18.0 preserves replay-safe inline local TOTP refresh, keeps temporary secrets time-bounded and emits one audit event per purged inactive grant |
+| Albedo dashboard shell, responsive forms and camera tabs | PASS (contract and pilot) | Exact-commit browser E2E plus authenticated pilot smoke; live node/readers projection, source-auth/network controls and recent-MFA status were exercised after the 0.18.0 update |
 | HTTPS management boundary and secret handling | PASS (contract); SITE REQUIRED certificate | Release verifier and deployment tests; CA-issued site certificate/SAN and secret inventory are local evidence |
 | Placement and move targets with stale runtime state | PASS | Both paths observe and persist plausible candidate runtime state through the guarded write-side helper before applying freshness filters |
 | Source credentials with reserved characters | PASS | Raw separate-field contract and exact encode-once regression; detail view exposes only sanitized host/port/path and a credential-presence flag, while username, password, query and fragment remain secret |
 | On-demand ingest diagnosis | PASS | Idle, connecting, unavailable and ready are derived without opening an unsafe second upstream session; active probe reason remains independent |
-| Isolated source probe worker/broker | PASS | Native amd64/arm64 broker, BPF, cancellation, policy and worker suites |
-| Collector and node metrics | PASS | Read-only collector plus least-privilege process identity observation; executable digests are cached only across an unchanged boot/PID/start/file identity and desired/observed media release drift is explicit |
+| Isolated source probe worker/broker | PASS | Native amd64/arm64 broker, BPF, cancellation, audited dynamic `/32`/`/24` policy, static-envelope and worker suites |
+| Collector and node metrics | PASS (contract and pilot) | Read-only collector plus least-privilege process identity observation; node detail now consumes the bounded live snapshot and the pilot projected health, runtime, bitrate and downstream readers through the MediaMTX transition |
 | Incident outbox/notifier semantics | PASS (contract); SITE REQUIRED relay | Deterministic accepted/rejected/ambiguous/recovery tests; a real configured SMTP relay drill is mandatory |
-| Immutable install/update/health rollback | PASS (contract and pilot continuity); SITE REQUIRED admitted host | Exact `0.17.9` both-architecture release CI installs verified MediaMTX at `/opt/rtsp-proxy/media/<media-release>/mediamtx`, migrates only digest-identical paths and never restarts media units during control-plane activation; the [0.17.9 pilot update](evidence/pilot-update-0.17.9-2026-09-14.md) preserved the active media PID, while 0.17.8 evidence records the earlier four-process shared-path activation and historical 0.17.4 evidence preserved an established reader |
-| PostgreSQL backup and isolated restore verification | PASS (tooling and pilot); SITE REQUIRED admitted host | The 0.17.9 pre-update archive passed checksum and restore-list verification; the exact historical `0.17.4` archive restored all 32 tables and five invariants in 1.80 s; the site must retain its own checksum-bound report |
+| Immutable install/update/health rollback | PASS (contract and pilot continuity); SITE REQUIRED admitted host | Exact `0.18.0` both-architecture release CI and the [0.18.0 pilot update](evidence/pilot-update-0.18.0-2026-09-16.md) prove that control-plane activation preserves media, while a separate zero-reader drain/preview/confirmation moves only the selected node from verified `0.2.1` to `0.2.2` |
+| PostgreSQL backup and isolated restore verification | PASS (tooling and pilot); SITE REQUIRED admitted host | The 0.18.0 pre-0026 archive passed checksum and restore-list verification; the exact historical `0.17.4` archive restored all 32 tables and five invariants in 1.80 s; the site must retain its own checksum-bound report |
 | Control assets/keyring backup and off-host copy | SITE REQUIRED | Root-owned archive, checksum, encrypted off-host copy and restore-access proof cannot be supplied by source CI |
 | RPO/RTO recovery drill | SITE REQUIRED | Restore database and control assets within RPO ≤5 min / control RTO ≤30 min on site hardware |
 | Control restart while media is established | PASS (pilot); SITE REQUIRED admitted host | Pilot web/auth/reconciler/collector restart preserved the media PID and reader; repeat on admitted hardware |
